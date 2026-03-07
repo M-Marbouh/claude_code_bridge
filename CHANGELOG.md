@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v5.2.8 (2026-03-07)
+
+### 📝 Documentation
+
+- **tmux Layout Tip**: Added English and Chinese usage notes explaining that `Ctrl+b` then `Space` cycles tmux layouts and can be pressed repeatedly
+
 ## v5.2.7 (2026-03-07)
 
 ### 🔧 Stability Fixes

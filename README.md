@@ -404,6 +404,7 @@ ccb -a codex gemini opencode  # Auto-approval mode with multiple providers
 ccb -a -r codex gemini opencode claude  # Auto + resume for all providers
 
 tmux tip: CCB's tmux status/pane theming is enabled only while CCB is running.
+tmux tip: press `Ctrl+b` then `Space` to cycle tmux layouts. You can press it repeatedly to keep switching layouts.
 
 Layout rule: the last provider runs in the current pane. Extras are ordered as `[cmd?, reversed providers]`; the first extra goes to the top-right, then the left column fills top-to-bottom, then the right column fills top-to-bottom. Examples: 4 panes = left2/right2, 5 panes = left2/right3.
 Note: `ccb up` is removed; use `ccb ...` or configure `ccb.config`.

@@ -360,6 +360,7 @@ ccb -a codex gemini opencode  # 自动权限模式，启动多个
 ccb -a -r codex gemini opencode claude  # 自动 + 恢复（四个全开）
 
 tmux 提示：CCB 的 tmux 状态栏/窗格标题主题只会在 CCB 运行期间启用。
+tmux 提示：在 tmux 内可以按 `Ctrl+b` 然后按 `Space` 来切换布局；可以连续按，多次循环切换不同布局。
 
 布局规则：当前 pane 对应 providers 列表的最后一个。额外 pane 顺序为 `[cmd?, providers 反序]`；第一个额外 pane 在右上，其后先填满左列（从上到下），再填右列（从上到下）。例：4 个 pane 左2右2，5 个 pane 左2右3。
 提示：`ccb up` 已移除，请使用 `ccb ...` 或配置 `ccb.config`。

@@ -121,6 +121,9 @@ SCRIPTS_TO_LINK=(
   bin/bask
   bin/bpend
   bin/bping
+  bin/qask
+  bin/qpend
+  bin/qping
   bin/ask
   bin/ccb-ping
   bin/pend

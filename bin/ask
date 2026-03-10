@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, droid, claude, copilot, codebuddy
+    gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen
 
 Modes:
     Default (async):  Background task with hook callback
@@ -58,6 +58,7 @@ PROVIDER_DAEMONS = {
     "claude": "lask",
     "copilot": "hask",
     "codebuddy": "bask",
+    "qwen": "qask",
 }
 
 CALLER_SESSION_FILES = {
@@ -68,6 +69,7 @@ CALLER_SESSION_FILES = {
     "droid": ".droid-session",
     "copilot": ".copilot-session",
     "codebuddy": ".codebuddy-session",
+    "qwen": ".qwen-session",
 }
 
 CALLER_PANE_ENV_HINTS = {
@@ -77,6 +79,7 @@ CALLER_PANE_ENV_HINTS = {
     "droid": ("DROID_TMUX_SESSION", "DROID_WEZTERM_PANE"),
     "copilot": ("COPILOT_TMUX_SESSION", "COPILOT_WEZTERM_PANE"),
     "codebuddy": ("CODEBUDDY_TMUX_SESSION", "CODEBUDDY_WEZTERM_PANE"),
+    "qwen": ("QWEN_TMUX_SESSION", "QWEN_WEZTERM_PANE"),
 }
 
 CALLER_ENV_HINTS = {
@@ -86,6 +89,7 @@ CALLER_ENV_HINTS = {
     "droid": ("DROID_SESSION_ID", "DROID_RUNTIME_DIR"),
     "copilot": ("COPILOT_SESSION_ID", "COPILOT_RUNTIME_DIR"),
     "codebuddy": ("CODEBUDDY_SESSION_ID", "CODEBUDDY_RUNTIME_DIR"),
+    "qwen": ("QWEN_SESSION_ID", "QWEN_RUNTIME_DIR"),
 }
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
@@ -479,7 +483,7 @@ def _usage() -> None:
     print("Usage: ask <provider> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude, copilot, codebuddy", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)

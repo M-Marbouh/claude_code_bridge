@@ -254,7 +254,7 @@ def main(argv: list[str]) -> int:
     args, _unknown = parser.parse_known_args(argv[1:])
 
     provider = (args.provider or Path(argv[0]).name).strip().lower()
-    if provider not in ("codex", "gemini", "claude", "opencode", "droid", "copilot", "codebuddy"):
+    if provider not in ("codex", "gemini", "claude", "opencode", "droid", "copilot", "codebuddy", "qwen"):
         print(f"[stub] unknown provider: {provider}", file=sys.stderr)
         return 2
 
@@ -272,6 +272,8 @@ def main(argv: list[str]) -> int:
     copilot_session_id = ""
     codebuddy_session_path: Path | None = None
     codebuddy_session_id = ""
+    qwen_session_path: Path | None = None
+    qwen_session_id = ""
 
     if provider == "gemini":
         gemini_session_path = _gemini_session_path()
@@ -315,6 +317,16 @@ def main(argv: list[str]) -> int:
             slug = _droid_slug(Path.cwd())
             codebuddy_session_path = root / slug / f"codebuddy-{codebuddy_session_id}.jsonl"
         _ensure_droid_session_start(codebuddy_session_path, codebuddy_session_id, os.getcwd())
+    elif provider == "qwen":
+        qwen_session_id = (os.environ.get("QWEN_SESSION_ID") or "").strip() or f"stub-{uuid.uuid4().hex}"
+        explicit = (os.environ.get("QWEN_SESSION_PATH") or "").strip()
+        if explicit:
+            qwen_session_path = Path(explicit).expanduser()
+        else:
+            root = _droid_sessions_root()
+            slug = _droid_slug(Path.cwd())
+            qwen_session_path = root / slug / f"qwen-{qwen_session_id}.jsonl"
+        _ensure_droid_session_start(qwen_session_path, qwen_session_id, os.getcwd())
 
     def _handle_request(req_id: str, prompt: str) -> None:
         if provider == "codex":
@@ -348,6 +360,10 @@ def main(argv: list[str]) -> int:
         if provider == "codebuddy":
             assert codebuddy_session_path is not None
             _handle_droid(req_id, prompt, delay_s, codebuddy_session_path, codebuddy_session_id)
+            return
+        if provider == "qwen":
+            assert qwen_session_path is not None
+            _handle_droid(req_id, prompt, delay_s, qwen_session_path, qwen_session_id)
             return
 
     def _signal_handler(_signum, _frame):

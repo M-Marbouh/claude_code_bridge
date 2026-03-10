@@ -179,3 +179,25 @@ BASK_CLIENT_SPEC = ProviderClientSpec(
     daemon_bin_name="askd",
     daemon_module="askd.daemon",
 )
+
+
+# ── Qwen (qwen-code CLI) ──────────────────────────────────────────────────────
+QASKD_SPEC = ProviderDaemonSpec(
+    daemon_key="qaskd",
+    protocol_prefix="qask",
+    state_file_name="qaskd.json",
+    log_file_name="qaskd.log",
+    idle_timeout_env="CCB_QASKD_IDLE_TIMEOUT_S",
+    lock_name="qaskd",
+)
+
+QASK_CLIENT_SPEC = ProviderClientSpec(
+    protocol_prefix="qask",
+    enabled_env="CCB_QASKD",
+    autostart_env_primary="CCB_QASKD_AUTOSTART",
+    autostart_env_legacy="CCB_AUTO_QASKD",
+    state_file_env="CCB_QASKD_STATE_FILE",
+    session_filename=".qwen-session",
+    daemon_bin_name="askd",
+    daemon_module="askd.daemon",
+)

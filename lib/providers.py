@@ -133,3 +133,26 @@ DASK_CLIENT_SPEC = ProviderClientSpec(
     daemon_bin_name="askd",
     daemon_module="askd.daemon",
 )
+
+
+# Copilot (GitHub Copilot CLI)
+HASKD_SPEC = ProviderDaemonSpec(
+    daemon_key="haskd",
+    protocol_prefix="hask",
+    state_file_name="haskd.json",
+    log_file_name="haskd.log",
+    idle_timeout_env="CCB_HASKD_IDLE_TIMEOUT_S",
+    lock_name="haskd",
+)
+
+
+HASK_CLIENT_SPEC = ProviderClientSpec(
+    protocol_prefix="hask",
+    enabled_env="CCB_HASKD",
+    autostart_env_primary="CCB_HASKD_AUTOSTART",
+    autostart_env_legacy="CCB_AUTO_HASKD",
+    state_file_env="CCB_HASKD_STATE_FILE",
+    session_filename=".copilot-session",
+    daemon_bin_name="askd",
+    daemon_module="askd.daemon",
+)

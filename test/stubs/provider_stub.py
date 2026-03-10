@@ -254,7 +254,7 @@ def main(argv: list[str]) -> int:
     args, _unknown = parser.parse_known_args(argv[1:])
 
     provider = (args.provider or Path(argv[0]).name).strip().lower()
-    if provider not in ("codex", "gemini", "claude", "opencode", "droid"):
+    if provider not in ("codex", "gemini", "claude", "opencode", "droid", "copilot"):
         print(f"[stub] unknown provider: {provider}", file=sys.stderr)
         return 2
 
@@ -268,6 +268,8 @@ def main(argv: list[str]) -> int:
     opencode_state: dict | None = None
     droid_session_path: Path | None = None
     droid_session_id = ""
+    copilot_session_path: Path | None = None
+    copilot_session_id = ""
 
     if provider == "gemini":
         gemini_session_path = _gemini_session_path()
@@ -291,6 +293,10 @@ def main(argv: list[str]) -> int:
         droid_session_path = _droid_session_path()
         droid_session_id = (os.environ.get("DROID_SESSION_ID") or "").strip() or f"stub-{uuid.uuid4().hex}"
         _ensure_droid_session_start(droid_session_path, droid_session_id, os.getcwd())
+    elif provider == "copilot":
+        copilot_session_path = _droid_session_path()  # Reuse droid-style JSONL for stub
+        copilot_session_id = (os.environ.get("COPILOT_SESSION_ID") or "").strip() or f"stub-{uuid.uuid4().hex}"
+        _ensure_droid_session_start(copilot_session_path, copilot_session_id, os.getcwd())
 
     def _handle_request(req_id: str, prompt: str) -> None:
         if provider == "codex":
@@ -316,6 +322,10 @@ def main(argv: list[str]) -> int:
         if provider == "droid":
             assert droid_session_path is not None
             _handle_droid(req_id, prompt, delay_s, droid_session_path, droid_session_id)
+            return
+        if provider == "copilot":
+            assert copilot_session_path is not None
+            _handle_droid(req_id, prompt, delay_s, copilot_session_path, copilot_session_id)
             return
 
     def _signal_handler(_signum, _frame):

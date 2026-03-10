@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, droid, claude
+    gemini, codex, opencode, droid, claude, copilot
 
 Modes:
     Default (async):  Background task with hook callback
@@ -56,6 +56,7 @@ PROVIDER_DAEMONS = {
     "opencode": "oask",
     "droid": "dask",
     "claude": "lask",
+    "copilot": "hask",
 }
 
 CALLER_SESSION_FILES = {
@@ -64,6 +65,7 @@ CALLER_SESSION_FILES = {
     "gemini": ".gemini-session",
     "opencode": ".opencode-session",
     "droid": ".droid-session",
+    "copilot": ".copilot-session",
 }
 
 CALLER_PANE_ENV_HINTS = {
@@ -71,6 +73,7 @@ CALLER_PANE_ENV_HINTS = {
     "gemini": ("GEMINI_TMUX_SESSION", "GEMINI_WEZTERM_PANE"),
     "opencode": ("OPENCODE_TMUX_SESSION", "OPENCODE_WEZTERM_PANE"),
     "droid": ("DROID_TMUX_SESSION", "DROID_WEZTERM_PANE"),
+    "copilot": ("COPILOT_TMUX_SESSION", "COPILOT_WEZTERM_PANE"),
 }
 
 CALLER_ENV_HINTS = {
@@ -78,6 +81,7 @@ CALLER_ENV_HINTS = {
     "gemini": ("GEMINI_SESSION_ID", "GEMINI_RUNTIME_DIR"),
     "opencode": ("OPENCODE_SESSION_ID", "OPENCODE_RUNTIME_DIR"),
     "droid": ("DROID_SESSION_ID", "DROID_RUNTIME_DIR"),
+    "copilot": ("COPILOT_SESSION_ID", "COPILOT_RUNTIME_DIR"),
 }
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
@@ -471,7 +475,7 @@ def _usage() -> None:
     print("Usage: ask <provider> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude, copilot", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)

@@ -227,6 +227,7 @@ def send_via_wezterm(pane_id: str, message: str, session_data: dict) -> bool:
         )
         _debug_log(f"wezterm send-text pane={pane_id!r} rc={result.returncode}")
         if result.returncode == 0:
+            time.sleep(0.1)  # Give TUI time to process bracketed paste before Enter
             if _send_wezterm_enter(base_args, pane_id):
                 _debug_log(f"wezterm submit via send-key pane={pane_id!r} rc=0")
                 return True

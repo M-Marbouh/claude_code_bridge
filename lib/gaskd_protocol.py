@@ -21,10 +21,10 @@ def wrap_gemini_prompt(message: str, req_id: str) -> str:
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "IMPORTANT — you MUST follow these rules:\n"
-        "1. Reply in English with an execution summary. Do not stay silent.\n"
-        "2. Your FINAL line MUST be exactly (copy verbatim, no extra text):\n"
-        f"   {DONE_PREFIX} {req_id}\n"
-        "3. Do NOT omit, modify, or paraphrase the line above.\n"
+        "1. Reply in English with a concise execution summary (2-5 sentences). Do not stay silent.\n"
+        "2. Your FINAL line MUST be exactly this — copy it verbatim, nothing after it:\n"
+        f"{DONE_PREFIX} {req_id}\n"
+        "3. Do NOT omit, modify, or paraphrase the line above. It must be the very last line of your response.\n"
     )
 
 
@@ -46,11 +46,17 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
 
     if not target_idxs:
-        # No CCB_DONE for our req_id found
-        # If there are other CCB_DONE markers, this is likely old content - return empty
+        # No CCB_DONE for our req_id found — Gemini forgot to write the marker.
+        # Return content after the last known done line (that's Gemini's current reply),
+        # stripping old content rather than returning empty.
         if done_idxs:
-            return ""  # Prevent returning old content
-        # Fallback: keep existing behavior (strip only if the last line matches).
+            segment = lines[done_idxs[-1] + 1 :]
+            while segment and segment[0].strip() == "":
+                segment = segment[1:]
+            while segment and segment[-1].strip() == "":
+                segment = segment[:-1]
+            return "\n".join(segment).rstrip()
+        # No CCB_DONE markers at all — strip any trailing noise and return as-is.
         return strip_done_text(text, req_id)
 
     target_i = target_idxs[-1]

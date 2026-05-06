@@ -596,7 +596,7 @@ copy_project() {
   # Method 3: From GitHub API (fallback)
   if [[ -z "$git_commit" ]] && command -v curl >/dev/null 2>&1; then
     local api_response
-    api_response=$(curl -fsSL "https://api.github.com/repos/bfly123/claude_code_bridge/commits/main" 2>/dev/null || echo "")
+    api_response=$(curl -fsSL "https://api.github.com/repos/M-Marbouh/claude_code_bridge/commits/main" 2>/dev/null || echo "")
     if [[ -n "$api_response" ]]; then
       git_commit=$(echo "$api_response" | grep -o '"sha": "[^"]*"' | head -1 | cut -d'"' -f4 | cut -c1-7)
       git_date=$(echo "$api_response" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 | cut -c1-10)

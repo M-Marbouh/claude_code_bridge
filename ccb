@@ -4133,7 +4133,7 @@ def _get_remote_version_info() -> dict | None:
     import urllib.request
     import ssl
 
-    api_url = "https://api.github.com/repos/bfly123/claude_code_bridge/commits/main"
+    api_url = "https://api.github.com/repos/M-Marbouh/claude_code_bridge/commits/main"
     try:
         ctx = ssl.create_default_context()
         req = urllib.request.Request(api_url, headers={"User-Agent": "ccb"})
@@ -4168,8 +4168,8 @@ def _get_available_versions() -> list[str]:
     import urllib.request
     import ssl
 
-    repo_url = "https://github.com/bfly123/claude_code_bridge"
-    api_url = "https://api.github.com/repos/bfly123/claude_code_bridge/tags"
+    repo_url = "https://github.com/M-Marbouh/claude_code_bridge"
+    api_url = "https://api.github.com/repos/M-Marbouh/claude_code_bridge/tags"
     versions = []
 
     def parse_api_response(data):
@@ -4316,7 +4316,7 @@ def cmd_update(args):
     install_dir = Path(os.environ.get("CODEX_INSTALL_PREFIX") or default_install_dir).expanduser()
     if (script_root / "install.sh").exists():
         install_dir = script_root
-    repo_url = "https://github.com/bfly123/claude_code_bridge"
+    repo_url = "https://github.com/M-Marbouh/claude_code_bridge"
 
     # Parse version target
     target_version = None

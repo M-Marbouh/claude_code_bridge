@@ -62,9 +62,8 @@ def wrap_codex_prompt(message: str, req_id: str) -> str:
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "IMPORTANT:\n"
-        "- Complete the task above.\n"
-        "- When done, reply in English with a concise summary (2-5 sentences) of what was accomplished.\n"
-        "- Do NOT include tool calls, file contents, or intermediate steps in your reply — summary only.\n"
+        "- Reply normally.\n"
+        "- Reply normally, in English.\n"
         "- End your reply with this exact final line (verbatim, on its own line):\n"
         f"{DONE_PREFIX} {req_id}\n"
     )

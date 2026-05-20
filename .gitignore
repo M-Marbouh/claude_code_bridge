@@ -3,7 +3,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 docs/
-!docs/**/*.md
 tests/
 .ccb_config/
 .ccb/state.json

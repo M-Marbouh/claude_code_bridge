@@ -497,6 +497,7 @@ def make_task_id() -> str:
 
 def _usage() -> None:
     print("Usage: ask <provider> [options] <message>", file=sys.stderr)
+    print("       ask --peer <target> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
     print("  gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen", file=sys.stderr)
@@ -508,12 +509,75 @@ def _usage() -> None:
     print("  --foreground            Run in foreground (no nohup/background)", file=sys.stderr)
     print("  --background            Force background mode", file=sys.stderr)
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
+    print("  --peer TARGET           Send to Claude in another CCB project", file=sys.stderr)
+
+
+def _run_peer_bridge(peer_target: str, timeout: float, message: str) -> int:
+    bridge_cmd = Path(__file__).resolve().parent / "ccb-bridge-ask"
+    cmd = [
+        sys.executable,
+        str(bridge_cmd),
+        "--target",
+        peer_target,
+        "--timeout",
+        str(timeout),
+    ]
+    try:
+        result = subprocess.run(cmd, input=message, text=True)
+        return result.returncode
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+
+def _handle_peer_mode(argv: list[str]) -> int:
+    timeout: float = 3600.0
+    peer_target = ""
+    parts: list[str] = []
+
+    it = iter(argv)
+    for token in it:
+        if token in ("-h", "--help"):
+            _usage()
+            return EXIT_OK
+        if token == "--peer":
+            try:
+                peer_target = next(it)
+            except StopIteration:
+                print("[ERROR] --peer requires a target", file=sys.stderr)
+                return EXIT_ERROR
+            continue
+        if token in ("-t", "--timeout"):
+            try:
+                timeout = float(next(it))
+            except StopIteration:
+                print("[ERROR] --timeout requires a number", file=sys.stderr)
+                return EXIT_ERROR
+            except ValueError:
+                print("[ERROR] --timeout must be a number", file=sys.stderr)
+                return EXIT_ERROR
+            continue
+        parts.append(token)
+
+    if not peer_target:
+        print("[ERROR] --peer requires a target", file=sys.stderr)
+        return EXIT_ERROR
+    message = " ".join(parts).strip()
+    if not message and not sys.stdin.isatty():
+        message = read_stdin_text().strip()
+    if not message:
+        print("[ERROR] Message cannot be empty", file=sys.stderr)
+        return EXIT_ERROR
+    return _run_peer_bridge(peer_target, timeout, message)
 
 
 def main(argv: list[str]) -> int:
     if len(argv) <= 1:
         _usage()
         return EXIT_ERROR
+
+    if argv[1] == "--peer":
+        return _handle_peer_mode(argv[1:])
 
     # First argument must be the provider
     raw_provider = argv[1].lower()
@@ -536,6 +600,7 @@ def main(argv: list[str]) -> int:
     timeout: float = 3600.0
     notify_mode = False
     no_wrap = False
+    peer_target = ""
     foreground_mode = _default_foreground()
     parts: list[str] = []
 
@@ -566,6 +631,13 @@ def main(argv: list[str]) -> int:
         if token == "--no-wrap":
             no_wrap = True
             continue
+        if token == "--peer":
+            try:
+                peer_target = next(it)
+            except StopIteration:
+                print("[ERROR] --peer requires a target", file=sys.stderr)
+                return EXIT_ERROR
+            continue
         parts.append(token)
 
     message = " ".join(parts).strip()
@@ -574,6 +646,9 @@ def main(argv: list[str]) -> int:
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
+
+    if peer_target:
+        return _run_peer_bridge(peer_target, timeout, message)
 
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:

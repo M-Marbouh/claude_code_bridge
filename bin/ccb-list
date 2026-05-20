@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+sys.path.insert(0, str(lib_dir))
+
+from askd_runtime import run_dir
+from compat import setup_windows_encoding
+from project_id import compute_ccb_project_id
+
+setup_windows_encoding()
+
+
+def _load_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _updated_at(data: dict[str, Any], fallback_path: Path) -> float:
+    raw = data.get("updated_at") or data.get("created_at") or 0
+    try:
+        return float(raw)
+    except Exception:
+        pass
+    if isinstance(raw, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(raw, fmt).timestamp()
+            except Exception:
+                pass
+    try:
+        return fallback_path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _tmux_alive_panes() -> set[str]:
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return set()
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _collect_pane_ids(value: Any, found: set[str]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"pane_id", "paneId", "pane"}:
+                found.add(str(child))
+            _collect_pane_ids(child, found)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_pane_ids(child, found)
+
+
+def _wezterm_alive_panes() -> set[str]:
+    try:
+        result = subprocess.run(
+            ["wezterm", "cli", "list", "--output=json"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return set()
+    if result.returncode != 0:
+        return set()
+    try:
+        data = json.loads(result.stdout)
+    except Exception:
+        return set()
+    found: set[str] = set()
+    _collect_pane_ids(data, found)
+    return found
+
+
+def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
+    try:
+        session_files = sorted(run_dir().glob("ccb-session-ai-*.json"))
+    except Exception:
+        session_files = []
+
+    alive_cache: dict[str, set[str]] = {}
+    entries: list[dict[str, Any]] = []
+
+    for session_file in session_files:
+        data = _load_json_dict(session_file)
+        if not data:
+            continue
+
+        work_dir_raw = str(data.get("work_dir") or "").strip()
+        if not work_dir_raw:
+            continue
+        work_dir = Path(work_dir_raw).expanduser()
+        if not work_dir.exists():
+            continue
+
+        providers_raw = data.get("providers")
+        if not isinstance(providers_raw, dict):
+            providers_raw = {}
+
+        terminal = str(data.get("terminal") or "tmux").strip().lower() or "tmux"
+        if terminal not in {"tmux", "wezterm"}:
+            terminal = "tmux"
+        if terminal not in alive_cache:
+            alive_cache[terminal] = _wezterm_alive_panes() if terminal == "wezterm" else _tmux_alive_panes()
+        alive_panes = alive_cache[terminal]
+
+        providers: dict[str, dict[str, Any]] = {}
+        any_alive = False
+        for provider, provider_data in providers_raw.items():
+            if not isinstance(provider_data, dict):
+                continue
+            pane_id = str(provider_data.get("pane_id") or provider_data.get("tmux_session") or "").strip()
+            pane_title_marker = str(provider_data.get("pane_title_marker") or "").strip()
+            alive = bool(pane_id and pane_id in alive_panes)
+            any_alive = any_alive or alive
+            providers[str(provider)] = {
+                "pane_id": pane_id,
+                "pane_title_marker": pane_title_marker,
+                "alive": alive,
+            }
+
+        if not include_stale and not any_alive:
+            continue
+
+        try:
+            ccb_project_id = compute_ccb_project_id(work_dir)
+        except Exception:
+            ccb_project_id = session_file.stem.replace("ccb-session-ai-", "")
+
+        entries.append(
+            {
+                "index": 0,
+                "work_dir": str(work_dir),
+                "ccb_project_id": ccb_project_id,
+                "terminal": terminal,
+                "updated_at": _updated_at(data, session_file),
+                "providers": providers,
+            }
+        )
+
+    entries.sort(key=lambda entry: float(entry.get("updated_at") or 0), reverse=True)
+    for index, entry in enumerate(entries, start=1):
+        entry["index"] = index
+    return entries
+
+
+def _print_human(entries: list[dict[str, Any]]) -> None:
+    print("Active CCB Projects:")
+    if not entries:
+        print("  (none)")
+        return
+
+    for entry in entries:
+        project_hash = str(entry.get("ccb_project_id") or "")[:8]
+        print(f"  [{entry['index']}] {entry['work_dir']}  ({project_hash})")
+        providers = entry.get("providers") or {}
+        for provider in sorted(providers):
+            provider_data = providers[provider]
+            pane_id = provider_data.get("pane_id") or ""
+            status = "alive" if provider_data.get("alive") else "stale"
+            dot = "●" if provider_data.get("alive") else "○"
+            print(f"      {provider:<7} pane:{pane_id}  {dot} {status}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="List active CCB projects and provider panes.")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    parser.add_argument("--stale", action="store_true", help="Include projects with only stale panes.")
+    args = parser.parse_args(argv)
+
+    entries = _session_entries(include_stale=args.stale)
+    if args.json:
+        print(json.dumps(entries, ensure_ascii=False, indent=2))
+    else:
+        _print_human(entries)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

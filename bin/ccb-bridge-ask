@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+sys.path.insert(0, str(lib_dir))
+
+import askd_rpc
+from askd_runtime import run_dir, state_file_path
+from compat import read_stdin_text, setup_windows_encoding
+
+setup_windows_encoding()
+
+
+def _task_id() -> str:
+    now = datetime.now()
+    ms = now.microsecond // 1000
+    return f"bridge-{now.strftime('%Y%m%d-%H%M%S')}-{ms:03d}-{os.getpid()}"
+
+
+def _load_targets() -> list[dict[str, Any]]:
+    list_cmd = script_dir / "ccb-list"
+    result = subprocess.run(
+        [sys.executable, str(list_cmd), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ccb-list failed")
+    try:
+        data = json.loads(result.stdout)
+    except Exception as exc:
+        raise RuntimeError(f"failed to parse ccb-list output: {exc}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError("ccb-list returned invalid JSON")
+    return [entry for entry in data if isinstance(entry, dict)]
+
+
+def _same_path(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    try:
+        return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+    except Exception:
+        return False
+
+
+def _resolve_target(entries: list[dict[str, Any]], target: str) -> dict[str, Any]:
+    raw = (target or "").strip()
+    if not raw:
+        raise ValueError("target cannot be empty")
+
+    matches: list[dict[str, Any]] = []
+
+    index_raw = raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+    if index_raw.isdigit():
+        wanted = int(index_raw)
+        matches = [entry for entry in entries if int(entry.get("index") or 0) == wanted]
+        if matches:
+            return matches[0]
+
+    path_matches = [entry for entry in entries if _same_path(str(entry.get("work_dir") or ""), raw)]
+    if path_matches:
+        if len(path_matches) > 1:
+            raise ValueError(f"target path is ambiguous: {raw}")
+        return path_matches[0]
+
+    if len(raw) >= 4 and all(ch in "0123456789abcdefABCDEF" for ch in raw):
+        lowered = raw.lower()
+        matches = [
+            entry
+            for entry in entries
+            if str(entry.get("ccb_project_id") or "").lower().startswith(lowered)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"target hash prefix is ambiguous: {raw}")
+
+    raise ValueError(f"no active CCB project matches target: {raw}")
+
+
+def _acquire_lock(target_hash: str):
+    try:
+        import fcntl
+    except Exception as exc:
+        raise RuntimeError("bridge locking requires fcntl on this platform") from exc
+
+    lock_dir = run_dir()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"bridge-{target_hash[:8]}.lock"
+    lock_handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_handle.close()
+        raise RuntimeError(f"target is busy: {target_hash[:8]}") from exc
+    return lock_handle, fcntl
+
+
+def _send_to_daemon(target: dict[str, Any], message: str, timeout: float) -> tuple[int, str]:
+    state = askd_rpc.read_state(state_file_path("askd.json"))
+    if not state:
+        raise RuntimeError("Unified askd daemon not running")
+    try:
+        host = state.get("connect_host") or state.get("host") or "127.0.0.1"
+        port = int(state["port"])
+        token = state["token"]
+    except Exception as exc:
+        raise RuntimeError("Invalid askd state") from exc
+
+    req = {
+        "type": "ask.request",
+        "v": 1,
+        "id": _task_id(),
+        "token": token,
+        "provider": "claude",
+        "work_dir": str(target.get("work_dir") or ""),
+        "timeout_s": timeout,
+        "message": message,
+        "no_wrap": False,
+        "caller": "claude",
+        "caller_pane_id": "",
+        "caller_terminal": "",
+    }
+
+    with socket.create_connection((host, port), timeout=5.0) as sock:
+        sock.settimeout(timeout + 10 if timeout > 0 else None)
+        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+    if not data:
+        raise RuntimeError("askd returned no response")
+    line = data.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+    try:
+        resp = json.loads(line)
+    except Exception as exc:
+        raise RuntimeError(f"invalid askd response: {line}") from exc
+    return int(resp.get("exit_code") or 0), str(resp.get("reply") or "")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Send a message to Claude in another CCB project.")
+    parser.add_argument("--target", required=True, help="Target project path, hash prefix, or list index.")
+    parser.add_argument("--timeout", type=float, default=3600.0, help="Request timeout in seconds.")
+    parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
+    args = parser.parse_args(argv)
+
+    message = " ".join(args.message).strip()
+    if not message and not sys.stdin.isatty():
+        message = read_stdin_text().strip()
+    if not message:
+        print("[ERROR] Message cannot be empty", file=sys.stderr)
+        return 1
+
+    try:
+        target = _resolve_target(_load_targets(), args.target)
+        claude = (target.get("providers") or {}).get("claude")
+        if not isinstance(claude, dict) or not claude.get("alive"):
+            print("[ERROR] Target project has no live Claude pane", file=sys.stderr)
+            return 1
+
+        target_hash = str(target.get("ccb_project_id") or "")
+        lock_handle, fcntl_mod = _acquire_lock(target_hash)
+        try:
+            exit_code, reply = _send_to_daemon(target, message, args.timeout)
+        finally:
+            try:
+                fcntl_mod.flock(lock_handle.fileno(), fcntl_mod.LOCK_UN)
+            finally:
+                lock_handle.close()
+        if reply:
+            print(reply)
+        return exit_code
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

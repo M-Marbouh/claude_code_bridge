@@ -225,21 +225,21 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
             continue
 
         providers: dict[str, dict[str, Any]] = {}
-        any_alive = False
         for provider, provider_data in providers_raw.items():
             if not isinstance(provider_data, dict):
                 continue
             pane_id = str(provider_data.get("pane_id") or provider_data.get("tmux_session") or "").strip()
             pane_title_marker = str(provider_data.get("pane_title_marker") or "").strip()
             alive = _provider_alive(terminal, provider_data, str(work_dir), terminal_panes)
-            any_alive = any_alive or alive
             providers[str(provider)] = {
                 "pane_id": pane_id,
                 "pane_title_marker": pane_title_marker,
                 "alive": alive,
             }
 
-        if not include_stale and not any_alive:
+        claude_entry = providers.get("claude") or {}
+        claude_alive = bool(claude_entry.get("alive")) if isinstance(claude_entry, dict) else False
+        if not include_stale and not claude_alive:
             continue
 
         try:

@@ -130,6 +130,37 @@ def test_ccb_list_omits_stale_only_projects_by_default(tmp_path: Path) -> None:
     assert len(_run_ccb_list(tmp_path, "--stale")) == 1
 
 
+def test_ccb_list_requires_alive_claude_pane_by_default(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(fake_bin, [{"pane_id": "%2", "title": "CCB-Codex-test", "cwd": str(work_dir), "dead": "0"}])
+
+    (run_dir / "ccb-session-ai-test.json").write_text(
+        json.dumps(
+            {
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {
+                    "claude": {"pane_id": "%1", "pane_title_marker": "CCB-Claude-test"},
+                    "codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _run_ccb_list(tmp_path) == []
+    stale = _run_ccb_list(tmp_path, "--stale")
+    assert len(stale) == 1
+    assert stale[0]["providers"]["claude"]["alive"] is False
+    assert stale[0]["providers"]["codex"]["alive"] is True
+
+
 def test_ccb_list_rejects_reused_tmux_pane_id_with_wrong_marker(tmp_path: Path) -> None:
     run_dir = tmp_path / ".ccb" / "run"
     run_dir.mkdir(parents=True)

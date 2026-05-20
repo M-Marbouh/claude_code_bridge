@@ -27,7 +27,9 @@ def _write_fake_tmux(bin_dir: Path, alive_panes: list[str]) -> None:
 
 def _run_ccb_list(tmp_path: Path, *args: str) -> list[dict]:
     env = os.environ.copy()
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+    env.pop("CCB_RUN_DIR", None)
+    env["HOME"] = str(tmp_path)
+    env["USERPROFILE"] = str(tmp_path)
     env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}"
     result = subprocess.run(
         [sys.executable, str(ROOT / "bin" / "ccb-list"), "--json", *args],
@@ -40,8 +42,8 @@ def _run_ccb_list(tmp_path: Path, *args: str) -> list[dict]:
 
 
 def test_ccb_list_reports_provider_liveness(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
     work_dir = tmp_path / "project"
     work_dir.mkdir()
     fake_bin = tmp_path / "bin"
@@ -73,8 +75,8 @@ def test_ccb_list_reports_provider_liveness(tmp_path: Path) -> None:
 
 
 def test_ccb_list_omits_stale_only_projects_by_default(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
     work_dir = tmp_path / "project"
     work_dir.mkdir()
     fake_bin = tmp_path / "bin"

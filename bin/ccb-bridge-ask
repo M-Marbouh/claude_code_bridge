@@ -109,7 +109,13 @@ def _acquire_lock(target_hash: str):
     return lock_handle, fcntl
 
 
-def _send_to_daemon(target: dict[str, Any], message: str, timeout: float) -> tuple[int, str]:
+def _send_to_daemon(
+    target: dict[str, Any],
+    message: str,
+    timeout: float,
+    caller_pane_id: str,
+    caller_terminal: str,
+) -> tuple[int, str, dict[str, Any]]:
     state = askd_rpc.read_state(state_file_path("askd.json"))
     if not state:
         raise RuntimeError("Unified askd daemon not running")
@@ -131,8 +137,8 @@ def _send_to_daemon(target: dict[str, Any], message: str, timeout: float) -> tup
         "message": message,
         "no_wrap": False,
         "caller": "claude",
-        "caller_pane_id": "",
-        "caller_terminal": "",
+        "caller_pane_id": caller_pane_id,
+        "caller_terminal": caller_terminal,
     }
 
     with socket.create_connection((host, port), timeout=5.0) as sock:
@@ -152,13 +158,32 @@ def _send_to_daemon(target: dict[str, Any], message: str, timeout: float) -> tup
         resp = json.loads(line)
     except Exception as exc:
         raise RuntimeError(f"invalid askd response: {line}") from exc
-    return int(resp.get("exit_code") or 0), str(resp.get("reply") or "")
+    meta = resp.get("meta") if isinstance(resp.get("meta"), dict) else {}
+    if not meta:
+        meta = {}
+    if resp.get("req_id"):
+        meta.setdefault("req_id", resp.get("req_id"))
+    return int(resp.get("exit_code") or 0), str(resp.get("reply") or ""), meta
+
+
+def _print_bridge_diagnostics(meta: dict[str, Any]) -> None:
+    print(
+        "[BRIDGE] "
+        f"done_seen={bool(meta.get('done_seen'))} "
+        f"anchor_seen={bool(meta.get('anchor_seen'))} "
+        f"fallback_scan={bool(meta.get('fallback_scan'))} "
+        f"status={meta.get('status') or ''} "
+        f"req_id={meta.get('req_id') or ''}",
+        file=sys.stderr,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Send a message to Claude in another CCB project.")
     parser.add_argument("--target", required=True, help="Target project path, hash prefix, or list index.")
     parser.add_argument("--timeout", type=float, default=3600.0, help="Request timeout in seconds.")
+    parser.add_argument("--caller-pane-id", default=os.environ.get("CCB_CALLER_PANE_ID", ""), help=argparse.SUPPRESS)
+    parser.add_argument("--caller-terminal", default=os.environ.get("CCB_CALLER_TERMINAL", ""), help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
 
@@ -179,12 +204,20 @@ def main(argv: list[str] | None = None) -> int:
         target_hash = str(target.get("ccb_project_id") or "")
         lock_handle, fcntl_mod = _acquire_lock(target_hash)
         try:
-            exit_code, reply = _send_to_daemon(target, message, args.timeout)
+            exit_code, reply, meta = _send_to_daemon(
+                target,
+                message,
+                args.timeout,
+                str(args.caller_pane_id or ""),
+                str(args.caller_terminal or ""),
+            )
         finally:
             try:
                 fcntl_mod.flock(lock_handle.fileno(), fcntl_mod.LOCK_UN)
             finally:
                 lock_handle.close()
+        if exit_code != 0 or not reply:
+            _print_bridge_diagnostics(meta)
         if reply:
             print(reply)
         return exit_code

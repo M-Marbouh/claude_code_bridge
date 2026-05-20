@@ -1,13 +1,13 @@
 ---
 name: ask
-description: Async via ask, end turn immediately; use when user explicitly delegates to any AI provider (gemini/codex/opencode/droid); NOT for questions about the providers themselves.
+description: Async via ask, end turn immediately; use when user explicitly delegates to any AI provider (gemini/codex/opencode/droid) within the CURRENT project. NOT for questions about the providers themselves. NOT for sending to Claude in another project — use peer-ask for that.
 metadata:
   short-description: Ask AI provider asynchronously
 ---
 
 # Ask AI Provider (Async)
 
-Send the user's request to specified AI provider asynchronously.
+Send the user's request to a provider running in the **current** CCB project.
 
 ## Usage
 
@@ -17,29 +17,7 @@ The first argument must be the provider name, followed by the message:
 - `opencode` - Send to OpenCode
 - `droid` - Send to Droid
 
-### Cross-Project Claude Bridge
-
-Use `ccb-list` to discover active CCB projects and their target identifiers:
-
-```
-Bash(ccb-list)
-```
-
-Send a message to Claude in another active CCB project:
-
-```
-Bash(CCB_CALLER=claude ask --peer <path-or-index-or-hash-prefix> "$MESSAGE")
-```
-
-Targets accepted by `--peer`:
-- Full project path from `ccb-list`
-- List index, e.g. `1` or `[1]`
-- CCB project hash prefix, minimum 4 hex characters
-
-Examples:
-- `ask --peer /home/musta/dev/content-automation "Review the current plan"`
-- `ask --peer b0e3 "Status?"`
-- `ask claude --peer 1 "Summarize your current task"`
+**NOT for cross-project messaging.** If the user says "Ask PRG Claude..." or references another project, use the `peer-ask` skill instead.
 
 ## Execution (MANDATORY)
 

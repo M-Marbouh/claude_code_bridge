@@ -1,6 +1,6 @@
 ---
 name: peer-ask
-description: Send a message to Claude in another active CCB project using natural language. Use when the user says things like "Ask PRG Claude about X", "Tell content-automation Claude...", or "Ask [project] Claude...". Discovers active projects via ccb-list, matches by alias/name, asks for clarification if ambiguous, and remembers confirmed aliases.
+description: Send a message to Claude in ANOTHER active CCB project using natural language. Use when the user says things like "Ask PRG Claude about X", "Tell content-automation Claude...", or "Ask [project] Claude...". NOT for asking Codex/Gemini/OpenCode/Droid — use the ask skill for those. Discovers active projects via ccb-list, matches by alias/name, asks for clarification if ambiguous, and remembers confirmed aliases.
 metadata:
   short-description: Natural-language cross-project Claude messaging
 ---

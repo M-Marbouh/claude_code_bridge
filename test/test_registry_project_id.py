@@ -13,15 +13,24 @@ from project_id import compute_ccb_project_id
 
 
 class _FakeBackend:
-    def __init__(self, alive: set[str], marker_map: Optional[dict[str, str]] = None):
+    def __init__(
+        self,
+        alive: set[str],
+        marker_map: Optional[dict[str, str]] = None,
+        cwd_map: Optional[dict[str, str]] = None,
+    ):
         self._alive = set(alive)
         self._marker_map = dict(marker_map or {})
+        self._cwd_map = dict(cwd_map or {})
 
     def is_alive(self, pane_id: str) -> bool:
         return pane_id in self._alive
 
     def find_pane_by_title_marker(self, marker: str, cwd_hint: str = "") -> str | None:
         return self._marker_map.get(marker)
+
+    def pane_belongs_to_cwd(self, pane_id: str, work_dir: str) -> bool:
+        return self._cwd_map.get(pane_id) == work_dir
 
 
 def _write_registry_file(home: Path, session_id: str, payload: dict) -> Path:
@@ -88,7 +97,7 @@ def test_load_registry_by_project_id_filters_dead_panes(tmp_path: Path, monkeypa
             "work_dir": str(work_dir),
             "terminal": "tmux",
             "updated_at": int(time.time()),
-            "providers": {"codex": {"pane_id": "%dead"}},
+            "providers": {"codex": {"pane_id": "%dead", "pane_title_marker": "CCB-Codex-new"}},
         },
     )
     # Older but alive.
@@ -101,11 +110,15 @@ def test_load_registry_by_project_id_filters_dead_panes(tmp_path: Path, monkeypa
             "work_dir": str(work_dir),
             "terminal": "tmux",
             "updated_at": int(time.time()) - 10,
-            "providers": {"codex": {"pane_id": "%alive"}},
+            "providers": {"codex": {"pane_id": "%alive", "pane_title_marker": "CCB-Codex-old"}},
         },
     )
 
-    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _rec: _FakeBackend(alive={"%alive"}))
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend(alive={"%alive"}, marker_map={"CCB-Codex-old": "%alive"}),
+    )
     rec = load_registry_by_project_id(pid, "codex")
     assert rec is not None
     assert rec.get("ccb_session_id") == "old"
@@ -129,10 +142,83 @@ def test_load_registry_by_project_id_infers_missing_project_id(tmp_path: Path, m
             "work_dir": str(work_dir),
             "terminal": "tmux",
             "updated_at": int(time.time()),
-            "providers": {"codex": {"pane_id": "%1"}},
+            "providers": {"codex": {"pane_id": "%1", "pane_title_marker": "CCB-Codex-legacy"}},
         },
     )
 
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend(alive={"%1"}, marker_map={"CCB-Codex-legacy": "%1"}),
+    )
     rec = load_registry_by_project_id(pid, "codex")
     assert rec is not None
     assert rec.get("ccb_session_id") == "legacy"
+
+
+def test_load_registry_by_project_id_rejects_reused_tmux_pane_id_with_wrong_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    work_dir = tmp_path / "proj"
+    work_dir.mkdir()
+    pid = compute_ccb_project_id(work_dir)
+
+    _write_registry_file(
+        tmp_path,
+        "stale",
+        {
+            "ccb_session_id": "stale",
+            "ccb_project_id": pid,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%4", "pane_title_marker": "CCB-Codex-stale"}},
+        },
+    )
+
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend(alive={"%4"}, marker_map={"CCB-Codex-other": "%4"}),
+    )
+
+    assert load_registry_by_project_id(pid, "codex") is None
+
+
+def test_load_registry_by_project_id_rejects_reused_wezterm_pane_id_with_wrong_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    work_dir = tmp_path / "proj"
+    work_dir.mkdir()
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    pid = compute_ccb_project_id(work_dir)
+
+    _write_registry_file(
+        tmp_path,
+        "stale",
+        {
+            "ccb_session_id": "stale",
+            "ccb_project_id": pid,
+            "work_dir": str(work_dir),
+            "terminal": "wezterm",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "23", "pane_title_marker": "CCB-Codex-stale"}},
+        },
+    )
+
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend(alive={"23"}, cwd_map={"23": str(other_dir)}),
+    )
+
+    assert load_registry_by_project_id(pid, "codex") is None

@@ -602,6 +602,29 @@ class TmuxBackend(TerminalBackend):
                     return pid
         return None
 
+    def pane_belongs_to_cwd(self, pane_id: str, work_dir: str) -> bool:
+        pane_id = (pane_id or "").strip()
+        work_dir = (work_dir or "").strip()
+        if not pane_id or not work_dir or not self._looks_like_tmux_target(pane_id):
+            return False
+        try:
+            cp = self._tmux_run(
+                ["display-message", "-p", "-t", pane_id, "#{pane_current_path}"],
+                capture=True,
+                timeout=0.5,
+            )
+        except Exception:
+            return False
+        if cp.returncode != 0:
+            return False
+        pane_cwd = (cp.stdout or "").strip()
+        if not pane_cwd:
+            return False
+        try:
+            return os.path.normpath(pane_cwd) == os.path.normpath(work_dir)
+        except Exception:
+            return False
+
     def get_pane_content(self, pane_id: str, lines: int = 20) -> Optional[str]:
         if not pane_id:
             return None

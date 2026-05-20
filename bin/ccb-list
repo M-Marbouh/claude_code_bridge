@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -14,7 +15,7 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
-from pane_registry import _iter_registry_files, _registry_dir
+from pane_registry import _is_stale, _iter_registry_files
 from project_id import compute_ccb_project_id
 
 setup_windows_encoding()
@@ -47,34 +48,53 @@ def _updated_at(data: dict[str, Any], fallback_path: Path) -> float:
         return 0.0
 
 
-def _tmux_alive_panes() -> set[str]:
+def _tmux_panes() -> dict[str, dict[str, str]]:
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}\t#{pane_current_path}\t#{pane_dead}"],
             capture_output=True,
             text=True,
             timeout=2,
             check=False,
         )
     except Exception:
-        return set()
+        return {}
     if result.returncode != 0:
-        return set()
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        return {}
+
+    panes: dict[str, dict[str, str]] = {}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) < 4:
+            continue
+        pane_id, title, cwd, dead = parts
+        pane_id = pane_id.strip()
+        if not pane_id:
+            continue
+        panes[pane_id] = {
+            "pane_id": pane_id,
+            "title": title.strip(),
+            "cwd": cwd.strip(),
+            "dead": dead.strip(),
+        }
+    return panes
 
 
-def _collect_pane_ids(value: Any, found: set[str]) -> None:
+def _collect_wezterm_panes(value: Any, found: dict[str, dict[str, Any]]) -> None:
     if isinstance(value, dict):
-        for key, child in value.items():
-            if key in {"pane_id", "paneId", "pane"}:
-                found.add(str(child))
-            _collect_pane_ids(child, found)
+        pane_id = value.get("pane_id") or value.get("paneId") or value.get("pane")
+        if pane_id is not None:
+            found[str(pane_id)] = value
+        for child in value.values():
+            _collect_wezterm_panes(child, found)
     elif isinstance(value, list):
         for child in value:
-            _collect_pane_ids(child, found)
+            _collect_wezterm_panes(child, found)
 
 
-def _wezterm_alive_panes() -> set[str]:
+def _wezterm_panes() -> dict[str, dict[str, Any]]:
     try:
         result = subprocess.run(
             ["wezterm", "cli", "list", "--format", "json"],
@@ -84,16 +104,89 @@ def _wezterm_alive_panes() -> set[str]:
             check=False,
         )
     except Exception:
-        return set()
+        return {}
     if result.returncode != 0:
-        return set()
+        return {}
     try:
         data = json.loads(result.stdout)
     except Exception:
-        return set()
-    found: set[str] = set()
-    _collect_pane_ids(data, found)
+        return {}
+    found: dict[str, dict[str, Any]] = {}
+    _collect_wezterm_panes(data, found)
     return found
+
+
+def _extract_cwd_path(file_url: str) -> str:
+    if not file_url:
+        return ""
+    value = str(file_url).strip()
+    if not value.startswith("file://"):
+        return value
+    rest = value[7:]
+    if rest.startswith("/"):
+        path = rest
+    else:
+        slash = rest.find("/")
+        path = rest[slash:] if slash >= 0 else ""
+    try:
+        from urllib.parse import unquote
+
+        path = unquote(path)
+    except Exception:
+        pass
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return path.rstrip("/") or "/"
+
+
+def _cwd_matches(pane_cwd: str, work_dir: str) -> bool:
+    if not pane_cwd or not work_dir:
+        return False
+    extracted = _extract_cwd_path(pane_cwd)
+    if not extracted:
+        return False
+    try:
+        return os.path.normpath(extracted) == os.path.normpath(work_dir)
+    except Exception:
+        return False
+
+
+def _title_matches_marker(pane: dict[str, Any], marker: str) -> bool:
+    if not marker:
+        return False
+    for key in ("title", "pane_title", "window_title", "tab_title"):
+        value = pane.get(key)
+        if isinstance(value, str) and value.startswith(marker):
+            return True
+    return False
+
+
+def _provider_alive(terminal: str, provider_data: dict[str, Any], work_dir: str, panes: dict[str, dict[str, Any]]) -> bool:
+    pane_id = str(provider_data.get("pane_id") or provider_data.get("tmux_session") or "").strip()
+    if not pane_id:
+        return False
+
+    pane = panes.get(pane_id)
+    if not pane:
+        return False
+
+    marker = str(provider_data.get("pane_title_marker") or "").strip()
+    if terminal == "tmux":
+        if str(pane.get("dead") or "").strip() not in {"", "0"}:
+            return False
+        if marker:
+            return _title_matches_marker(pane, marker)
+        return False
+
+    if terminal == "wezterm":
+        cwd = str(pane.get("cwd") or "").strip()
+        if cwd:
+            return _cwd_matches(cwd, work_dir)
+        if marker:
+            return _title_matches_marker(pane, marker)
+        return False
+
+    return False
 
 
 def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
@@ -102,7 +195,7 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
     except Exception:
         session_files = []
 
-    alive_cache: dict[str, set[str]] = {}
+    pane_cache: dict[str, dict[str, dict[str, Any]]] = {}
     entries: list[dict[str, Any]] = []
 
     for session_file in session_files:
@@ -124,9 +217,12 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
         terminal = str(data.get("terminal") or "tmux").strip().lower() or "tmux"
         if terminal not in {"tmux", "wezterm"}:
             terminal = "tmux"
-        if terminal not in alive_cache:
-            alive_cache[terminal] = _wezterm_alive_panes() if terminal == "wezterm" else _tmux_alive_panes()
-        alive_panes = alive_cache[terminal]
+        if terminal not in pane_cache:
+            pane_cache[terminal] = _wezterm_panes() if terminal == "wezterm" else _tmux_panes()
+        terminal_panes = pane_cache[terminal]
+        updated_at = _updated_at(data, session_file)
+        if _is_stale(int(updated_at)):
+            continue
 
         providers: dict[str, dict[str, Any]] = {}
         any_alive = False
@@ -135,7 +231,7 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
                 continue
             pane_id = str(provider_data.get("pane_id") or provider_data.get("tmux_session") or "").strip()
             pane_title_marker = str(provider_data.get("pane_title_marker") or "").strip()
-            alive = bool(pane_id and pane_id in alive_panes)
+            alive = _provider_alive(terminal, provider_data, str(work_dir), terminal_panes)
             any_alive = any_alive or alive
             providers[str(provider)] = {
                 "pane_id": pane_id,
@@ -157,7 +253,7 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
                 "work_dir": str(work_dir),
                 "ccb_project_id": ccb_project_id,
                 "terminal": terminal,
-                "updated_at": _updated_at(data, session_file),
+                "updated_at": updated_at,
                 "providers": providers,
             }
         )

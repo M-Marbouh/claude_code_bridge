@@ -160,12 +160,14 @@ def _provider_pane_alive(record: Dict[str, Any], provider: str) -> bool:
     if not backend:
         return False
 
+    work_dir = str(record.get("work_dir") or "").strip()
+
     # Best-effort marker resolution if pane_id is missing/stale.
     if (not pane_id) and marker:
         resolver = getattr(backend, "find_pane_by_title_marker", None)
         if callable(resolver):
             try:
-                pane_id = str(resolver(marker) or "").strip()
+                pane_id = str(resolver(marker, work_dir) or "").strip()
             except Exception:
                 pane_id = ""
 
@@ -173,9 +175,32 @@ def _provider_pane_alive(record: Dict[str, Any], provider: str) -> bool:
         return False
 
     try:
-        return bool(backend.is_alive(pane_id))
+        if not bool(backend.is_alive(pane_id)):
+            return False
     except Exception:
         return False
+
+    terminal = str(record.get("terminal") or "tmux").strip().lower() or "tmux"
+    if terminal == "wezterm":
+        cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
+        if callable(cwd_check) and work_dir:
+            try:
+                if not bool(cwd_check(pane_id, work_dir)):
+                    return False
+            except Exception:
+                return False
+        return True
+
+    if marker:
+        resolver = getattr(backend, "find_pane_by_title_marker", None)
+        if not callable(resolver):
+            return False
+        try:
+            return str(resolver(marker, work_dir) or "").strip() == pane_id
+        except Exception:
+            return False
+
+    return False
 
 
 def load_registry_by_session_id(session_id: str) -> Optional[Dict[str, Any]]:

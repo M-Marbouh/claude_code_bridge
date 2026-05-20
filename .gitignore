@@ -21,6 +21,8 @@ tests/
 .opencode-session
 opencode.json
 .claude/
+.codex/
+.memsearch/
 *.mp4
 tmp/
 compare_with_mcp/

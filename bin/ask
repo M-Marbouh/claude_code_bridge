@@ -521,7 +521,13 @@ def _peer_caller_pane_info() -> tuple[str, str]:
     return pane_id or detected_pane_id, terminal or detected_terminal
 
 
-def _peer_bridge_cmd(peer_target: str, timeout: float, caller_pane_id: str, caller_terminal: str) -> list[str]:
+def _peer_bridge_cmd(
+    peer_target: str,
+    timeout: float,
+    caller_pane_id: str,
+    caller_terminal: str,
+    sender_work_dir: str,
+) -> list[str]:
     bridge_cmd = Path(__file__).resolve().parent / "ccb-bridge-ask"
     return [
         sys.executable,
@@ -534,14 +540,18 @@ def _peer_bridge_cmd(peer_target: str, timeout: float, caller_pane_id: str, call
         caller_pane_id,
         "--caller-terminal",
         caller_terminal,
+        "--sender-work-dir",
+        sender_work_dir,
     ]
 
 
 def _run_peer_bridge_foreground(peer_target: str, timeout: float, message: str, caller: str) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
-    cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal)
+    sender_work_dir = os.getcwd()
+    cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal, sender_work_dir)
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
+    env["CCB_WORK_DIR"] = sender_work_dir
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
     if caller_terminal:
@@ -573,7 +583,8 @@ def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, 
     _cleanup_task_logs(log_dir)
 
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
-    bridge_cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal)
+    sender_work_dir = os.getcwd()
+    bridge_cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal, sender_work_dir)
     quoted_status = shlex.quote(str(status_file))
     quoted_log = shlex.quote(str(log_file))
     quoted_msg = shlex.quote(str(msg_file))
@@ -602,7 +613,7 @@ exit "$rc"
     env = os.environ.copy()
     env["CCB_REQ_ID"] = task_id
     env["CCB_CALLER"] = caller
-    env["CCB_WORK_DIR"] = os.getcwd()
+    env["CCB_WORK_DIR"] = sender_work_dir
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
     if caller_terminal:

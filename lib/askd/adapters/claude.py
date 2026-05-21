@@ -625,7 +625,6 @@ class ClaudeAdapter(BaseProviderAdapter):
         done_ms: Optional[int] = None
 
         anchor_grace_deadline = min(deadline, time.time() + 1.5) if deadline else (time.time() + 1.5)
-        anchor_collect_grace = min(deadline, time.time() + 2.0) if deadline else (time.time() + 2.0)
         rebounded = False
         tail_bytes = int(os.environ.get("CCB_LASKD_REBIND_TAIL_BYTES", str(2 * 1024 * 1024)))
         pane_check_interval = float(os.environ.get("CCB_LASKD_PANE_CHECK_INTERVAL", "2.0"))
@@ -683,7 +682,7 @@ class ClaudeAdapter(BaseProviderAdapter):
                     continue
                 if role != "assistant":
                     continue
-                if (not anchor_seen) and time.time() < anchor_collect_grace:
+                if not anchor_seen:
                     continue
                 chunks.append(text)
                 combined = "\n".join(chunks)

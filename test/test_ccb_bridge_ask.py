@@ -65,3 +65,10 @@ def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
 
     assert rc == 0
     assert "[BRIDGE] done_seen=False anchor_seen=True fallback_scan=True status=incomplete req_id=req-1" in captured.err
+
+
+def test_bridge_appends_reply_target() -> None:
+    bridge = _load_bridge_module()
+
+    assert bridge._append_reply_target("hello", "/tmp/sender") == "hello\n\nCCB_REPLY_TARGET: /tmp/sender"
+    assert bridge._append_reply_target("hello\n", "") == "hello"

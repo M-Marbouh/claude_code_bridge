@@ -316,3 +316,58 @@ def test_claude_adapter_honors_cancel_event(monkeypatch, tmp_path: Path) -> None
 
     assert result.status == "cancelled"
     assert notifications[0]["status"] == "cancelled"
+
+
+def test_claude_adapter_does_not_capture_assistant_without_anchor(tmp_path: Path, monkeypatch) -> None:
+    from askd.adapters import claude as claude_mod
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def time(self) -> float:
+            self.now += 0.6
+            return self.now
+
+    class _Reader:
+        def wait_for_events(self, state: dict, timeout: float):
+            return [("assistant", "Unrelated WP-CLI explanation from the local conversation.")], state
+
+    class _Backend:
+        def is_alive(self, pane_id: str) -> bool:
+            return True
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=10.0,
+        quiet=False,
+        message="peer request",
+        caller="claude",
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+    )
+
+    clock = _Clock()
+    monkeypatch.setattr(claude_mod.time, "time", clock.time)
+
+    result = ClaudeAdapter()._wait_for_response(
+        task,
+        SimpleNamespace(work_dir=str(tmp_path)),
+        "claude:test",
+        0,
+        _Reader(),
+        {},
+        _Backend(),
+        "pane-1",
+        deadline=1006.0,
+    )
+
+    assert result.anchor_seen is False
+    assert result.done_seen is False
+    assert result.reply == ""
+    assert result.status == "incomplete"

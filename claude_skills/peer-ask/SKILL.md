@@ -19,6 +19,22 @@ Trigger this skill when the user references another project's Claude:
 
 ## Execution Steps
 
+### Step 0 — Reply to an inbound peer message
+
+If the message you are responding to contains a line like:
+```
+CCB_REPLY_TARGET: /path/to/sender/project
+```
+
+use that path as the peer target. Do not run `ccb-list` or rediscover the sender unless the send fails or the user asks you to choose a different target.
+
+Reply with:
+```
+Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" "<reply message>")
+```
+
+Follow the **Async Guardrail** in CLAUDE.md — if output contains `CCB_ASYNC_SUBMITTED`, end turn immediately.
+
 ### Step 1 — Discover active projects
 
 ```
@@ -86,3 +102,4 @@ User: "Ask Claude in project 3 about the current task"
 - Only Claude panes are targeted (providers.claude). Other providers are not reachable via this skill.
 - If the target Claude pane is stale (not alive), report the error and show the live options.
 - The `--peer` flag accepts the full `work_dir` path — always use path form for reliability.
+- Inbound peer messages include `CCB_REPLY_TARGET: <sender_work_dir>` when the sender is known. Use it as the direct reply path.

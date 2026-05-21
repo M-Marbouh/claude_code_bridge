@@ -115,6 +115,7 @@ def _send_to_daemon(
     timeout: float,
     caller_pane_id: str,
     caller_terminal: str,
+    sender_work_dir: str,
 ) -> tuple[int, str, dict[str, Any]]:
     state = askd_rpc.read_state(state_file_path("askd.json"))
     if not state:
@@ -126,6 +127,8 @@ def _send_to_daemon(
     except Exception as exc:
         raise RuntimeError("Invalid askd state") from exc
 
+    message_for_target = _append_reply_target(message, sender_work_dir)
+
     req = {
         "type": "ask.request",
         "v": 1,
@@ -134,7 +137,7 @@ def _send_to_daemon(
         "provider": "claude",
         "work_dir": str(target.get("work_dir") or ""),
         "timeout_s": timeout,
-        "message": message,
+        "message": message_for_target,
         "no_wrap": False,
         "caller": "claude",
         "caller_pane_id": caller_pane_id,
@@ -166,6 +169,14 @@ def _send_to_daemon(
     return int(resp.get("exit_code") or 0), str(resp.get("reply") or ""), meta
 
 
+def _append_reply_target(message: str, sender_work_dir: str) -> str:
+    sender = str(sender_work_dir or "").strip()
+    body = (message or "").rstrip()
+    if not sender:
+        return body
+    return f"{body}\n\nCCB_REPLY_TARGET: {sender}"
+
+
 def _print_bridge_diagnostics(meta: dict[str, Any]) -> None:
     print(
         "[BRIDGE] "
@@ -184,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=3600.0, help="Request timeout in seconds.")
     parser.add_argument("--caller-pane-id", default=os.environ.get("CCB_CALLER_PANE_ID", ""), help=argparse.SUPPRESS)
     parser.add_argument("--caller-terminal", default=os.environ.get("CCB_CALLER_TERMINAL", ""), help=argparse.SUPPRESS)
+    parser.add_argument("--sender-work-dir", default=os.environ.get("CCB_WORK_DIR", os.getcwd()), help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
 
@@ -210,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.timeout,
                 str(args.caller_pane_id or ""),
                 str(args.caller_terminal or ""),
+                str(args.sender_work_dir or ""),
             )
         finally:
             try:

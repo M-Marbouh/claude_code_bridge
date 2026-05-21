@@ -28,9 +28,22 @@ CCB_REPLY_TARGET: /path/to/sender/project
 
 use that path as the peer target. Do not run `ccb-list` or rediscover the sender unless the send fails or the user asks you to choose a different target.
 
+**Rules for inbound peer messages — read carefully:**
+
+1. **No acknowledgements.** Do NOT reply with "Got it", "Thanks for reaching out", "I'll look into that", or any variant. The sender is waiting for results, not confirmation. Every peer round-trip has latency cost — waste none of it.
+
+2. **Do the work first, then reply.** If the request requires research, code review, analysis, or implementation: complete it before sending the reply. Use your available sub-agents where appropriate:
+   - **Codex** (`/ask codex`) for implementation, code changes, or detailed technical work
+   - **Explorer agent** (`Agent(subagent_type=Explore)`) for codebase searches, file lookups, or pattern scanning
+   - **Architect/Plan agent** (`Agent(subagent_type=Plan)`) for design decisions or multi-file planning
+   - Any other specialist available in your project
+   Do not do all work yourself when a sub-agent is better suited — delegate, collect the result, then reply.
+
+3. **Reply with substance.** The reverse peer message should contain the actual answer, findings, or outcome — not a status update. If a task is genuinely too large for one turn, break it into a concrete first result plus explicit follow-up questions.
+
 Reply with:
 ```
-Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" "<reply message>")
+Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" "<result>")
 ```
 
 Follow the **Async Guardrail** in CLAUDE.md — if output contains `CCB_ASYNC_SUBMITTED`, end turn immediately.

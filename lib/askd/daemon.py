@@ -166,6 +166,8 @@ class UnifiedAskDaemon:
                 output_path=str(msg.get("output_path")) if msg.get("output_path") else None,
                 req_id=str(msg.get("req_id")) if msg.get("req_id") else None,
                 no_wrap=bool(msg.get("no_wrap") or False),
+                delivery_only=bool(msg.get("delivery_only") or msg.get("no_reply_wait") or False),
+                suppress_completion_hook=bool(msg.get("suppress_completion_hook") or False),
                 email_req_id=str(msg.get("email_req_id") or ""),
                 email_msg_id=str(msg.get("email_msg_id") or ""),
                 email_from=str(msg.get("email_from") or ""),

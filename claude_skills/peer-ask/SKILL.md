@@ -35,6 +35,8 @@ Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" "<reply message>")
 
 Follow the **Async Guardrail** in CLAUDE.md — if output contains `CCB_ASYNC_SUBMITTED`, end turn immediately.
 
+Do not add a local `CCB_DONE` for the inbound peer delivery. CCB treats peer delivery as complete once the message lands in your pane; the real answer is the reverse `ask --peer` message.
+
 ### Step 1 — Discover active projects
 
 ```
@@ -103,3 +105,4 @@ User: "Ask Claude in project 3 about the current task"
 - If the target Claude pane is stale (not alive), report the error and show the live options.
 - The `--peer` flag accepts the full `work_dir` path — always use path form for reliability.
 - Inbound peer messages include `CCB_REPLY_TARGET: <sender_work_dir>` when the sender is known. Use it as the direct reply path.
+- Peer delivery is asynchronous: receiving Claude should reply by sending a reverse peer message, not by trying to complete the original delivery request locally.

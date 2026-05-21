@@ -139,6 +139,8 @@ def _send_to_daemon(
         "timeout_s": timeout,
         "message": message_for_target,
         "no_wrap": False,
+        "delivery_only": True,
+        "suppress_completion_hook": True,
         "caller": "claude",
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,

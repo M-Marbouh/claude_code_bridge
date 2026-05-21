@@ -145,6 +145,17 @@ def wrap_claude_prompt(message: str, req_id: str) -> str:
     )
 
 
+def wrap_claude_delivery_prompt(message: str, req_id: str) -> str:
+    message = (message or "").rstrip()
+    return (
+        f"{REQ_ID_PREFIX} {req_id}\n\n"
+        f"{message}\n\n"
+        "This is an asynchronous peer message delivered by CCB.\n"
+        "If you reply, use CCB_REPLY_TARGET from the message and send the reply with ask --peer.\n"
+        "Do not wait to produce a local CCB_DONE for this delivery.\n"
+    )
+
+
 @dataclass(frozen=True)
 class LaskdRequest:
     client_id: str

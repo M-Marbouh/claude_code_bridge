@@ -24,7 +24,7 @@ from completion_hook import (
     notify_completion,
 )
 from laskd_registry import get_session_registry
-from laskd_protocol import extract_reply_for_req, is_done_text, wrap_claude_prompt
+from laskd_protocol import extract_reply_for_req, is_done_text, wrap_claude_delivery_prompt, wrap_claude_prompt
 from laskd_session import compute_session_key, load_project_session
 from providers import LASKD_SPEC
 from session_file_watcher import HAS_WATCHDOG
@@ -548,9 +548,16 @@ class ClaudeAdapter(BaseProviderAdapter):
 
         if req.no_wrap:
             prompt = req.message
+        elif req.delivery_only:
+            prompt = wrap_claude_delivery_prompt(req.message, task.req_id)
         else:
             prompt = wrap_claude_prompt(req.message, task.req_id)
         backend.send_text(pane_id, prompt)
+
+        if req.delivery_only:
+            result = self._wait_for_delivery(task, session, session_key, started_ms, log_reader, state, backend, pane_id, deadline)
+            self._finalize_result(result, req, task)
+            return result
 
         # Use structured Claude session logs only
         result = self._wait_for_response(
@@ -562,6 +569,10 @@ class ClaudeAdapter(BaseProviderAdapter):
 
     def _finalize_result(self, result: ProviderResult, req: ProviderRequest, task: QueuedTask) -> None:
         _write_log(f"[INFO] done provider=claude req_id={result.req_id} exit={result.exit_code}")
+
+        if req.suppress_completion_hook:
+            _write_log(f"[INFO] completion hook suppressed req_id={result.req_id}")
+            return
 
         reply_for_hook = result.reply
         status = result.status or (COMPLETION_STATUS_COMPLETED if result.done_seen else COMPLETION_STATUS_INCOMPLETE)
@@ -589,6 +600,98 @@ class ClaudeAdapter(BaseProviderAdapter):
             work_dir=req.work_dir,
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
+        )
+
+    def _wait_for_delivery(
+        self, task: QueuedTask, session: Any, session_key: str,
+        started_ms: int, log_reader: ClaudeLogReader, state: dict,
+        backend: Any, pane_id: str, deadline: Optional[float] = None
+    ) -> ProviderResult:
+        req = task.request
+        ack_timeout = float(os.environ.get("CCB_LASKD_DELIVERY_ACK_TIMEOUT", "10.0"))
+        local_deadline = time.time() + max(0.1, ack_timeout)
+        if deadline is not None:
+            local_deadline = min(local_deadline, deadline)
+
+        anchor_seen = False
+        fallback_scan = False
+        anchor_ms: Optional[int] = None
+        rebounded = False
+        tail_bytes = int(os.environ.get("CCB_LASKD_REBIND_TAIL_BYTES", str(2 * 1024 * 1024)))
+        anchor_grace_deadline = min(local_deadline, time.time() + 1.5)
+        pane_check_interval = float(os.environ.get("CCB_LASKD_PANE_CHECK_INTERVAL", "2.0"))
+        last_pane_check = time.time()
+
+        while True:
+            if task.cancel_event and task.cancel_event.is_set():
+                break
+
+            remaining = local_deadline - time.time()
+            if remaining <= 0:
+                break
+            wait_step = min(remaining, 0.5)
+
+            if time.time() - last_pane_check >= pane_check_interval:
+                try:
+                    alive = bool(backend.is_alive(pane_id))
+                except Exception:
+                    alive = False
+                if not alive:
+                    _write_log(f"[ERROR] Pane {pane_id} died during delivery req_id={task.req_id}")
+                    return ProviderResult(
+                        exit_code=1,
+                        reply="Claude pane died during delivery",
+                        req_id=task.req_id,
+                        session_key=session_key,
+                        done_seen=False,
+                        anchor_seen=anchor_seen,
+                        fallback_scan=fallback_scan,
+                        anchor_ms=anchor_ms,
+                        status=COMPLETION_STATUS_FAILED,
+                    )
+                last_pane_check = time.time()
+
+            events, state = log_reader.wait_for_events(state, wait_step)
+            if not events:
+                if (not rebounded) and (not anchor_seen) and time.time() >= anchor_grace_deadline:
+                    log_reader = ClaudeLogReader(work_dir=Path(session.work_dir), use_sessions_index=False)
+                    log_hint = log_reader.current_session_path()
+                    state = _tail_state_for_log(log_hint, tail_bytes=tail_bytes)
+                    fallback_scan = True
+                    rebounded = True
+                continue
+
+            for role, text in events:
+                if role == "user" and f"{REQ_ID_PREFIX} {task.req_id}" in text:
+                    anchor_seen = True
+                    anchor_ms = _now_ms() - started_ms
+                    break
+            if anchor_seen:
+                break
+
+        if task.cancelled or (task.cancel_event and task.cancel_event.is_set()):
+            status = COMPLETION_STATUS_CANCELLED
+            exit_code = 2
+            reply = "Peer message delivery cancelled."
+        elif anchor_seen:
+            status = COMPLETION_STATUS_COMPLETED
+            exit_code = 0
+            reply = "Peer message delivered."
+        else:
+            status = COMPLETION_STATUS_INCOMPLETE
+            exit_code = 2
+            reply = "Peer message sent, but delivery anchor was not confirmed."
+
+        return ProviderResult(
+            exit_code=exit_code,
+            reply=reply,
+            req_id=task.req_id,
+            session_key=session_key,
+            done_seen=False,
+            anchor_seen=anchor_seen,
+            anchor_ms=anchor_ms,
+            fallback_scan=fallback_scan,
+            status=status,
         )
 
     def _postprocess_reply(self, req: ProviderRequest, reply: str) -> str:

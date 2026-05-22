@@ -21,16 +21,19 @@ The first argument must be the provider name, followed by the message:
 
 ## Execution (MANDATORY)
 
+You MUST call the Bash tool with this exact command — do not skip it, do not simulate it:
+
 ```
 Bash(CCB_CALLER=claude ask $PROVIDER "$MESSAGE")
 ```
 
 ## Rules
 
+- **Never say "[Provider] processing..." unless the Bash output contains `[CCB_ASYNC_SUBMITTED`.** If you did not run the Bash call, or the output does not contain `CCB_ASYNC_SUBMITTED`, you have NOT submitted anything — do not pretend otherwise.
 - Follow the **Async Guardrail** rule in CLAUDE.md (mandatory).
-- Local fallback: if output contains `CCB_ASYNC_SUBMITTED`, end your turn immediately.
-- If submit fails (non-zero exit):
-  - Reply with exactly one line: `[Provider] submit failed: <short error>`
+- Local fallback: if output contains `CCB_ASYNC_SUBMITTED`, end your turn immediately with `[Provider] processing...`
+- If submit fails (non-zero exit) or `CCB_ASYNC_SUBMITTED` is absent from output:
+  - Reply with exactly one line: `[Provider] submit failed: <short error or 'no async marker in output'>`
   - End your turn immediately.
 
 ## Examples

@@ -3323,32 +3323,7 @@ class AILauncher:
                 except Exception:
                     pass
 
-            # Check if we own this daemon or if forced shutdown is enabled
-            force_rebind = _env_bool("CCB_FORCE_REBIND", False)
-            owned_by_us = False
-            try:
-                parent_pid = int((askd_st or {}).get("parent_pid") or 0)
-                owned_by_us = (parent_pid == self.ccb_pid)
-            except Exception:
-                pass
-
-            # Only shutdown if we own it, or force flag is set, or owner is dead
-            should_shutdown = False
-            if force_rebind:
-                should_shutdown = True
-            elif owned_by_us:
-                should_shutdown = True
-            else:
-                # Check if foreign owner is still alive
-                try:
-                    parent_pid = int((askd_st or {}).get("parent_pid") or 0)
-                    if parent_pid > 0:
-                        foreign_alive = _is_pid_alive(parent_pid)
-                        if not foreign_alive:
-                            should_shutdown = True  # Owner is dead, safe to cleanup
-                except Exception:
-                    pass
-
+            should_shutdown, _reason = _should_shutdown_shared_askd(askd_st, owner_pid=self.ccb_pid)
             if should_shutdown:
                 shutdown_daemon("ask", 1.0, askd_state)
         except Exception:
@@ -3918,8 +3893,88 @@ def _kill_pid(pid: int, force: bool = False) -> bool:
         return False
 
 
+def _shared_askd_belongs_to_work_dir(askd_st: dict | None, work_dir: Path) -> bool:
+    if not isinstance(askd_st, dict):
+        return False
+    daemon_work_dir = askd_st.get("work_dir")
+    if not isinstance(daemon_work_dir, str) or not daemon_work_dir.strip():
+        return False
+    current_norm = _normalize_path_for_match(str(work_dir))
+    daemon_norm = _normalize_path_for_match(daemon_work_dir)
+    if not current_norm or not daemon_norm:
+        return False
+    return _normpath_within(current_norm, daemon_norm)
+
+
+def _should_shutdown_shared_askd(
+    askd_st: dict | None,
+    *,
+    owner_pid: int | None = None,
+    owner_work_dir: Path | None = None,
+) -> tuple[bool, str]:
+    if _env_bool("CCB_FORCE_REBIND", False):
+        return True, "force"
+
+    try:
+        parent_pid = int((askd_st or {}).get("parent_pid") or 0)
+    except Exception:
+        parent_pid = 0
+
+    if owner_pid is not None and parent_pid == owner_pid:
+        return True, "owned_by_pid"
+
+    if owner_work_dir is not None and _shared_askd_belongs_to_work_dir(askd_st, owner_work_dir):
+        return True, "owned_by_work_dir"
+
+    if parent_pid > 0:
+        try:
+            if not _is_pid_alive(parent_pid):
+                return True, "owner_dead"
+        except Exception:
+            pass
+        return False, "foreign_owner_alive"
+
+    return False, "owner_unknown"
+
+
+def _shutdown_shared_askd_for_project_kill(work_dir: Path) -> bool:
+    askd_state = state_file_path("askd.json")
+    askd_st = read_state(askd_state) or {}
+    if not askd_st:
+        print("ℹ️  askd: No shared daemon state found")
+        return False
+
+    should_shutdown, reason = _should_shutdown_shared_askd(askd_st, owner_work_dir=work_dir)
+    if not should_shutdown:
+        if reason == "foreign_owner_alive":
+            print("ℹ️  askd: Shared daemon belongs to another live project; leaving it running")
+        else:
+            print("ℹ️  askd: Shared daemon ownership is unknown; leaving it running")
+        return False
+
+    if shutdown_daemon("ask", 1.0, askd_state):
+        print("✅ askd daemon shutdown requested")
+        return True
+
+    if askd_st.get("pid"):
+        try:
+            pid = int(askd_st["pid"])
+        except Exception:
+            pid = 0
+        if pid > 0:
+            if _kill_pid(pid, force=True):
+                print(f"✅ askd daemon force killed (pid={pid})")
+                return True
+            print(f"⚠️ askd daemon could not be killed (pid={pid})")
+            return False
+
+    print("⚠️ askd daemon shutdown failed")
+    return False
+
+
 def cmd_kill(args):
     force = getattr(args, "force", False)
+    daemon = getattr(args, "daemon", False)
 
     # Global zombie cleanup mode
     if force:
@@ -3930,15 +3985,6 @@ def cmd_kill(args):
     providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude", "droid"], allow_unknown=True)
     if not providers:
         return 2
-
-    # Map provider names to their client specs to find daemon info
-    specs = {
-        "codex": CASK_CLIENT_SPEC,
-        "gemini": GASK_CLIENT_SPEC,
-        "opencode": OASK_CLIENT_SPEC,
-        "claude": LASK_CLIENT_SPEC,
-        "droid": DASK_CLIENT_SPEC,
-    }
 
     for provider in providers:
         # 1. Kill UI sessions (tmux/wezterm)
@@ -3971,28 +4017,12 @@ def cmd_kill(args):
             except Exception as e:
                 print(f"❌ {provider}: {e}")
         else:
-             print(f"ℹ️  {provider}: No active session file found")
+            print(f"ℹ️  {provider}: No active session file found")
 
-        # 2. Kill background daemon (graceful shutdown, then force kill)
-        spec = specs.get(provider)
-        if spec:
-            daemon_name = spec.daemon_bin_name
-            st_file = state_file_path(f"{daemon_name}.json")
-
-            try:
-                if shutdown_daemon(spec.protocol_prefix, 1.0, st_file):
-                    print(f"✅ {daemon_name} daemon shutdown requested")
-                else:
-                    # Graceful shutdown failed, try force kill using PID from state file
-                    st = read_state(st_file)
-                    if st and st.get("pid"):
-                        pid = int(st["pid"])
-                        if _kill_pid(pid, force=True):
-                            print(f"✅ {daemon_name} daemon force killed (pid={pid})")
-                        else:
-                            print(f"⚠️ {daemon_name} daemon could not be killed (pid={pid})")
-            except Exception:
-                pass
+    if daemon:
+        _shutdown_shared_askd_for_project_kill(Path.cwd())
+    else:
+        print("ℹ️  askd: Shared daemon left running (use --daemon to stop it)")
 
     return 0
 
@@ -4909,6 +4939,7 @@ def main():
 
         kill_parser = subparsers.add_parser("kill", help="Terminate session or clean up zombies")
         kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude/droid)")
+        kill_parser.add_argument("--daemon", action="store_true", help="Also stop the shared askd daemon when ownership checks allow it")
         kill_parser.add_argument("-f", "--force", action="store_true", help="Clean up all zombie tmux sessions globally")
         kill_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt (with -f)")
 

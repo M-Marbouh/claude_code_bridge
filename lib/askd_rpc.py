@@ -59,7 +59,17 @@ def shutdown_daemon(protocol_prefix: str, timeout_s: float, state_file: Path) ->
         with socket.create_connection((host, port), timeout=timeout_s) as sock:
             req = {"type": f"{protocol_prefix}.shutdown", "v": 1, "id": "shutdown", "token": token}
             sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-            _ = sock.recv(1024)
-        return True
+            buf = b""
+            deadline = time.time() + timeout_s
+            while b"\n" not in buf and time.time() < deadline:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                buf += chunk
+            if b"\n" not in buf:
+                return False
+            line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+            resp = json.loads(line)
+            return resp.get("type") == f"{protocol_prefix}.response" and int(resp.get("exit_code", 1)) == 0
     except Exception:
         return False

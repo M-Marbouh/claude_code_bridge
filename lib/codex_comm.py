@@ -363,17 +363,17 @@ class CodexLogReader:
         """Non-blocking read for reply"""
         return self._read_since(state, timeout=0.0, block=False)
 
-    def wait_for_event(self, state: Dict[str, Any], timeout: float) -> Tuple[Optional[Tuple[str, str]], Dict[str, Any]]:
+    def wait_for_event(self, state: Dict[str, Any], timeout: float) -> Tuple[Optional[Tuple[str, str, str]], Dict[str, Any]]:
         """
         Block and wait for a new event.
 
         Returns:
-            ((role, text), new_state) or (None, state) on timeout.
+            ((role, text, phase), new_state) or (None, state) on timeout.
         """
         return self._read_event_since(state, timeout, block=True)
 
-    def try_get_event(self, state: Dict[str, Any]) -> Tuple[Optional[Tuple[str, str]], Dict[str, Any]]:
-        """Non-blocking read for an event."""
+    def try_get_event(self, state: Dict[str, Any]) -> Tuple[Optional[Tuple[str, str, str]], Dict[str, Any]]:
+        """Non-blocking read for an event. Returns ((role, text, phase), state)."""
         return self._read_event_since(state, timeout=0.0, block=False)
 
     def latest_message(self) -> Optional[str]:
@@ -501,11 +501,11 @@ class CodexLogReader:
             if time.time() >= deadline:
                 return None, {"log_path": log_path, "offset": offset}
 
-    def _read_event_since(self, state: Dict[str, Any], timeout: float, block: bool) -> Tuple[Optional[Tuple[str, str]], Dict[str, Any]]:
+    def _read_event_since(self, state: Dict[str, Any], timeout: float, block: bool) -> Tuple[Optional[Tuple[str, str, str]], Dict[str, Any]]:
         """
-        Like _read_since(), but returns structured (role, text) events.
+        Like _read_since(), but returns structured (role, text, phase) events.
 
-        Role is one of: "user", "assistant".
+        Role is one of: "user", "assistant". See _extract_event for phase values.
         """
         deadline = time.time() + timeout
         current_path = self._normalize_path(state.get("log_path"))
@@ -668,18 +668,43 @@ class CodexLogReader:
                     return "\n".join(filter(None, texts)).strip()
         return None
 
-    @classmethod
-    def _extract_event(cls, entry: dict) -> Optional[Tuple[str, str]]:
+    @staticmethod
+    def _assistant_phase(entry: dict) -> str:
         """
-        Extract a (role, text) event from a JSONL entry.
-        Role is "user" or "assistant".
+        Classify an assistant entry's turn phase.
+
+        Modern Codex logs tag response_item/message assistant entries with a
+        "phase" field ("final_answer" for the final report vs "commentary" for
+        interim progress). The duplicate event_msg/agent_message twin and legacy
+        shapes carry no phase; we label those "event" so reply assembly can
+        prefer the canonical final_answer and drop the duplicate/commentary noise.
+        """
+        if entry.get("type") == "response_item":
+            payload = entry.get("payload", {})
+            if isinstance(payload, dict) and payload.get("type") == "message" and payload.get("role") != "user":
+                phase = payload.get("phase")
+                if isinstance(phase, str) and phase.strip():
+                    return phase.strip()
+        return "event"
+
+    @classmethod
+    def _extract_event(cls, entry: dict) -> Optional[Tuple[str, str, str]]:
+        """
+        Extract a (role, text, phase) event from a JSONL entry.
+
+        Role is "user" or "assistant". Phase qualifies assistant messages:
+          - "final_answer" / "commentary": from the response_item/message "phase"
+          - "event": the duplicate event_msg/agent_message twin, the generic
+            role=="assistant" fallback, and any message without explicit phase
+          - "" for user messages
+        Callers that want only the final report should keep phase=="final_answer".
         """
         user_msg = cls._extract_user_message(entry)
         if isinstance(user_msg, str) and user_msg.strip():
-            return "user", user_msg.strip()
+            return "user", user_msg.strip(), ""
         ai_msg = cls._extract_message(entry)
         if isinstance(ai_msg, str) and ai_msg.strip():
-            return "assistant", ai_msg.strip()
+            return "assistant", ai_msg.strip(), cls._assistant_phase(entry)
         return None
 
     def latest_conversations(self, n: int = 1) -> List[Tuple[str, str]]:

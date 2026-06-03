@@ -46,6 +46,22 @@ def _tail_state_for_log(log_path_val: Optional[Path], *, tail_bytes: int) -> dic
     return {"log_path": log_path_val, "offset": offset}
 
 
+def _assemble_reply(final_chunks: list[str], combined: str, req_id: str) -> str:
+    """
+    Assemble the reply Codex returns to the caller.
+
+    Modern Codex logs tag the final report with phase=="final_answer"; interim
+    progress is phase=="commentary" and the duplicate event_msg twin is
+    phase=="event". When we captured any final_answer content, return only that
+    (stripped of the trailing CCB_DONE marker). Otherwise fall back to the legacy
+    behavior of extracting the full anchor->DONE span -- this preserves replies
+    from older Codex builds that emit no phase metadata.
+    """
+    if final_chunks:
+        return strip_done_text("\n".join(final_chunks), req_id)
+    return extract_reply_for_req(combined, req_id)
+
+
 def _scan_latest_any_log(work_dir: Path) -> Optional[Path]:
     try:
         return CodexLogReader(log_path=None, session_id_filter=None, work_dir=work_dir).current_log_path()
@@ -146,6 +162,7 @@ class CodexAdapter(BaseProviderAdapter):
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
         chunks: list[str] = []
+        final_chunks: list[str] = []
         anchor_seen = False
         done_seen = False
         anchor_ms: Optional[int] = None
@@ -245,7 +262,7 @@ class CodexAdapter(BaseProviderAdapter):
                             _write_log(f"[WARN] stale codex log detected; switching to {latest_log}")
                 continue
 
-            role, text = event
+            role, text, phase = event
             if role == "user":
                 if f"{REQ_ID_PREFIX} {task.req_id}" in text:
                     anchor_seen = True
@@ -263,7 +280,19 @@ class CodexAdapter(BaseProviderAdapter):
 
             chunks.append(text)
             combined = "\n".join(chunks)
-            if is_done_text(combined, task.req_id):
+            done_now = is_done_text(combined, task.req_id)
+            # A message belongs to the final report if Codex tagged it
+            # phase=="final_answer" OR it carries the terminating CCB_DONE line.
+            # The event_msg/agent_message twin of the final answer is logged
+            # *before* the canonical phase=="final_answer" record and already
+            # carries CCB_DONE, so the loop breaks on the twin first. We must
+            # therefore treat the DONE-bearing message as final too; otherwise
+            # final_chunks stays empty and we fall back to the noisy full span.
+            # Interim commentary and its event twin (no DONE, not final_answer)
+            # still feed `chunks` for completion/idle detection + legacy fallback.
+            if (phase == "final_answer" or done_now) and (not final_chunks or final_chunks[-1] != text):
+                final_chunks.append(text)
+            if done_now:
                 done_seen = True
                 done_ms = _now_ms() - started_ms
                 break
@@ -282,7 +311,7 @@ class CodexAdapter(BaseProviderAdapter):
                 break
 
         combined = "\n".join(chunks)
-        reply = extract_reply_for_req(combined, task.req_id)
+        reply = _assemble_reply(final_chunks, combined, task.req_id)
         status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
         if task.cancelled:
             status = COMPLETION_STATUS_CANCELLED

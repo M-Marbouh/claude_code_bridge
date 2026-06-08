@@ -2,7 +2,7 @@
 
 Lightweight multi-agent terminal coordination for a single-machine workflow.
 
-This fork is based on the v5 line of `bfly123/claude_code_bridge`. It keeps the original split-pane model and focuses on a practical Linux setup: Claude, Codex, Gemini, OpenCode, Droid, Qwen, and related CLI agents running visibly in WezTerm or tmux panes.
+This fork is based on the v5 line of `SeemSeam/claude_code_bridge` (formerly `bfly123/claude_code_bridge`, now redirected). It keeps the original split-pane model and focuses on a practical Linux setup: Claude, Codex, Gemini, OpenCode, Droid, Qwen, and related CLI agents running visibly in WezTerm or tmux panes.
 
 ## What It Is
 
@@ -50,6 +50,7 @@ The live install is copied to `~/.local/share/codex-dual/`. Make source changes 
 
 This fork diverges from upstream v5 in a few practical areas:
 
+- **Multi-instance, model-tiered providers (new in `0.10.0`)**: run a second pane of the same provider on a cheaper model — `codex:worker` (gpt-5.4-mini) for edit application and tests, `claude:worker` (Haiku) for memory and changelog/doc chores — while the architect/orchestrator panes stay on the strong model. Each instance gets its own session, resume, and pane; `CCB_CODEX_SHOW_TIER=1` prints the live model/effort so you can confirm the tier.
 - Gemini `CCB_DONE` handling is hardened for replies that omit or misplace completion markers.
 - Self-update URLs point at the `M-Marbouh/claude_code_bridge` fork.
 - `ccb-list` lists active local CCB projects and provider pane liveness.
@@ -74,6 +75,30 @@ ask codex "Investigate the failing test and report the likely cause"
 ask gemini "Review this implementation plan for edge cases"
 pend codex
 ```
+
+### Model-tiered workers
+
+Declare extra instances of a provider in `ccb.config` (or on the command line). A `:worker` token spawns a second, cheaper pane:
+
+```
+codex, codex:worker, claude, claude:worker
+```
+
+`:worker` panes auto-resolve to cheap defaults (`codex` → gpt-5.4-mini, `claude` → Haiku) with no model strings required; the architect/orchestrator panes (`codex`, `claude`) stay on the strong model. Send work to a worker the same way you reach any provider:
+
+```bash
+ask codex:worker "Apply this patch and run the test suite"
+ask claude:worker "Update the changelog and project memory"
+```
+
+Confirm the live model/effort of a Codex pane (off by default, so normal output is unchanged):
+
+```bash
+CCB_CODEX_SHOW_TIER=1 ask codex:worker "noop"
+# reply ends with: [codex:worker model=gpt-5.4-mini effort=medium sandbox=workspace-write]
+```
+
+Only `codex` and `claude` support instances today. The feature is inert unless you declare a `:worker`, so plain `ccb codex` is unchanged. Override a worker's model per project with an `instances` map in `ccb.config` (JSON form).
 
 List active CCB projects:
 
@@ -100,12 +125,16 @@ Targets for `--peer` can be:
 
 The current milestone is `v1.0.0`.
 
+Recently shipped (`0.10.0`):
+
+- Multi-instance, model-tiered providers (`codex:worker`, `claude:worker`) with per-instance session, pane, and resume isolation, and a `CCB_CODEX_SHOW_TIER` verification footer.
+
 Planned before `v1.0.0`:
 
 - Stabilize the `ccb-list` output contract.
 - Harden `ccb-bridge-ask` target resolution and stale pane diagnostics.
-- Document common Claude + Codex workflows.
-- Add public-facing examples for single-machine Linux setups.
-- Keep the fork's README, changelog, and versioning independent from upstream v5/v6.
+- Per-instance resume polish and per-project model/effort overrides.
+- Document common Claude + Codex workflows and single-machine Linux examples.
+- Keep the fork's README, changelog, and versioning independent from upstream.
 
-Current pre-release version: `0.9.0`.
+Current pre-release version: `0.10.0`.

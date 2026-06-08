@@ -142,7 +142,15 @@ class _ScriptedReader:
         return None
 
 
-def _drive_handle_task(monkeypatch, tmp_path: Path, req_id: str, events: list[tuple[str, str, str]], *, instance: str | None = None):
+def _drive_handle_task(
+    monkeypatch,
+    tmp_path: Path,
+    req_id: str,
+    events: list[tuple[str, str, str]],
+    *,
+    instance: str | None = None,
+    show_tier: bool = False,
+):
     # Prepend the user anchor so anchor_seen flips before assistant events.
     scripted = [("user", f"{REQ_ID_PREFIX} {req_id}", "")] + events
 
@@ -155,6 +163,7 @@ def _drive_handle_task(monkeypatch, tmp_path: Path, req_id: str, events: list[tu
     req = ProviderRequest(
         client_id="c", work_dir=str(tmp_path), timeout_s=5.0, quiet=True,
         message="do the thing", caller="claude", req_id=req_id, instance=instance,
+        show_tier=show_tier,
     )
     task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
 
@@ -245,6 +254,17 @@ def test_handle_task_footer_off_by_default(monkeypatch, tmp_path: Path) -> None:
     ])
 
     assert result.reply == "Plain reply."
+
+
+def test_handle_task_footer_on_per_request_flag(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("CCB_CODEX_SHOW_TIER", raising=False)
+    req_id = make_req_id()
+
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [
+        ("assistant", f"Plain reply.\nCCB_DONE: {req_id}", "final_answer"),
+    ], show_tier=True)
+
+    assert result.reply == "Plain reply.\n[codex model=unknown effort=unknown sandbox=unknown]"
 
 
 def test_handle_task_footer_on_unknown_when_context_missing(monkeypatch, tmp_path: Path) -> None:

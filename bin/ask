@@ -362,6 +362,8 @@ def _send_via_unified_daemon(
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,
     }
+    if _env_bool("CCB_CODEX_SHOW_TIER", False):
+        req["show_tier"] = True
 
     # Pass email-related env vars for email caller
     if caller == "email":

@@ -38,6 +38,17 @@ def _write_log(line: str) -> None:
     write_log(log_path(ASKD_SPEC.log_file_name), line)
 
 
+def _request_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if not raw:
+            return False
+        return raw in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
     """Worker thread for processing tasks for a specific session."""
 
@@ -166,6 +177,7 @@ class UnifiedAskDaemon:
                 output_path=str(msg.get("output_path")) if msg.get("output_path") else None,
                 req_id=str(msg.get("req_id")) if msg.get("req_id") else None,
                 no_wrap=bool(msg.get("no_wrap") or False),
+                show_tier=_request_bool(msg.get("show_tier")),
                 delivery_only=bool(msg.get("delivery_only") or msg.get("no_reply_wait") or False),
                 suppress_completion_hook=bool(msg.get("suppress_completion_hook") or False),
                 email_req_id=str(msg.get("email_req_id") or ""),

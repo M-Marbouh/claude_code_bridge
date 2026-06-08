@@ -24,6 +24,7 @@ class ProviderRequest:
     output_path: Optional[str] = None
     req_id: Optional[str] = None
     no_wrap: bool = False
+    show_tier: bool = False
     delivery_only: bool = False
     suppress_completion_hook: bool = False
     # Email-related fields for email caller

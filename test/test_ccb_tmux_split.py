@@ -30,11 +30,12 @@ def test_run_up_sorts_providers_in_tmux(monkeypatch, tmp_path: Path) -> None:
     launcher = ccb.AILauncher(providers=["opencode", "gemini", "codex"])
     launcher.terminal_type = "tmux"
 
-    called: list[str] = []
+    called: list[tuple[str, str | None, str | None, str]] = []
 
     def _start_provider(p: str, **_kwargs) -> str:
-        called.append(p)
-        return f"%{len(called)}"
+        pane_id = f"%{len(called) + 1}"
+        called.append((p, _kwargs.get("parent_pane"), _kwargs.get("direction"), pane_id))
+        return pane_id
 
     monkeypatch.setattr(launcher, "_start_provider", _start_provider)
     monkeypatch.setattr(launcher, "_warmup_provider", lambda *_args, **_kwargs: True)
@@ -45,7 +46,10 @@ def test_run_up_sorts_providers_in_tmux(monkeypatch, tmp_path: Path) -> None:
 
     rc = launcher.run_up()
     assert rc == 0
-    assert called == ["gemini", "opencode"]
+    assert called == [
+        ("gemini", "%0", "right", "%1"),
+        ("opencode", "%1", "bottom", "%2"),
+    ]
 
 
 def test_run_up_spawns_provider_instances_without_polluting_providers(monkeypatch, tmp_path: Path) -> None:
@@ -64,15 +68,17 @@ def test_run_up_spawns_provider_instances_without_polluting_providers(monkeypatc
     )
     launcher.terminal_type = "tmux"
 
-    started: list[tuple[str, str | None]] = []
+    started: list[tuple[str, str | None, str | None, str | None, str]] = []
 
     def _start_provider(provider: str, **kwargs) -> str:
-        started.append((provider, kwargs.get("instance")))
-        return f"%{len(started)}"
+        pane_id = f"%{len(started) + 1}"
+        started.append((provider, kwargs.get("instance"), kwargs.get("parent_pane"), kwargs.get("direction"), pane_id))
+        return pane_id
 
     def _start_claude_pane(**kwargs) -> str:
-        started.append(("claude", kwargs.get("instance")))
-        return f"%{len(started)}"
+        pane_id = f"%{len(started) + 1}"
+        started.append(("claude", kwargs.get("instance"), kwargs.get("parent_pane"), kwargs.get("direction"), pane_id))
+        return pane_id
 
     monkeypatch.setattr(launcher, "_start_provider", _start_provider)
     monkeypatch.setattr(launcher, "_start_claude_pane", _start_claude_pane)
@@ -86,7 +92,67 @@ def test_run_up_spawns_provider_instances_without_polluting_providers(monkeypatc
     assert rc == 0
     assert launcher.providers == ["codex", "claude"]
     assert launcher.anchor_provider == "claude"
-    assert started == [("codex", None), ("codex", "worker"), ("claude", "worker")]
+    assert started == [
+        ("codex", None, "%0", "right", "%1"),
+        ("claude", "worker", "%0", "bottom", "%2"),
+        ("codex", "worker", "%1", "bottom", "%3"),
+    ]
+
+
+def test_run_up_groups_provider_instances_with_cmd_pane(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TMUX_PANE", "%0")
+    monkeypatch.setattr(ccb, "detect_terminal", lambda: "tmux")
+
+    launcher = ccb.AILauncher(
+        providers=["codex", "claude"],
+        provider_instances=[
+            {"provider": "codex", "instance": "worker", "key": "codex:worker"},
+            {"provider": "claude", "instance": "worker", "key": "claude:worker"},
+        ],
+        cmd_config={"enabled": True, "start_cmd": "bash"},
+    )
+    launcher.terminal_type = "tmux"
+
+    started: list[tuple[str, str | None, str | None, str | None, str]] = []
+
+    def _next_pane() -> str:
+        return f"%{len(started) + 1}"
+
+    def _start_cmd_pane(**kwargs) -> str:
+        pane_id = _next_pane()
+        started.append(("cmd", None, kwargs.get("parent_pane"), kwargs.get("direction"), pane_id))
+        return pane_id
+
+    def _start_provider(provider: str, **kwargs) -> str:
+        pane_id = _next_pane()
+        started.append((provider, kwargs.get("instance"), kwargs.get("parent_pane"), kwargs.get("direction"), pane_id))
+        return pane_id
+
+    def _start_claude_pane(**kwargs) -> str:
+        pane_id = _next_pane()
+        started.append(("claude", kwargs.get("instance"), kwargs.get("parent_pane"), kwargs.get("direction"), pane_id))
+        return pane_id
+
+    monkeypatch.setattr(launcher, "_start_cmd_pane", _start_cmd_pane)
+    monkeypatch.setattr(launcher, "_start_provider", _start_provider)
+    monkeypatch.setattr(launcher, "_start_claude_pane", _start_claude_pane)
+    monkeypatch.setattr(launcher, "_warmup_provider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(launcher, "_maybe_start_caskd", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "_start_provider_in_current_pane", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(launcher, "cleanup", lambda: None)
+
+    rc = launcher.run_up()
+
+    assert rc == 0
+    assert started == [
+        ("cmd", None, "%0", "right", "%1"),
+        ("claude", "worker", "%0", "bottom", "%2"),
+        ("codex", None, "%1", "bottom", "%3"),
+        ("codex", "worker", "%3", "bottom", "%4"),
+    ]
 
 
 def test_cli_parser_rejects_unsupported_provider_instance(capsys) -> None:

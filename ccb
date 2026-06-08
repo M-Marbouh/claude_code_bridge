@@ -3601,30 +3601,48 @@ class AILauncher:
             return 2
 
         cmd_settings = self._cmd_settings()
-        spawn_items: list[object] = []
+        base_spawn_items: list[object] = []
         if cmd_settings.get("enabled"):
-            spawn_items.append("cmd")
-        spawn_items.extend(list(reversed(self.providers[:-1])))
-        spawn_items.extend(dict(spec) for spec in self.provider_instances)
-        total_panes = 1 + len(spawn_items)
+            base_spawn_items.append("cmd")
+        base_spawn_items.extend(list(reversed(self.providers[:-1])))
+        total_panes = 1 + len(base_spawn_items)
         left_count = 1 if total_panes <= 1 else max(1, total_panes // 2)
         right_count = total_panes - left_count
 
-        extras = list(spawn_items)
+        extras = list(base_spawn_items)
         right_top_item = extras[0] if right_count > 0 and extras else None
         remaining = extras[1:] if right_top_item else extras
 
         left_slots = max(0, left_count - 1)
         right_slots = max(0, right_count - (1 if right_top_item else 0))
 
-        left_items = [self.anchor_provider]
+        left_items: list[object] = [self.anchor_provider]
         left_items.extend(remaining[:left_slots])
 
-        right_items: list[str] = []
+        right_items: list[object] = []
         if right_top_item:
             right_items.append(right_top_item)
         if right_slots:
             right_items.extend(remaining[left_slots:left_slots + right_slots])
+
+        instances_by_provider: dict[str, list[dict]] = {}
+        for spec in self.provider_instances:
+            provider = str(spec.get("provider") or "").strip().lower()
+            instances_by_provider.setdefault(provider, []).append(dict(spec))
+
+        def _with_provider_instances(items: list[object]) -> list[object]:
+            expanded: list[object] = []
+            for item in items:
+                expanded.append(item)
+                if isinstance(item, str) and item != "cmd":
+                    provider = str(item).strip().lower()
+                    expanded.extend(instances_by_provider.pop(provider, []))
+            return expanded
+
+        left_items = _with_provider_instances(left_items)
+        right_items = _with_provider_instances(right_items)
+        for specs in instances_by_provider.values():
+            left_items.extend(specs)
 
         cleanup_kwargs = {}
 

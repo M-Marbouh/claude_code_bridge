@@ -342,7 +342,7 @@ class CodexAdapter(BaseProviderAdapter):
         except Exception:
             pass
 
-        if _show_tier_footer():
+        if req.show_tier or _show_tier_footer():
             provider_key = make_qualified_key("codex", instance)
             ctx = read_latest_turn_context(
                 codex_log_path,

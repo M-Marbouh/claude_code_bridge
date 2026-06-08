@@ -452,3 +452,55 @@ class TestDaemonInstanceRouting:
         key1 = make_qualified_key("codex", "auth")
         key2 = make_qualified_key("gemini", "auth")
         assert key1 != key2
+
+    def test_daemon_populates_show_tier_request_field(self, tmp_path: Path):
+        """Request-level footer flag should reach ProviderRequest without daemon env."""
+        from askd.adapters.base import ProviderResult
+        from askd.daemon import UnifiedAskDaemon
+
+        captured = {}
+
+        class _Registry:
+            def get(self, _provider):
+                return object()
+
+        class _Pool:
+            def submit(self, pool_key, request):
+                captured["pool_key"] = pool_key
+                captured["request"] = request
+                done_event = threading.Event()
+                done_event.set()
+                return types.SimpleNamespace(
+                    req_id="req-1",
+                    done_event=done_event,
+                    result=ProviderResult(
+                        exit_code=0,
+                        reply="ok",
+                        req_id="req-1",
+                        session_key="codex:worker:test",
+                        done_seen=True,
+                    ),
+                    cancel_event=None,
+                    cancelled=False,
+                )
+
+        daemon = UnifiedAskDaemon(registry=_Registry(), state_file=tmp_path / "askd.json", work_dir=str(tmp_path))
+        daemon.pool = _Pool()
+
+        resp = daemon._handle_request(
+            {
+                "type": "ask.request",
+                "id": "client-1",
+                "provider": "codex:worker",
+                "work_dir": str(tmp_path),
+                "timeout_s": 1,
+                "message": "hello",
+                "caller": "claude",
+                "show_tier": True,
+            }
+        )
+
+        assert resp["exit_code"] == 0
+        assert captured["pool_key"] == "codex:worker"
+        assert captured["request"].show_tier is True
+        assert captured["request"].instance == "worker"

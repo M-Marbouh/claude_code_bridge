@@ -12,6 +12,7 @@ import sys
 import time
 import shlex
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
@@ -35,6 +36,14 @@ SESSION_ID_PATTERN = re.compile(
 _CODEX_WATCHER: Optional[SessionFileWatcher] = None
 _CODEX_WATCH_STARTED = False
 _CODEX_WATCH_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class CodexTurnContext:
+    model: str | None
+    effort: str | None
+    sandbox: str | None
+    raw_sandbox_policy: dict | None = None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -114,6 +123,57 @@ def _ensure_codex_watchdog_started() -> None:
             return
         _CODEX_WATCHER = watcher
         _CODEX_WATCH_STARTED = True
+
+
+def _sandbox_type_from_policy(policy: object) -> str | None:
+    if isinstance(policy, dict):
+        raw = policy.get("type")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    if isinstance(policy, str) and policy.strip():
+        return policy.strip()
+    return None
+
+
+def read_latest_turn_context(
+    log_path: str | Path | None,
+    *,
+    session_id_filter: str | None = None,
+    max_bytes: int | None = None,
+    max_lines: int | None = None,
+) -> CodexTurnContext | None:
+    if not log_path:
+        return None
+    try:
+        path = Path(log_path).expanduser()
+    except Exception:
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+
+    reader = CodexLogReader(log_path=path, session_id_filter=session_id_filter)
+    tail_bytes = max_bytes if isinstance(max_bytes, int) and max_bytes > 0 else reader._env_int("CODEX_LOG_TURN_CONTEXT_TAIL_BYTES", 1024 * 1024 * 8)
+    tail_lines = max_lines if isinstance(max_lines, int) and max_lines > 0 else reader._env_int("CODEX_LOG_TURN_CONTEXT_TAIL_LINES", 5000)
+    for line in reader._iter_lines_reverse(path, max_bytes=tail_bytes, max_lines=tail_lines):
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "turn_context":
+            continue
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        sandbox_policy = payload.get("sandbox_policy")
+        model = payload.get("model")
+        effort = payload.get("effort")
+        return CodexTurnContext(
+            model=model.strip() if isinstance(model, str) and model.strip() else None,
+            effort=effort.strip() if isinstance(effort, str) and effort.strip() else None,
+            sandbox=_sandbox_type_from_policy(sandbox_policy),
+            raw_sandbox_policy=sandbox_policy if isinstance(sandbox_policy, dict) else None,
+        )
+    return None
 
 
 class CodexLogReader:

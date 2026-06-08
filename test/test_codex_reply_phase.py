@@ -9,13 +9,14 @@ no duplicate lines -- while older logs without phase metadata keep working.
 """
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
 from askd.adapters import codex as codex_adapter
 from askd.adapters.base import ProviderRequest, QueuedTask
 from ccb_protocol import REQ_ID_PREFIX, make_req_id
-from codex_comm import CodexLogReader
+from codex_comm import CodexLogReader, CodexTurnContext, read_latest_turn_context
 
 
 # --------------------------------------------------------------------------
@@ -141,7 +142,7 @@ class _ScriptedReader:
         return None
 
 
-def _drive_handle_task(monkeypatch, tmp_path: Path, req_id: str, events: list[tuple[str, str, str]]):
+def _drive_handle_task(monkeypatch, tmp_path: Path, req_id: str, events: list[tuple[str, str, str]], *, instance: str | None = None):
     # Prepend the user anchor so anchor_seen flips before assistant events.
     scripted = [("user", f"{REQ_ID_PREFIX} {req_id}", "")] + events
 
@@ -153,7 +154,7 @@ def _drive_handle_task(monkeypatch, tmp_path: Path, req_id: str, events: list[tu
 
     req = ProviderRequest(
         client_id="c", work_dir=str(tmp_path), timeout_s=5.0, quiet=True,
-        message="do the thing", caller="claude", req_id=req_id,
+        message="do the thing", caller="claude", req_id=req_id, instance=instance,
     )
     task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
 
@@ -208,3 +209,66 @@ def test_handle_task_legacy_event_only_falls_back(monkeypatch, tmp_path: Path) -
 
     assert result.done_seen is True
     assert result.reply == "Legacy reply body."
+
+
+def test_read_latest_turn_context_reads_bound_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "codex.jsonl"
+    log_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session_meta", "payload": {"id": "s1"}}),
+                "{not-json",
+                json.dumps({"type": "turn_context", "payload": {"model": "old", "effort": "low", "sandbox_policy": {"type": "read-only"}}}),
+                json.dumps({"type": "turn_context", "payload": {"model": "gpt-5.4-mini", "effort": "medium", "sandbox_policy": {"type": "workspace-write"}}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ctx = read_latest_turn_context(log_path, session_id_filter="s1")
+
+    assert ctx == CodexTurnContext(
+        model="gpt-5.4-mini",
+        effort="medium",
+        sandbox="workspace-write",
+        raw_sandbox_policy={"type": "workspace-write"},
+    )
+
+
+def test_handle_task_footer_off_by_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("CCB_CODEX_SHOW_TIER", raising=False)
+    req_id = make_req_id()
+
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [
+        ("assistant", f"Plain reply.\nCCB_DONE: {req_id}", "final_answer"),
+    ])
+
+    assert result.reply == "Plain reply."
+
+
+def test_handle_task_footer_on_unknown_when_context_missing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CCB_CODEX_SHOW_TIER", "1")
+    req_id = make_req_id()
+
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [
+        ("assistant", f"Plain reply.\nCCB_DONE: {req_id}", "final_answer"),
+    ])
+
+    assert result.reply == "Plain reply.\n[codex model=unknown effort=unknown sandbox=unknown]"
+
+
+def test_handle_task_footer_uses_qualified_worker_key(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CCB_CODEX_SHOW_TIER", "1")
+    monkeypatch.setattr(
+        codex_adapter,
+        "read_latest_turn_context",
+        lambda *a, **k: CodexTurnContext(model="gpt-5.4-mini", effort="medium", sandbox="workspace-write"),
+    )
+    req_id = make_req_id()
+
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [
+        ("assistant", f"Worker reply.\nCCB_DONE: {req_id}", "final_answer"),
+    ], instance="worker")
+
+    assert result.reply == "Worker reply.\n[codex:worker model=gpt-5.4-mini effort=medium sandbox=workspace-write]"

@@ -223,6 +223,15 @@ class TestStartConfigInstanceNormalization:
         assert instances == []
         assert cmd_enabled is False
 
+    def test_unsupported_provider_instance_is_dropped_in_config(self):
+        from ccb_start_config import normalize_provider_tokens
+
+        providers, instances, cmd_enabled = normalize_provider_tokens(["gemini:worker", "gemini"])
+
+        assert providers == ["gemini"]
+        assert instances == []
+        assert cmd_enabled is False
+
 
 class TestProviderInstanceDefaults:
     def test_partial_override_keeps_defaults(self):

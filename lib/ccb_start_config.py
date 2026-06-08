@@ -28,6 +28,7 @@ class ProviderInstanceSpec:
 
 
 _ALLOWED_PROVIDERS = {"codex", "gemini", "opencode", "claude", "droid"}
+_INSTANCE_PROVIDERS = {"codex", "claude"}
 
 
 def _parse_tokens(raw: str) -> list[str]:
@@ -74,7 +75,7 @@ def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], list[dict],
             add_provider(base)
             continue
         normalized_instance = normalize_instance_name(instance)
-        if not normalized_instance:
+        if not normalized_instance or base not in _INSTANCE_PROVIDERS:
             continue
         add_provider(base)
         key = make_qualified_key(base, normalized_instance)
@@ -101,7 +102,7 @@ def instance_specs_from_config(data: Mapping[str, object]) -> list[ProviderInsta
             continue
         provider = str(item.get("provider") or "").strip().lower()
         instance = normalize_instance_name(str(item.get("instance") or ""))
-        if provider not in _ALLOWED_PROVIDERS or not instance:
+        if provider not in _INSTANCE_PROVIDERS or not instance:
             continue
         key = make_qualified_key(provider, instance)
         if key in seen:

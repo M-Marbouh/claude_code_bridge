@@ -14,7 +14,7 @@ from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderRes
 from askd_runtime import log_path, write_log
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text, extract_reply_for_req, wrap_codex_prompt
 from caskd_session import CodexProjectSession, compute_session_key, load_project_session
-from codex_comm import CodexCommunicator, CodexLogReader
+from codex_comm import CodexCommunicator, CodexLogReader, CodexTurnContext, read_latest_turn_context
 from completion_hook import (
     COMPLETION_STATUS_CANCELLED,
     COMPLETION_STATUS_COMPLETED,
@@ -23,7 +23,7 @@ from completion_hook import (
     default_reply_for_status,
     notify_completion,
 )
-from providers import CASKD_SPEC
+from providers import CASKD_SPEC, make_qualified_key
 from terminal import get_backend_for_session, is_windows
 
 
@@ -60,6 +60,24 @@ def _assemble_reply(final_chunks: list[str], combined: str, req_id: str) -> str:
     if final_chunks:
         return strip_done_text("\n".join(final_chunks), req_id)
     return extract_reply_for_req(combined, req_id)
+
+
+def _show_tier_footer() -> bool:
+    return (os.environ.get("CCB_CODEX_SHOW_TIER") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_tier_footer(provider_key: str, ctx: CodexTurnContext | None) -> str:
+    model = ctx.model if ctx and ctx.model else "unknown"
+    effort = ctx.effort if ctx and ctx.effort else "unknown"
+    sandbox = ctx.sandbox if ctx and ctx.sandbox else "unknown"
+    return f"[{provider_key} model={model} effort={effort} sandbox={sandbox}]"
+
+
+def _append_tier_footer(reply: str, footer: str) -> str:
+    base = reply.rstrip("\n")
+    if not base:
+        return footer
+    return f"{base}\n{footer}"
 
 
 def _scan_latest_any_log(work_dir: Path) -> Optional[Path]:
@@ -323,6 +341,14 @@ class CodexAdapter(BaseProviderAdapter):
                 codex_log_path = str(lp)
         except Exception:
             pass
+
+        if _show_tier_footer():
+            provider_key = make_qualified_key("codex", instance)
+            ctx = read_latest_turn_context(
+                codex_log_path,
+                session_id_filter=codex_session_id,
+            )
+            reply = _append_tier_footer(reply, _format_tier_footer(provider_key, ctx))
 
         result = ProviderResult(
             exit_code=0 if done_seen else 2,

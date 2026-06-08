@@ -652,7 +652,7 @@ class AILauncher:
                 continue
             provider = str(item.get("provider") or "").strip().lower()
             instance = normalize_instance_name(str(item.get("instance") or ""))
-            if not provider or not instance:
+            if provider not in {"codex", "claude"} or not instance:
                 continue
             key = make_qualified_key(provider, instance)
             if key in seen:
@@ -697,6 +697,10 @@ class AILauncher:
 
     def _policy_for(self, provider: str, instance: str | None = None):
         return resolve_instance_policy(provider, normalize_instance_name(instance), self.instance_overrides)
+
+    def _provider_has_instances(self, provider: str) -> bool:
+        base = str(provider or "").strip().lower()
+        return any(str(spec.get("provider") or "").strip().lower() == base for spec in self.provider_instances)
 
     def _migrate_legacy_project_files(self) -> None:
         """
@@ -1328,7 +1332,7 @@ class AILauncher:
         runtime = self._runtime_dir_for(provider, instance)
         runtime.mkdir(parents=True, exist_ok=True)
 
-        start_cmd = self._get_start_cmd(provider)
+        start_cmd = self._get_start_cmd(provider, instance)
         keep_open = os.environ.get("CODEX_WEZTERM_KEEP_OPEN", "1").lower() not in {"0", "false", "no", "off"}
         if keep_open:
             start_cmd = _build_keep_open_cmd(provider, start_cmd)
@@ -1846,13 +1850,109 @@ class AILauncher:
         except Exception as e:
             print(f"⚠️ Failed to configure codex auto-approval: {e}")
 
-    def _build_codex_start_cmd(self) -> str:
+    def _codex_session_log_matches_id(self, log_path: Path, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid or not log_path.exists() or not log_path.is_file():
+            return False
+        if sid in log_path.name or sid in log_path.stem:
+            return True
+        try:
+            with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for _ in range(50):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if sid in line:
+                        return True
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(entry, dict) and entry.get("type") == "session_meta":
+                        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                        if payload.get("id") == sid:
+                            return True
+        except Exception:
+            return False
+        return False
+
+    def _codex_session_exists(self, session_id: str, log_path: str | None = None) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        if log_path:
+            try:
+                if self._codex_session_log_matches_id(Path(log_path).expanduser(), sid):
+                    return True
+            except Exception:
+                pass
+        root = Path(os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
+        if not root.exists():
+            return False
+        try:
+            logs = sorted(
+                (p for p in root.glob("**/*.jsonl") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            logs = []
+        scan_limit = 400
+        raw_limit = (os.environ.get("CCB_CODEX_SCAN_LIMIT") or "").strip()
+        if raw_limit:
+            try:
+                scan_limit = max(100, min(20000, int(raw_limit)))
+            except Exception:
+                scan_limit = 400
+        for candidate in logs[:scan_limit]:
+            if self._codex_session_log_matches_id(candidate, sid):
+                return True
+        return False
+
+    def _get_bound_codex_session_id(self, instance: str | None = None) -> tuple[str | None, bool]:
+        session_file = self._project_session_file_for_provider("codex", instance)
+        if not session_file.exists():
+            return None, False
+        data = self._read_json_file(session_file)
+        sid = str(data.get("codex_session_id") or "").strip()
+        if not sid:
+            return None, False
+
+        recorded_pid = str(data.get("ccb_project_id") or "").strip()
+        current_pid = compute_ccb_project_id(self.project_root)
+        if recorded_pid and current_pid and recorded_pid != current_pid:
+            print(f"⚠️ Codex resume skipped for {self._instance_key('codex', instance)}: session belongs to another project", file=sys.stderr)
+            return None, True
+
+        recorded_norm = _extract_session_work_dir_norm(data)
+        current_keys = _work_dir_match_keys(self.project_root)
+        if recorded_norm and current_keys and recorded_norm not in current_keys:
+            print(f"⚠️ Codex resume skipped for {self._instance_key('codex', instance)}: session work_dir mismatch", file=sys.stderr)
+            return None, True
+
+        log_path = str(data.get("codex_session_path") or "").strip() or None
+        if not self._codex_session_exists(sid, log_path=log_path):
+            print(f"⚠️ Codex resume skipped for {self._instance_key('codex', instance)}: bound session id not found ({sid[:8]})", file=sys.stderr)
+            return None, True
+        return sid, True
+
+    def _build_codex_start_cmd(self, instance: str | None = None) -> str:
         if self.auto:
             self._ensure_codex_auto_approval()
         # NOTE: Codex CLI (codex-cli) does not support the legacy flag
         # `--dangerously-bypass-approvals-and-sandbox`. Auto-mode is implemented via config and
         # supported `-c key=value` overrides.
         cmd_parts = ["codex", "-c", "disable_paste_burst=true"]
+        normalized_instance = normalize_instance_name(instance)
+        apply_policy = bool(normalized_instance) or self._provider_has_instances("codex")
+        if apply_policy:
+            policy = self._policy_for("codex", normalized_instance)
+            if policy.model:
+                cmd_parts.extend(["--model", shlex.quote(policy.model)])
+            if policy.effort:
+                cmd_parts.extend(["-c", f"model_reasoning_effort='\"{policy.effort}\"'"])
+            if policy.sandbox and not self.auto:
+                cmd_parts.extend(["-c", f'sandbox_mode="{policy.sandbox}"'])
         if self.auto:
             cmd_parts.extend([
                 "-c", 'trust_level="trusted"',
@@ -1862,14 +1962,17 @@ class AILauncher:
         cmd = " ".join(cmd_parts)
         codex_resumed = False
         if self.resume:
-            session_id, has_history = self._get_latest_codex_session_id()
+            if normalized_instance:
+                session_id, has_history = self._get_bound_codex_session_id(normalized_instance)
+            else:
+                session_id, has_history = self._get_latest_codex_session_id()
             if session_id:
                 cmd = f"{cmd} resume {session_id}"
-                print(f"🔁 {t('resuming_session', provider='Codex', session_id=session_id[:8])}")
+                print(f"🔁 {t('resuming_session', provider=self._provider_display('codex', instance), session_id=session_id[:8])}")
                 codex_resumed = True
 
             if not codex_resumed:
-                print(f"ℹ️ {t('no_history_fresh', provider='Codex')}")
+                print(f"ℹ️ {t('no_history_fresh', provider=self._provider_display('codex', instance))}")
         return cmd
 
     def _get_latest_gemini_project_hash(self) -> tuple[str | None, bool, Path | None]:
@@ -1992,11 +2095,11 @@ class AILauncher:
         print(f"⚠️ Warmup failed: {provider}")
         return False
 
-    def _get_start_cmd(self, provider: str) -> str:
+    def _get_start_cmd(self, provider: str, instance: str | None = None) -> str:
         if provider == "codex":
             # NOTE: Codex TUI has paste-burst detection; terminal injection (wezterm send-text/tmux paste-buffer)
             # is often detected as "paste", causing Enter to only line-break not submit. Disable detection by default.
-            cmd = self._build_codex_start_cmd()
+            cmd = self._build_codex_start_cmd(instance)
         elif provider == "gemini":
             cmd = self._build_gemini_start_cmd()
         elif provider == "opencode":
@@ -2241,7 +2344,7 @@ class AILauncher:
             os.mkfifo(output_fifo, 0o644)
 
         env_overrides = self._provider_env_overrides("codex")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd(instance)
         pane_title_marker = self._pane_marker_for("codex", instance)
 
         backend = TmuxBackend()
@@ -3233,6 +3336,9 @@ class AILauncher:
             _, has_history, resume_dir = self._get_latest_claude_session_id()
             if has_history:
                 cmd.append("--continue")
+        policy = self._policy_for("claude", instance)
+        if normalize_instance_name(instance) and policy.model:
+            cmd.extend(["--model", policy.model])
         # Append per-provider launch_args from config.
         extra = self.launch_args.get("claude")
         if isinstance(extra, str) and extra.strip():
@@ -4225,6 +4331,9 @@ def _parse_provider_specs(values: list[str], *, allow_unknown: bool = False) -> 
             unknown.append(token)
             continue
         if instance is not None and not normalize_instance_name(instance):
+            unknown.append(token)
+            continue
+        if instance is not None and base not in {"codex", "claude"}:
             unknown.append(token)
 
     if unknown:

@@ -89,6 +89,17 @@ def test_run_up_spawns_provider_instances_without_polluting_providers(monkeypatc
     assert started == [("codex", None), ("codex", "worker"), ("claude", "worker")]
 
 
+def test_cli_parser_rejects_unsupported_provider_instance(capsys) -> None:
+    ccb = _load_ccb_module()
+
+    providers, instances, cmd_enabled = ccb._parse_provider_specs(["gemini:worker"])
+
+    assert providers == []
+    assert instances == []
+    assert cmd_enabled is False
+    assert "invalid provider" in capsys.readouterr().err
+
+
 def test_start_codex_tmux_writes_bridge_pid(monkeypatch, tmp_path: Path) -> None:
     ccb = _load_ccb_module()
     monkeypatch.chdir(tmp_path)
@@ -248,6 +259,209 @@ def test_start_claude_worker_pane_uses_instance_resources(monkeypatch, tmp_path:
     assert data["instance"] == "worker"
     assert data["qualified_provider"] == "claude:worker"
     assert data["pane_title_marker"].startswith("CCB-Claude-worker-")
+
+
+def test_codex_start_cmd_bare_main_is_policy_inert(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["codex"])
+    cmd = launcher._build_codex_start_cmd()
+
+    assert cmd == "codex -c disable_paste_burst=true"
+    assert "--model" not in cmd
+    assert "model_reasoning_effort" not in cmd
+    assert "sandbox_mode" not in cmd
+
+
+def test_codex_start_cmd_applies_main_policy_when_codex_instance_configured(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}])
+    cmd = launcher._build_codex_start_cmd()
+
+    assert "--model gpt-5.5" in cmd
+    assert "-c model_reasoning_effort='\"xhigh\"'" in cmd
+    assert '-c sandbox_mode="workspace-write"' in cmd
+    assert "danger-full-access" not in cmd
+
+
+def test_codex_start_cmd_applies_worker_policy(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}])
+    cmd = launcher._build_codex_start_cmd("worker")
+
+    assert "--model gpt-5.4-mini" in cmd
+    assert "-c model_reasoning_effort='\"medium\"'" in cmd
+    assert '-c sandbox_mode="workspace-write"' in cmd
+
+
+def test_codex_start_cmd_partial_override_keeps_effort(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(
+        providers=["codex"],
+        provider_instances=[{"provider": "codex", "instance": "worker"}],
+        instance_overrides={"codex:worker": {"model": "gpt-5.4"}},
+    )
+    cmd = launcher._build_codex_start_cmd("worker")
+
+    assert "--model gpt-5.4" in cmd
+    assert "-c model_reasoning_effort='\"medium\"'" in cmd
+
+
+def test_codex_auto_keeps_danger_sandbox_and_skips_policy_sandbox(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}], auto=True)
+    monkeypatch.setattr(launcher, "_ensure_codex_auto_approval", lambda: None)
+
+    cmd = launcher._build_codex_start_cmd()
+
+    assert "--model gpt-5.5" in cmd
+    assert "-c model_reasoning_effort='\"xhigh\"'" in cmd
+    assert '-c sandbox_mode="danger-full-access"' in cmd
+    assert '-c sandbox_mode="workspace-write"' not in cmd
+
+
+def test_codex_auto_bare_main_keeps_legacy_danger_without_policy(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["codex"], auto=True)
+    monkeypatch.setattr(launcher, "_ensure_codex_auto_approval", lambda: None)
+
+    cmd = launcher._build_codex_start_cmd()
+
+    assert "--model" not in cmd
+    assert "model_reasoning_effort" not in cmd
+    assert '-c sandbox_mode="danger-full-access"' in cmd
+    assert '-c sandbox_mode="workspace-write"' not in cmd
+
+
+def test_claude_worker_start_plan_applies_haiku_without_pinning_main(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["claude"], provider_instances=[{"provider": "claude", "instance": "worker"}])
+    monkeypatch.setattr(launcher, "_find_claude_cmd", lambda: "claude")
+
+    main_cmd, _, _ = launcher._claude_start_plan()
+    worker_cmd, _, _ = launcher._claude_start_plan("worker")
+
+    assert main_cmd == ["claude"]
+    assert worker_cmd == ["claude", "--model", "haiku"]
+
+
+def _write_codex_resume_fixture(session_file: Path, log_file: Path, *, session_id: str, work_dir: Path, project_id: str) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": session_id, "cwd": str(work_dir)}}) + "\n",
+        encoding="utf-8",
+    )
+    session_file.write_text(
+        json.dumps(
+            {
+                "active": True,
+                "work_dir": str(work_dir),
+                "work_dir_norm": ccb_mod_normalize_path(str(work_dir)),
+                "ccb_project_id": project_id,
+                "codex_session_id": session_id,
+                "codex_session_path": str(log_file),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def ccb_mod_normalize_path(value: str) -> str:
+    ccb = _load_ccb_module()
+    return ccb._normalize_path_for_match(value)
+
+
+def test_codex_worker_resume_uses_bound_instance_session(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    session_id = "11111111-1111-1111-1111-111111111111"
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}], resume=True)
+    log_file = tmp_path / "codex-sessions" / "worker.jsonl"
+    _write_codex_resume_fixture(
+        cfg / ".codex-worker-session",
+        log_file,
+        session_id=session_id,
+        work_dir=tmp_path.resolve(),
+        project_id=launcher.project_id,
+    )
+    monkeypatch.setattr(launcher, "_get_latest_codex_session_id", lambda: (_ for _ in ()).throw(AssertionError("latest-by-cwd should not be used")))
+
+    cmd = launcher._build_codex_start_cmd("worker")
+
+    assert f"resume {session_id}" in cmd
+
+
+def test_codex_worker_resume_rejects_project_mismatch(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    session_id = "22222222-2222-2222-2222-222222222222"
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}], resume=True)
+    log_file = tmp_path / "codex-sessions" / "worker.jsonl"
+    _write_codex_resume_fixture(
+        cfg / ".codex-worker-session",
+        log_file,
+        session_id=session_id,
+        work_dir=tmp_path.resolve(),
+        project_id="other-project",
+    )
+
+    cmd = launcher._build_codex_start_cmd("worker")
+
+    assert " resume " not in cmd
+
+
+def test_codex_worker_resume_starts_fresh_when_bound_id_missing(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    session_id = "33333333-3333-3333-3333-333333333333"
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}], resume=True)
+    (cfg / ".codex-worker-session").write_text(
+        json.dumps(
+            {
+                "active": True,
+                "work_dir": str(tmp_path.resolve()),
+                "work_dir_norm": ccb._normalize_path_for_match(str(tmp_path.resolve())),
+                "ccb_project_id": launcher.project_id,
+                "codex_session_id": session_id,
+                "codex_session_path": str(tmp_path / "missing.jsonl"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(tmp_path / "empty-sessions"))
+
+    cmd = launcher._build_codex_start_cmd("worker")
+
+    assert " resume " not in cmd
 
 
 def test_run_up_backfills_existing_claude_session_work_dir_fields(monkeypatch, tmp_path: Path) -> None:

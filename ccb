@@ -29,7 +29,7 @@ sys.path.insert(0, str(script_dir / "lib"))
 from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_shell_type, get_backend_for_session
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
-from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config
+from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, normalize_provider_tokens
 from session_utils import (
     check_session_writable,
     find_project_session_file,
@@ -40,7 +40,18 @@ from session_utils import (
 )
 from pane_registry import upsert_registry, load_registry_by_project_id
 from project_id import compute_ccb_project_id
-from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, DASK_CLIENT_SPEC
+from provider_instance_defaults import normalize_instance_overrides, resolve_instance_policy
+from providers import (
+    CASK_CLIENT_SPEC,
+    GASK_CLIENT_SPEC,
+    OASK_CLIENT_SPEC,
+    LASK_CLIENT_SPEC,
+    DASK_CLIENT_SPEC,
+    make_qualified_key,
+    normalize_instance_name,
+    parse_qualified_provider,
+    session_filename_for_instance,
+)
 from process_lock import ProviderLock
 from askd_rpc import shutdown_daemon, read_state
 from askd_runtime import state_file_path
@@ -552,6 +563,8 @@ class AILauncher:
     def __init__(
         self,
         providers: list,
+        provider_instances: list | None = None,
+        instance_overrides: dict | None = None,
         resume: bool = False,
         auto: bool = False,
         cmd_config: dict | None = None,
@@ -559,6 +572,8 @@ class AILauncher:
         launch_env: dict | None = None,
     ):
         self.providers = providers or ["codex"]
+        self.provider_instances = self._normalize_provider_instances(provider_instances)
+        self.instance_overrides = normalize_instance_overrides(instance_overrides)
         self.resume = resume
         self.auto = auto
         self.cmd_config = self._normalize_cmd_config(cmd_config)
@@ -628,6 +643,60 @@ class AILauncher:
     def _project_session_file(self, filename: str) -> Path:
         cfg = self._project_config_dir()
         return cfg / filename
+
+    def _normalize_provider_instances(self, raw: list | None) -> list[dict]:
+        specs: list[dict] = []
+        seen: set[str] = set()
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "").strip().lower()
+            instance = normalize_instance_name(str(item.get("instance") or ""))
+            if not provider or not instance:
+                continue
+            key = make_qualified_key(provider, instance)
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append({"provider": provider, "instance": instance, "key": key})
+        return specs
+
+    def _instance_key(self, provider: str, instance: str | None = None) -> str:
+        inst = normalize_instance_name(instance)
+        return make_qualified_key(str(provider or "").strip().lower(), inst)
+
+    def _provider_display(self, provider: str, instance: str | None = None) -> str:
+        base = str(provider or "").strip().capitalize()
+        inst = normalize_instance_name(instance)
+        return f"{base}:{inst}" if inst else base
+
+    def _runtime_dir_for(self, provider: str, instance: str | None = None) -> Path:
+        return self.runtime_dir / self._instance_key(provider, instance).replace(":", "-")
+
+    def _pane_marker_for(self, provider: str, instance: str | None = None) -> str:
+        base = str(provider or "").strip().capitalize()
+        inst = normalize_instance_name(instance)
+        suffix = f"-{inst}" if inst else ""
+        return f"CCB-{base}{suffix}-{self.project_id[:8]}"
+
+    def _session_filename_for(self, provider: str, instance: str | None = None) -> str:
+        base = {
+            "codex": ".codex-session",
+            "gemini": ".gemini-session",
+            "opencode": ".opencode-session",
+            "claude": ".claude-session",
+            "droid": ".droid-session",
+        }.get(str(provider or "").strip().lower(), f".{provider}-session")
+        return session_filename_for_instance(base, normalize_instance_name(instance))
+
+    def _project_session_file_for_provider(self, provider: str, instance: str | None = None) -> Path:
+        return self._project_session_file(self._session_filename_for(provider, instance))
+
+    def _registry_provider_key(self, provider: str, instance: str | None = None) -> str:
+        return self._instance_key(provider, instance)
+
+    def _policy_for(self, provider: str, instance: str | None = None):
+        return resolve_instance_policy(provider, normalize_instance_name(instance), self.instance_overrides)
 
     def _migrate_legacy_project_files(self) -> None:
         """
@@ -1191,7 +1260,14 @@ class AILauncher:
         )
         return True
 
-    def _start_provider(self, provider: str, *, parent_pane: str | None = None, direction: str | None = None) -> str | None:
+    def _start_provider(
+        self,
+        provider: str,
+        *,
+        parent_pane: str | None = None,
+        direction: str | None = None,
+        instance: str | None = None,
+    ) -> str | None:
         # Handle case when no terminal detected
         if self.terminal_type is None:
             print(f"❌ {t('no_terminal_backend')}")
@@ -1205,16 +1281,16 @@ class AILauncher:
 
         # WezTerm mode: no tmux dependency
         if self.terminal_type == "wezterm":
-            print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm')}")
-            return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
+            print(f"🚀 {t('starting_backend', provider=self._provider_display(provider, instance), terminal='wezterm')}")
+            return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction, instance=instance)
 
         # tmux mode: check if tmux is available
         if not shutil.which("tmux"):
             # Try fallback to WezTerm
             if detect_terminal() == "wezterm":
                 self.terminal_type = "wezterm"
-                print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm - tmux unavailable')}")
-                return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
+                print(f"🚀 {t('starting_backend', provider=self._provider_display(provider, instance), terminal='wezterm - tmux unavailable')}")
+                return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction, instance=instance)
             else:
                 print(f"❌ {t('tmux_not_installed')}")
                 print(f"   {t('install_wezterm_or_tmux')}")
@@ -1227,10 +1303,10 @@ class AILauncher:
             print(f"   Then: {' '.join(['ccb', *sys.argv[1:]])}", file=sys.stderr)
             return None
 
-        print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux')}")
+        print(f"🚀 {t('starting_backend', provider=self._provider_display(provider, instance), terminal='tmux')}")
 
         if provider == "codex":
-            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction)
+            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction, instance=instance)
         elif provider == "gemini":
             return self._start_gemini_tmux(parent_pane=parent_pane, direction=direction)
         elif provider == "opencode":
@@ -1247,8 +1323,9 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        instance: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / provider
+        runtime = self._runtime_dir_for(provider, instance)
         runtime.mkdir(parents=True, exist_ok=True)
 
         start_cmd = self._get_start_cmd(provider)
@@ -1263,13 +1340,13 @@ class AILauncher:
             except StopIteration:
                 use_parent = None
 
-        pane_title_marker = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
+        pane_title_marker = self._pane_marker_for(provider, instance)
         title_cmd = _build_pane_title_cmd(pane_title_marker)
         env_overrides = self._provider_env_overrides(provider)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
         backend = WeztermBackend()
         pane_id = backend.create_pane(full_cmd, str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
-        self.wezterm_panes[provider] = pane_id
+        self.wezterm_panes[self._instance_key(provider, instance)] = pane_id
 
         if provider == "codex":
             input_fifo = runtime / "input.fifo"
@@ -1283,6 +1360,7 @@ class AILauncher:
                 pane_id=pane_id,
                 pane_title_marker=pane_title_marker,
                 codex_start_cmd=start_cmd,
+                instance=instance,
             )
         elif provider == "gemini":
             self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
@@ -1294,7 +1372,7 @@ class AILauncher:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
 
-        print(f"✅ {t('started_backend', provider=provider.capitalize(), terminal='wezterm pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=self._provider_display(provider, instance), terminal='wezterm pane', pane_id=pane_id)}")
         return pane_id
 
     def _work_dir_strings(self, work_dir: Path) -> list[str]:
@@ -1361,8 +1439,8 @@ class AILauncher:
             print(f"⚠️ codex_session_clear_failed: {exc}", file=sys.stderr)
             return data if isinstance(data, dict) else {}
 
-    def _claude_session_file(self) -> Path:
-        return self._project_session_file(".claude-session")
+    def _claude_session_file(self, instance: str | None = None) -> Path:
+        return self._project_session_file_for_provider("claude", instance)
 
     def _backfill_claude_session_work_dir_fields(self) -> None:
         path = self._claude_session_file()
@@ -1416,8 +1494,10 @@ class AILauncher:
         pane_id: str | None = None,
         pane_title_marker: str | None = None,
         terminal: str | None = None,
+        instance: str | None = None,
     ) -> None:
-        path = self._claude_session_file()
+        path = self._claude_session_file(instance)
+        provider_key = self._registry_provider_key("claude", instance)
         writable, reason, fix = check_session_writable(path)
         if not writable:
             print(f"❌ Cannot write {path.name}: {reason}", file=sys.stderr)
@@ -1429,6 +1509,9 @@ class AILauncher:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if session_id:
             data["claude_session_id"] = session_id
+        data["provider"] = "claude"
+        data["instance"] = normalize_instance_name(instance)
+        data["qualified_provider"] = provider_key
         data["session_id"] = self.session_id
         try:
             data["ccb_project_id"] = compute_ccb_project_id(work_dir)
@@ -1460,7 +1543,7 @@ class AILauncher:
                         "work_dir": str(self.project_root),
                         "terminal": terminal or self.terminal_type,
                         "providers": {
-                            "claude": {
+                            provider_key: {
                                 "pane_id": pane_id,
                                 "pane_title_marker": pane_title_marker,
                                 "session_file": str(path),
@@ -2144,8 +2227,9 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        instance: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / "codex"
+        runtime = self._runtime_dir_for("codex", instance)
         runtime.mkdir(parents=True, exist_ok=True)
 
         input_fifo = runtime / "input.fifo"
@@ -2158,7 +2242,7 @@ class AILauncher:
 
         env_overrides = self._provider_env_overrides("codex")
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
-        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
+        pane_title_marker = self._pane_marker_for("codex", instance)
 
         backend = TmuxBackend()
 
@@ -2185,7 +2269,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Codex")
 
-        self.tmux_panes["codex"] = pane_id
+        self.tmux_panes[self._instance_key("codex", instance)] = pane_id
 
         bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
         bridge_env = os.environ.copy()
@@ -2233,9 +2317,10 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
+            instance=instance,
         )
 
-        print(f"✅ {t('started_backend', provider='Codex', terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=self._provider_display('codex', instance), terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_gemini_tmux(
@@ -2693,8 +2778,19 @@ class AILauncher:
         print(f"❌ {t('unknown_provider', provider=provider)}")
         return 1
 
-    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None, pane_title_marker=None, codex_start_cmd=None):
-        session_file = self._project_session_file(".codex-session")
+    def _write_codex_session(
+        self,
+        runtime,
+        tmux_session,
+        input_fifo,
+        output_fifo,
+        pane_id=None,
+        pane_title_marker=None,
+        codex_start_cmd=None,
+        instance: str | None = None,
+    ):
+        session_file = self._project_session_file_for_provider("codex", instance)
+        provider_key = self._registry_provider_key("codex", instance)
 
         # Pre-check permissions
         writable, reason, fix = check_session_writable(session_file)
@@ -2712,6 +2808,9 @@ class AILauncher:
 
         work_dir = self.project_root
         data.update({
+            "provider": "codex",
+            "instance": normalize_instance_name(instance),
+            "qualified_provider": provider_key,
             "session_id": self.session_id,
             "ccb_project_id": compute_ccb_project_id(work_dir),
             "runtime_dir": str(runtime),
@@ -2743,7 +2842,7 @@ class AILauncher:
                 "work_dir": str(self.project_root),
                 "terminal": self.terminal_type,
                 "providers": {
-                    "codex": {
+                    provider_key: {
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
@@ -3118,19 +3217,19 @@ class AILauncher:
 
         return env
 
-    def _build_claude_env(self) -> dict:
+    def _build_claude_env(self, instance: str | None = None) -> dict:
         env = self._with_bin_path_env()
         env.update(self._claude_env_overrides())
         return env
 
-    def _claude_start_plan(self) -> tuple[list[str], str, bool]:
+    def _claude_start_plan(self, instance: str | None = None) -> tuple[list[str], str, bool]:
         claude_cmd = self._find_claude_cmd()
         cmd = [claude_cmd]
         if self.auto:
             cmd.append("--dangerously-skip-permissions")
         has_history = False
         resume_dir = None
-        if self.resume:
+        if self.resume and not normalize_instance_name(instance):
             _, has_history, resume_dir = self._get_latest_claude_session_id()
             if has_history:
                 cmd.append("--continue")
@@ -3184,25 +3283,32 @@ class AILauncher:
             print(f"\n⚠️ {t('user_interrupted')}")
             return 130
 
-    def _start_claude_pane(self, *, parent_pane: str | None, direction: str | None) -> str | None:
+    def _start_claude_pane(
+        self,
+        *,
+        parent_pane: str | None,
+        direction: str | None,
+        instance: str | None = None,
+    ) -> str | None:
         print(f"🚀 {t('starting_claude')}")
         env_overrides = self._claude_env_overrides()
 
         try:
-            cmd_parts, run_cwd, has_history = self._claude_start_plan()
+            cmd_parts, run_cwd, has_history = self._claude_start_plan(instance)
         except FileNotFoundError as e:
             print(str(e))
             return None
 
-        if self.resume:
+        if self.resume and not normalize_instance_name(instance):
             if has_history:
                 print(f"🔁 {t('resuming_claude', session_id='')}")
             else:
                 print(f"ℹ️ {t('no_claude_session')}")
 
         start_cmd = " ".join(cmd_parts)
+        pane_title_marker = self._pane_marker_for("claude", instance)
         full_cmd = (
-            _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
+            _build_pane_title_cmd(pane_title_marker)
             + self._build_env_prefix(env_overrides)
             + _build_export_path_cmd(self.script_dir / "bin")
             + start_cmd
@@ -3214,27 +3320,28 @@ class AILauncher:
         if self.terminal_type == "wezterm":
             backend = WeztermBackend()
             pane_id = backend.create_pane(full_cmd, run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
-            self.wezterm_panes["claude"] = pane_id
+            self.wezterm_panes[self._instance_key("claude", instance)] = pane_id
         else:
             backend = TmuxBackend()
             pane_id = backend.create_pane("", run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
             backend.respawn_pane(pane_id, cmd=full_cmd, cwd=run_cwd, remain_on_exit=True)
-            backend.set_pane_title(pane_id, f"CCB-Claude-{self.project_id[:8]}")
+            backend.set_pane_title(pane_id, pane_title_marker)
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
-            self.tmux_panes["claude"] = pane_id
+            self.tmux_panes[self._instance_key("claude", instance)] = pane_id
 
         try:
             self._write_local_claude_session(
-                session_id=self._read_local_claude_session_id(),
+                session_id=self._read_local_claude_session_id() if not normalize_instance_name(instance) else None,
                 active=True,
                 pane_id=str(pane_id or ""),
-                pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
+                pane_title_marker=pane_title_marker,
                 terminal=self.terminal_type,
+                instance=instance,
             )
         except Exception:
             pass
 
-        print(f"✅ {t('started_backend', provider='Claude', terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=self._provider_display('claude', instance), terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
         return pane_id
 
     def cleanup(
@@ -3292,13 +3399,20 @@ class AILauncher:
                         backend.kill_pane(pane_id)
 
         if clear_sessions:
-            for session_file in [
+            session_files = [
                 self._project_session_file(".codex-session"),
                 self._project_session_file(".gemini-session"),
                 self._project_session_file(".opencode-session"),
                 self._project_session_file(".claude-session"),
                 self._project_session_file(".droid-session"),
-            ]:
+            ]
+            for spec in self.provider_instances:
+                if isinstance(spec, dict):
+                    provider = str(spec.get("provider") or "").strip().lower()
+                    instance = normalize_instance_name(str(spec.get("instance") or ""))
+                    if provider and instance:
+                        session_files.append(self._project_session_file_for_provider(provider, instance))
+            for session_file in session_files:
                 if session_file.exists():
                     try:
                         data = self._read_json_file(session_file)
@@ -3381,10 +3495,11 @@ class AILauncher:
             return 2
 
         cmd_settings = self._cmd_settings()
-        spawn_items: list[str] = []
+        spawn_items: list[object] = []
         if cmd_settings.get("enabled"):
             spawn_items.append("cmd")
         spawn_items.extend(list(reversed(self.providers[:-1])))
+        spawn_items.extend(dict(spec) for spec in self.provider_instances)
         total_panes = 1 + len(spawn_items)
         left_count = 1 if total_panes <= 1 else max(1, total_panes // 2)
         right_count = total_panes - left_count
@@ -3462,14 +3577,22 @@ class AILauncher:
             except Exception:
                 pass
 
-        def _start_item(item: str, *, parent: str | None, direction: str | None) -> str | None:
+        def _start_item(item: object, *, parent: str | None, direction: str | None) -> str | None:
             if item == "cmd":
                 return self._start_cmd_pane(parent_pane=parent, direction=direction, cmd_settings=cmd_settings)
-            if item == "claude":
-                return self._start_claude_pane(parent_pane=parent, direction=direction)
-            pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
+            if isinstance(item, dict):
+                provider = str(item.get("provider") or "").strip().lower()
+                instance = normalize_instance_name(str(item.get("instance") or ""))
+                key = self._instance_key(provider, instance)
+            else:
+                provider = str(item or "").strip().lower()
+                instance = None
+                key = provider
+            if provider == "claude":
+                return self._start_claude_pane(parent_pane=parent, direction=direction, instance=instance)
+            pane_id = self._start_provider(provider, parent_pane=parent, direction=direction, instance=instance)
             if pane_id:
-                self._warmup_provider(item)
+                self._warmup_provider(key)
             return pane_id
 
         right_top: str | None = None
@@ -3642,11 +3765,13 @@ def cmd_start(args):
             return 2
 
     # Parse explicit provider args early so lock-collision path can reuse an existing pane.
-    requested_providers, _requested_cmd_enabled = _parse_providers_with_cmd(args.providers or [])
+    requested_providers, requested_instances, _requested_cmd_enabled = _parse_provider_specs_with_cmd(args.providers or [])
+    requested_raw_parts = _split_provider_tokens(args.providers or [])
 
     def _existing_provider_pane_for_project(project_work_dir: Path, provider: str) -> tuple[dict | None, str]:
         prov = (provider or "").strip().lower()
-        if not prov:
+        base_provider, _instance = parse_qualified_provider(prov)
+        if not base_provider:
             return None, ""
         try:
             project_id = compute_ccb_project_id(project_work_dir)
@@ -3654,7 +3779,7 @@ def cmd_start(args):
             return None, ""
         if not project_id:
             return None, ""
-        record = load_registry_by_project_id(project_id, prov)
+        record = load_registry_by_project_id(project_id, base_provider)
         if not isinstance(record, dict):
             return None, ""
         providers_map = record.get("providers")
@@ -3679,7 +3804,14 @@ def cmd_start(args):
 
         # Fast-path: if user requests a single provider, try activating its existing pane
         # in the already-running instance instead of hard failing.
-        focus_provider = requested_providers[0] if len(requested_providers) == 1 else ""
+        focus_provider = ""
+        if len(requested_raw_parts) == 1:
+            raw_focus = requested_raw_parts[0]
+            base_focus, inst_focus = parse_qualified_provider(raw_focus)
+            if inst_focus and requested_instances:
+                focus_provider = requested_instances[0].get("key", "")
+            elif base_focus in requested_providers:
+                focus_provider = base_focus
         if focus_provider:
             record, pane_id = _existing_provider_pane_for_project(work_dir, focus_provider)
             if record and pane_id:
@@ -3704,11 +3836,12 @@ def cmd_start(args):
         return 2
     atexit.register(ccb_lock.release)
 
-    providers, cmd_enabled = requested_providers, _requested_cmd_enabled
+    providers, provider_instances, cmd_enabled = requested_providers, list(requested_instances), _requested_cmd_enabled
     config = load_start_config(work_dir)
     config_data = config.data if isinstance(config.data, dict) else {}
 
-    if not providers:
+    using_config_providers = not providers
+    if using_config_providers:
         raw_providers = config_data.get("providers")
         if isinstance(raw_providers, str):
             raw_providers = [raw_providers]
@@ -3720,7 +3853,11 @@ def cmd_start(args):
                 created_path, created = ensure_default_start_config(work_dir)
                 if created and created_path:
                     print(f"✅ Created default config: {created_path}", file=sys.stderr)
-        providers = _parse_providers([str(p) for p in raw_providers])
+        providers, provider_instances, _config_cmd_enabled = _parse_provider_specs([str(p) for p in raw_providers])
+        if _config_cmd_enabled:
+            cmd_enabled = True
+        if not provider_instances and isinstance(config_data.get("provider_instances"), list):
+            provider_instances = [dict(item) for item in config_data.get("provider_instances") if isinstance(item, dict)]
 
     if not providers:
         print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
@@ -3741,9 +3878,13 @@ def cmd_start(args):
     launch_args = raw_launch_args if isinstance(raw_launch_args, dict) else None
     raw_launch_env = config_data.get("launch_env")
     launch_env = raw_launch_env if isinstance(raw_launch_env, dict) else None
+    raw_instances = config_data.get("instances")
+    instance_overrides = raw_instances if isinstance(raw_instances, dict) else None
 
     launcher = AILauncher(
         providers=providers,
+        provider_instances=provider_instances,
+        instance_overrides=instance_overrides,
         resume=resume,
         auto=auto,
         cmd_config=cmd_config,
@@ -4049,31 +4190,50 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     Returns a de-duplicated list preserving order.
     """
+    providers, _instances, _cmd_enabled = _parse_provider_specs(values, allow_unknown=allow_unknown)
+    return providers
+
+
+def _parse_provider_specs(values: list[str], *, allow_unknown: bool = False) -> tuple[list[str], list[dict], bool]:
     allowed = {"codex", "gemini", "opencode", "claude", "droid"}
     raw_parts = _split_provider_tokens(values)
-
     if not raw_parts:
-        return []
+        return [], [], False
 
-    seen: set[str] = set()
-    parsed: list[str] = []
+    if allow_unknown:
+        parsed: list[str] = []
+        seen: set[str] = set()
+        cmd_enabled = False
+        for token in raw_parts:
+            if token == "cmd":
+                cmd_enabled = True
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            parsed.append(token)
+        return parsed, [], cmd_enabled
+
+    providers, instances, cmd_enabled = normalize_provider_tokens(raw_parts)
+
     unknown: list[str] = []
-    for p in raw_parts:
-        if p in seen:
+    for token in raw_parts:
+        if token == "cmd":
             continue
-        seen.add(p)
-        if p in allowed or allow_unknown:
-            parsed.append(p)
-        else:
-            unknown.append(p)
+        base, instance = parse_qualified_provider(token)
+        if base not in allowed:
+            unknown.append(token)
+            continue
+        if instance is not None and not normalize_instance_name(instance):
+            unknown.append(token)
 
-    if unknown and not allow_unknown:
+    if unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude droid  (spaces)  or  ccb codex,gemini,opencode,claude,droid  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid", file=sys.stderr)
-        return []
+        print("💡 use: ccb codex codex:worker claude claude:worker cmd  (spaces)  or  ccb codex,codex:worker,claude,claude:worker,cmd  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, droid, cmd; instance names: [a-z0-9][a-z0-9_-]*", file=sys.stderr)
+        return [], [], cmd_enabled
 
-    return parsed
+    return providers, instances, cmd_enabled
 
 
 def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
@@ -4081,35 +4241,12 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
     Parse providers from argv and treat "cmd" as a separate flag.
     Returns (providers, cmd_enabled).
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "droid"}
-    raw_parts = _split_provider_tokens(values)
-    if not raw_parts:
-        return [], False
+    providers, _instances, cmd_enabled = _parse_provider_specs_with_cmd(values)
+    return providers, cmd_enabled
 
-    seen: set[str] = set()
-    parsed: list[str] = []
-    unknown: list[str] = []
-    cmd_enabled = False
 
-    for p in raw_parts:
-        if p == "cmd":
-            cmd_enabled = True
-            continue
-        if p in seen:
-            continue
-        seen.add(p)
-        if p in allowed:
-            parsed.append(p)
-        else:
-            unknown.append(p)
-
-    if unknown:
-        print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude droid cmd  (spaces)  or  ccb codex,gemini,opencode,claude,droid,cmd  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid, cmd", file=sys.stderr)
-        return [], cmd_enabled
-
-    return parsed, cmd_enabled
+def _parse_provider_specs_with_cmd(values: list[str]) -> tuple[list[str], list[dict], bool]:
+    return _parse_provider_specs(values)
 
 
 def _get_version_info(dir_path: Path) -> dict:

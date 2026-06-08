@@ -164,6 +164,79 @@ class TestSessionFilenameForInstance:
             assert session_filename_for_instance(base, inst) == expected, f"Failed for {base} + {inst}"
 
 
+class TestInstanceNameValidation:
+    def test_valid_instance_names(self):
+        from providers import normalize_instance_name, validate_instance_name
+
+        for name in ("worker", "docs-1", "haiku_worker", "a1"):
+            assert validate_instance_name(name)
+            assert normalize_instance_name(name.upper()) == name
+
+    def test_invalid_instance_names(self):
+        from providers import normalize_instance_name, validate_instance_name
+
+        for name in ("", "  ", "../x", "x/y", "auth:extra", "-worker", "worker.name"):
+            assert not validate_instance_name(name)
+            assert normalize_instance_name(name) is None
+
+
+class TestStartConfigInstanceNormalization:
+    def test_one_line_config_normalizes_to_bare_providers_and_instances(self):
+        from ccb_start_config import normalize_start_config_data
+
+        data = normalize_start_config_data({
+            "providers": "codex, codex:worker, claude, claude:worker",
+            "instances": {"codex:worker": {"model": "gpt-5.4"}},
+        })
+
+        assert data["providers"] == ["codex", "claude"]
+        assert data["provider_instances"] == [
+            {"provider": "codex", "instance": "worker", "key": "codex:worker"},
+            {"provider": "claude", "instance": "worker", "key": "claude:worker"},
+        ]
+        assert data["instances"] == {"codex:worker": {"model": "gpt-5.4"}}
+
+    def test_cmd_and_dedup_with_qualified_tokens(self):
+        from ccb_start_config import normalize_provider_tokens
+
+        providers, instances, cmd_enabled = normalize_provider_tokens([
+            "codex:worker",
+            "cmd",
+            "codex",
+            "codex:worker",
+            "claude:docs-1",
+        ])
+
+        assert providers == ["codex", "claude"]
+        assert instances == [
+            {"provider": "codex", "instance": "worker", "key": "codex:worker"},
+            {"provider": "claude", "instance": "docs-1", "key": "claude:docs-1"},
+        ]
+        assert cmd_enabled is True
+
+    def test_invalid_instance_token_is_dropped_in_config(self):
+        from ccb_start_config import normalize_provider_tokens
+
+        providers, instances, cmd_enabled = normalize_provider_tokens(["codex:../x", "codex"])
+
+        assert providers == ["codex"]
+        assert instances == []
+        assert cmd_enabled is False
+
+
+class TestProviderInstanceDefaults:
+    def test_partial_override_keeps_defaults(self):
+        from provider_instance_defaults import resolve_instance_policy
+
+        policy = resolve_instance_policy("codex", "worker", {"codex:worker": {"model": "gpt-5.4"}})
+
+        assert policy.provider == "codex"
+        assert policy.instance == "worker"
+        assert policy.model == "gpt-5.4"
+        assert policy.effort == "medium"
+        assert policy.sandbox == "workspace-write"
+
+
 # ── Session module instance support ────────────────────────────────────────
 
 class TestSessionModuleInstance:
@@ -249,6 +322,36 @@ class TestSessionModuleInstance:
         key = compute_session_key(session, instance="frontend")
         assert "frontend" in key
         assert "xyz789" in key
+
+    def test_claude_find_session_file_with_instance(self, tmp_path):
+        from laskd_session import find_project_session_file
+        ccb_dir = tmp_path / ".ccb"
+        ccb_dir.mkdir()
+        session_file = ccb_dir / ".claude-worker-session"
+        session_file.write_text('{"pane_id": "test"}')
+        result = find_project_session_file(tmp_path, instance="worker")
+        assert result is not None
+        assert result.name == ".claude-worker-session"
+
+    def test_claude_load_session_with_instance_file_exists(self, tmp_path):
+        from laskd_session import load_project_session
+        ccb_dir = tmp_path / ".ccb"
+        ccb_dir.mkdir()
+        session_file = ccb_dir / ".claude-worker-session"
+        session_file.write_text('{"pane_id": "%88", "work_dir": "/tmp/test"}')
+        result = load_project_session(tmp_path, instance="worker")
+        assert result is not None
+        assert result.pane_id == "%88"
+
+    def test_claude_compute_session_key_with_instance(self):
+        from laskd_session import compute_session_key, ClaudeProjectSession
+        session = ClaudeProjectSession(
+            session_file=Path("/tmp/test/.ccb/.claude-worker-session"),
+            data={"ccb_project_id": "claude123", "work_dir": "/tmp/test"},
+        )
+        key = compute_session_key(session, instance="worker")
+        assert "worker" in key
+        assert "claude123" in key
 
 
 # ── ProviderRequest instance field ──────────────────────────────────────────

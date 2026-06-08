@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 @dataclass
@@ -204,6 +205,23 @@ QASK_CLIENT_SPEC = ProviderClientSpec(
 
 
 # ── Multi-instance provider utilities ────────────────────────────────────────
+
+
+_INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def normalize_instance_name(instance: str | None) -> str | None:
+    """Normalize a provider instance name for launcher/session-file use."""
+    value = str(instance or "").strip().lower()
+    if not value:
+        return None
+    if not _INSTANCE_RE.fullmatch(value):
+        return None
+    return value
+
+
+def validate_instance_name(instance: str | None) -> bool:
+    return normalize_instance_name(instance) is not None
 
 
 def parse_qualified_provider(key: str) -> tuple[str, str | None]:

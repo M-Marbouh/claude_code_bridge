@@ -30,6 +30,7 @@ from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_s
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
 from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, normalize_provider_tokens
+from ccb_cleanup import DEFAULT_KEEP_NEWEST, DEFAULT_TTL_SECONDS, plan_prune, run_prune
 from session_utils import (
     check_session_writable,
     find_project_session_file,
@@ -63,7 +64,7 @@ backend_env = get_backend_env()
 if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 GIT_COMMIT = "c539e79"
 GIT_DATE = "2026-06-09"
 
@@ -597,6 +598,7 @@ class AILauncher:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._cleaned = False
         self._askd_checked = False
+        self._auto_prune_done = False
         self._watchdog_thread = None
         self._watchdog_stop_event = None
         self._daemon_proc = None  # Track daemon Popen object for reaping
@@ -701,6 +703,26 @@ class AILauncher:
     def _provider_has_instances(self, provider: str) -> bool:
         base = str(provider or "").strip().lower()
         return any(str(spec.get("provider") or "").strip().lower() == base for spec in self.provider_instances)
+
+    def _auto_prune_session_records(self) -> None:
+        if self._auto_prune_done:
+            return
+        self._auto_prune_done = True
+        if _env_bool("CCB_NO_AUTO_PRUNE", False):
+            return
+        try:
+            plan = plan_prune(project=self.project_root)
+            result = run_prune(plan)
+            if _env_bool("CCB_DEBUG", False):
+                print(
+                    "🧹 CCB session record prune: "
+                    f"scanned={result.scanned} deleted={result.deleted} "
+                    f"kept={result.kept} failed={result.failed}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            if _env_bool("CCB_DEBUG", False):
+                print(f"⚠️ CCB session record prune skipped: {exc}", file=sys.stderr)
 
     def _migrate_legacy_project_files(self) -> None:
         """
@@ -1560,6 +1582,7 @@ class AILauncher:
             except Exception:
                 pass
         self._maybe_start_provider_daemon("claude")
+        self._auto_prune_session_records()
 
     def _get_latest_codex_session_id(self) -> tuple[str | None, bool]:
         """
@@ -2955,6 +2978,7 @@ class AILauncher:
         except Exception:
             pass
         self._maybe_start_provider_daemon("codex")
+        self._auto_prune_session_records()
         return True
 
     def _write_cend_registry(self, claude_pane_id: str, codex_pane_id: str | None) -> bool:
@@ -3032,6 +3056,7 @@ class AILauncher:
         except Exception:
             pass
         self._maybe_start_provider_daemon("gemini")
+        self._auto_prune_session_records()
         return True
 
     def _write_opencode_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
@@ -3081,6 +3106,7 @@ class AILauncher:
         except Exception:
             pass
         self._maybe_start_provider_daemon("opencode")
+        self._auto_prune_session_records()
         return True
 
     def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
@@ -3149,6 +3175,7 @@ class AILauncher:
         except Exception:
             pass
         self._maybe_start_provider_daemon("droid")
+        self._auto_prune_session_records()
         return True
 
     def _claude_project_dir(self, work_dir: Path) -> Path:
@@ -4292,6 +4319,104 @@ def cmd_kill(args):
     return 0
 
 
+_DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhdwSMHDW]?)\s*$")
+
+
+def _parse_duration_seconds(value: str | int | float) -> int:
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        if seconds < 0:
+            raise argparse.ArgumentTypeError("duration must be non-negative")
+        return seconds
+    text = str(value or "").strip()
+    match = _DURATION_RE.match(text)
+    if not match:
+        raise argparse.ArgumentTypeError("duration must be like 3600, 12h, 7d, or 2w")
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    multipliers = {
+        "": 1,
+        "s": 1,
+        "m": 60,
+        "h": 60 * 60,
+        "d": 24 * 60 * 60,
+        "w": 7 * 24 * 60 * 60,
+    }
+    return amount * multipliers[unit]
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds % (7 * 24 * 60 * 60) == 0 and seconds:
+        return f"{seconds // (7 * 24 * 60 * 60)}w"
+    if seconds % (24 * 60 * 60) == 0 and seconds:
+        return f"{seconds // (24 * 60 * 60)}d"
+    if seconds % (60 * 60) == 0 and seconds:
+        return f"{seconds // (60 * 60)}h"
+    if seconds % 60 == 0 and seconds:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _print_clean_summary(result) -> None:
+    plan = result.plan
+    action = "would delete" if result.dry_run else "deleted"
+    scope = "all projects" if not plan.project else f"project {plan.project}"
+    print("CCB clean")
+    print(f"scope: {scope}")
+    print(f"run_dir: {plan.run_dir}")
+    print(f"keep newest per project: {plan.keep}")
+    print(f"older than: {_format_duration(plan.older_than_seconds)}")
+    print(f"scanned: {result.scanned}")
+    print(f"kept: {result.kept}")
+    print(f"prunable: {result.planned}")
+    print(f"{action}: {result.planned if result.dry_run else result.deleted}")
+    if result.failed:
+        print(f"failed: {result.failed}", file=sys.stderr)
+    summary = plan.summary
+    print(
+        "kept reasons: "
+        f"newest={summary.get('skipped_keep_newest', 0)} "
+        f"not_old_enough={summary.get('skipped_not_old_enough', 0)} "
+        f"live={summary.get('skipped_live', 0)} "
+        f"running={summary.get('skipped_running', 0)} "
+        f"unknown={summary.get('skipped_unknown', 0)}"
+    )
+    if plan.prunable:
+        print("planned files:")
+        for record in plan.prunable:
+            print(f"  {record.path}")
+
+
+def cmd_clean(args) -> int:
+    try:
+        older_than = _parse_duration_seconds(args.older_than)
+    except argparse.ArgumentTypeError as exc:
+        print(f"❌ Invalid --older-than: {exc}", file=sys.stderr)
+        return 2
+
+    keep = int(args.keep)
+    if keep < 0:
+        print("❌ --keep must be non-negative", file=sys.stderr)
+        return 2
+
+    if args.all_projects:
+        project = None
+    elif args.project:
+        project = Path(args.project).expanduser()
+    else:
+        project = Path.cwd()
+
+    plan = plan_prune(keep=keep, older_than_seconds=older_than, project=project)
+    result = run_prune(plan, dry_run=bool(args.dry_run))
+
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        _print_clean_summary(result)
+
+    return 1 if result.failed else 0
+
+
 def _split_provider_tokens(values: list[str]) -> list[str]:
     raw_parts: list[str] = []
     for item in (values or []):
@@ -5197,7 +5322,7 @@ def main():
     if argv and argv[0] == "droid" and len(argv) > 1 and argv[1] in {"setup-delegation", "test-delegation"}:
         return cmd_droid_subcommand(argv[1:])
 
-    if argv and argv[0] in {"kill", "update", "version", "uninstall", "reinstall"}:
+    if argv and argv[0] in {"kill", "clean", "update", "version", "uninstall", "reinstall"}:
         parser = argparse.ArgumentParser(description="Claude AI unified launcher", add_help=True)
         subparsers = parser.add_subparsers(dest="command", help="Subcommands")
 
@@ -5206,6 +5331,19 @@ def main():
         kill_parser.add_argument("--daemon", action="store_true", help="Also stop the shared askd daemon when ownership checks allow it")
         kill_parser.add_argument("-f", "--force", action="store_true", help="Clean up all zombie tmux sessions globally")
         kill_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt (with -f)")
+
+        clean_parser = subparsers.add_parser("clean", help="Prune stale dead CCB session records")
+        clean_parser.add_argument("--dry-run", action="store_true", help="Preview files without deleting anything")
+        clean_parser.add_argument("--keep", type=int, default=DEFAULT_KEEP_NEWEST, help="Newest records to keep per project")
+        clean_parser.add_argument(
+            "--older-than",
+            default=_format_duration(DEFAULT_TTL_SECONDS),
+            help="Only prune records older than this duration (examples: 3600, 12h, 7d, 2w)",
+        )
+        clean_scope = clean_parser.add_mutually_exclusive_group()
+        clean_scope.add_argument("--all-projects", action="store_true", help="Scan all project hashes")
+        clean_scope.add_argument("--project", help="Project path or project id to clean")
+        clean_parser.add_argument("--json", action="store_true", help="Emit JSON result")
 
         update_parser = subparsers.add_parser("update", help="Update to latest or specified version")
         update_parser.add_argument("target", nargs="?",
@@ -5218,6 +5356,8 @@ def main():
         args = parser.parse_args(argv)
         if args.command == "kill":
             return cmd_kill(args)
+        if args.command == "clean":
+            return cmd_clean(args)
         if args.command == "update":
             return cmd_update(args)
         if args.command == "version":
@@ -5236,7 +5376,7 @@ def main():
     start_parser = argparse.ArgumentParser(
         description="Claude AI unified launcher",
         add_help=True,
-        epilog="Other commands: ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup",
+        epilog="Other commands: ccb clean | ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup",
     )
     start_parser.add_argument(
         "providers",

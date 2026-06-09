@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -46,7 +47,8 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 from cli_output import EXIT_ERROR, EXIT_OK
-from providers import parse_qualified_provider
+from ccb_runtime_status import ProviderRuntimeStatus, provider_status_for_target
+from providers import make_qualified_key, parse_qualified_provider
 from session_utils import find_project_session_file
 
 
@@ -92,6 +94,8 @@ CALLER_ENV_HINTS = {
     "codebuddy": ("CODEBUDDY_SESSION_ID", "CODEBUDDY_RUNTIME_DIR"),
     "qwen": ("QWEN_SESSION_ID", "QWEN_RUNTIME_DIR"),
 }
+
+_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGNORECASE)
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
 
@@ -235,6 +239,68 @@ def _use_unified_daemon() -> bool:
     if val in ("0", "false", "no", "off"):
         return False
     return True  # Default to unified daemon
+
+
+def _extract_leading_route_tag(message: str) -> tuple[str | None, str]:
+    match = _ROUTE_TAG_RE.match(message or "")
+    if not match:
+        return None, message
+    tag = match.group(1).upper()
+    stripped = (message or "")[match.end():].lstrip()
+    return tag, stripped
+
+
+def _route_bool(value: bool) -> str:
+    return "true" if bool(value) else "false"
+
+
+def _route_error_line(target: str, status: ProviderRuntimeStatus, *, reason: str = "not_mounted") -> str:
+    return (
+        f"CCB_ROUTE_ERROR target={target} reason={reason}"
+        f" configured={_route_bool(status.configured)}"
+        f" registered={_route_bool(status.registered)}"
+        f" pane_alive={_route_bool(status.pane_alive)}"
+        f" session_bound={_route_bool(status.session_bound)}"
+        f" daemon_online={_route_bool(status.daemon_online)}"
+    )
+
+
+def _resolve_tagged_route(provider: str, message: str, *, allow_fallback: bool) -> tuple[str, str, bool]:
+    tag, stripped_message = _extract_leading_route_tag(message)
+    if not tag:
+        return provider, message, True
+    if not stripped_message:
+        print(f"CCB_ROUTE_ERROR target={provider} reason=empty_message", file=sys.stderr)
+        return provider, stripped_message, False
+
+    base_provider, explicit_instance = parse_qualified_provider(provider)
+    requested_instance = "worker" if tag == "WORKER" else None
+    requested_target = make_qualified_key(base_provider, requested_instance)
+    explicit_target = make_qualified_key(base_provider, explicit_instance)
+
+    if explicit_instance is not None and explicit_target != requested_target:
+        print(f"CCB_ROUTE_ERROR target={explicit_target} reason=tag_conflict tag={tag}", file=sys.stderr)
+        return provider, stripped_message, False
+
+    target = explicit_target if explicit_instance is not None else requested_target
+
+    if _use_unified_daemon():
+        _maybe_start_unified_daemon()
+
+    status = provider_status_for_target(target, work_dir=Path.cwd())
+    if status.mounted:
+        return target, stripped_message, True
+
+    fallback_enabled = allow_fallback or _env_bool("CCB_ROUTE_FALLBACK", False)
+    fallback_target = base_provider
+    if fallback_enabled and target != fallback_target:
+        fallback_status = provider_status_for_target(fallback_target, work_dir=Path.cwd())
+        if fallback_status.mounted:
+            print(f"CCB_ROUTE_FALLBACK from={target} to={fallback_target}", file=sys.stderr)
+            return fallback_target, stripped_message, True
+
+    print(_route_error_line(target, status), file=sys.stderr)
+    return target, stripped_message, False
 
 
 def _maybe_start_unified_daemon() -> bool:
@@ -511,6 +577,7 @@ def _usage() -> None:
     print("  --foreground            Run in foreground (no nohup/background)", file=sys.stderr)
     print("  --background            Force background mode", file=sys.stderr)
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
+    print("  --route-fallback        Explicitly allow tagged worker route fallback to base provider", file=sys.stderr)
     print("  --peer TARGET           Send to Claude in another CCB project", file=sys.stderr)
 
 
@@ -735,6 +802,7 @@ def main(argv: list[str]) -> int:
     notify_mode = False
     no_wrap = False
     peer_target = ""
+    route_fallback = False
     foreground_mode = _default_foreground()
     parts: list[str] = []
 
@@ -765,6 +833,9 @@ def main(argv: list[str]) -> int:
         if token == "--no-wrap":
             no_wrap = True
             continue
+        if token == "--route-fallback":
+            route_fallback = True
+            continue
         if token == "--peer":
             try:
                 peer_target = next(it)
@@ -780,6 +851,12 @@ def main(argv: list[str]) -> int:
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
+
+    provider, message, route_ok = _resolve_tagged_route(provider, message, allow_fallback=route_fallback)
+    if not route_ok:
+        return EXIT_ERROR
+    base_provider, instance = parse_qualified_provider(provider)
+    daemon_cmd = PROVIDER_DAEMONS[base_provider]
 
     if peer_target:
         return _run_peer_bridge(peer_target, timeout, message, foreground_mode)

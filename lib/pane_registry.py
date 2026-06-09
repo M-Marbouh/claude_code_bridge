@@ -140,11 +140,11 @@ def _get_providers_map(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def _provider_pane_alive(record: Dict[str, Any], provider: str) -> bool:
-    base_provider, _ = parse_qualified_provider(provider)
+    provider_key = (provider or "").strip().lower()
+    base_provider, instance = parse_qualified_provider(provider_key)
     providers = _get_providers_map(record)
-    # Try qualified key first, fall back to base provider
-    entry = providers.get((provider or "").strip().lower())
-    if not isinstance(entry, dict):
+    entry = providers.get(provider_key)
+    if not isinstance(entry, dict) and instance is None:
         entry = providers.get(base_provider)
     if not isinstance(entry, dict):
         return False
@@ -284,8 +284,9 @@ def load_registry_by_project_id(ccb_project_id: str, provider: str) -> Optional[
         if effective != proj:
             continue
 
-        # Use base provider for pane alive check
-        if not _provider_pane_alive(data, base_prov):
+        # Qualified lookups must validate the qualified pane entry; do not let
+        # a live base pane satisfy an instance route such as codex:worker.
+        if not _provider_pane_alive(data, prov):
             continue
 
         # Prefer the newest record for this project+provider.

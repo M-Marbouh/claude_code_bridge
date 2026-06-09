@@ -23,12 +23,28 @@ def _write_fake_tmux(bin_dir: Path, panes: list[dict[str, str]]) -> None:
         )
         for pane in panes
     )
+    dead_cases = ""
+    for pane in panes:
+        pane_id = pane["pane_id"]
+        dead = pane.get("dead", "0")
+        dead_cases += f"    {json.dumps(pane_id)}) printf '%s\\n' {json.dumps(dead)}; exit 0 ;;\n"
     script = bin_dir / "tmux"
     script.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = \"list-panes\" ]; then\n"
         f"  printf '%b\\n' {json.dumps(lines)}\n"
         "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"display-message\" ]; then\n"
+        "  target=\"\"\n"
+        "  while [ \"$#\" -gt 0 ]; do\n"
+        "    if [ \"$1\" = \"-t\" ]; then shift; target=\"$1\"; fi\n"
+        "    shift || true\n"
+        "  done\n"
+        "  case \"$target\" in\n"
+        f"{dead_cases}"
+        "  esac\n"
+        "  exit 1\n"
         "fi\n"
         "exit 1\n",
         encoding="utf-8",
@@ -215,7 +231,7 @@ def test_ccb_list_rejects_reused_wezterm_pane_id_with_wrong_cwd(tmp_path: Path) 
     assert stale[0]["providers"]["claude"]["alive"] is False
 
 
-def test_ccb_list_omits_expired_registry_even_if_pane_matches(tmp_path: Path) -> None:
+def test_ccb_list_exposes_expired_registry_only_with_stale_flag(tmp_path: Path) -> None:
     run_dir = tmp_path / ".ccb" / "run"
     run_dir.mkdir(parents=True)
     work_dir = tmp_path / "project"
@@ -237,4 +253,68 @@ def test_ccb_list_omits_expired_registry_even_if_pane_matches(tmp_path: Path) ->
     )
 
     assert _run_ccb_list(tmp_path) == []
-    assert _run_ccb_list(tmp_path, "--stale") == []
+    stale = _run_ccb_list(tmp_path, "--stale")
+    assert len(stale) == 1
+    assert stale[0]["providers"]["claude"]["timestamp_stale"] is True
+    assert stale[0]["providers"]["claude"]["reason"] == "registry_stale"
+
+
+def test_ccb_list_merges_qualified_instances_without_stale_shadowing(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    (work_dir / ".ccb").mkdir(parents=True)
+    (work_dir / ".ccb" / "ccb.config").write_text("codex,codex:worker,claude,claude:worker\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [
+            {"pane_id": "%1", "title": "CCB-Claude-test", "cwd": str(work_dir), "dead": "0"},
+            {"pane_id": "%2", "title": "CCB-Codex-test", "cwd": str(work_dir), "dead": "0"},
+            {"pane_id": "%3", "title": "CCB-Claude-worker-test", "cwd": str(work_dir), "dead": "0"},
+            {"pane_id": "%4", "title": "CCB-Codex-worker-test", "cwd": str(work_dir), "dead": "0"},
+        ],
+    )
+
+    old = int(time.time()) - (8 * 24 * 60 * 60)
+    now = int(time.time())
+    (run_dir / "ccb-session-ai-stale.json").write_text(
+        json.dumps(
+            {
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": old,
+                "providers": {
+                    "claude": {"pane_id": "%1", "pane_title_marker": "CCB-Claude-test"},
+                    "codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "ccb-session-ai-live.json").write_text(
+        json.dumps(
+            {
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": now,
+                "providers": {
+                    "claude": {"pane_id": "%1", "pane_title_marker": "CCB-Claude-test"},
+                    "codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+                    "claude:worker": {"pane_id": "%3", "pane_title_marker": "CCB-Claude-worker-test"},
+                    "codex:worker": {"pane_id": "%4", "pane_title_marker": "CCB-Codex-worker-test"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = _run_ccb_list(tmp_path)
+
+    assert len(entries) == 1
+    providers = entries[0]["providers"]
+    assert set(providers) == {"claude", "codex", "claude:worker", "codex:worker"}
+    assert providers["claude:worker"]["alive"] is True
+    assert providers["codex:worker"]["alive"] is True
+    assert providers["claude:worker"]["timestamp_stale"] is False

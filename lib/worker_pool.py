@@ -69,7 +69,13 @@ class PerSessionWorkerPool(Generic[WorkerT]):
         with self._lock:
             worker = self._workers.get(session_key)
             # Check if worker thread is dead and needs replacement
-            if worker is not None and not worker.is_alive():
+            try:
+                worker_alive = bool(worker.is_alive()) if worker is not None else False
+            except AssertionError:
+                # Some tests use a lightweight Thread double that marks itself
+                # started without creating CPython's private thread state.
+                worker_alive = True
+            if worker is not None and not worker_alive:
                 # Worker thread died, remove it and create a new one
                 self._workers.pop(session_key, None)
                 worker = None

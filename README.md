@@ -128,6 +128,7 @@ The current milestone is `v1.0.0`.
 
 Recently shipped:
 
+- `0.11.2` — multi-instance session isolation: `ccb kill` now enumerates every project session file (worker instances included, qualified args like `codex:worker` accepted); `ccb -r` resumes each pane from its validated bound session id (launch-time binding + anchor-confirmed repair) instead of latest-by-cwd/`--continue`, so architect/orchestrator no longer inherit a worker's conversation; Codex reader hardened against cross-instance log pickup.
 - `0.11.1` — `ccb clean` plus conservative auto-prune of stale `ccb-session-ai-*.json` records (keep newest N per project, TTL, and a liveness gate that never deletes a live/running session). Auto-prunes the launching project on startup unless `CCB_NO_AUTO_PRUNE=1`.
 - `0.11.0` — runtime-status primitive behind `ccb-list`/`ccb-mounted` (per-qualified-key capable/configured/mounted, robust to stale session files) and honest `[WORKER]`/`[ARCHITECT]` tag routing with structured `CCB_ROUTE_ERROR` / `CCB_ROUTE_FALLBACK` (no silent base fallback).
 - `0.10.0` — multi-instance, model-tiered providers (`codex:worker`, `claude:worker`) with per-instance session, pane, and resume isolation, and a `CCB_CODEX_SHOW_TIER` verification footer.
@@ -139,4 +140,4 @@ Planned before `v1.0.0`:
 - Document common Claude + Codex workflows and single-machine Linux examples.
 - Keep the fork's README, changelog, and versioning independent from upstream.
 
-Current pre-release version: `0.11.1`.
+Current pre-release version: `0.11.2`.

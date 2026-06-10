@@ -180,11 +180,13 @@ class CodexLogReader:
     """Reads Codex official logs from ~/.codex/sessions"""
 
     def __init__(self, root: Path = SESSION_ROOT, log_path: Optional[Path] = None,
-                 session_id_filter: Optional[str] = None, work_dir: Optional[Path] = None):
+                 session_id_filter: Optional[str] = None, work_dir: Optional[Path] = None,
+                 allow_stale_switch: bool = True):
         self.root = Path(root).expanduser()
         self._preferred_log = self._normalize_path(log_path)
         self._session_id_filter = session_id_filter
         self._work_dir = self._normalize_work_dir(work_dir)
+        self._allow_stale_switch = bool(allow_stale_switch)
         try:
             poll = float(os.environ.get("CODEX_POLL_INTERVAL", "0.05"))
         except Exception:
@@ -353,21 +355,22 @@ class CodexLogReader:
         preferred = self._preferred_log
         if preferred and preferred.exists():
             if self._session_id_filter:
-                latest_any = self._scan_latest_any()
-                if latest_any and latest_any != preferred:
-                    threshold = _env_float("CCB_CODEX_STALE_LOG_SECONDS", 10.0)
-                    if threshold > 0:
-                        try:
-                            preferred_mtime = preferred.stat().st_mtime
-                            latest_mtime = latest_any.stat().st_mtime
-                            if latest_mtime - preferred_mtime >= threshold:
+                if self._allow_stale_switch:
+                    latest_any = self._scan_latest_any()
+                    if latest_any and latest_any != preferred:
+                        threshold = _env_float("CCB_CODEX_STALE_LOG_SECONDS", 10.0)
+                        if threshold > 0:
+                            try:
+                                preferred_mtime = preferred.stat().st_mtime
+                                latest_mtime = latest_any.stat().st_mtime
+                                if latest_mtime - preferred_mtime >= threshold:
+                                    self._preferred_log = latest_any
+                                    self._debug(f"Preferred log stale (bound); switching to latest: {latest_any}")
+                                    return latest_any
+                            except OSError:
                                 self._preferred_log = latest_any
-                                self._debug(f"Preferred log stale (bound); switching to latest: {latest_any}")
+                                self._debug(f"Preferred log stat failed (bound); switching to latest: {latest_any}")
                                 return latest_any
-                        except OSError:
-                            self._preferred_log = latest_any
-                            self._debug(f"Preferred log stat failed (bound); switching to latest: {latest_any}")
-                            return latest_any
                 self._debug(f"Using preferred log (bound): {preferred}")
                 return preferred
 

@@ -116,22 +116,24 @@ class _FakeSession:
         self.data = {}
         self.codex_session_path = None
         self.codex_session_id = None
+        self.bindings: list[dict] = []
 
     def ensure_pane(self):
         return True, "pane-1"
 
-    def update_codex_log_binding(self, **kwargs) -> None:  # pragma: no cover - unused here
-        pass
+    def update_codex_log_binding(self, **kwargs) -> None:
+        self.bindings.append(kwargs)
 
 
 class _ScriptedReader:
     """Yields a fixed sequence of (role, text, phase) events, one per call."""
 
-    def __init__(self, events: list[tuple[str, str, str]]) -> None:
+    def __init__(self, events: list[tuple[str, str, str]], log_path: Path | None = None) -> None:
         self._events = list(events)
+        self._log_path = log_path
 
     def capture_state(self) -> dict:
-        return {"log_path": None, "offset": 0}
+        return {"log_path": self._log_path, "offset": 0}
 
     def wait_for_event(self, state, timeout):
         if self._events:
@@ -150,18 +152,25 @@ def _drive_handle_task(
     *,
     instance: str | None = None,
     show_tier: bool = False,
+    include_anchor: bool = True,
+    timeout_s: float = 5.0,
+    log_path: Path | None = None,
+    session_obj: _FakeSession | None = None,
 ):
     # Prepend the user anchor so anchor_seen flips before assistant events.
-    scripted = [("user", f"{REQ_ID_PREFIX} {req_id}", "")] + events
+    scripted = list(events)
+    if include_anchor:
+        scripted = [("user", f"{REQ_ID_PREFIX} {req_id}", "")] + scripted
 
-    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd, inst: _FakeSession(tmp_path))
+    session = session_obj or _FakeSession(tmp_path)
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd, inst: session)
     monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: _FakeBackend())
-    monkeypatch.setattr(codex_adapter, "CodexLogReader", lambda **kw: _ScriptedReader(scripted))
+    monkeypatch.setattr(codex_adapter, "CodexLogReader", lambda **kw: _ScriptedReader(scripted, log_path=log_path))
     monkeypatch.setattr(codex_adapter, "notify_completion", lambda **kw: None)
     monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
 
     req = ProviderRequest(
-        client_id="c", work_dir=str(tmp_path), timeout_s=5.0, quiet=True,
+        client_id="c", work_dir=str(tmp_path), timeout_s=timeout_s, quiet=True,
         message="do the thing", caller="claude", req_id=req_id, instance=instance,
         show_tier=show_tier,
     )
@@ -218,6 +227,85 @@ def test_handle_task_legacy_event_only_falls_back(monkeypatch, tmp_path: Path) -
 
     assert result.done_seen is True
     assert result.reply == "Legacy reply body."
+
+
+def test_handle_task_multi_instance_unbound_requires_anchor(monkeypatch, tmp_path: Path) -> None:
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / ".codex-worker-session").write_text(
+        json.dumps({"provider": "codex", "instance": "worker", "work_dir": str(tmp_path)}),
+        encoding="utf-8",
+    )
+    req_id = make_req_id()
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", f"Wrong pane output.\nCCB_DONE: {req_id}", "event")],
+        include_anchor=False,
+        timeout_s=0.05,
+    )
+
+    assert result.done_seen is False
+    assert result.anchor_seen is False
+    assert result.reply == ""
+
+
+def test_handle_task_anchor_confirmed_completion_repairs_binding(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    sid = "12345678-1234-1234-1234-123456789abc"
+    log_path = tmp_path / f"{sid}.jsonl"
+    log_path.write_text("", encoding="utf-8")
+    session = _FakeSession(tmp_path)
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", f"Done.\nCCB_DONE: {req_id}", "final_answer")],
+        log_path=log_path,
+        session_obj=session,
+    )
+
+    assert result.done_seen is True
+    assert session.bindings == [{"log_path": str(log_path), "session_id": sid}]
+
+
+def test_scan_latest_candidate_excludes_sibling_and_requires_anchor(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "codex-root"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(root))
+    req_id = make_req_id()
+    base_id = "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa"
+    sibling_id = "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb"
+    base_log = root / f"{base_id}.jsonl"
+    sibling_log = root / f"{sibling_id}.jsonl"
+    for path, sid in [(base_log, base_id), (sibling_log, sibling_id)]:
+        path.write_text(
+            "\n".join([
+                json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(tmp_path)}}),
+                json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": f"{REQ_ID_PREFIX} {req_id}"}}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+    base_log.touch()
+    sibling_log.touch()
+
+    selected = codex_adapter._scan_latest_candidate_log(
+        tmp_path,
+        exclude_session_ids={sibling_id},
+        req_id=req_id,
+    )
+
+    assert selected == base_log
+
+    missing = codex_adapter._scan_latest_candidate_log(
+        tmp_path,
+        exclude_session_ids={base_id, sibling_id},
+        req_id=req_id,
+    )
+    assert missing is None
 
 
 def test_read_latest_turn_context_reads_bound_log(tmp_path: Path) -> None:

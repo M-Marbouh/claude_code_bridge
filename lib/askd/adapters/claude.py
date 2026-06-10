@@ -26,7 +26,9 @@ from completion_hook import (
 from laskd_registry import get_session_registry
 from laskd_protocol import extract_reply_for_req, is_done_text, wrap_claude_delivery_prompt, wrap_claude_prompt
 from laskd_session import compute_session_key, load_project_session
-from providers import LASKD_SPEC
+from pane_registry import upsert_registry
+from project_id import compute_ccb_project_id
+from providers import LASKD_SPEC, make_qualified_key
 from session_file_watcher import HAS_WATCHDOG
 from terminal import get_backend_for_session
 
@@ -799,6 +801,43 @@ class ClaudeAdapter(BaseProviderAdapter):
 
         combined = "\n".join(chunks)
         final_reply = extract_reply_for_req(combined, task.req_id)
+
+        if done_seen:
+            session_path = state.get("session_path") if isinstance(state, dict) else None
+            session_id = session_path.stem if isinstance(session_path, Path) else None
+            try:
+                session.update_claude_binding(
+                    session_path=session_path if isinstance(session_path, Path) else None,
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+            try:
+                ccb_pid = str(session.data.get("ccb_project_id") or "").strip()
+                if not ccb_pid:
+                    ccb_pid = compute_ccb_project_id(Path(session.work_dir))
+                ccb_session_id = str(session.data.get("ccb_session_id") or session.data.get("session_id") or "").strip()
+                if ccb_session_id:
+                    upsert_registry(
+                        {
+                            "ccb_session_id": ccb_session_id,
+                            "ccb_project_id": ccb_pid or None,
+                            "work_dir": str(session.work_dir),
+                            "terminal": session.terminal,
+                            "providers": {
+                                make_qualified_key("claude", req.instance): {
+                                    "pane_id": session.pane_id or None,
+                                    "pane_title_marker": session.pane_title_marker or None,
+                                    "session_file": str(session.session_file),
+                                    "claude_session_id": session.data.get("claude_session_id"),
+                                    "claude_session_path": session.data.get("claude_session_path"),
+                                    "active": bool(session.data.get("active", True)),
+                                }
+                            },
+                        }
+                    )
+            except Exception:
+                pass
 
         result = ProviderResult(
             exit_code=0 if done_seen else 2,

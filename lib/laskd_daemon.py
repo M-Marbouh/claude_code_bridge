@@ -28,7 +28,7 @@ from terminal import get_backend_for_session
 from askd_runtime import state_file_path, log_path, write_log, random_token
 import askd_rpc
 from askd_server import AskDaemonServer
-from providers import LASKD_SPEC
+from providers import LASKD_SPEC, make_qualified_key
 
 
 def _now_ms() -> int:
@@ -258,12 +258,13 @@ class _SessionWorker(BaseSessionWorker[_QueuedTask, LaskdResult]):
                             "work_dir": str(session.work_dir),
                             "terminal": session.terminal,
                             "providers": {
-                                "claude": {
+                                make_qualified_key("claude", str(session.data.get("instance") or "").strip() or None): {
                                     "pane_id": session.pane_id or None,
                                     "pane_title_marker": session.pane_title_marker or None,
                                     "session_file": str(session.session_file),
                                     "claude_session_id": session.data.get("claude_session_id"),
                                     "claude_session_path": session.data.get("claude_session_path"),
+                                    "active": bool(session.data.get("active", True)),
                                 }
                             },
                         }

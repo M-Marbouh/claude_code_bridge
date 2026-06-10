@@ -64,7 +64,7 @@ backend_env = get_backend_env()
 if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
-VERSION = "0.11.1"
+VERSION = "0.11.2"
 GIT_COMMIT = "c539e79"
 GIT_DATE = "2026-06-09"
 
@@ -203,6 +203,73 @@ def _extract_session_work_dir_norm(session_data: dict) -> str:
     if isinstance(raw, str) and raw.strip():
         return _normalize_path_for_match(raw)
     return ""
+
+
+def _session_file_provider_key(path: Path, data: dict | None = None) -> tuple[str, str | None]:
+    """Infer provider + optional instance from a project session file."""
+    payload = data if isinstance(data, dict) else {}
+    qualified = str(payload.get("qualified_provider") or "").strip().lower()
+    if qualified:
+        base, instance = parse_qualified_provider(qualified)
+        return base, normalize_instance_name(instance)
+
+    provider = str(payload.get("provider") or "").strip().lower()
+    instance = normalize_instance_name(payload.get("instance"))
+    if provider:
+        return provider, instance
+
+    name = path.name
+    match = re.fullmatch(r"\.([a-z0-9]+)(?:-([a-z0-9_-]+))?-session", name)
+    if not match:
+        return "", None
+    return match.group(1).lower(), normalize_instance_name(match.group(2))
+
+
+def _session_file_matches_project(path: Path, data: dict, project_root: Path) -> bool:
+    """Return True when a session file belongs to the current project root."""
+    if not isinstance(data, dict):
+        return False
+
+    recorded_pid = str(data.get("ccb_project_id") or "").strip()
+    if recorded_pid:
+        try:
+            if recorded_pid != compute_ccb_project_id(project_root):
+                return False
+        except Exception:
+            return False
+
+    recorded_norm = _extract_session_work_dir_norm(data)
+    if recorded_norm:
+        keys = _work_dir_match_keys(project_root)
+        if keys and recorded_norm not in keys:
+            return False
+        return True
+
+    # Back-compat: old local session files may not have work_dir fields. Only
+    # trust them when they live inside this project's config directory.
+    try:
+        return path.parent.resolve() == resolve_project_config_dir(project_root).resolve()
+    except Exception:
+        return path.parent == resolve_project_config_dir(project_root)
+
+
+def _read_json_session(path: Path) -> dict:
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _project_session_files(project_root: Path) -> list[Path]:
+    cfg = resolve_project_config_dir(project_root)
+    if not cfg.is_dir():
+        return []
+    try:
+        return sorted(p for p in cfg.glob(".*-session") if p.is_file())
+    except Exception:
+        return []
 
 
 def _get_git_info() -> str:
@@ -1370,6 +1437,7 @@ class AILauncher:
         title_cmd = _build_pane_title_cmd(pane_title_marker)
         env_overrides = self._provider_env_overrides(provider)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
+        codex_snapshot = self._snapshot_codex_rollouts() if provider == "codex" else set()
         backend = WeztermBackend()
         pane_id = backend.create_pane(full_cmd, str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
         self.wezterm_panes[self._instance_key(provider, instance)] = pane_id
@@ -1388,6 +1456,7 @@ class AILauncher:
                 codex_start_cmd=start_cmd,
                 instance=instance,
             )
+            self._bind_new_codex_session_from_snapshot(codex_snapshot, instance)
         elif provider == "gemini":
             self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         elif provider == "opencode":
@@ -1439,6 +1508,243 @@ class AILauncher:
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    def _codex_session_root(self) -> Path:
+        return Path(os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
+
+    def _snapshot_codex_rollouts(self) -> set[Path]:
+        root = self._codex_session_root()
+        if not root.exists():
+            return set()
+        try:
+            return {p for p in root.glob("**/*.jsonl") if p.is_file()}
+        except Exception:
+            return set()
+
+    def _read_codex_rollout_meta(self, log_path: Path) -> tuple[str | None, str | None]:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for _ in range(50):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+                        continue
+                    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                    sid = payload.get("id")
+                    cwd = payload.get("cwd")
+                    return (
+                        sid.strip() if isinstance(sid, str) and sid.strip() else None,
+                        cwd.strip() if isinstance(cwd, str) and cwd.strip() else None,
+                    )
+        except Exception:
+            return None, None
+        return None, None
+
+    def _valid_new_codex_rollouts(self, before: set[Path]) -> list[tuple[Path, str]]:
+        root = self._codex_session_root()
+        if not root.exists():
+            return []
+        root_norm = _normalize_path_for_match(str(self.project_root))
+        try:
+            current = {p for p in root.glob("**/*.jsonl") if p.is_file()}
+        except Exception:
+            return []
+
+        candidates: list[tuple[Path, str]] = []
+        for log_path in current - set(before or set()):
+            sid, cwd = self._read_codex_rollout_meta(log_path)
+            if not sid:
+                try:
+                    sid = str(uuid.UUID(log_path.stem))
+                except Exception:
+                    sid = None
+            if not sid or not cwd:
+                continue
+            cwd_norm = _normalize_path_for_match(cwd)
+            if not _normpath_within(cwd_norm, root_norm):
+                continue
+            candidates.append((log_path, sid))
+        try:
+            candidates.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+        except Exception:
+            pass
+        return candidates
+
+    def _write_codex_launch_binding(self, instance: str | None, log_path: Path, session_id: str) -> None:
+        session_file = self._project_session_file_for_provider("codex", instance)
+        if not session_file.exists():
+            return
+        data = self._read_json_file(session_file)
+        if not isinstance(data, dict):
+            data = {}
+        data["codex_session_id"] = session_id
+        data["codex_session_path"] = str(log_path)
+        data["codex_start_cmd"] = f"codex resume {session_id}"
+        data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if data.get("active") is False:
+            data["active"] = True
+        self._write_json_file(session_file, data)
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(self.project_root),
+                "work_dir": str(self.project_root),
+                "terminal": self.terminal_type,
+                "providers": {
+                    self._registry_provider_key("codex", instance): {
+                        "pane_id": data.get("pane_id"),
+                        "pane_title_marker": data.get("pane_title_marker"),
+                        "session_file": str(session_file),
+                        "codex_session_id": session_id,
+                        "codex_session_path": str(log_path),
+                        "active": bool(data.get("active", True)),
+                    }
+                },
+            })
+        except Exception:
+            pass
+
+    def _bind_new_codex_session_from_snapshot(
+        self,
+        before: set[Path],
+        instance: str | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> bool:
+        if timeout_s is None:
+            try:
+                timeout_s = float(os.environ.get("CCB_LAUNCH_BIND_TIMEOUT", "5.0"))
+            except Exception:
+                timeout_s = 5.0
+        deadline = time.time() + max(0.0, min(float(timeout_s), 15.0))
+        while True:
+            candidates = self._valid_new_codex_rollouts(before)
+            if len(candidates) == 1:
+                log_path, sid = candidates[0]
+                self._write_codex_launch_binding(instance, log_path, sid)
+                return True
+            if len(candidates) > 1:
+                print(
+                    f"⚠️ Codex launch binding skipped for {self._instance_key('codex', instance)}: "
+                    f"{len(candidates)} new sessions matched",
+                    file=sys.stderr,
+                )
+                return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _bind_new_codex_session_async(self, before: set[Path], instance: str | None = None) -> None:
+        thread = threading.Thread(
+            target=lambda: self._bind_new_codex_session_from_snapshot(before, instance),
+            daemon=True,
+        )
+        thread.start()
+
+    def _snapshot_claude_sessions(self) -> set[Path]:
+        project_dir = self._claude_project_dir(self.project_root)
+        if not project_dir.exists():
+            return set()
+        try:
+            return {p for p in project_dir.glob("*.jsonl") if p.is_file()}
+        except Exception:
+            return set()
+
+    def _valid_new_claude_sessions(self, before: set[Path]) -> list[tuple[Path, str]]:
+        project_dir = self._claude_project_dir(self.project_root)
+        if not project_dir.exists():
+            return []
+        try:
+            current = {p for p in project_dir.glob("*.jsonl") if p.is_file()}
+        except Exception:
+            return []
+        candidates: list[tuple[Path, str]] = []
+        for path in current - set(before or set()):
+            try:
+                sid = str(uuid.UUID(path.stem))
+            except Exception:
+                continue
+            candidates.append((path, sid))
+        try:
+            candidates.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+        except Exception:
+            pass
+        return candidates
+
+    def _write_claude_launch_binding(self, instance: str | None, session_path: Path, session_id: str) -> None:
+        session_file = self._claude_session_file(instance)
+        if not session_file.exists():
+            return
+        data = self._read_json_file(session_file)
+        if not isinstance(data, dict):
+            data = {}
+        data["claude_session_id"] = session_id
+        data["claude_session_path"] = str(session_path)
+        data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if data.get("active") is False:
+            data["active"] = True
+        self._write_json_file(session_file, data)
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(self.project_root),
+                "work_dir": str(self.project_root),
+                "terminal": self.terminal_type,
+                "providers": {
+                    self._registry_provider_key("claude", instance): {
+                        "pane_id": data.get("pane_id"),
+                        "pane_title_marker": data.get("pane_title_marker"),
+                        "session_file": str(session_file),
+                        "claude_session_id": session_id,
+                        "claude_session_path": str(session_path),
+                        "active": bool(data.get("active", True)),
+                    }
+                },
+            })
+        except Exception:
+            pass
+
+    def _bind_new_claude_session_from_snapshot(
+        self,
+        before: set[Path],
+        instance: str | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> bool:
+        if timeout_s is None:
+            try:
+                timeout_s = float(os.environ.get("CCB_LAUNCH_BIND_TIMEOUT", "5.0"))
+            except Exception:
+                timeout_s = 5.0
+        deadline = time.time() + max(0.0, min(float(timeout_s), 15.0))
+        while True:
+            candidates = self._valid_new_claude_sessions(before)
+            if len(candidates) == 1:
+                path, sid = candidates[0]
+                self._write_claude_launch_binding(instance, path, sid)
+                return True
+            if len(candidates) > 1:
+                print(
+                    f"⚠️ Claude launch binding skipped for {self._instance_key('claude', instance)}: "
+                    f"{len(candidates)} new sessions matched",
+                    file=sys.stderr,
+                )
+                return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _bind_new_claude_session_async(self, before: set[Path], instance: str | None = None) -> None:
+        thread = threading.Thread(
+            target=lambda: self._bind_new_claude_session_from_snapshot(before, instance),
+            daemon=True,
+        )
+        thread.start()
 
     def _require_project_config_dir(self) -> bool:
         cfg = self._project_config_dir()
@@ -1521,6 +1827,7 @@ class AILauncher:
         pane_title_marker: str | None = None,
         terminal: str | None = None,
         instance: str | None = None,
+        start_cmd: str | None = None,
     ) -> None:
         path = self._claude_session_file(instance)
         provider_key = self._registry_provider_key("claude", instance)
@@ -1554,6 +1861,9 @@ class AILauncher:
             data["pane_id"] = pane_id
         if pane_title_marker:
             data["pane_title_marker"] = pane_title_marker
+        if start_cmd:
+            data["claude_start_cmd"] = str(start_cmd)
+            data["start_cmd"] = str(start_cmd)
 
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         ok, err = safe_write_session(path, payload)
@@ -1584,7 +1894,23 @@ class AILauncher:
         self._maybe_start_provider_daemon("claude")
         self._auto_prune_session_records()
 
-    def _get_latest_codex_session_id(self) -> tuple[str | None, bool]:
+    def _bound_codex_session_ids(self, *, include_base: bool = False) -> set[str]:
+        bound: set[str] = set()
+        for path in _project_session_files(self.project_root):
+            data = self._read_json_file(path)
+            provider, instance = _session_file_provider_key(path, data)
+            if provider != "codex":
+                continue
+            if not include_base and not instance:
+                continue
+            if not _session_file_matches_project(path, data, self.project_root):
+                continue
+            sid = str(data.get("codex_session_id") or "").strip()
+            if sid:
+                bound.add(sid)
+        return bound
+
+    def _get_latest_codex_session_id(self, *, exclude_session_ids: set[str] | None = None) -> tuple[str | None, bool]:
         """
         Returns (session_id, has_any_history_for_cwd).
         Session id is Codex CLI's UUID used by `codex resume <id>`.
@@ -1620,6 +1946,7 @@ class AILauncher:
             except Exception:
                 scan_limit = 400
 
+        excluded = {str(s or "").strip() for s in (exclude_session_ids or set()) if str(s or "").strip()}
         for log_path in logs[:scan_limit]:
             try:
                 with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -1645,6 +1972,8 @@ class AILauncher:
                     continue
                 sid = payload.get("id")
                 if isinstance(sid, str) and sid:
+                    if sid in excluded:
+                        continue
                     # Update local .codex-session file with latest session id
                     data = self._read_json_file(project_session) if project_session.exists() else {}
                     data.update({
@@ -1988,7 +2317,11 @@ class AILauncher:
             if normalized_instance:
                 session_id, has_history = self._get_bound_codex_session_id(normalized_instance)
             else:
-                session_id, has_history = self._get_latest_codex_session_id()
+                session_id, has_history = self._get_bound_codex_session_id(None)
+                if not session_id and not self._provider_has_instances("codex"):
+                    session_id, has_history = self._get_latest_codex_session_id(
+                        exclude_session_ids=self._bound_codex_session_ids(include_base=False)
+                    )
             if session_id:
                 cmd = f"{cmd} resume {session_id}"
                 print(f"🔁 {t('resuming_session', provider=self._provider_display('codex', instance), session_id=session_id[:8])}")
@@ -2369,6 +2702,7 @@ class AILauncher:
         env_overrides = self._provider_env_overrides("codex")
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd(instance)
         pane_title_marker = self._pane_marker_for("codex", instance)
+        codex_snapshot = self._snapshot_codex_rollouts()
 
         backend = TmuxBackend()
 
@@ -2445,6 +2779,7 @@ class AILauncher:
             codex_start_cmd=start_cmd,
             instance=instance,
         )
+        self._bind_new_codex_session_from_snapshot(codex_snapshot, instance)
 
         print(f"✅ {t('started_backend', provider=self._provider_display('codex', instance), terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
@@ -2690,6 +3025,7 @@ class AILauncher:
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
         self._maybe_start_caskd()
+        codex_snapshot = self._snapshot_codex_rollouts()
 
         if self.terminal_type == "tmux":
             bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
@@ -2730,6 +3066,7 @@ class AILauncher:
                 env["CODEX_WEZTERM_PANE"] = pane_id
             else:
                 env["CODEX_TMUX_SESSION"] = pane_id
+            self._bind_new_codex_session_async(codex_snapshot, None)
             return self._run_shell_command(self._build_codex_start_cmd(), env=env, cwd=str(Path.cwd()))
 
         cmd_parts = shlex.split(self._build_codex_start_cmd())
@@ -2757,6 +3094,7 @@ class AILauncher:
         except Exception:
             pass
 
+        self._bind_new_codex_session_async(codex_snapshot, None)
         return proc.wait()
 
     def _start_gemini_current_pane(self) -> int:
@@ -3274,6 +3612,63 @@ class AILauncher:
             return None, True, best_cwd
         return None, False, None
 
+    def _claude_session_exists(self, session_id: str, session_path: str | None = None) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        if session_path:
+            try:
+                p = Path(session_path).expanduser()
+                if p.exists() and p.is_file() and p.stem == sid:
+                    return True
+            except Exception:
+                pass
+
+        for work_dir in (Path.cwd(), self.invocation_dir, self.project_root):
+            project_dir = self._claude_project_dir(work_dir)
+            candidate = project_dir / f"{sid}.jsonl"
+            try:
+                if candidate.exists() and candidate.is_file():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _get_bound_claude_session_id(self, instance: str | None = None) -> tuple[str | None, bool, Path | None]:
+        session_file = self._claude_session_file(instance)
+        if not session_file.exists():
+            return None, False, None
+        data = self._read_json_file(session_file)
+        sid = str(data.get("claude_session_id") or data.get("session_id") or "").strip()
+        if not sid:
+            return None, False, None
+
+        recorded_pid = str(data.get("ccb_project_id") or "").strip()
+        current_pid = compute_ccb_project_id(self.project_root)
+        if recorded_pid and current_pid and recorded_pid != current_pid:
+            print(f"⚠️ Claude resume skipped for {self._instance_key('claude', instance)}: session belongs to another project", file=sys.stderr)
+            return None, True, None
+
+        recorded_norm = _extract_session_work_dir_norm(data)
+        current_keys = _work_dir_match_keys(self.project_root)
+        if recorded_norm and current_keys and recorded_norm not in current_keys:
+            print(f"⚠️ Claude resume skipped for {self._instance_key('claude', instance)}: session work_dir mismatch", file=sys.stderr)
+            return None, True, None
+
+        session_path = str(data.get("claude_session_path") or "").strip() or None
+        if not self._claude_session_exists(sid, session_path=session_path):
+            print(f"⚠️ Claude resume skipped for {self._instance_key('claude', instance)}: bound session id not found ({sid[:8]})", file=sys.stderr)
+            return None, True, None
+
+        resume_dir = self.project_root
+        work_dir = str(data.get("work_dir") or "").strip()
+        if work_dir:
+            try:
+                resume_dir = Path(work_dir)
+            except Exception:
+                resume_dir = self.project_root
+        return sid, True, resume_dir
+
     def _find_claude_cmd(self) -> str:
         """Find Claude CLI executable"""
         if sys.platform == "win32":
@@ -3359,10 +3754,15 @@ class AILauncher:
             cmd.append("--dangerously-skip-permissions")
         has_history = False
         resume_dir = None
-        if self.resume and not normalize_instance_name(instance):
-            _, has_history, resume_dir = self._get_latest_claude_session_id()
-            if has_history:
-                cmd.append("--continue")
+        normalized_instance = normalize_instance_name(instance)
+        if self.resume:
+            session_id, has_history, resume_dir = self._get_bound_claude_session_id(normalized_instance)
+            if session_id:
+                cmd.extend(["--resume", session_id])
+            elif not normalized_instance and not self._provider_has_instances("claude"):
+                _, has_history, resume_dir = self._get_latest_claude_session_id()
+                if has_history:
+                    cmd.append("--continue")
         policy = self._policy_for("claude", instance)
         if normalize_instance_name(instance) and policy.model:
             cmd.extend(["--model", policy.model])
@@ -3389,7 +3789,7 @@ class AILauncher:
             if has_history:
                 print(f"🔁 {t('resuming_claude', session_id='')}")
             else:
-                print(f"ℹ️ {t('no_claude_session')}")
+                print(f"ℹ️ {t('no_history_fresh', provider=self._provider_display('claude'))}")
 
         print(f"📋 Session ID: {self.session_id}")
         print(f"📁 Runtime dir: {self.runtime_dir}")
@@ -3406,6 +3806,9 @@ class AILauncher:
             print("   dask/dping/dpend - Droid communication")
         print()
         print(f"Executing: {' '.join(cmd)}")
+
+        session_snapshot = self._snapshot_claude_sessions()
+        self._bind_new_claude_session_async(session_snapshot, None)
 
         try:
             # Let subprocess inherit stdio by default. Explicitly passing sys.stdin/out/err
@@ -3432,11 +3835,11 @@ class AILauncher:
             print(str(e))
             return None
 
-        if self.resume and not normalize_instance_name(instance):
+        if self.resume:
             if has_history:
                 print(f"🔁 {t('resuming_claude', session_id='')}")
             else:
-                print(f"ℹ️ {t('no_claude_session')}")
+                print(f"ℹ️ {t('no_history_fresh', provider=self._provider_display('claude', instance))}")
 
         start_cmd = " ".join(cmd_parts)
         pane_title_marker = self._pane_marker_for("claude", instance)
@@ -3449,6 +3852,8 @@ class AILauncher:
 
         use_direction = (direction or "right").strip() or "right"
         use_parent = parent_pane
+
+        session_snapshot = self._snapshot_claude_sessions()
 
         if self.terminal_type == "wezterm":
             backend = WeztermBackend()
@@ -3470,9 +3875,12 @@ class AILauncher:
                 pane_title_marker=pane_title_marker,
                 terminal=self.terminal_type,
                 instance=instance,
+                start_cmd=start_cmd,
             )
         except Exception:
             pass
+
+        self._bind_new_claude_session_from_snapshot(session_snapshot, instance)
 
         print(f"✅ {t('started_backend', provider=self._provider_display('claude', instance), terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
         return pane_id
@@ -4273,25 +4681,62 @@ def cmd_kill(args):
         yes = getattr(args, "yes", False)
         return _kill_global_zombies(yes=yes)
 
-    # Project-level cleanup (original behavior)
-    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude", "droid"], allow_unknown=True)
-    if not providers:
-        return 2
+    project_root = Path.cwd()
+    requested: set[str] | None = None
+    raw_providers = getattr(args, "providers", None) or []
+    if raw_providers:
+        requested = set()
+        for token in _split_provider_tokens(raw_providers):
+            base, instance = parse_qualified_provider(token)
+            if not base:
+                continue
+            requested.add(make_qualified_key(base, normalize_instance_name(instance)))
+        if not requested:
+            return 2
 
-    for provider in providers:
-        # 1. Kill UI sessions (tmux/wezterm)
-        session_file = find_project_session_file(Path.cwd(), f".{provider}-session")
-        if session_file and session_file.exists():
-            try:
-                data = json.loads(session_file.read_text(encoding="utf-8-sig"))
-                terminal = data.get("terminal", "tmux")
-                pane_id = data.get("pane_id") if terminal == "wezterm" else (data.get("pane_id") or data.get("tmux_session") or "")
+    matched = 0
+    for session_file in _project_session_files(project_root):
+        data = _read_json_session(session_file)
+        provider, instance = _session_file_provider_key(session_file, data)
+        if not provider:
+            continue
+        provider_key = make_qualified_key(provider, instance)
+        if requested and provider_key not in requested and provider not in requested:
+            continue
+        if not _session_file_matches_project(session_file, data, project_root):
+            continue
+        matched += 1
 
-                if terminal == "wezterm" and pane_id:
-                    backend = WeztermBackend()
+        try:
+            terminal = str(data.get("terminal") or "tmux").strip().lower()
+            pane_id = data.get("pane_id") if terminal == "wezterm" else (data.get("pane_id") or data.get("tmux_session") or "")
+            pane_id = str(pane_id or "").strip()
+            killed = False
+
+            if terminal == "wezterm" and pane_id:
+                backend = WeztermBackend()
+                try:
+                    pane_alive = bool(backend.is_alive(pane_id))
+                except Exception:
+                    pane_alive = True
+                cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
+                if pane_alive and callable(cwd_check) and not bool(cwd_check(pane_id, str(project_root))):
+                    print(f"⚠️ {provider_key}: pane cwd does not match current project; skipped")
+                    continue
+                if pane_alive:
                     backend.kill_pane(pane_id)
-                elif pane_id and shutil.which("tmux"):
-                    backend = TmuxBackend()
+                    killed = True
+            elif pane_id and shutil.which("tmux"):
+                backend = TmuxBackend()
+                try:
+                    pane_alive = bool(backend.is_alive(str(pane_id)))
+                except Exception:
+                    pane_alive = True
+                cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
+                if pane_alive and callable(cwd_check) and str(pane_id).startswith("%") and not bool(cwd_check(str(pane_id), str(project_root))):
+                    print(f"⚠️ {provider_key}: pane cwd does not match current project; skipped")
+                    continue
+                if pane_alive:
                     if str(pane_id).startswith("%"):
                         backend.kill_pane(str(pane_id))
                     else:
@@ -4301,15 +4746,39 @@ def cmd_kill(args):
                             subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_session}"], stderr=subprocess.DEVNULL)
                         else:
                             backend.kill_pane(str(pane_id))
+                    killed = True
 
-                data["active"] = False
-                data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
-                print(f"✅ {provider.capitalize()} session terminated")
-            except Exception as e:
-                print(f"❌ {provider}: {e}")
-        else:
-            print(f"ℹ️  {provider}: No active session file found")
+            data["active"] = False
+            data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+            try:
+                ccb_session_id = str(data.get("ccb_session_id") or data.get("session_id") or "").strip()
+                if ccb_session_id:
+                    upsert_registry({
+                        "ccb_session_id": ccb_session_id,
+                        "ccb_project_id": data.get("ccb_project_id") or compute_ccb_project_id(project_root),
+                        "work_dir": str(project_root),
+                        "terminal": terminal,
+                        "providers": {
+                            provider_key: {
+                                "pane_id": pane_id or None,
+                                "pane_title_marker": data.get("pane_title_marker"),
+                                "session_file": str(session_file),
+                                "active": False,
+                                "ended_at": data["ended_at"],
+                            }
+                        },
+                    })
+            except Exception:
+                pass
+            suffix = "terminated" if killed else "marked inactive"
+            print(f"✅ {provider_key} session {suffix}")
+        except Exception as e:
+            print(f"❌ {provider_key}: {e}")
+
+    if matched == 0:
+        target = ", ".join(sorted(requested)) if requested else "project"
+        print(f"ℹ️  {target}: No active session file found")
 
     if daemon:
         _shutdown_shared_askd_for_project_kill(Path.cwd())

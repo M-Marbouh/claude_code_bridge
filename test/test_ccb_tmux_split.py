@@ -452,9 +452,109 @@ def _write_codex_resume_fixture(session_file: Path, log_file: Path, *, session_i
     )
 
 
+def _write_codex_log(log_file: Path, *, session_id: str, work_dir: Path) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": session_id, "cwd": str(work_dir)}}) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_claude_resume_fixture(session_file: Path, log_file: Path, *, session_id: str, work_dir: Path, project_id: str) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("{}\n", encoding="utf-8")
+    session_file.write_text(
+        json.dumps(
+            {
+                "active": True,
+                "work_dir": str(work_dir),
+                "work_dir_norm": ccb_mod_normalize_path(str(work_dir)),
+                "ccb_project_id": project_id,
+                "claude_session_id": session_id,
+                "claude_session_path": str(log_file),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def ccb_mod_normalize_path(value: str) -> str:
     ccb = _load_ccb_module()
     return ccb._normalize_path_for_match(value)
+
+
+def test_codex_base_resume_prefers_bound_session_with_instances(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    session_id = "44444444-4444-4444-4444-444444444444"
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}], resume=True)
+    _write_codex_resume_fixture(
+        cfg / ".codex-session",
+        tmp_path / "codex-sessions" / "base.jsonl",
+        session_id=session_id,
+        work_dir=tmp_path.resolve(),
+        project_id=launcher.project_id,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_get_latest_codex_session_id",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("latest fallback should not be used")),
+    )
+
+    cmd = launcher._build_codex_start_cmd()
+
+    assert f"resume {session_id}" in cmd
+
+
+def test_codex_base_resume_with_instances_starts_fresh_when_unbound(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}], resume=True)
+    monkeypatch.setattr(
+        launcher,
+        "_get_latest_codex_session_id",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("latest fallback should not be used")),
+    )
+
+    cmd = launcher._build_codex_start_cmd()
+
+    assert " resume " not in cmd
+
+
+def test_codex_base_latest_fallback_excludes_sibling_bound_sessions(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "codex-root"
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(root))
+    base_id = "55555555-5555-5555-5555-555555555555"
+    worker_id = "66666666-6666-6666-6666-666666666666"
+    base_log = root / "base.jsonl"
+    worker_log = root / "worker.jsonl"
+    _write_codex_log(base_log, session_id=base_id, work_dir=tmp_path.resolve())
+    _write_codex_log(worker_log, session_id=worker_id, work_dir=tmp_path.resolve())
+    os.utime(base_log, (1000, 1000))
+    os.utime(worker_log, (2000, 2000))
+
+    launcher = ccb.AILauncher(providers=["codex"], resume=True)
+    _write_codex_resume_fixture(
+        cfg / ".codex-worker-session",
+        worker_log,
+        session_id=worker_id,
+        work_dir=tmp_path.resolve(),
+        project_id=launcher.project_id,
+    )
+
+    cmd = launcher._build_codex_start_cmd()
+
+    assert f"resume {base_id}" in cmd
+    assert worker_id not in cmd
 
 
 def test_codex_worker_resume_uses_bound_instance_session(monkeypatch, tmp_path: Path) -> None:
@@ -528,6 +628,117 @@ def test_codex_worker_resume_starts_fresh_when_bound_id_missing(monkeypatch, tmp
     cmd = launcher._build_codex_start_cmd("worker")
 
     assert " resume " not in cmd
+
+
+def test_codex_launch_binding_candidate_logic_zero_one_many(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "codex-root"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(root))
+    launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}])
+    session_file = cfg / ".codex-worker-session"
+    session_file.write_text(json.dumps({"active": True, "ccb_project_id": launcher.project_id}), encoding="utf-8")
+
+    snapshot = launcher._snapshot_codex_rollouts()
+    assert launcher._bind_new_codex_session_from_snapshot(snapshot, "worker", timeout_s=0) is False
+    assert "codex_session_id" not in json.loads(session_file.read_text(encoding="utf-8"))
+
+    one_id = "77777777-7777-7777-7777-777777777777"
+    one_log = root / "one.jsonl"
+    _write_codex_log(one_log, session_id=one_id, work_dir=tmp_path.resolve())
+    assert launcher._bind_new_codex_session_from_snapshot(snapshot, "worker", timeout_s=0) is True
+    data = json.loads(session_file.read_text(encoding="utf-8"))
+    assert data["codex_session_id"] == one_id
+    assert data["codex_session_path"] == str(one_log)
+
+    session_file.write_text(json.dumps({"active": True, "ccb_project_id": launcher.project_id}), encoding="utf-8")
+    snapshot = launcher._snapshot_codex_rollouts()
+    _write_codex_log(root / "many-a.jsonl", session_id="88888888-8888-8888-8888-888888888888", work_dir=tmp_path.resolve())
+    _write_codex_log(root / "many-b.jsonl", session_id="99999999-9999-9999-9999-999999999999", work_dir=tmp_path.resolve())
+    assert launcher._bind_new_codex_session_from_snapshot(snapshot, "worker", timeout_s=0) is False
+    assert "codex_session_id" not in json.loads(session_file.read_text(encoding="utf-8"))
+
+
+def test_claude_base_resume_prefers_bound_session_with_instances(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    session_id = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
+    launcher = ccb.AILauncher(providers=["claude"], provider_instances=[{"provider": "claude", "instance": "worker"}], resume=True)
+    monkeypatch.setattr(launcher, "_find_claude_cmd", lambda: "claude")
+    _write_claude_resume_fixture(
+        cfg / ".claude-session",
+        tmp_path / "claude" / f"{session_id}.jsonl",
+        session_id=session_id,
+        work_dir=tmp_path.resolve(),
+        project_id=launcher.project_id,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_get_latest_claude_session_id",
+        lambda: (_ for _ in ()).throw(AssertionError("continue fallback should not be used")),
+    )
+
+    cmd, _, _ = launcher._claude_start_plan()
+
+    assert cmd == ["claude", "--resume", session_id]
+
+
+def test_claude_worker_resume_uses_bound_session(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".ccb"
+    cfg.mkdir(parents=True, exist_ok=True)
+    session_id = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
+    launcher = ccb.AILauncher(providers=["claude"], provider_instances=[{"provider": "claude", "instance": "worker"}], resume=True)
+    monkeypatch.setattr(launcher, "_find_claude_cmd", lambda: "claude")
+    _write_claude_resume_fixture(
+        cfg / ".claude-worker-session",
+        tmp_path / "claude" / f"{session_id}.jsonl",
+        session_id=session_id,
+        work_dir=tmp_path.resolve(),
+        project_id=launcher.project_id,
+    )
+
+    cmd, _, _ = launcher._claude_start_plan("worker")
+
+    assert cmd[:3] == ["claude", "--resume", session_id]
+    assert "--model" in cmd
+
+
+def test_claude_base_with_instances_starts_fresh_when_unbound(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+    launcher = ccb.AILauncher(providers=["claude"], provider_instances=[{"provider": "claude", "instance": "worker"}], resume=True)
+    monkeypatch.setattr(launcher, "_find_claude_cmd", lambda: "claude")
+    monkeypatch.setattr(
+        launcher,
+        "_get_latest_claude_session_id",
+        lambda: (_ for _ in ()).throw(AssertionError("continue fallback should not be used")),
+    )
+
+    cmd, _, _ = launcher._claude_start_plan()
+
+    assert cmd == ["claude"]
+
+
+def test_claude_base_without_instances_keeps_continue_fallback(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
+    launcher = ccb.AILauncher(providers=["claude"], resume=True)
+    monkeypatch.setattr(launcher, "_find_claude_cmd", lambda: "claude")
+    monkeypatch.setattr(launcher, "_get_latest_claude_session_id", lambda: (None, True, tmp_path))
+
+    cmd, run_cwd, _ = launcher._claude_start_plan()
+
+    assert cmd == ["claude", "--continue"]
+    assert run_cwd == str(tmp_path)
 
 
 def test_run_up_backfills_existing_claude_session_work_dir_fields(monkeypatch, tmp_path: Path) -> None:

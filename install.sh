@@ -1169,8 +1169,10 @@ install_settings_permissions() {
   local settings_file="$HOME/.claude/settings.json"
   mkdir -p "$HOME/.claude"
 
+  # NOTE: 'Bash(ask *)' is intentionally NOT auto-allowed. Sending an ask to
+  # another AI is an outward action the user wants to confirm each time; it is
+  # also actively removed below so a re-install self-heals a prior injection.
   local perms_to_add=(
-    'Bash(ask *)'
     'Bash(ccb-ping *)'
     'Bash(pend *)'
   )
@@ -1180,7 +1182,6 @@ install_settings_permissions() {
 {
 	  "permissions": {
 	    "allow": [
-	      "Bash(ask *)",
 	      "Bash(ccb-ping *)",
 	      "Bash(pend *)"
 	    ],
@@ -1195,6 +1196,7 @@ SETTINGS
   # Remove legacy permissions from previous versions
   local perms_to_remove=(
     'Bash(ping *)'
+    'Bash(ask *)'
   )
   for old_perm in "${perms_to_remove[@]}"; do
     if grep -q "$old_perm" "$settings_file" 2>/dev/null; then

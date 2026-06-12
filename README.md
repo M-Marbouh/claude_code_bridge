@@ -128,6 +128,7 @@ The current milestone is `v1.0.0`.
 
 Recently shipped:
 
+- `0.11.5` — removed dead `bin/laskd` + `lib/laskd_daemon.py` (superseded by the unified `askd`; nothing imported or spawned them). The installer already lists them as legacy, so this makes that cleanup effective instead of a no-op.
 - `0.11.4` — installer no longer auto-allows `Bash(ask *)` (sending an ask is an outward action worth confirming) and actively removes a prior injection on re-install, so the confirmation prompt survives deploys.
 - `0.11.3` — default `codex:worker` reasoning effort raised `medium → xhigh` (more WHAT→HOW bridging IQ for bounded implementation; preserves the mini cost tier). Override per project via `ccb.config` `instances`.
 - `0.11.2` — multi-instance session isolation: `ccb kill` now enumerates every project session file (worker instances included, qualified args like `codex:worker` accepted); `ccb -r` resumes each pane from its validated bound session id (launch-time binding + anchor-confirmed repair) instead of latest-by-cwd/`--continue`, so architect/orchestrator no longer inherit a worker's conversation; Codex reader hardened against cross-instance log pickup.
@@ -142,4 +143,4 @@ Planned before `v1.0.0`:
 - Document common Claude + Codex workflows and single-machine Linux examples.
 - Keep the fork's README, changelog, and versioning independent from upstream.
 
-Current pre-release version: `0.11.4`.
+Current pre-release version: `0.11.5`.

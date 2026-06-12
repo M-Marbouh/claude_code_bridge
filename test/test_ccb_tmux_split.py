@@ -364,7 +364,7 @@ def test_codex_start_cmd_applies_worker_policy(monkeypatch, tmp_path: Path) -> N
     cmd = launcher._build_codex_start_cmd("worker")
 
     assert "--model gpt-5.4-mini" in cmd
-    assert "-c model_reasoning_effort='\"medium\"'" in cmd
+    assert "-c model_reasoning_effort='\"xhigh\"'" in cmd
     assert '-c sandbox_mode="workspace-write"' in cmd
 
 
@@ -381,7 +381,7 @@ def test_codex_start_cmd_partial_override_keeps_effort(monkeypatch, tmp_path: Pa
     cmd = launcher._build_codex_start_cmd("worker")
 
     assert "--model gpt-5.4" in cmd
-    assert "-c model_reasoning_effort='\"medium\"'" in cmd
+    assert "-c model_reasoning_effort='\"xhigh\"'" in cmd
 
 
 def test_codex_auto_keeps_danger_sandbox_and_skips_policy_sandbox(monkeypatch, tmp_path: Path) -> None:

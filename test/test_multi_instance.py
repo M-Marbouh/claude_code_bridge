@@ -242,7 +242,7 @@ class TestProviderInstanceDefaults:
         assert policy.provider == "codex"
         assert policy.instance == "worker"
         assert policy.model == "gpt-5.4"
-        assert policy.effort == "medium"
+        assert policy.effort == "xhigh"
         assert policy.sandbox == "workspace-write"
 
 

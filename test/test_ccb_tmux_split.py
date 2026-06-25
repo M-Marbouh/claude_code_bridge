@@ -355,7 +355,7 @@ def test_codex_start_cmd_applies_main_policy_when_codex_instance_configured(monk
     assert "danger-full-access" not in cmd
 
 
-def test_codex_start_cmd_applies_worker_policy(monkeypatch, tmp_path: Path) -> None:
+def test_codex_start_cmd_worker_no_default_policy(monkeypatch, tmp_path: Path) -> None:
     ccb = _load_ccb_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
@@ -363,9 +363,9 @@ def test_codex_start_cmd_applies_worker_policy(monkeypatch, tmp_path: Path) -> N
     launcher = ccb.AILauncher(providers=["codex"], provider_instances=[{"provider": "codex", "instance": "worker"}])
     cmd = launcher._build_codex_start_cmd("worker")
 
-    assert "--model gpt-5.4-mini" in cmd
-    assert "-c model_reasoning_effort='\"xhigh\"'" in cmd
-    assert '-c sandbox_mode="workspace-write"' in cmd
+    assert "--model" not in cmd
+    assert "model_reasoning_effort" not in cmd
+    assert "sandbox_mode" not in cmd
 
 
 def test_codex_start_cmd_partial_override_keeps_effort(monkeypatch, tmp_path: Path) -> None:
@@ -381,7 +381,7 @@ def test_codex_start_cmd_partial_override_keeps_effort(monkeypatch, tmp_path: Pa
     cmd = launcher._build_codex_start_cmd("worker")
 
     assert "--model gpt-5.4" in cmd
-    assert "-c model_reasoning_effort='\"xhigh\"'" in cmd
+    assert "model_reasoning_effort" not in cmd
 
 
 def test_codex_auto_keeps_danger_sandbox_and_skips_policy_sandbox(monkeypatch, tmp_path: Path) -> None:
@@ -428,7 +428,7 @@ def test_claude_worker_start_plan_applies_haiku_without_pinning_main(monkeypatch
     worker_cmd, _, _ = launcher._claude_start_plan("worker")
 
     assert main_cmd == ["claude"]
-    assert worker_cmd == ["claude", "--model", "haiku"]
+    assert worker_cmd == ["claude"]
 
 
 def _write_codex_resume_fixture(session_file: Path, log_file: Path, *, session_id: str, work_dir: Path, project_id: str) -> None:
@@ -707,7 +707,6 @@ def test_claude_worker_resume_uses_bound_session(monkeypatch, tmp_path: Path) ->
     cmd, _, _ = launcher._claude_start_plan("worker")
 
     assert cmd[:3] == ["claude", "--resume", session_id]
-    assert "--model" in cmd
 
 
 def test_claude_base_with_instances_starts_fresh_when_unbound(monkeypatch, tmp_path: Path) -> None:

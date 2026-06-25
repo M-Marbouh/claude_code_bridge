@@ -242,8 +242,8 @@ class TestProviderInstanceDefaults:
         assert policy.provider == "codex"
         assert policy.instance == "worker"
         assert policy.model == "gpt-5.4"
-        assert policy.effort == "xhigh"
-        assert policy.sandbox == "workspace-write"
+        assert policy.effort is None
+        assert policy.sandbox is None
 
 
 # ── Session module instance support ────────────────────────────────────────

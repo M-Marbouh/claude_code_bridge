@@ -23,14 +23,6 @@ _DEFAULT_POLICIES: dict[str, dict[str, object]] = {
         "effort": "xhigh",
         "sandbox": "workspace-write",
     },
-    "codex:worker": {
-        "model": "gpt-5.4-mini",
-        "effort": "xhigh",
-        "sandbox": "workspace-write",
-    },
-    "claude:worker": {
-        "model": "haiku",
-    },
 }
 
 

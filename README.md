@@ -128,6 +128,7 @@ The current milestone is `v1.0.0`.
 
 Recently shipped:
 
+- `0.11.6` — removed built-in `codex:worker` and `claude:worker` default policies; worker pane model/effort now opt-in via project `ccb.config` instance overrides.
 - `0.11.5` — removed dead `bin/laskd` + `lib/laskd_daemon.py` (superseded by the unified `askd`; nothing imported or spawned them). The installer already lists them as legacy, so this makes that cleanup effective instead of a no-op.
 - `0.11.4` — installer no longer auto-allows `Bash(ask *)` (sending an ask is an outward action worth confirming) and actively removes a prior injection on re-install, so the confirmation prompt survives deploys.
 - `0.11.3` — default `codex:worker` reasoning effort raised `medium → xhigh` (more WHAT→HOW bridging IQ for bounded implementation; preserves the mini cost tier). Override per project via `ccb.config` `instances`.

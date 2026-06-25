@@ -50,8 +50,8 @@ The live install is copied to `~/.local/share/codex-dual/`. Make source changes 
 
 This fork diverges from upstream v5 in a few practical areas:
 
-- **Runtime mount-awareness + honest tag routing (new in `0.11.0`)**: `ccb-list` and `ccb-mounted` report each *qualified* provider's real state (capable / configured / mounted), so a session can't mistake "not mounted here" for "feature not installed." `ask` understands a leading `[WORKER]` / `[ARCHITECT]` tag and routes to the cheap worker or the architect instance — and if that instance isn't mounted it fails loudly with a structured `CCB_ROUTE_ERROR` instead of silently running on the base model (opt-in fallback prints `CCB_ROUTE_FALLBACK`).
-- **Multi-instance, model-tiered providers (new in `0.10.0`)**: run a second pane of the same provider on a cheaper model — `codex:worker` (gpt-5.4-mini) for edit application and tests, `claude:worker` (Haiku) for memory and changelog/doc chores — while the architect/orchestrator panes stay on the strong model. Each instance gets its own session, resume, and pane; `CCB_CODEX_SHOW_TIER=1` prints the live model/effort so you can confirm the tier.
+- **Runtime mount-awareness (new in `0.11.0`)**: `ccb-list` and `ccb-mounted` report each qualified provider's real state (capable / configured / mounted). `ask codex:worker` routes to that instance if mounted and fails loudly with `CCB_ROUTE_ERROR` if not — no silent base fallback.
+- **Multi-instance providers (new in `0.10.0`)**: run a second pane of the same provider (`codex:worker`, `claude:worker`) with its own session, resume, and pane. Configure in `.claude/ccb.config`; no built-in model defaults — supply `instances` overrides in `ccb.config` if needed. `CCB_CODEX_SHOW_TIER=1` prints the live model/effort.
 - Gemini `CCB_DONE` handling is hardened for replies that omit or misplace completion markers.
 - Self-update URLs point at the `M-Marbouh/claude_code_bridge` fork.
 - `ccb-list` lists active local CCB projects and provider pane liveness.

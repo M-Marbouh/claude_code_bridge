@@ -1567,7 +1567,7 @@ install_all() {
   else
     echo "   Global CLAUDE.md configured with CCB collaboration rules (inline)"
   fi
-  echo "   AGENTS.md configured with review rubrics"
+  echo "   AGENTS.md configured with Mutual Ratification protocol"
   echo "   .clinerules configured with role assignments"
   echo "   Global settings.json permissions added"
 }

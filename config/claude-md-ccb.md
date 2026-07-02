@@ -25,27 +25,31 @@ Abstract roles map to concrete AI providers. Skills reference roles, not provide
 |------|----------|-------------|
 | `designer` | `claude` | Primary planner and architect — owns plans and designs |
 | `inspiration` | `gemini` | Creative brainstorming — provides ideas as reference only (unreliable, never blindly follow) |
-| `reviewer` | `codex` | Scored quality gate — evaluates plans/code using Rubrics |
+| `reviewer` | `codex` | Ratification gate — verdicts (concur/amend/contest) on proposals and implementations |
 | `executor` | `claude` | Code implementation — writes and modifies code |
 
 To change a role assignment, edit the Provider column above.
 When a skill references a role (e.g. `reviewer`), resolve it to the provider listed here (e.g. `/ask codex`).
 <!-- CCB_ROLES_END -->
 
-<!-- CODEX_REVIEW_START -->
-## Peer Review Framework
+<!-- MUTUAL_RATIFICATION_START -->
+## Mutual Ratification
 
-The `designer` MUST send to `reviewer` (via `/ask`) at two checkpoints:
-1. **Plan Review** — after finalizing a plan, BEFORE writing code. Tag: `[PLAN REVIEW REQUEST]`.
-2. **Code Review** — after completing code changes, BEFORE reporting done. Tag: `[CODE REVIEW REQUEST]`.
+Principle: the `designer`'s inspection/review conclusions are PROPOSALS, not directives. Applies to substantive/high-impact work; trivial edits keep a fast path.
 
-Include the full plan or `git diff` between `--- PLAN START/END ---` or `--- CHANGES START/END ---` delimiters.
-The `reviewer` scores using Rubrics defined in `AGENTS.md` and returns JSON.
+1. **Propose** — `designer`: claim + evidence + intended action (a concrete diagnosis, not broad exploration notes).
+2. **Ratify** — `reviewer` verdict: concur / concur-with-amendment / contest / insufficient-evidence.
+3. **Act** — `reviewer` (engaged via `/ask codex`, see the `delegate` skill) implements only ratified work.
+4. **Validate** — `designer` reviews the result. HIGH-RISK diffs get an independent Opus subagent (fresh eyes) given the diff + agreed plan + success criteria. High-risk = schema/contract, auth/security, prompt behavior, cross-service, migrations, prod workflows, broad frontend state. Ordinary low-risk multi-file changes get `designer` review alone.
+5. **Ratify Fixes** — `designer` findings are PROPOSALS; `reviewer` verdict: accept / "valid issue, different fix" / "not a bug because…" / "needs plan adjustment". Never conclude-and-direct.
+6. **Escalate** — material disagreement surviving one clarification round → `/debate`, with both evidence sets, forced to an outcome (choose `designer`'s plan / choose `reviewer`'s plan / run a small verification experiment / defer).
 
-**Pass criteria**: overall >= 7.0 AND no single dimension <= 3.
-**On fail**: fix issues from response, re-submit (max 3 rounds). After 3 failures, present results to user.
-**On pass**: display final scores as a summary table.
-<!-- CODEX_REVIEW_END -->
+Guardrails:
+- **Ceremony-light default**: claim/evidence/action ↔ concur/contest/amend; proceed unless disagreement is MATERIAL. No heavier templates unless high-impact.
+- **Stale evidence**: ratification binds to the evidence snapshot; material code drift REOPENS step 2 or 5.
+- **Ownership**: `designer` still owns synthesis and final integration, SUBJECT TO ratification at steps 2 and 5.
+- **Layering** (not merged): `delegate` (briefs) → Mutual Ratification (light, always-on for substantive work) → `/debate` (escalation only) → validate/review mechanics (Opus subagent for high-risk).
+<!-- MUTUAL_RATIFICATION_END -->
 
 <!-- GEMINI_INSPIRATION_START -->
 ## Inspiration Consultation

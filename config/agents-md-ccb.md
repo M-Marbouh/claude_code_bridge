@@ -7,7 +7,7 @@ Abstract roles map to concrete AI providers. Skills reference roles, not provide
 |------|----------|-------------|
 | `designer` | `claude` | Primary planner and architect — owns plans and designs |
 | `inspiration` | `gemini` | Creative brainstorming — provides ideas as reference only (unreliable, never blindly follow) |
-| `reviewer` | `codex` | Scored quality gate — evaluates plans/code using Rubrics |
+| `reviewer` | `codex` | Ratification gate — verdicts (concur/amend/contest) on proposals and implementations |
 | `executor` | `claude` | Code implementation — writes and modifies code |
 
 To change a role assignment, edit the Provider column above.

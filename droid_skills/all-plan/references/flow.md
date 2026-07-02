@@ -7,7 +7,7 @@ Planning skill using abstract roles defined in CLAUDE.md Role Assignment table.
 **Roles used by this skill** (resolve to providers via CLAUDE.md `CCB_ROLES`):
 - `designer` — Primary planner, owns the plan from start to finish
 - `inspiration` — Creative brainstorming consultant (unreliable, use with judgment)
-- `reviewer` — Scored quality gate, evaluates the plan using Rubric A (must pass >= 7.0)
+- `reviewer` — Ratification gate, verdicts the plan as concur / concur-with-amendment / contest / insufficient-evidence
 
 ---
 
@@ -312,56 +312,24 @@ Save as `plan_draft_v1`.
 
 ---
 
-### Phase 4: Scored Review
+### Phase 4: Ratification
 
-Submit the plan to `reviewer` for scored review using Rubric A (defined in CLAUDE.md).
+Submit the plan to `reviewer` for ratification per the Mutual Ratification protocol (defined in CLAUDE.md). The plan is a proposal, not a directive — `reviewer` verifies it and returns a verdict, not a score.
 
-**4.1 Submit Plan for Review**
+**4.1 Submit Plan for Ratification**
 
 Send to `reviewer` (via `/ask`):
 
 ```
-[PLAN REVIEW REQUEST]
-Review the following implementation plan using Rubric A. Score EACH dimension individually with detailed feedback.
-Return your response as JSON with this exact structure:
-{
-  "review_type": "plan",
-  "dimensions": {
-    "clarity": {
-      "score": N,
-      "strengths": ["..."],
-      "weaknesses": ["..."],
-      "fix": "specific action to improve"
-    },
-    "completeness": {
-      "score": N,
-      "strengths": ["..."],
-      "weaknesses": ["..."],
-      "fix": "specific action to improve"
-    },
-    "feasibility": {
-      "score": N,
-      "strengths": ["..."],
-      "weaknesses": ["..."],
-      "fix": "specific action to improve"
-    },
-    "risk_assessment": {
-      "score": N,
-      "strengths": ["..."],
-      "weaknesses": ["..."],
-      "fix": "specific action to improve"
-    },
-    "requirement_alignment": {
-      "score": N,
-      "strengths": ["..."],
-      "weaknesses": ["..."],
-      "fix": "specific action to improve"
-    }
-  },
-  "overall": N.N,
-  "critical_issues": ["..."],
-  "summary": "one-paragraph overall assessment"
-}
+[PLAN PROPOSAL]
+This plan is a proposal, not a directive. Verify the claim (stated goal), the evidence (approach, risks, acceptance criteria), and the intended action (the steps). Return one verdict:
+
+- concur — proceed as written
+- concur-with-amendment — proceed, but apply the listed amendments
+- contest — do not proceed; state what's wrong and what's missing
+- insufficient-evidence — cannot judge; state what's needed
+
+Respond in plain text: **Verdict**, a short justification (what you checked, why), and amendments/issues as a bullet list if the verdict isn't a clean concur.
 
 --- PLAN START ---
 [plan_draft_v1]
@@ -370,50 +338,43 @@ Return your response as JSON with this exact structure:
 
 **4.2 Parse and Judge**
 
-After receiving the `reviewer`'s JSON response:
+After receiving the `reviewer`'s verdict:
 
 ```
 iteration = 1
 
 CHECK:
-  - If overall >= 7.0 AND no single dimension score <= 3 → PASS
-  - Otherwise → FAIL
+  - concur → PASS
+  - concur-with-amendment → PASS, apply amendments to the plan before saving
+  - contest OR insufficient-evidence → FAIL
 ```
 
-**4.3 Auto-Correction Loop (on FAIL)**
+**4.3 Revise-and-Reratify Loop (on FAIL)**
 
 ```
 WHILE result == FAIL AND iteration <= 3:
-  1. Read each dimension's weaknesses and fix suggestions
-  2. Read critical_issues list
-  3. Revise plan_draft to address ALL issues
-  4. Save as plan_draft_v{iteration+1}
-  5. Re-submit to `reviewer` via /ask (same template)
-  6. iteration += 1
-  7. Re-check PASS/FAIL
+  1. Read the reviewer's stated issues (contest) or missing evidence (insufficient-evidence)
+  2. Revise plan_draft to address them
+  3. Save as plan_draft_v{iteration+1}
+  4. Re-submit to `reviewer` via /ask (same template)
+  5. iteration += 1
+  6. Re-check PASS/FAIL
 
 IF iteration > 3 AND still FAIL:
-  Present all review rounds to user
-  Ask: "Review did not pass after 3 rounds. How would you like to proceed?"
+  Present all rounds and the standing disagreement to user
+  Ask: "Ratification did not pass after 3 rounds. Escalate via /debate, or how would you like to proceed?"
 ```
 
-**4.4 Display Score Summary (on PASS)**
+**4.4 Display Verdict (on PASS)**
 
 ```
-REVIEW: PASSED (Round [N])
+RATIFICATION: [CONCUR / CONCUR-WITH-AMENDMENT] (Round [N])
 =================================
-| Dimension             | Score | Weight | Weighted |
-|-----------------------|-------|--------|----------|
-| Clarity               | X/10  | 20%    | X.XX     |
-| Completeness          | X/10  | 25%    | X.XX     |
-| Feasibility           | X/10  | 25%    | X.XX     |
-| Risk Assessment       | X/10  | 15%    | X.XX     |
-| Requirement Alignment | X/10  | 15%    | X.XX     |
-|-----------------------|-------|--------|----------|
-| OVERALL               |       |        | X.XX/10  |
+Verdict: [reviewer's verdict]
+Justification: [reviewer's justification]
 
-Key Strengths:
-- [from `reviewer` response]
+Amendments applied (if any):
+- [amendment 1]
 
 Addressed Issues:
 - [issues fixed during iteration, if any]
@@ -541,18 +502,15 @@ Finish the plan document with credits and appendix:
 
 ---
 
-## Review Summary
+## Ratification Summary
 
-| Dimension | Score |
-|-----------|-------|
-| Clarity | X/10 |
-| Completeness | X/10 |
-| Feasibility | X/10 |
-| Risk Assessment | X/10 |
-| Requirement Alignment | X/10 |
-| **Overall** | **X.XX/10** |
+Verdict: [concur / concur-with-amendment]
+Round: [N]
 
-Review rounds: [N]
+Justification: [reviewer's justification]
+
+Amendments applied:
+- [amendment, if any]
 
 ---
 
@@ -583,7 +541,7 @@ Summary:
 - Steps: [N] implementation steps
 - Risks: [N] identified with mitigations
 - Readiness: [X]/100
-- Review Score: [X.XX]/10 (round [N])
+- Ratification: [verdict] (round [N])
 - Inspiration Ideas: [N] adopted, [N] adapted, [N] discarded
 
 Next: Review the plan and proceed with implementation when ready.
@@ -598,8 +556,8 @@ Next: Review the plan and proceed with implementation when ready.
 3. **Readiness Scoring**: Quantify requirement completeness before proceeding
 4. **`inspiration` for Ideas Only**: Leverage creativity but never blindly follow it
 5. **User Controls Inspiration**: User decides which ideas to adopt/discard
-6. **`reviewer` as Quality Gate**: Plan must pass Rubric A (>= 7.0) before proceeding
-7. **Dimension-Level Feedback**: The `reviewer` scores each dimension individually with actionable fixes
+6. **`reviewer` as Ratification Gate**: Plan must be ratified (concur or concur-with-amendment) before proceeding
+7. **Proposal, Not Directive**: The plan is submitted for the `reviewer` to verify, not a fait accompli — see Mutual Ratification in CLAUDE.md
 8. **Auto-Correction with Limits**: Max 3 review rounds; escalate to user if still failing
 9. **Concrete Deliverables**: Output actionable plan document, not just discussion notes
 10. **Research When Needed**: Use WebSearch for external knowledge when applicable

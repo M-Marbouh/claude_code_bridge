@@ -20,7 +20,7 @@ Example:
 1. **Requirement Clarification** - 5-Dimension readiness model, structured Q&A
 2. **Inspiration Brainstorming** - Creative ideas from `inspiration` (reference only)
 3. **Design** - `designer` creates the full plan, integrating adopted ideas
-4. **Scored Review** - `reviewer` scores using Rubric A (must pass >= 7.0)
+4. **Ratification** - `reviewer` verdicts the plan (concur / concur-with-amendment / contest / insufficient-evidence)
 5. **Final Output** - Actionable plan saved to `plans/` directory
 
 ## Roles Used
@@ -29,7 +29,7 @@ Example:
 |------|---------------|
 | `designer` | Primary planner, owns the plan |
 | `inspiration` | Creative consultant (unreliable, user decides) |
-| `reviewer` | Quality gate (Rubric A, per-dimension scoring) |
+| `reviewer` | Ratification gate (concur/amend/contest, see Mutual Ratification in CLAUDE.md) |
 
 Roles resolve to providers via CLAUDE.md `CCB_ROLES` table.
 
@@ -37,7 +37,7 @@ Roles resolve to providers via CLAUDE.md `CCB_ROLES` table.
 
 - **Structured Clarification**: 5-Dimension readiness scoring (100 pts)
 - **Inspiration Filter**: Adopt / Adapt / Discard with user approval
-- **Scored Quality Gate**: Dimension-level scoring, auto-correction (max 3 rounds)
+- **Ratification Gate**: Concur/amend/contest verdict, revise-and-reratify loop (max 3 rounds)
 - **Optional Web Research**: Triggered when requirements depend on external info
 
 ## When to Use
@@ -52,5 +52,5 @@ A comprehensive plan including:
 - Goal and architecture with rationale
 - Implementation steps with dependencies
 - Risk management matrix
-- Review scores (per-dimension)
+- Ratification verdict and justification
 - Inspiration credits (adopted/adapted/discarded)

@@ -128,6 +128,7 @@ The current milestone is `v1.0.0`.
 
 Recently shipped:
 
+- `0.11.8` — finished the Mutual Ratification rollout: retired the orphaned scored-Rubric templates in `config/agents-md-ccb.md`'s AGENTS.md block, and migrated the `all-plan` skill (all three provider copies) from dimension-scored review to ratification verdicts (concur/concur-with-amendment/contest/insufficient-evidence).
 - `0.11.7` — retired the scored "Peer Review Framework" for **Mutual Ratification**: Claude's inspection/review conclusions are proposals (claim + evidence + intended action), not directives, and Codex ratifies (concur/amend/contest) before acting and before fixes land. Wired into the `delegate` skill's briefing standard.
 - `0.11.6` — removed built-in `codex:worker` and `claude:worker` default policies; worker pane model/effort now opt-in via project `ccb.config` instance overrides.
 - `0.11.5` — removed dead `bin/laskd` + `lib/laskd_daemon.py` (superseded by the unified `askd`; nothing imported or spawned them). The installer already lists them as legacy, so this makes that cleanup effective instead of a no-op.
@@ -145,4 +146,4 @@ Planned before `v1.0.0`:
 - Document common Claude + Codex workflows and single-machine Linux examples.
 - Keep the fork's README, changelog, and versioning independent from upstream.
 
-Current pre-release version: `0.11.7`.
+Current pre-release version: `0.11.8`.

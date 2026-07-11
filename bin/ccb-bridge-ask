@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -20,6 +21,8 @@ from askd_runtime import run_dir, state_file_path
 from compat import read_stdin_text, setup_windows_encoding
 
 setup_windows_encoding()
+
+PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def _write_background_status(line: str) -> None:
@@ -130,6 +133,7 @@ def _send_to_daemon(
     sender_work_dir: str,
     intent: str,
     peer_task_id: str,
+    reply_to: str,
 ) -> tuple[int, str, dict[str, Any]]:
     state = askd_rpc.read_state(state_file_path("askd.json"))
     if not state:
@@ -141,7 +145,7 @@ def _send_to_daemon(
     except Exception as exc:
         raise RuntimeError("Invalid askd state") from exc
 
-    message_for_target = _append_peer_context(message, sender_work_dir, intent, peer_task_id)
+    message_for_target = _append_peer_context(message, sender_work_dir, intent, peer_task_id, reply_to)
 
     req = {
         "type": "ask.request",
@@ -185,13 +189,21 @@ def _send_to_daemon(
     return int(resp.get("exit_code") or 0), str(resp.get("reply") or ""), meta
 
 
-def _append_peer_context(message: str, sender_work_dir: str, intent: str, peer_task_id: str = "") -> str:
+def _append_peer_context(
+    message: str,
+    sender_work_dir: str,
+    intent: str,
+    peer_task_id: str = "",
+    reply_to: str = "",
+) -> str:
     sender = str(sender_work_dir or "").strip()
     body = (message or "").rstrip()
     mode = intent if intent in {"wait", "background", "notify"} else "wait"
     metadata = [f"CCB_PEER_INTENT: {mode}"]
     if peer_task_id:
         metadata.append(f"CCB_PEER_TASK_ID: {peer_task_id}")
+    if reply_to:
+        metadata.append(f"CCB_PEER_REPLY_TO: {reply_to}")
     if mode == "notify":
         metadata.append("CCB_REPLY_EXPECTED: no")
     elif sender:
@@ -220,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sender-work-dir", default=os.environ.get("CCB_WORK_DIR", os.getcwd()), help=argparse.SUPPRESS)
     parser.add_argument("--intent", choices=("wait", "background", "notify"), default="wait", help=argparse.SUPPRESS)
     parser.add_argument("--peer-task-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--reply-to", default="", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
 
@@ -228,6 +241,12 @@ def main(argv: list[str] | None = None) -> int:
         message = read_stdin_text().strip()
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
+        return 1
+    if args.intent == "notify" and message.rstrip().endswith("?"):
+        print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
+        return 1
+    if args.reply_to and not PEER_CORRELATION_ID_RE.fullmatch(str(args.reply_to)):
+        print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
         return 1
 
     try:
@@ -249,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.sender_work_dir or ""),
                 str(args.intent or "wait"),
                 str(args.peer_task_id or ""),
+                str(args.reply_to or ""),
             )
         finally:
             try:

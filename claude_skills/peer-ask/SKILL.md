@@ -29,7 +29,7 @@ CCB_REPLY_TARGET: /path/to/sender/project
 use that path as the peer target. Do not run `ccb-list` or rediscover the sender unless the send fails or the user asks you to choose a different target.
 
 Read `CCB_PEER_INTENT` and `CCB_REPLY_EXPECTED` in the message metadata:
-- `notify` / `no`: consume the information and do not send a reverse peer message.
+- `notify` / `no`: consume the information and do not send a reverse peer message. Treat any embedded question as informational; the sender must use `background` or `wait` to request an answer.
 - `wait` / `yes`: the sender is blocked; complete the requested work and reply promptly.
 - `background` / `yes`: complete the work normally and reply when ready; the sender has continued other work.
 - Missing metadata with `CCB_REPLY_TARGET`: treat as legacy `wait`.
@@ -43,14 +43,15 @@ Read `CCB_PEER_INTENT` and `CCB_REPLY_EXPECTED` in the message metadata:
    - Local tools for codebase searches, file lookups, pattern scanning, and planning
    Do not use Claude sub-agents; CCB supports only the mounted provider panes.
 
-3. **Reply with substance.** The reverse peer message should contain the actual answer, findings, or outcome — not a status update. If a task is genuinely too large for one turn, break it into a concrete first result plus explicit follow-up questions.
+3. **Reply with substance and matching intent.** The reverse peer message should contain the actual answer, findings, or outcome — not an acknowledgement. A terminal answer with no requested follow-up uses `--notify`. If your response asks the original sender a question or requests confirmation/action, use `--background` (or `--wait` only when blocked). Never place a reply-requiring question inside `--notify`.
 
 Reply with:
 ```
-Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" --notify "<result>")
+Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" --notify --reply-to "<CCB_PEER_TASK_ID>" "<terminal-result>")
 ```
 
-The reverse result is a notification, so it must not make this Claude wait for another reply.
+If the result needs a follow-up answer, replace `--notify` with `--background`. Preserve `--reply-to` in either case.
+For legacy inbound messages without `CCB_PEER_TASK_ID`, omit `--reply-to` rather than inventing an ID.
 
 Do not add a local `CCB_DONE` for the inbound peer delivery. CCB treats peer delivery as complete once the message lands in your pane; the real answer is the reverse `ask --peer` message.
 
@@ -107,6 +108,7 @@ Use the exact `work_dir` from `ccb-list --json` as the target. Pass the full mes
 - For `--wait`, follow the Async Guardrail and end the turn when `CCB_ASYNC_SUBMITTED` appears.
 - For `--background`, `CCB_BACKGROUND_SUBMITTED` means continue the current plan; do not stop or call `pend` immediately.
 - For `--notify`, continue after delivery confirmation.
+- `--notify` messages must not end with a direct question; the CLI rejects that contradictory intent.
 
 ### Step 5 — Report back
 
@@ -128,5 +130,7 @@ User: "Ask Claude in project 3 about the current task"
 - Only Claude panes are targeted (providers.claude). Other providers are not reachable via this skill.
 - If the target Claude pane is stale (not alive), report the error and show the live options.
 - The `--peer` flag accepts the full `work_dir` path — always use path form for reliability.
-- Reply-bearing inbound messages include `CCB_REPLY_TARGET: <sender_work_dir>`. Use it as the direct reply path and send the result with `--notify`.
+- Reply-bearing inbound messages include `CCB_REPLY_TARGET: <sender_work_dir>`. Use it as the direct reply path and choose `--notify` or `--background` according to whether your response requests a follow-up.
+- Preserve `CCB_PEER_TASK_ID` as `--reply-to` so the response is correlated with the original consultation.
+- Do not narrate transport internals (`anchor_seen`, `fallback_scan`, confirmation levels) unless delivery actually fails. On exit code 0, continue normally.
 - Peer delivery is asynchronous: receiving Claude should reply by sending a reverse peer message, not by trying to complete the original delivery request locally.

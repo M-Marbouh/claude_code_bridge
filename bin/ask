@@ -80,6 +80,7 @@ CALLER_ENV_HINTS = {
 }
 
 _REMOVED_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGNORECASE)
+_PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
 
@@ -524,6 +525,7 @@ def _usage() -> None:
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
     print("  --peer TARGET           Send to Claude in another CCB project", file=sys.stderr)
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
+    print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
 
 
 def _peer_caller_pane_info() -> tuple[str, str]:
@@ -535,6 +537,15 @@ def _peer_caller_pane_info() -> tuple[str, str]:
     return pane_id or detected_pane_id, terminal or detected_terminal
 
 
+def _notify_requests_reply(message: str) -> bool:
+    """Reject the clearest contradictory intent: a notification ending in a question."""
+    return (message or "").rstrip().endswith("?")
+
+
+def _valid_peer_correlation_id(value: str) -> bool:
+    return not value or _PEER_CORRELATION_ID_RE.fullmatch(value) is not None
+
+
 def _peer_bridge_cmd(
     peer_target: str,
     timeout: float,
@@ -543,6 +554,7 @@ def _peer_bridge_cmd(
     sender_work_dir: str,
     intent: str,
     task_id: str = "",
+    reply_to: str = "",
 ) -> list[str]:
     bridge_cmd = Path(__file__).resolve().parent / "ccb-bridge-ask"
     cmd = [
@@ -563,13 +575,30 @@ def _peer_bridge_cmd(
     ]
     if task_id:
         cmd.extend(["--peer-task-id", task_id])
+    if reply_to:
+        cmd.extend(["--reply-to", reply_to])
     return cmd
 
 
-def _run_peer_bridge_foreground(peer_target: str, timeout: float, message: str, caller: str, intent: str) -> int:
+def _run_peer_bridge_foreground(
+    peer_target: str,
+    timeout: float,
+    message: str,
+    caller: str,
+    intent: str,
+    reply_to: str,
+) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir = os.getcwd()
-    cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal, sender_work_dir, intent)
+    cmd = _peer_bridge_cmd(
+        peer_target,
+        timeout,
+        caller_pane_id,
+        caller_terminal,
+        sender_work_dir,
+        intent,
+        reply_to=reply_to,
+    )
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
     env["CCB_WORK_DIR"] = sender_work_dir
@@ -585,7 +614,14 @@ def _run_peer_bridge_foreground(peer_target: str, timeout: float, message: str, 
         return EXIT_ERROR
 
 
-def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, caller: str, intent: str) -> int:
+def _run_peer_bridge_background(
+    peer_target: str,
+    timeout: float,
+    message: str,
+    caller: str,
+    intent: str,
+    reply_to: str,
+) -> int:
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -612,6 +648,7 @@ def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, 
         sender_work_dir,
         intent,
         task_id,
+        reply_to,
     )
     env = os.environ.copy()
     env["CCB_REQ_ID"] = task_id
@@ -664,11 +701,18 @@ def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, 
     return EXIT_OK
 
 
-def _run_peer_bridge(peer_target: str, timeout: float, message: str, foreground_mode: bool, intent: str) -> int:
+def _run_peer_bridge(
+    peer_target: str,
+    timeout: float,
+    message: str,
+    foreground_mode: bool,
+    intent: str,
+    reply_to: str = "",
+) -> int:
     caller = _require_caller()
     if foreground_mode:
-        return _run_peer_bridge_foreground(peer_target, timeout, message, caller, intent)
-    return _run_peer_bridge_background(peer_target, timeout, message, caller, intent)
+        return _run_peer_bridge_foreground(peer_target, timeout, message, caller, intent, reply_to)
+    return _run_peer_bridge_background(peer_target, timeout, message, caller, intent, reply_to)
 
 
 def _handle_peer_mode(argv: list[str]) -> int:
@@ -676,6 +720,7 @@ def _handle_peer_mode(argv: list[str]) -> int:
     peer_target = ""
     foreground_mode = _default_foreground()
     peer_intent = "wait"
+    peer_reply_to = ""
     parts: list[str] = []
 
     it = iter(argv)
@@ -698,6 +743,13 @@ def _handle_peer_mode(argv: list[str]) -> int:
                 return EXIT_ERROR
             except ValueError:
                 print("[ERROR] --timeout must be a number", file=sys.stderr)
+                return EXIT_ERROR
+            continue
+        if token == "--reply-to":
+            try:
+                peer_reply_to = next(it)
+            except StopIteration:
+                print("[ERROR] --reply-to requires a task ID", file=sys.stderr)
                 return EXIT_ERROR
             continue
         if token == "--foreground":
@@ -726,7 +778,13 @@ def _handle_peer_mode(argv: list[str]) -> int:
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
-    return _run_peer_bridge(peer_target, timeout, message, foreground_mode, peer_intent)
+    if not _valid_peer_correlation_id(peer_reply_to):
+        print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
+        return EXIT_ERROR
+    if peer_intent == "notify" and _notify_requests_reply(message):
+        print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
+        return EXIT_ERROR
+    return _run_peer_bridge(peer_target, timeout, message, foreground_mode, peer_intent, peer_reply_to)
 
 
 def main(argv: list[str]) -> int:
@@ -763,6 +821,7 @@ def main(argv: list[str]) -> int:
     peer_target = ""
     foreground_mode = _default_foreground()
     peer_intent = "wait"
+    peer_reply_to = ""
     parts: list[str] = []
 
     it = iter(argv[2:])
@@ -778,6 +837,13 @@ def main(argv: list[str]) -> int:
                 return EXIT_ERROR
             except ValueError:
                 print("[ERROR] --timeout must be a number", file=sys.stderr)
+                return EXIT_ERROR
+            continue
+        if token == "--reply-to":
+            try:
+                peer_reply_to = next(it)
+            except StopIteration:
+                print("[ERROR] --reply-to requires a task ID", file=sys.stderr)
                 return EXIT_ERROR
             continue
         if token == "--notify":
@@ -813,6 +879,9 @@ def main(argv: list[str]) -> int:
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
+    if not _valid_peer_correlation_id(peer_reply_to):
+        print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
+        return EXIT_ERROR
 
     if _REMOVED_ROUTE_TAG_RE.match(message):
         print("[ERROR] [WORKER]/[ARCHITECT] routing tags are no longer supported", file=sys.stderr)
@@ -821,7 +890,10 @@ def main(argv: list[str]) -> int:
     if peer_target:
         if peer_intent == "notify":
             foreground_mode = True
-        return _run_peer_bridge(peer_target, timeout, message, foreground_mode, peer_intent)
+            if _notify_requests_reply(message):
+                print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
+                return EXIT_ERROR
+        return _run_peer_bridge(peer_target, timeout, message, foreground_mode, peer_intent, peer_reply_to)
 
     if not notify_mode:
         if _use_unified_daemon():

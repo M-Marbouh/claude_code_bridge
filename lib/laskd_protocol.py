@@ -152,8 +152,9 @@ def wrap_claude_delivery_prompt(message: str, req_id: str) -> str:
         f"{message}\n\n"
         "This is an asynchronous peer message delivered by CCB.\n"
         "Read CCB_PEER_INTENT and CCB_REPLY_EXPECTED in the message.\n"
-        "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message.\n"
-        "If a reply is expected, use CCB_REPLY_TARGET and send the completed result with ask --peer --notify.\n"
+        "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message; embedded questions are informational.\n"
+        "If a reply is expected, preserve CCB_PEER_TASK_ID as --reply-to. Use ask --peer --notify only for a terminal result with no follow-up question; otherwise use --background.\n"
+        "Do not narrate CCB transport markers or confirmation diagnostics to the user unless delivery fails.\n"
         "Do not wait to produce a local CCB_DONE for this delivery.\n"
     )
 

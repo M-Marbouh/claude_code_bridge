@@ -6,6 +6,8 @@
 
 - Added explicit `--wait`, `--background`, and `--notify` intent for cross-project Claude messages.
 - Made background peer consultations non-blocking and reverse peer results one-way, preventing unrelated plans from being abandoned while waiting.
+- Treat successful pane injection as peer-delivery success even when Claude's session-log anchor is delayed or unavailable.
+- Added `--reply-to` task correlation and rejected notifications that end with reply-requiring questions.
 
 ## v0.12.0 (2026-07-11)
 

@@ -248,6 +248,7 @@ class UnifiedAskDaemon:
                 "anchor_ms": result.anchor_ms,
                 "fallback_scan": result.fallback_scan,
                 "log_path": result.log_path,
+                "confirmation": (result.extra or {}).get("confirmation", ""),
             },
         }
 

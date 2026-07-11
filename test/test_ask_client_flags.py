@@ -103,13 +103,21 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
     ask = _load_ask_module()
     captured: dict = {}
 
-    def _capture(target: str, timeout: float, message: str, foreground: bool, intent: str) -> int:
+    def _capture(
+        target: str,
+        timeout: float,
+        message: str,
+        foreground: bool,
+        intent: str,
+        reply_to: str,
+    ) -> int:
         captured.update(
             target=target,
             timeout=timeout,
             message=message,
             foreground=foreground,
             intent=intent,
+            reply_to=reply_to,
         )
         return 0
 
@@ -124,4 +132,41 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
         "message": "result",
         "foreground": True,
         "intent": "notify",
+        "reply_to": "",
     }
+
+
+def test_peer_notify_rejects_direct_question(monkeypatch, capsys) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("contradictory notify must not send")),
+    )
+
+    rc = ask._handle_peer_mode(["--peer", "/tmp/peer", "--notify", "Can you confirm?"])
+
+    assert rc == 1
+    assert "use --background or --wait" in capsys.readouterr().err
+
+
+def test_peer_reply_to_is_forwarded(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda target, timeout, message, foreground, intent, reply_to: captured.update(
+            target=target,
+            intent=intent,
+            reply_to=reply_to,
+        ) or 0,
+    )
+
+    rc = ask._handle_peer_mode(
+        ["--peer", "/tmp/peer", "--notify", "--reply-to", "20260711-212112-453-72347", "Done."]
+    )
+
+    assert rc == 0
+    assert captured["intent"] == "notify"
+    assert captured["reply_to"] == "20260711-212112-453-72347"

@@ -92,6 +92,7 @@ ask --peer ~/dev/another-project --notify "FYI: deployment completed"
 
 Targets may be an exact path, a `ccb-list` index, or a project-hash prefix of at least four characters.
 Plain `ask --peer` retains the historical `--wait` behavior. Background consultations do not trigger the end-turn guardrail, and notifications do not include a reply target.
+Peer responses preserve the original task with `--reply-to <task-id>`. A notification is terminal and cannot end with a direct question; use `--background` when a follow-up answer is expected.
 
 ## Session safety
 

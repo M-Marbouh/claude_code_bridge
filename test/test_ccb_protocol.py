@@ -71,5 +71,6 @@ def test_strip_trailing_markers_removes_done_and_harness_trailers() -> None:
 def test_claude_delivery_prompt_respects_peer_reply_intent() -> None:
     prompt = wrap_claude_delivery_prompt("hello", "req-1")
 
-    assert "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message." in prompt
-    assert "ask --peer --notify" in prompt
+    assert "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message" in prompt
+    assert "preserve CCB_PEER_TASK_ID as --reply-to" in prompt
+    assert "otherwise use --background" in prompt

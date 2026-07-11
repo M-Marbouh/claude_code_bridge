@@ -71,8 +71,8 @@ def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
 def test_bridge_appends_wait_context() -> None:
     bridge = _load_bridge_module()
 
-    assert bridge._append_peer_context("hello", "/tmp/sender", "wait", "task-1") == (
-        "hello\n\nCCB_PEER_INTENT: wait\nCCB_PEER_TASK_ID: task-1\n"
+    assert bridge._append_peer_context("hello", "/tmp/sender", "wait", "task-1", "parent-1") == (
+        "hello\n\nCCB_PEER_INTENT: wait\nCCB_PEER_TASK_ID: task-1\nCCB_PEER_REPLY_TO: parent-1\n"
         "CCB_REPLY_TARGET: /tmp/sender\nCCB_REPLY_EXPECTED: yes"
     )
 
@@ -84,6 +84,15 @@ def test_bridge_notify_context_has_no_reply_target() -> None:
 
     assert message == "hello\n\nCCB_PEER_INTENT: notify\nCCB_REPLY_EXPECTED: no"
     assert "CCB_REPLY_TARGET" not in message
+
+
+def test_bridge_rejects_notify_that_asks_for_reply(capsys) -> None:
+    bridge = _load_bridge_module()
+
+    rc = bridge.main(["--target", "1", "--intent", "notify", "Can you confirm?"])
+
+    assert rc == 1
+    assert "use --background or --wait" in capsys.readouterr().err
 
 
 def test_bridge_request_is_delivery_only(monkeypatch) -> None:
@@ -118,6 +127,7 @@ def test_bridge_request_is_delivery_only(monkeypatch) -> None:
         "/tmp/sender",
         "background",
         "task-2",
+        "parent-2",
     )
 
     assert exit_code == 0
@@ -125,6 +135,6 @@ def test_bridge_request_is_delivery_only(monkeypatch) -> None:
     assert sent["delivery_only"] is True
     assert sent["suppress_completion_hook"] is True
     assert sent["message"] == (
-        "hello\n\nCCB_PEER_INTENT: background\nCCB_PEER_TASK_ID: task-2\n"
+        "hello\n\nCCB_PEER_INTENT: background\nCCB_PEER_TASK_ID: task-2\nCCB_PEER_REPLY_TO: parent-2\n"
         "CCB_REPLY_TARGET: /tmp/sender\nCCB_REPLY_EXPECTED: yes"
     )

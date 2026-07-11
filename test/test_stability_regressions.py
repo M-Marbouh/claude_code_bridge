@@ -438,7 +438,77 @@ def test_claude_adapter_delivery_only_returns_after_anchor_and_suppresses_hook(
     assert result.exit_code == 0
     assert result.reply == "Peer message delivered."
     assert result.anchor_seen is True
+    assert result.extra == {"confirmation": "observed"}
     assert result.done_seen is False
     assert notifications == []
     assert "CCB_REQ_ID: req-1" in sent_prompts[0]
     assert "CCB_DONE: req-1" not in sent_prompts[0]
+
+
+def test_claude_adapter_delivery_only_accepts_successful_send_without_log_anchor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from askd.adapters import claude as claude_mod
+
+    class _Session:
+        work_dir = str(tmp_path)
+        claude_session_path = None
+        data = {}
+
+        def ensure_pane(self):
+            return True, "pane-1"
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def is_alive(self, pane_id: str) -> bool:
+            return True
+
+    class _Reader:
+        def __init__(self, work_dir: Path, use_sessions_index: bool = True):
+            self.work_dir = work_dir
+
+        def set_preferred_session(self, path: Path) -> None:
+            return None
+
+        def capture_state(self) -> dict:
+            return {}
+
+        def wait_for_events(self, state: dict, timeout: float):
+            return [], state
+
+        def current_session_path(self):
+            return None
+
+    monkeypatch.setenv("CCB_LASKD_DELIVERY_ACK_TIMEOUT", "0.05")
+    monkeypatch.setattr(claude_mod, "load_project_session", lambda work_dir, instance=None: _Session())
+    monkeypatch.setattr(claude_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(claude_mod, "ClaudeLogReader", _Reader)
+    monkeypatch.setattr(claude_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=30.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+        delivery_only=True,
+        suppress_completion_hook=True,
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+    )
+
+    result = ClaudeAdapter().handle_task(task)
+
+    assert result.exit_code == 0
+    assert result.reply == "Peer message accepted."
+    assert result.anchor_seen is False
+    assert result.status == "completed"
+    assert result.extra == {"confirmation": "sent"}

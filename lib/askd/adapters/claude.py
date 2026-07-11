@@ -609,7 +609,10 @@ class ClaudeAdapter(BaseProviderAdapter):
         backend: Any, pane_id: str, deadline: Optional[float] = None
     ) -> ProviderResult:
         req = task.request
-        ack_timeout = float(os.environ.get("CCB_LASKD_DELIVERY_ACK_TIMEOUT", "10.0"))
+        # Pane injection is the transport acknowledgement. Session-log anchors are
+        # useful diagnostics, but Claude may record them late or in a newly rotated
+        # JSONL file, so absence must never turn a successful send into a failure.
+        ack_timeout = float(os.environ.get("CCB_LASKD_DELIVERY_ACK_TIMEOUT", "2.0"))
         local_deadline = time.time() + max(0.1, ack_timeout)
         if deadline is not None:
             local_deadline = min(local_deadline, deadline)
@@ -674,14 +677,17 @@ class ClaudeAdapter(BaseProviderAdapter):
             status = COMPLETION_STATUS_CANCELLED
             exit_code = 2
             reply = "Peer message delivery cancelled."
+            confirmation = "cancelled"
         elif anchor_seen:
             status = COMPLETION_STATUS_COMPLETED
             exit_code = 0
             reply = "Peer message delivered."
+            confirmation = "observed"
         else:
-            status = COMPLETION_STATUS_INCOMPLETE
-            exit_code = 2
-            reply = "Peer message sent, but delivery anchor was not confirmed."
+            status = COMPLETION_STATUS_COMPLETED
+            exit_code = 0
+            reply = "Peer message accepted."
+            confirmation = "sent"
 
         return ProviderResult(
             exit_code=exit_code,
@@ -693,6 +699,7 @@ class ClaudeAdapter(BaseProviderAdapter):
             anchor_ms=anchor_ms,
             fallback_scan=fallback_scan,
             status=status,
+            extra={"confirmation": confirmation},
         )
 
     def _postprocess_reply(self, req: ProviderRequest, reply: str) -> str:

@@ -253,36 +253,11 @@ class ClaudeProjectSession:
             return
 
 
-def find_project_session_file(work_dir: Path, instance: Optional[str] = None) -> Optional[Path]:
-    from providers import session_filename_for_instance
-    filename = session_filename_for_instance(".claude-session", instance)
-    return _find_project_session_file(work_dir, filename)
+def find_project_session_file(work_dir: Path) -> Optional[Path]:
+    return _find_project_session_file(work_dir, ".claude-session")
 
 
-def load_project_session(work_dir: Path, instance: Optional[str] = None) -> Optional[ClaudeProjectSession]:
-    # When an instance is specified, use the instance-specific session file
-    # instead of the resolver (which only knows about the default session).
-    if instance:
-        session_file = find_project_session_file(work_dir, instance)
-        if not session_file:
-            return None
-        try:
-            raw = session_file.read_text(encoding="utf-8-sig")
-            data = json.loads(raw)
-            if not isinstance(data, dict) or not data:
-                return None
-        except Exception:
-            return None
-        data.setdefault("work_dir", str(work_dir))
-        if not data.get("ccb_project_id"):
-            try:
-                data["ccb_project_id"] = compute_ccb_project_id(Path(data.get("work_dir") or work_dir))
-            except Exception:
-                pass
-        _ensure_work_dir_fields(data, session_file=session_file, fallback_work_dir=work_dir)
-        return ClaudeProjectSession(session_file=session_file, data=data)
-
-    # Default behavior: use resolve_claude_session
+def load_project_session(work_dir: Path) -> Optional[ClaudeProjectSession]:
     resolution = resolve_claude_session(work_dir)
     if not resolution:
         return None
@@ -309,14 +284,11 @@ def load_project_session(work_dir: Path, instance: Optional[str] = None) -> Opti
     return ClaudeProjectSession(session_file=session_file, data=data)
 
 
-def compute_session_key(session: ClaudeProjectSession, instance: Optional[str] = None) -> str:
+def compute_session_key(session: ClaudeProjectSession) -> str:
     pid = str(session.data.get("ccb_project_id") or "").strip()
     if not pid:
         try:
             pid = compute_ccb_project_id(Path(session.work_dir))
         except Exception:
             pid = ""
-    prefix = "claude"
-    if instance:
-        prefix = f"claude:{instance}"
-    return f"{prefix}:{pid}" if pid else f"{prefix}:unknown"
+    return f"claude:{pid}" if pid else "claude:unknown"

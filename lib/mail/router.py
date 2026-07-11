@@ -22,7 +22,6 @@ DEFAULT_SUBJECT_PREFIXES = {
     "codex": "[codex]",
     "gemini": "[gemini]",
     "opencode": "[opencode]",
-    "droid": "[droid]",
 }
 
 

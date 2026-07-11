@@ -28,7 +28,7 @@ class PingResult(BaseModel):
     error: Optional[str] = None
 
 
-KNOWN_PROVIDERS = ["claude", "codex", "gemini", "opencode", "droid"]
+KNOWN_PROVIDERS = ["claude", "codex", "gemini", "opencode"]
 
 
 def check_provider_available(provider: str) -> ProviderStatus:

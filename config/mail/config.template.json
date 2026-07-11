@@ -21,8 +21,7 @@
     "claude": {"enabled": false, "notify_mode": "on_completion"},
     "codex": {"enabled": false, "notify_mode": "on_completion"},
     "gemini": {"enabled": false, "notify_mode": "on_completion"},
-    "opencode": {"enabled": false, "notify_mode": "on_completion"},
-    "droid": {"enabled": false, "notify_mode": "on_completion"}
+    "opencode": {"enabled": false, "notify_mode": "on_completion"}
   },
   "notification": {
     "include_context_lines": 50,

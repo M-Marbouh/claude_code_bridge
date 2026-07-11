@@ -4,9 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Mapping, Optional, Tuple
+from typing import Optional, Tuple
 
-from providers import make_qualified_key, normalize_instance_name, parse_qualified_provider
 from session_utils import legacy_project_config_dir, project_config_dir
 
 
@@ -20,15 +19,7 @@ class StartConfig:
     path: Optional[Path] = None
 
 
-@dataclass(frozen=True)
-class ProviderInstanceSpec:
-    provider: str
-    instance: str
-    key: str
-
-
-_ALLOWED_PROVIDERS = {"codex", "gemini", "opencode", "claude", "droid"}
-_INSTANCE_PROVIDERS = {"codex", "claude"}
+_ALLOWED_PROVIDERS = {"codex", "gemini", "opencode", "claude"}
 
 
 def _parse_tokens(raw: str) -> list[str]:
@@ -48,11 +39,9 @@ def _parse_tokens(raw: str) -> list[str]:
     return [p for p in (part.strip() for part in parts) if p]
 
 
-def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], list[dict], bool]:
+def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], bool]:
     providers: list[str] = []
-    instances: list[dict] = []
     seen_providers: set[str] = set()
-    seen_instances: set[str] = set()
     cmd_enabled = False
 
     def add_provider(provider: str) -> None:
@@ -68,48 +57,14 @@ def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], list[dict],
         if token == "cmd":
             cmd_enabled = True
             continue
-        base, instance = parse_qualified_provider(token)
-        if base not in _ALLOWED_PROVIDERS:
+        if token not in _ALLOWED_PROVIDERS:
             continue
-        if instance is None:
-            add_provider(base)
-            continue
-        normalized_instance = normalize_instance_name(instance)
-        if not normalized_instance or base not in _INSTANCE_PROVIDERS:
-            continue
-        add_provider(base)
-        key = make_qualified_key(base, normalized_instance)
-        if key in seen_instances:
-            continue
-        seen_instances.add(key)
-        instances.append({"provider": base, "instance": normalized_instance, "key": key})
-    return providers, instances, cmd_enabled
-
-
-def _normalize_providers(tokens: list[str]) -> tuple[list[str], bool]:
-    providers, _instances, cmd_enabled = normalize_provider_tokens(tokens)
+        add_provider(token)
     return providers, cmd_enabled
 
 
-def instance_specs_from_config(data: Mapping[str, object]) -> list[ProviderInstanceSpec]:
-    raw = data.get("provider_instances") if isinstance(data, Mapping) else None
-    if not isinstance(raw, list):
-        return []
-    specs: list[ProviderInstanceSpec] = []
-    seen: set[str] = set()
-    for item in raw:
-        if not isinstance(item, Mapping):
-            continue
-        provider = str(item.get("provider") or "").strip().lower()
-        instance = normalize_instance_name(str(item.get("instance") or ""))
-        if provider not in _INSTANCE_PROVIDERS or not instance:
-            continue
-        key = make_qualified_key(provider, instance)
-        if key in seen:
-            continue
-        seen.add(key)
-        specs.append(ProviderInstanceSpec(provider=provider, instance=instance, key=key))
-    return specs
+def _normalize_providers(tokens: list[str]) -> tuple[list[str], bool]:
+    return normalize_provider_tokens(tokens)
 
 
 def normalize_start_config_data(data: dict) -> dict:
@@ -124,17 +79,12 @@ def normalize_start_config_data(data: dict) -> dict:
         tokens = [str(raw_providers)]
 
     if tokens:
-        providers, instances, cmd_enabled = normalize_provider_tokens(tokens)
+        providers, cmd_enabled = normalize_provider_tokens(tokens)
         out["providers"] = providers
-        out["provider_instances"] = instances
         if cmd_enabled and "cmd" not in out:
             out["cmd"] = True
-    elif "provider_instances" not in out:
-        out["provider_instances"] = []
-
-    raw_instances = out.get("instances")
-    if isinstance(raw_instances, dict):
-        out["instances"] = dict(raw_instances)
+    out.pop("provider_instances", None)
+    out.pop("instances", None)
     return out
 
 
@@ -144,16 +94,16 @@ def _parse_config_obj(obj: object) -> dict:
 
     if isinstance(obj, list):
         tokens = [str(p) for p in obj if p is not None]
-        providers, instances, cmd_enabled = normalize_provider_tokens(tokens)
-        data: dict = {"providers": providers, "provider_instances": instances}
+        providers, cmd_enabled = normalize_provider_tokens(tokens)
+        data: dict = {"providers": providers}
         if cmd_enabled:
             data["cmd"] = True
         return data
 
     if isinstance(obj, str):
         tokens = _parse_tokens(obj)
-        providers, instances, cmd_enabled = normalize_provider_tokens(tokens)
-        data = {"providers": providers, "provider_instances": instances}
+        providers, cmd_enabled = normalize_provider_tokens(tokens)
+        data = {"providers": providers}
         if cmd_enabled:
             data["cmd"] = True
         return data
@@ -174,8 +124,8 @@ def _read_config(path: Path) -> dict:
         obj = None
     if obj is None:
         tokens = _parse_tokens(raw)
-        providers, instances, cmd_enabled = normalize_provider_tokens(tokens)
-        data: dict = {"providers": providers, "provider_instances": instances}
+        providers, cmd_enabled = normalize_provider_tokens(tokens)
+        data: dict = {"providers": providers}
         if cmd_enabled:
             data["cmd"] = True
         return data

@@ -1,6 +1,6 @@
 ---
 name: ping
-description: Test connectivity with AI provider (gemini/codex/opencode/droid/claude).
+description: Test connectivity with AI provider (gemini/codex/opencode/claude).
 metadata:
   short-description: Test AI provider connectivity
 ---
@@ -15,7 +15,6 @@ The first argument must be the provider name:
 - `gemini` - Test Gemini
 - `codex` - Test Codex
 - `opencode` - Test OpenCode
-- `droid` - Test Droid
 - `claude` - Test Claude
 
 ## Execution (MANDATORY)

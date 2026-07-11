@@ -187,12 +187,12 @@ def notify_completion(
     Notify the caller that a CCB delegation task has completed.
 
     Args:
-        provider: Provider name (codex, gemini, opencode, droid)
+        provider: Provider name (codex, gemini, opencode, claude)
         output_file: Path to the output file (if any)
         reply: The reply text from the provider
         req_id: The request ID
         done_seen: Whether the CCB_DONE signal was detected
-        caller: Who initiated the request (claude, codex, droid, email)
+        caller: Who initiated the request (claude, codex, gemini, opencode, email)
         email_req_id: Email request ID (for email caller)
         email_msg_id: Original email Message-ID (for email caller)
         email_from: Original sender email address (for email caller)

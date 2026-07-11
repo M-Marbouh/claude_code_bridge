@@ -88,9 +88,8 @@ def resolve_work_dir_with_registry(
     Priority:
       1) cli_session_file (--session-file)
       2) env_session_file (CCB_SESSION_FILE)
-      3) daemon state work_dir (if unified askd is enabled)
-      4) registry lookup by ccb_project_id + provider
-      5) default_cwd / Path.cwd()
+      3) registry lookup by ccb_project_id + provider
+      4) default_cwd / Path.cwd()
     """
     raw = (cli_session_file or "").strip() or (env_session_file or "").strip()
     if raw:
@@ -100,17 +99,6 @@ def resolve_work_dir_with_registry(
             env_session_file=env_session_file,
             default_cwd=default_cwd,
         )
-
-    # Try to get work_dir from unified askd daemon state
-    from askd_runtime import get_daemon_work_dir
-    daemon_work_dir = get_daemon_work_dir("askd.json")
-    if daemon_work_dir and daemon_work_dir.exists():
-        try:
-            found = find_project_session_file(daemon_work_dir, spec.session_filename)
-            if found:
-                return daemon_work_dir, found
-        except Exception:
-            pass
 
     cwd = default_cwd or Path.cwd()
     try:
@@ -291,8 +279,17 @@ def maybe_start_daemon(spec: ProviderClientSpec, work_dir: Path) -> bool:
         argv = [entry]
     else:
         argv = [sys.executable, entry]
+    if spec.daemon_bin_name == "askd":
+        argv.extend(["--work-dir", str(work_dir)])
     try:
         kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+        env = os.environ.copy()
+        # The daemon is detached and must not inherit the lifecycle of the CCB
+        # pane/process that happened to perform this health check.
+        env.pop("CCB_PARENT_PID", None)
+        env.pop("CCB_MANAGED", None)
+        env["CCB_WORK_DIR"] = str(work_dir)
+        kwargs["env"] = env
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:

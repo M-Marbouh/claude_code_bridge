@@ -21,7 +21,6 @@ _BASE_SESSION_FILES = {
     "gemini": ".gemini-session",
     "opencode": ".opencode-session",
     "claude": ".claude-session",
-    "droid": ".droid-session",
 }
 
 

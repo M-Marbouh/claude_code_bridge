@@ -28,7 +28,7 @@ from laskd_protocol import extract_reply_for_req, is_done_text, wrap_claude_deli
 from laskd_session import compute_session_key, load_project_session
 from pane_registry import upsert_registry
 from project_id import compute_ccb_project_id
-from providers import LASKD_SPEC, make_qualified_key
+from providers import LASKD_SPEC
 from session_file_watcher import HAS_WATCHDOG
 from terminal import get_backend_for_session
 
@@ -489,11 +489,11 @@ class ClaudeAdapter(BaseProviderAdapter):
         except Exception:
             pass
 
-    def load_session(self, work_dir: Path, instance: Optional[str] = None) -> Optional[Any]:
-        return load_project_session(work_dir, instance)
+    def load_session(self, work_dir: Path) -> Optional[Any]:
+        return load_project_session(work_dir)
 
-    def compute_session_key(self, session: Any, instance: Optional[str] = None) -> str:
-        return compute_session_key(session, instance) if session else "claude:unknown"
+    def compute_session_key(self, session: Any) -> str:
+        return compute_session_key(session) if session else "claude:unknown"
 
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
@@ -501,9 +501,8 @@ class ClaudeAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=claude req_id={task.req_id} work_dir={req.work_dir}")
 
-        instance = task.request.instance
-        session = load_project_session(work_dir, instance)
-        session_key = self.compute_session_key(session, instance)
+        session = load_project_session(work_dir)
+        session_key = self.compute_session_key(session)
 
         if not session:
             return ProviderResult(
@@ -825,7 +824,7 @@ class ClaudeAdapter(BaseProviderAdapter):
                             "work_dir": str(session.work_dir),
                             "terminal": session.terminal,
                             "providers": {
-                                make_qualified_key("claude", req.instance): {
+                                "claude": {
                                     "pane_id": session.pane_id or None,
                                     "pane_title_marker": session.pane_title_marker or None,
                                     "session_file": str(session.session_file),

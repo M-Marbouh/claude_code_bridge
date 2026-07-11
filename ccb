@@ -29,7 +29,7 @@ sys.path.insert(0, str(script_dir / "lib"))
 from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_shell_type, get_backend_for_session
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
-from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, normalize_provider_tokens
+from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config
 from ccb_cleanup import DEFAULT_KEEP_NEWEST, DEFAULT_TTL_SECONDS, plan_prune, run_prune
 from session_utils import (
     check_session_writable,
@@ -41,18 +41,7 @@ from session_utils import (
 )
 from pane_registry import upsert_registry, load_registry_by_project_id
 from project_id import compute_ccb_project_id
-from provider_instance_defaults import normalize_instance_overrides, resolve_instance_policy
-from providers import (
-    CASK_CLIENT_SPEC,
-    GASK_CLIENT_SPEC,
-    OASK_CLIENT_SPEC,
-    LASK_CLIENT_SPEC,
-    DASK_CLIENT_SPEC,
-    make_qualified_key,
-    normalize_instance_name,
-    parse_qualified_provider,
-    session_filename_for_instance,
-)
+from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC
 from process_lock import ProviderLock
 from askd_rpc import shutdown_daemon, read_state
 from askd_runtime import state_file_path
@@ -64,9 +53,9 @@ backend_env = get_backend_env()
 if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
-VERSION = "0.11.8"
+VERSION = "0.12.0"
 GIT_COMMIT = "c539e79"
-GIT_DATE = "2026-06-09"
+GIT_DATE = "2026-02-25"
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:([/\\\\]|$)")
 _MNT_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])/(.*)$")
@@ -203,73 +192,6 @@ def _extract_session_work_dir_norm(session_data: dict) -> str:
     if isinstance(raw, str) and raw.strip():
         return _normalize_path_for_match(raw)
     return ""
-
-
-def _session_file_provider_key(path: Path, data: dict | None = None) -> tuple[str, str | None]:
-    """Infer provider + optional instance from a project session file."""
-    payload = data if isinstance(data, dict) else {}
-    qualified = str(payload.get("qualified_provider") or "").strip().lower()
-    if qualified:
-        base, instance = parse_qualified_provider(qualified)
-        return base, normalize_instance_name(instance)
-
-    provider = str(payload.get("provider") or "").strip().lower()
-    instance = normalize_instance_name(payload.get("instance"))
-    if provider:
-        return provider, instance
-
-    name = path.name
-    match = re.fullmatch(r"\.([a-z0-9]+)(?:-([a-z0-9_-]+))?-session", name)
-    if not match:
-        return "", None
-    return match.group(1).lower(), normalize_instance_name(match.group(2))
-
-
-def _session_file_matches_project(path: Path, data: dict, project_root: Path) -> bool:
-    """Return True when a session file belongs to the current project root."""
-    if not isinstance(data, dict):
-        return False
-
-    recorded_pid = str(data.get("ccb_project_id") or "").strip()
-    if recorded_pid:
-        try:
-            if recorded_pid != compute_ccb_project_id(project_root):
-                return False
-        except Exception:
-            return False
-
-    recorded_norm = _extract_session_work_dir_norm(data)
-    if recorded_norm:
-        keys = _work_dir_match_keys(project_root)
-        if keys and recorded_norm not in keys:
-            return False
-        return True
-
-    # Back-compat: old local session files may not have work_dir fields. Only
-    # trust them when they live inside this project's config directory.
-    try:
-        return path.parent.resolve() == resolve_project_config_dir(project_root).resolve()
-    except Exception:
-        return path.parent == resolve_project_config_dir(project_root)
-
-
-def _read_json_session(path: Path) -> dict:
-    try:
-        raw = path.read_text(encoding="utf-8-sig")
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _project_session_files(project_root: Path) -> list[Path]:
-    cfg = resolve_project_config_dir(project_root)
-    if not cfg.is_dir():
-        return []
-    try:
-        return sorted(p for p in cfg.glob(".*-session") if p.is_file())
-    except Exception:
-        return []
 
 
 def _get_git_info() -> str:
@@ -631,8 +553,6 @@ class AILauncher:
     def __init__(
         self,
         providers: list,
-        provider_instances: list | None = None,
-        instance_overrides: dict | None = None,
         resume: bool = False,
         auto: bool = False,
         cmd_config: dict | None = None,
@@ -640,8 +560,6 @@ class AILauncher:
         launch_env: dict | None = None,
     ):
         self.providers = providers or ["codex"]
-        self.provider_instances = self._normalize_provider_instances(provider_instances)
-        self.instance_overrides = normalize_instance_overrides(instance_overrides)
         self.resume = resume
         self.auto = auto
         self.cmd_config = self._normalize_cmd_config(cmd_config)
@@ -681,12 +599,14 @@ class AILauncher:
         self._migrate_legacy_project_files()
         os.environ["CCB_MANAGED"] = "1"
         os.environ["CCB_PARENT_PID"] = str(self.ccb_pid)
+        os.environ["CCB_SESSION_ID"] = self.session_id
         os.environ.setdefault("CCB_RUN_DIR", str(self.project_run_dir))
 
     def _managed_env_overrides(self) -> dict:
         env = {
             "CCB_MANAGED": "1",
             "CCB_PARENT_PID": str(self.ccb_pid),
+            "CCB_SESSION_ID": self.session_id,
         }
         if os.environ.get("CCB_RUN_DIR"):
             env["CCB_RUN_DIR"] = os.environ["CCB_RUN_DIR"]
@@ -696,7 +616,7 @@ class AILauncher:
         """Managed env + explicit caller marker for the pane/provider process."""
         env = self._managed_env_overrides()
         prov = (provider or "").strip().lower()
-        if prov in {"claude", "codex", "gemini", "opencode", "droid", "email", "manual"}:
+        if prov in {"claude", "codex", "gemini", "opencode", "email", "manual"}:
             env["CCB_CALLER"] = prov
         # Merge per-provider launch_env from config.
         extra = self.launch_env.get(prov)
@@ -713,64 +633,6 @@ class AILauncher:
         cfg = self._project_config_dir()
         return cfg / filename
 
-    def _normalize_provider_instances(self, raw: list | None) -> list[dict]:
-        specs: list[dict] = []
-        seen: set[str] = set()
-        for item in raw or []:
-            if not isinstance(item, dict):
-                continue
-            provider = str(item.get("provider") or "").strip().lower()
-            instance = normalize_instance_name(str(item.get("instance") or ""))
-            if provider not in {"codex", "claude"} or not instance:
-                continue
-            key = make_qualified_key(provider, instance)
-            if key in seen:
-                continue
-            seen.add(key)
-            specs.append({"provider": provider, "instance": instance, "key": key})
-        return specs
-
-    def _instance_key(self, provider: str, instance: str | None = None) -> str:
-        inst = normalize_instance_name(instance)
-        return make_qualified_key(str(provider or "").strip().lower(), inst)
-
-    def _provider_display(self, provider: str, instance: str | None = None) -> str:
-        base = str(provider or "").strip().capitalize()
-        inst = normalize_instance_name(instance)
-        return f"{base}:{inst}" if inst else base
-
-    def _runtime_dir_for(self, provider: str, instance: str | None = None) -> Path:
-        return self.runtime_dir / self._instance_key(provider, instance).replace(":", "-")
-
-    def _pane_marker_for(self, provider: str, instance: str | None = None) -> str:
-        base = str(provider or "").strip().capitalize()
-        inst = normalize_instance_name(instance)
-        suffix = f"-{inst}" if inst else ""
-        return f"CCB-{base}{suffix}-{self.project_id[:8]}"
-
-    def _session_filename_for(self, provider: str, instance: str | None = None) -> str:
-        base = {
-            "codex": ".codex-session",
-            "gemini": ".gemini-session",
-            "opencode": ".opencode-session",
-            "claude": ".claude-session",
-            "droid": ".droid-session",
-        }.get(str(provider or "").strip().lower(), f".{provider}-session")
-        return session_filename_for_instance(base, normalize_instance_name(instance))
-
-    def _project_session_file_for_provider(self, provider: str, instance: str | None = None) -> Path:
-        return self._project_session_file(self._session_filename_for(provider, instance))
-
-    def _registry_provider_key(self, provider: str, instance: str | None = None) -> str:
-        return self._instance_key(provider, instance)
-
-    def _policy_for(self, provider: str, instance: str | None = None):
-        return resolve_instance_policy(provider, normalize_instance_name(instance), self.instance_overrides)
-
-    def _provider_has_instances(self, provider: str) -> bool:
-        base = str(provider or "").strip().lower()
-        return any(str(spec.get("provider") or "").strip().lower() == base for spec in self.provider_instances)
-
     def _auto_prune_session_records(self) -> None:
         if self._auto_prune_done:
             return
@@ -778,15 +640,7 @@ class AILauncher:
         if _env_bool("CCB_NO_AUTO_PRUNE", False):
             return
         try:
-            plan = plan_prune(project=self.project_root)
-            result = run_prune(plan)
-            if _env_bool("CCB_DEBUG", False):
-                print(
-                    "🧹 CCB session record prune: "
-                    f"scanned={result.scanned} deleted={result.deleted} "
-                    f"kept={result.kept} failed={result.failed}",
-                    file=sys.stderr,
-                )
+            run_prune(plan_prune(project=self.project_root))
         except Exception as exc:
             if _env_bool("CCB_DEBUG", False):
                 print(f"⚠️ CCB session record prune skipped: {exc}", file=sys.stderr)
@@ -803,7 +657,7 @@ class AILauncher:
         if not cfg.is_dir():
             return
 
-        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".droid-session"):
+        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session"):
             legacy = self.project_root / name
             if not legacy.exists():
                 continue
@@ -932,7 +786,7 @@ class AILauncher:
     def _maybe_start_unified_askd(self, *, quiet: bool = False) -> None:
         """Start unified askd daemon (provider-agnostic)."""
         # Try to start for any enabled provider that uses askd (including claude)
-        for provider in ["codex", "gemini", "opencode", "droid", "claude"]:
+        for provider in ["codex", "gemini", "opencode", "claude"]:
             if provider in [p.lower() for p in self.providers]:
                 # Try to start and check if successful
                 self._maybe_start_provider_daemon(provider, quiet=quiet)
@@ -970,7 +824,6 @@ class AILauncher:
             "gemini": GASK_CLIENT_SPEC,
             "opencode": OASK_CLIENT_SPEC,
             "claude": LASK_CLIENT_SPEC,
-            "droid": DASK_CLIENT_SPEC,
         }
         spec = specs.get(provider)
         if not spec:
@@ -1353,14 +1206,7 @@ class AILauncher:
         )
         return True
 
-    def _start_provider(
-        self,
-        provider: str,
-        *,
-        parent_pane: str | None = None,
-        direction: str | None = None,
-        instance: str | None = None,
-    ) -> str | None:
+    def _start_provider(self, provider: str, *, parent_pane: str | None = None, direction: str | None = None) -> str | None:
         # Handle case when no terminal detected
         if self.terminal_type is None:
             print(f"❌ {t('no_terminal_backend')}")
@@ -1374,16 +1220,16 @@ class AILauncher:
 
         # WezTerm mode: no tmux dependency
         if self.terminal_type == "wezterm":
-            print(f"🚀 {t('starting_backend', provider=self._provider_display(provider, instance), terminal='wezterm')}")
-            return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction, instance=instance)
+            print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm')}")
+            return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
 
         # tmux mode: check if tmux is available
         if not shutil.which("tmux"):
             # Try fallback to WezTerm
             if detect_terminal() == "wezterm":
                 self.terminal_type = "wezterm"
-                print(f"🚀 {t('starting_backend', provider=self._provider_display(provider, instance), terminal='wezterm - tmux unavailable')}")
-                return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction, instance=instance)
+                print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm - tmux unavailable')}")
+                return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
             else:
                 print(f"❌ {t('tmux_not_installed')}")
                 print(f"   {t('install_wezterm_or_tmux')}")
@@ -1396,16 +1242,14 @@ class AILauncher:
             print(f"   Then: {' '.join(['ccb', *sys.argv[1:]])}", file=sys.stderr)
             return None
 
-        print(f"🚀 {t('starting_backend', provider=self._provider_display(provider, instance), terminal='tmux')}")
+        print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux')}")
 
         if provider == "codex":
-            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction, instance=instance)
+            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction)
         elif provider == "gemini":
             return self._start_gemini_tmux(parent_pane=parent_pane, direction=direction)
         elif provider == "opencode":
             return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction)
-        elif provider == "droid":
-            return self._start_droid_tmux(parent_pane=parent_pane, direction=direction)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -1416,12 +1260,11 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
-        instance: str | None = None,
     ) -> str | None:
-        runtime = self._runtime_dir_for(provider, instance)
+        runtime = self.runtime_dir / provider
         runtime.mkdir(parents=True, exist_ok=True)
 
-        start_cmd = self._get_start_cmd(provider, instance)
+        start_cmd = self._get_start_cmd(provider)
         keep_open = os.environ.get("CODEX_WEZTERM_KEEP_OPEN", "1").lower() not in {"0", "false", "no", "off"}
         if keep_open:
             start_cmd = _build_keep_open_cmd(provider, start_cmd)
@@ -1433,14 +1276,13 @@ class AILauncher:
             except StopIteration:
                 use_parent = None
 
-        pane_title_marker = self._pane_marker_for(provider, instance)
+        pane_title_marker = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
         title_cmd = _build_pane_title_cmd(pane_title_marker)
         env_overrides = self._provider_env_overrides(provider)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
-        codex_snapshot = self._snapshot_codex_rollouts() if provider == "codex" else set()
         backend = WeztermBackend()
         pane_id = backend.create_pane(full_cmd, str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
-        self.wezterm_panes[self._instance_key(provider, instance)] = pane_id
+        self.wezterm_panes[provider] = pane_id
 
         if provider == "codex":
             input_fifo = runtime / "input.fifo"
@@ -1454,20 +1296,16 @@ class AILauncher:
                 pane_id=pane_id,
                 pane_title_marker=pane_title_marker,
                 codex_start_cmd=start_cmd,
-                instance=instance,
             )
-            self._bind_new_codex_session_from_snapshot(codex_snapshot, instance)
         elif provider == "gemini":
             self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         elif provider == "opencode":
             self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
-        elif provider == "droid":
-            self._write_droid_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
 
-        print(f"✅ {t('started_backend', provider=self._provider_display(provider, instance), terminal='wezterm pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=provider.capitalize(), terminal='wezterm pane', pane_id=pane_id)}")
         return pane_id
 
     def _work_dir_strings(self, work_dir: Path) -> list[str]:
@@ -1509,243 +1347,6 @@ class AILauncher:
         except Exception:
             pass
 
-    def _codex_session_root(self) -> Path:
-        return Path(os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
-
-    def _snapshot_codex_rollouts(self) -> set[Path]:
-        root = self._codex_session_root()
-        if not root.exists():
-            return set()
-        try:
-            return {p for p in root.glob("**/*.jsonl") if p.is_file()}
-        except Exception:
-            return set()
-
-    def _read_codex_rollout_meta(self, log_path: Path) -> tuple[str | None, str | None]:
-        try:
-            with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
-                for _ in range(50):
-                    line = handle.readline()
-                    if not line:
-                        break
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
-                    if not isinstance(entry, dict) or entry.get("type") != "session_meta":
-                        continue
-                    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-                    sid = payload.get("id")
-                    cwd = payload.get("cwd")
-                    return (
-                        sid.strip() if isinstance(sid, str) and sid.strip() else None,
-                        cwd.strip() if isinstance(cwd, str) and cwd.strip() else None,
-                    )
-        except Exception:
-            return None, None
-        return None, None
-
-    def _valid_new_codex_rollouts(self, before: set[Path]) -> list[tuple[Path, str]]:
-        root = self._codex_session_root()
-        if not root.exists():
-            return []
-        root_norm = _normalize_path_for_match(str(self.project_root))
-        try:
-            current = {p for p in root.glob("**/*.jsonl") if p.is_file()}
-        except Exception:
-            return []
-
-        candidates: list[tuple[Path, str]] = []
-        for log_path in current - set(before or set()):
-            sid, cwd = self._read_codex_rollout_meta(log_path)
-            if not sid:
-                try:
-                    sid = str(uuid.UUID(log_path.stem))
-                except Exception:
-                    sid = None
-            if not sid or not cwd:
-                continue
-            cwd_norm = _normalize_path_for_match(cwd)
-            if not _normpath_within(cwd_norm, root_norm):
-                continue
-            candidates.append((log_path, sid))
-        try:
-            candidates.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
-        except Exception:
-            pass
-        return candidates
-
-    def _write_codex_launch_binding(self, instance: str | None, log_path: Path, session_id: str) -> None:
-        session_file = self._project_session_file_for_provider("codex", instance)
-        if not session_file.exists():
-            return
-        data = self._read_json_file(session_file)
-        if not isinstance(data, dict):
-            data = {}
-        data["codex_session_id"] = session_id
-        data["codex_session_path"] = str(log_path)
-        data["codex_start_cmd"] = f"codex resume {session_id}"
-        data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        if data.get("active") is False:
-            data["active"] = True
-        self._write_json_file(session_file, data)
-        try:
-            upsert_registry({
-                "ccb_session_id": self.session_id,
-                "ccb_project_id": compute_ccb_project_id(self.project_root),
-                "work_dir": str(self.project_root),
-                "terminal": self.terminal_type,
-                "providers": {
-                    self._registry_provider_key("codex", instance): {
-                        "pane_id": data.get("pane_id"),
-                        "pane_title_marker": data.get("pane_title_marker"),
-                        "session_file": str(session_file),
-                        "codex_session_id": session_id,
-                        "codex_session_path": str(log_path),
-                        "active": bool(data.get("active", True)),
-                    }
-                },
-            })
-        except Exception:
-            pass
-
-    def _bind_new_codex_session_from_snapshot(
-        self,
-        before: set[Path],
-        instance: str | None = None,
-        *,
-        timeout_s: float | None = None,
-    ) -> bool:
-        if timeout_s is None:
-            try:
-                timeout_s = float(os.environ.get("CCB_LAUNCH_BIND_TIMEOUT", "5.0"))
-            except Exception:
-                timeout_s = 5.0
-        deadline = time.time() + max(0.0, min(float(timeout_s), 15.0))
-        while True:
-            candidates = self._valid_new_codex_rollouts(before)
-            if len(candidates) == 1:
-                log_path, sid = candidates[0]
-                self._write_codex_launch_binding(instance, log_path, sid)
-                return True
-            if len(candidates) > 1:
-                print(
-                    f"⚠️ Codex launch binding skipped for {self._instance_key('codex', instance)}: "
-                    f"{len(candidates)} new sessions matched",
-                    file=sys.stderr,
-                )
-                return False
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.2)
-
-    def _bind_new_codex_session_async(self, before: set[Path], instance: str | None = None) -> None:
-        thread = threading.Thread(
-            target=lambda: self._bind_new_codex_session_from_snapshot(before, instance),
-            daemon=True,
-        )
-        thread.start()
-
-    def _snapshot_claude_sessions(self) -> set[Path]:
-        project_dir = self._claude_project_dir(self.project_root)
-        if not project_dir.exists():
-            return set()
-        try:
-            return {p for p in project_dir.glob("*.jsonl") if p.is_file()}
-        except Exception:
-            return set()
-
-    def _valid_new_claude_sessions(self, before: set[Path]) -> list[tuple[Path, str]]:
-        project_dir = self._claude_project_dir(self.project_root)
-        if not project_dir.exists():
-            return []
-        try:
-            current = {p for p in project_dir.glob("*.jsonl") if p.is_file()}
-        except Exception:
-            return []
-        candidates: list[tuple[Path, str]] = []
-        for path in current - set(before or set()):
-            try:
-                sid = str(uuid.UUID(path.stem))
-            except Exception:
-                continue
-            candidates.append((path, sid))
-        try:
-            candidates.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
-        except Exception:
-            pass
-        return candidates
-
-    def _write_claude_launch_binding(self, instance: str | None, session_path: Path, session_id: str) -> None:
-        session_file = self._claude_session_file(instance)
-        if not session_file.exists():
-            return
-        data = self._read_json_file(session_file)
-        if not isinstance(data, dict):
-            data = {}
-        data["claude_session_id"] = session_id
-        data["claude_session_path"] = str(session_path)
-        data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        if data.get("active") is False:
-            data["active"] = True
-        self._write_json_file(session_file, data)
-        try:
-            upsert_registry({
-                "ccb_session_id": self.session_id,
-                "ccb_project_id": compute_ccb_project_id(self.project_root),
-                "work_dir": str(self.project_root),
-                "terminal": self.terminal_type,
-                "providers": {
-                    self._registry_provider_key("claude", instance): {
-                        "pane_id": data.get("pane_id"),
-                        "pane_title_marker": data.get("pane_title_marker"),
-                        "session_file": str(session_file),
-                        "claude_session_id": session_id,
-                        "claude_session_path": str(session_path),
-                        "active": bool(data.get("active", True)),
-                    }
-                },
-            })
-        except Exception:
-            pass
-
-    def _bind_new_claude_session_from_snapshot(
-        self,
-        before: set[Path],
-        instance: str | None = None,
-        *,
-        timeout_s: float | None = None,
-    ) -> bool:
-        if timeout_s is None:
-            try:
-                timeout_s = float(os.environ.get("CCB_LAUNCH_BIND_TIMEOUT", "5.0"))
-            except Exception:
-                timeout_s = 5.0
-        deadline = time.time() + max(0.0, min(float(timeout_s), 15.0))
-        while True:
-            candidates = self._valid_new_claude_sessions(before)
-            if len(candidates) == 1:
-                path, sid = candidates[0]
-                self._write_claude_launch_binding(instance, path, sid)
-                return True
-            if len(candidates) > 1:
-                print(
-                    f"⚠️ Claude launch binding skipped for {self._instance_key('claude', instance)}: "
-                    f"{len(candidates)} new sessions matched",
-                    file=sys.stderr,
-                )
-                return False
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.2)
-
-    def _bind_new_claude_session_async(self, before: set[Path], instance: str | None = None) -> None:
-        thread = threading.Thread(
-            target=lambda: self._bind_new_claude_session_from_snapshot(before, instance),
-            daemon=True,
-        )
-        thread.start()
-
     def _require_project_config_dir(self) -> bool:
         cfg = self._project_config_dir()
         if cfg.is_dir():
@@ -1771,8 +1372,8 @@ class AILauncher:
             print(f"⚠️ codex_session_clear_failed: {exc}", file=sys.stderr)
             return data if isinstance(data, dict) else {}
 
-    def _claude_session_file(self, instance: str | None = None) -> Path:
-        return self._project_session_file_for_provider("claude", instance)
+    def _claude_session_file(self) -> Path:
+        return self._project_session_file(".claude-session")
 
     def _backfill_claude_session_work_dir_fields(self) -> None:
         path = self._claude_session_file()
@@ -1826,11 +1427,8 @@ class AILauncher:
         pane_id: str | None = None,
         pane_title_marker: str | None = None,
         terminal: str | None = None,
-        instance: str | None = None,
-        start_cmd: str | None = None,
     ) -> None:
-        path = self._claude_session_file(instance)
-        provider_key = self._registry_provider_key("claude", instance)
+        path = self._claude_session_file()
         writable, reason, fix = check_session_writable(path)
         if not writable:
             print(f"❌ Cannot write {path.name}: {reason}", file=sys.stderr)
@@ -1842,9 +1440,6 @@ class AILauncher:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if session_id:
             data["claude_session_id"] = session_id
-        data["provider"] = "claude"
-        data["instance"] = normalize_instance_name(instance)
-        data["qualified_provider"] = provider_key
         data["session_id"] = self.session_id
         try:
             data["ccb_project_id"] = compute_ccb_project_id(work_dir)
@@ -1861,9 +1456,6 @@ class AILauncher:
             data["pane_id"] = pane_id
         if pane_title_marker:
             data["pane_title_marker"] = pane_title_marker
-        if start_cmd:
-            data["claude_start_cmd"] = str(start_cmd)
-            data["start_cmd"] = str(start_cmd)
 
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         ok, err = safe_write_session(path, payload)
@@ -1879,7 +1471,7 @@ class AILauncher:
                         "work_dir": str(self.project_root),
                         "terminal": terminal or self.terminal_type,
                         "providers": {
-                            provider_key: {
+                            "claude": {
                                 "pane_id": pane_id,
                                 "pane_title_marker": pane_title_marker,
                                 "session_file": str(path),
@@ -1894,23 +1486,7 @@ class AILauncher:
         self._maybe_start_provider_daemon("claude")
         self._auto_prune_session_records()
 
-    def _bound_codex_session_ids(self, *, include_base: bool = False) -> set[str]:
-        bound: set[str] = set()
-        for path in _project_session_files(self.project_root):
-            data = self._read_json_file(path)
-            provider, instance = _session_file_provider_key(path, data)
-            if provider != "codex":
-                continue
-            if not include_base and not instance:
-                continue
-            if not _session_file_matches_project(path, data, self.project_root):
-                continue
-            sid = str(data.get("codex_session_id") or "").strip()
-            if sid:
-                bound.add(sid)
-        return bound
-
-    def _get_latest_codex_session_id(self, *, exclude_session_ids: set[str] | None = None) -> tuple[str | None, bool]:
+    def _get_latest_codex_session_id(self) -> tuple[str | None, bool]:
         """
         Returns (session_id, has_any_history_for_cwd).
         Session id is Codex CLI's UUID used by `codex resume <id>`.
@@ -1946,7 +1522,6 @@ class AILauncher:
             except Exception:
                 scan_limit = 400
 
-        excluded = {str(s or "").strip() for s in (exclude_session_ids or set()) if str(s or "").strip()}
         for log_path in logs[:scan_limit]:
             try:
                 with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -1972,8 +1547,6 @@ class AILauncher:
                     continue
                 sid = payload.get("id")
                 if isinstance(sid, str) and sid:
-                    if sid in excluded:
-                        continue
                     # Update local .codex-session file with latest session id
                     data = self._read_json_file(project_session) if project_session.exists() else {}
                     data.update({
@@ -2202,109 +1775,13 @@ class AILauncher:
         except Exception as e:
             print(f"⚠️ Failed to configure codex auto-approval: {e}")
 
-    def _codex_session_log_matches_id(self, log_path: Path, session_id: str) -> bool:
-        sid = str(session_id or "").strip()
-        if not sid or not log_path.exists() or not log_path.is_file():
-            return False
-        if sid in log_path.name or sid in log_path.stem:
-            return True
-        try:
-            with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
-                for _ in range(50):
-                    line = handle.readline()
-                    if not line:
-                        break
-                    if sid in line:
-                        return True
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(entry, dict) and entry.get("type") == "session_meta":
-                        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-                        if payload.get("id") == sid:
-                            return True
-        except Exception:
-            return False
-        return False
-
-    def _codex_session_exists(self, session_id: str, log_path: str | None = None) -> bool:
-        sid = str(session_id or "").strip()
-        if not sid:
-            return False
-        if log_path:
-            try:
-                if self._codex_session_log_matches_id(Path(log_path).expanduser(), sid):
-                    return True
-            except Exception:
-                pass
-        root = Path(os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
-        if not root.exists():
-            return False
-        try:
-            logs = sorted(
-                (p for p in root.glob("**/*.jsonl") if p.is_file()),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-        except Exception:
-            logs = []
-        scan_limit = 400
-        raw_limit = (os.environ.get("CCB_CODEX_SCAN_LIMIT") or "").strip()
-        if raw_limit:
-            try:
-                scan_limit = max(100, min(20000, int(raw_limit)))
-            except Exception:
-                scan_limit = 400
-        for candidate in logs[:scan_limit]:
-            if self._codex_session_log_matches_id(candidate, sid):
-                return True
-        return False
-
-    def _get_bound_codex_session_id(self, instance: str | None = None) -> tuple[str | None, bool]:
-        session_file = self._project_session_file_for_provider("codex", instance)
-        if not session_file.exists():
-            return None, False
-        data = self._read_json_file(session_file)
-        sid = str(data.get("codex_session_id") or "").strip()
-        if not sid:
-            return None, False
-
-        recorded_pid = str(data.get("ccb_project_id") or "").strip()
-        current_pid = compute_ccb_project_id(self.project_root)
-        if recorded_pid and current_pid and recorded_pid != current_pid:
-            print(f"⚠️ Codex resume skipped for {self._instance_key('codex', instance)}: session belongs to another project", file=sys.stderr)
-            return None, True
-
-        recorded_norm = _extract_session_work_dir_norm(data)
-        current_keys = _work_dir_match_keys(self.project_root)
-        if recorded_norm and current_keys and recorded_norm not in current_keys:
-            print(f"⚠️ Codex resume skipped for {self._instance_key('codex', instance)}: session work_dir mismatch", file=sys.stderr)
-            return None, True
-
-        log_path = str(data.get("codex_session_path") or "").strip() or None
-        if not self._codex_session_exists(sid, log_path=log_path):
-            print(f"⚠️ Codex resume skipped for {self._instance_key('codex', instance)}: bound session id not found ({sid[:8]})", file=sys.stderr)
-            return None, True
-        return sid, True
-
-    def _build_codex_start_cmd(self, instance: str | None = None) -> str:
+    def _build_codex_start_cmd(self) -> str:
         if self.auto:
             self._ensure_codex_auto_approval()
         # NOTE: Codex CLI (codex-cli) does not support the legacy flag
         # `--dangerously-bypass-approvals-and-sandbox`. Auto-mode is implemented via config and
         # supported `-c key=value` overrides.
         cmd_parts = ["codex", "-c", "disable_paste_burst=true"]
-        normalized_instance = normalize_instance_name(instance)
-        apply_policy = bool(normalized_instance) or self._provider_has_instances("codex")
-        if apply_policy:
-            policy = self._policy_for("codex", normalized_instance)
-            if policy.model:
-                cmd_parts.extend(["--model", shlex.quote(policy.model)])
-            if policy.effort:
-                cmd_parts.extend(["-c", f"model_reasoning_effort='\"{policy.effort}\"'"])
-            if policy.sandbox and not self.auto:
-                cmd_parts.extend(["-c", f'sandbox_mode="{policy.sandbox}"'])
         if self.auto:
             cmd_parts.extend([
                 "-c", 'trust_level="trusted"',
@@ -2314,21 +1791,14 @@ class AILauncher:
         cmd = " ".join(cmd_parts)
         codex_resumed = False
         if self.resume:
-            if normalized_instance:
-                session_id, has_history = self._get_bound_codex_session_id(normalized_instance)
-            else:
-                session_id, has_history = self._get_bound_codex_session_id(None)
-                if not session_id and not self._provider_has_instances("codex"):
-                    session_id, has_history = self._get_latest_codex_session_id(
-                        exclude_session_ids=self._bound_codex_session_ids(include_base=False)
-                    )
+            session_id, has_history = self._get_latest_codex_session_id()
             if session_id:
                 cmd = f"{cmd} resume {session_id}"
-                print(f"🔁 {t('resuming_session', provider=self._provider_display('codex', instance), session_id=session_id[:8])}")
+                print(f"🔁 {t('resuming_session', provider='Codex', session_id=session_id[:8])}")
                 codex_resumed = True
 
             if not codex_resumed:
-                print(f"ℹ️ {t('no_history_fresh', provider=self._provider_display('codex', instance))}")
+                print(f"ℹ️ {t('no_history_fresh', provider='Codex')}")
         return cmd
 
     def _get_latest_gemini_project_hash(self) -> tuple[str | None, bool, Path | None]:
@@ -2415,8 +1885,6 @@ class AILauncher:
             ping_script = self.script_dir / "bin" / "gping"
         elif provider == "opencode":
             ping_script = self.script_dir / "bin" / "oping"
-        elif provider == "droid":
-            ping_script = self.script_dir / "bin" / "dping"
         else:
             return False
 
@@ -2451,17 +1919,15 @@ class AILauncher:
         print(f"⚠️ Warmup failed: {provider}")
         return False
 
-    def _get_start_cmd(self, provider: str, instance: str | None = None) -> str:
+    def _get_start_cmd(self, provider: str) -> str:
         if provider == "codex":
             # NOTE: Codex TUI has paste-burst detection; terminal injection (wezterm send-text/tmux paste-buffer)
             # is often detected as "paste", causing Enter to only line-break not submit. Disable detection by default.
-            cmd = self._build_codex_start_cmd(instance)
+            cmd = self._build_codex_start_cmd()
         elif provider == "gemini":
             cmd = self._build_gemini_start_cmd()
         elif provider == "opencode":
             cmd = self._build_opencode_start_cmd()
-        elif provider == "droid":
-            cmd = self._build_droid_start_cmd()
         else:
             cmd = ""
         # Append per-provider launch_args from config.
@@ -2597,52 +2063,6 @@ class AILauncher:
 
         return cmd
 
-    def _get_latest_droid_session_id(self) -> tuple[str | None, bool, Path | None]:
-        """
-        Returns (session_id, has_any_history, resume_dir).
-        - session_id: latest Droid session id if found (from session_start).
-        - has_any_history: whether this project has any Droid sessions on disk.
-        - resume_dir: cwd from session_start (if it exists on disk).
-        """
-        try:
-            from droid_comm import DroidLogReader, read_droid_session_start
-        except Exception:
-            return None, False, None
-
-        reader = DroidLogReader(work_dir=self.project_root)
-        session_path = reader.current_session_path()
-        if not session_path or not session_path.exists():
-            return None, False, None
-
-        cwd, session_id = read_droid_session_start(session_path)
-        resume_dir = None
-        if isinstance(cwd, str) and cwd.strip():
-            try:
-                candidate = Path(cwd)
-                if candidate.is_dir():
-                    resume_dir = candidate
-            except Exception:
-                resume_dir = None
-        return session_id or None, True, resume_dir
-
-    def _build_droid_start_cmd(self) -> str:
-        cmd = (os.environ.get("DROID_START_CMD") or "droid").strip() or "droid"
-        resume_cmd = (os.environ.get("DROID_RESUME_CMD") or "").strip()
-        if self.resume:
-            session_id, has_history, resume_dir = self._get_latest_droid_session_id()
-            if has_history:
-                if resume_cmd:
-                    cmd = resume_cmd
-                else:
-                    if resume_dir:
-                        cmd = f"{_build_cd_cmd(resume_dir)}{cmd}"
-                    cmd = f"{cmd} -r"
-                sid_hint = session_id[:8] if session_id else ""
-                print(f"🔁 {t('resuming_session', provider='Droid', session_id=sid_hint)}")
-            else:
-                print(f"ℹ️ {t('no_history_fresh', provider='Droid')}")
-        return cmd
-
     def _ensure_opencode_auto_config(self) -> None:
         """
         Ensure project-local opencode.json exists with full allow permissions (auto mode).
@@ -2686,9 +2106,8 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
-        instance: str | None = None,
     ) -> str | None:
-        runtime = self._runtime_dir_for("codex", instance)
+        runtime = self.runtime_dir / "codex"
         runtime.mkdir(parents=True, exist_ok=True)
 
         input_fifo = runtime / "input.fifo"
@@ -2700,9 +2119,8 @@ class AILauncher:
             os.mkfifo(output_fifo, 0o644)
 
         env_overrides = self._provider_env_overrides("codex")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd(instance)
-        pane_title_marker = self._pane_marker_for("codex", instance)
-        codex_snapshot = self._snapshot_codex_rollouts()
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
+        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
 
         backend = TmuxBackend()
 
@@ -2729,7 +2147,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Codex")
 
-        self.tmux_panes[self._instance_key("codex", instance)] = pane_id
+        self.tmux_panes["codex"] = pane_id
 
         bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
         bridge_env = os.environ.copy()
@@ -2777,11 +2195,9 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
-            instance=instance,
         )
-        self._bind_new_codex_session_from_snapshot(codex_snapshot, instance)
 
-        print(f"✅ {t('started_backend', provider=self._provider_display('codex', instance), terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider='Codex', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_gemini_tmux(
@@ -2889,58 +2305,6 @@ class AILauncher:
         print(f"✅ {t('started_backend', provider='OpenCode', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
-    def _start_droid_tmux(
-        self,
-        *,
-        parent_pane: str | None = None,
-        direction: str | None = None,
-    ) -> str | None:
-        runtime = self.runtime_dir / "droid"
-        runtime.mkdir(parents=True, exist_ok=True)
-
-        env_overrides = self._provider_env_overrides("droid")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_droid_start_cmd()
-        pane_title_marker = f"CCB-Droid-{self.project_id[:8]}"
-
-        backend = TmuxBackend()
-
-        use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
-        use_parent = parent_pane
-        if not use_parent:
-            try:
-                use_parent = backend.get_current_pane_id()
-            except Exception:
-                use_parent = None
-        if not use_parent and use_direction == "bottom":
-            try:
-                use_parent = next(reversed(self.tmux_panes.values()))
-            except StopIteration:
-                use_parent = None
-
-        try:
-            if use_parent and str(use_parent).startswith("%") and not backend.pane_exists(str(use_parent)):
-                use_parent = backend.get_current_pane_id()
-        except Exception:
-            use_parent = None
-
-        pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
-        backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
-        backend.set_pane_title(pane_id, pane_title_marker)
-        backend.set_pane_user_option(pane_id, "@ccb_agent", "Droid")
-
-        self.tmux_panes["droid"] = pane_id
-
-        self._write_droid_session(
-            runtime,
-            None,
-            pane_id=pane_id,
-            pane_title_marker=pane_title_marker,
-            start_cmd=start_cmd,
-        )
-
-        print(f"✅ {t('started_backend', provider='Droid', terminal='tmux pane', pane_id=pane_id)}")
-        return pane_id
-
     def _start_cmd_pane(
         self,
         *,
@@ -3025,7 +2389,6 @@ class AILauncher:
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
         self._maybe_start_caskd()
-        codex_snapshot = self._snapshot_codex_rollouts()
 
         if self.terminal_type == "tmux":
             bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
@@ -3066,7 +2429,6 @@ class AILauncher:
                 env["CODEX_WEZTERM_PANE"] = pane_id
             else:
                 env["CODEX_TMUX_SESSION"] = pane_id
-            self._bind_new_codex_session_async(codex_snapshot, None)
             return self._run_shell_command(self._build_codex_start_cmd(), env=env, cwd=str(Path.cwd()))
 
         cmd_parts = shlex.split(self._build_codex_start_cmd())
@@ -3094,7 +2456,6 @@ class AILauncher:
         except Exception:
             pass
 
-        self._bind_new_codex_session_async(codex_snapshot, None)
         return proc.wait()
 
     def _start_gemini_current_pane(self) -> int:
@@ -3193,41 +2554,6 @@ class AILauncher:
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
-    def _start_droid_current_pane(self) -> int:
-        runtime = self.runtime_dir / "droid"
-        runtime.mkdir(parents=True, exist_ok=True)
-
-        pane_id = self._current_pane_id()
-        if not pane_id:
-            print("❌ Unable to determine current pane id for Droid", file=sys.stderr)
-            return 1
-
-        pane_title_marker = f"CCB-Droid-{self.project_id[:8]}"
-        if self.terminal_type == "tmux":
-            try:
-                backend = TmuxBackend()
-                backend.set_pane_title(pane_id, pane_title_marker)
-                backend.set_pane_user_option(pane_id, "@ccb_agent", "Droid")
-            except Exception:
-                pass
-
-        title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
-        start_cmd = (
-            title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("droid"))
-            + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_droid_start_cmd()
-        )
-        self._write_droid_session(
-            runtime,
-            None,
-            pane_id=pane_id,
-            pane_title_marker=pane_title_marker,
-            start_cmd=start_cmd,
-        )
-
-        return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
-
     def _start_provider_in_current_pane(self, provider: str) -> int:
         if provider == "claude":
             return self._start_claude()
@@ -3237,24 +2563,11 @@ class AILauncher:
             return self._start_gemini_current_pane()
         if provider == "opencode":
             return self._start_opencode_current_pane()
-        if provider == "droid":
-            return self._start_droid_current_pane()
         print(f"❌ {t('unknown_provider', provider=provider)}")
         return 1
 
-    def _write_codex_session(
-        self,
-        runtime,
-        tmux_session,
-        input_fifo,
-        output_fifo,
-        pane_id=None,
-        pane_title_marker=None,
-        codex_start_cmd=None,
-        instance: str | None = None,
-    ):
-        session_file = self._project_session_file_for_provider("codex", instance)
-        provider_key = self._registry_provider_key("codex", instance)
+    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None, pane_title_marker=None, codex_start_cmd=None):
+        session_file = self._project_session_file(".codex-session")
 
         # Pre-check permissions
         writable, reason, fix = check_session_writable(session_file)
@@ -3272,9 +2585,6 @@ class AILauncher:
 
         work_dir = self.project_root
         data.update({
-            "provider": "codex",
-            "instance": normalize_instance_name(instance),
-            "qualified_provider": provider_key,
             "session_id": self.session_id,
             "ccb_project_id": compute_ccb_project_id(work_dir),
             "runtime_dir": str(runtime),
@@ -3306,7 +2616,7 @@ class AILauncher:
                 "work_dir": str(self.project_root),
                 "terminal": self.terminal_type,
                 "providers": {
-                    provider_key: {
+                    "codex": {
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
@@ -3447,75 +2757,6 @@ class AILauncher:
         self._auto_prune_session_records()
         return True
 
-    def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
-        session_file = self._project_session_file(".droid-session")
-
-        writable, reason, fix = check_session_writable(session_file)
-        if not writable:
-            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
-            print(f"💡 Fix: {fix}", file=sys.stderr)
-            return False
-
-        droid_session_path = None
-        droid_session_id = None
-        try:
-            from droid_comm import DroidLogReader, read_droid_session_start
-
-            reader = DroidLogReader(work_dir=self.project_root)
-            session_path = reader.current_session_path()
-            if session_path and session_path.exists():
-                droid_session_path = str(session_path)
-                _cwd, session_id = read_droid_session_start(session_path)
-                if session_id:
-                    droid_session_id = session_id
-        except Exception:
-            pass
-
-        data = {
-            "session_id": self.session_id,
-            "ccb_session_id": self.session_id,
-            "ccb_project_id": compute_ccb_project_id(self.project_root),
-            "runtime_dir": str(runtime),
-            "terminal": self.terminal_type,
-            "tmux_session": tmux_session,
-            "pane_id": pane_id,
-            "pane_title_marker": pane_title_marker,
-            "work_dir": str(self.project_root),
-            "work_dir_norm": _normalize_path_for_match(str(self.project_root)),
-            "start_dir": str(self.invocation_dir),
-            "active": True,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "start_cmd": str(start_cmd) if start_cmd else None,
-            "droid_session_id": droid_session_id,
-            "droid_session_path": droid_session_path,
-        }
-
-        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
-        if not ok:
-            print(err, file=sys.stderr)
-            return False
-        try:
-            upsert_registry({
-                "ccb_session_id": self.session_id,
-                "ccb_project_id": compute_ccb_project_id(self.project_root),
-                "work_dir": str(self.project_root),
-                "terminal": self.terminal_type,
-                "providers": {
-                    "droid": {
-                        "pane_id": pane_id,
-                        "pane_title_marker": pane_title_marker,
-                        "session_file": str(session_file),
-                        "droid_session_id": droid_session_id,
-                        "droid_session_path": droid_session_path,
-                    }
-                },
-            })
-        except Exception:
-            pass
-        self._maybe_start_provider_daemon("droid")
-        self._auto_prune_session_records()
-        return True
-
     def _claude_project_dir(self, work_dir: Path) -> Path:
         projects_root = Path.home() / ".claude" / "projects"
         # Claude Code uses a filesystem-friendly key derived from the working directory.
@@ -3612,63 +2853,6 @@ class AILauncher:
             return None, True, best_cwd
         return None, False, None
 
-    def _claude_session_exists(self, session_id: str, session_path: str | None = None) -> bool:
-        sid = str(session_id or "").strip()
-        if not sid:
-            return False
-        if session_path:
-            try:
-                p = Path(session_path).expanduser()
-                if p.exists() and p.is_file() and p.stem == sid:
-                    return True
-            except Exception:
-                pass
-
-        for work_dir in (Path.cwd(), self.invocation_dir, self.project_root):
-            project_dir = self._claude_project_dir(work_dir)
-            candidate = project_dir / f"{sid}.jsonl"
-            try:
-                if candidate.exists() and candidate.is_file():
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _get_bound_claude_session_id(self, instance: str | None = None) -> tuple[str | None, bool, Path | None]:
-        session_file = self._claude_session_file(instance)
-        if not session_file.exists():
-            return None, False, None
-        data = self._read_json_file(session_file)
-        sid = str(data.get("claude_session_id") or data.get("session_id") or "").strip()
-        if not sid:
-            return None, False, None
-
-        recorded_pid = str(data.get("ccb_project_id") or "").strip()
-        current_pid = compute_ccb_project_id(self.project_root)
-        if recorded_pid and current_pid and recorded_pid != current_pid:
-            print(f"⚠️ Claude resume skipped for {self._instance_key('claude', instance)}: session belongs to another project", file=sys.stderr)
-            return None, True, None
-
-        recorded_norm = _extract_session_work_dir_norm(data)
-        current_keys = _work_dir_match_keys(self.project_root)
-        if recorded_norm and current_keys and recorded_norm not in current_keys:
-            print(f"⚠️ Claude resume skipped for {self._instance_key('claude', instance)}: session work_dir mismatch", file=sys.stderr)
-            return None, True, None
-
-        session_path = str(data.get("claude_session_path") or "").strip() or None
-        if not self._claude_session_exists(sid, session_path=session_path):
-            print(f"⚠️ Claude resume skipped for {self._instance_key('claude', instance)}: bound session id not found ({sid[:8]})", file=sys.stderr)
-            return None, True, None
-
-        resume_dir = self.project_root
-        work_dir = str(data.get("work_dir") or "").strip()
-        if work_dir:
-            try:
-                resume_dir = Path(work_dir)
-            except Exception:
-                resume_dir = self.project_root
-        return sid, True, resume_dir
-
     def _find_claude_cmd(self) -> str:
         """Find Claude CLI executable"""
         if sys.platform == "win32":
@@ -3729,43 +2913,24 @@ class AILauncher:
             else:
                 env["OPENCODE_TMUX_SESSION"] = pane_id
 
-        if "droid" in self.providers:
-            runtime = self.runtime_dir / "droid"
-            env["DROID_SESSION_ID"] = self.session_id
-            env["DROID_RUNTIME_DIR"] = str(runtime)
-            env["DROID_TERMINAL"] = self.terminal_type or ""
-            pane_id = self._provider_pane_id("droid")
-            if self.terminal_type == "wezterm":
-                env["DROID_WEZTERM_PANE"] = pane_id
-            else:
-                env["DROID_TMUX_SESSION"] = pane_id
-
         return env
 
-    def _build_claude_env(self, instance: str | None = None) -> dict:
+    def _build_claude_env(self) -> dict:
         env = self._with_bin_path_env()
         env.update(self._claude_env_overrides())
         return env
 
-    def _claude_start_plan(self, instance: str | None = None) -> tuple[list[str], str, bool]:
+    def _claude_start_plan(self) -> tuple[list[str], str, bool]:
         claude_cmd = self._find_claude_cmd()
         cmd = [claude_cmd]
         if self.auto:
             cmd.append("--dangerously-skip-permissions")
         has_history = False
         resume_dir = None
-        normalized_instance = normalize_instance_name(instance)
         if self.resume:
-            session_id, has_history, resume_dir = self._get_bound_claude_session_id(normalized_instance)
-            if session_id:
-                cmd.extend(["--resume", session_id])
-            elif not normalized_instance and not self._provider_has_instances("claude"):
-                _, has_history, resume_dir = self._get_latest_claude_session_id()
-                if has_history:
-                    cmd.append("--continue")
-        policy = self._policy_for("claude", instance)
-        if normalize_instance_name(instance) and policy.model:
-            cmd.extend(["--model", policy.model])
+            _, has_history, resume_dir = self._get_latest_claude_session_id()
+            if has_history:
+                cmd.append("--continue")
         # Append per-provider launch_args from config.
         extra = self.launch_args.get("claude")
         if isinstance(extra, str) and extra.strip():
@@ -3789,7 +2954,7 @@ class AILauncher:
             if has_history:
                 print(f"🔁 {t('resuming_claude', session_id='')}")
             else:
-                print(f"ℹ️ {t('no_history_fresh', provider=self._provider_display('claude'))}")
+                print(f"ℹ️ {t('no_claude_session')}")
 
         print(f"📋 Session ID: {self.session_id}")
         print(f"📁 Runtime dir: {self.runtime_dir}")
@@ -3802,13 +2967,8 @@ class AILauncher:
             print("   gask/gping/gpend - Gemini communication")
         if "opencode" in self.providers:
             print("   oask/oping/opend - OpenCode communication")
-        if "droid" in self.providers:
-            print("   dask/dping/dpend - Droid communication")
         print()
         print(f"Executing: {' '.join(cmd)}")
-
-        session_snapshot = self._snapshot_claude_sessions()
-        self._bind_new_claude_session_async(session_snapshot, None)
 
         try:
             # Let subprocess inherit stdio by default. Explicitly passing sys.stdin/out/err
@@ -3819,18 +2979,12 @@ class AILauncher:
             print(f"\n⚠️ {t('user_interrupted')}")
             return 130
 
-    def _start_claude_pane(
-        self,
-        *,
-        parent_pane: str | None,
-        direction: str | None,
-        instance: str | None = None,
-    ) -> str | None:
+    def _start_claude_pane(self, *, parent_pane: str | None, direction: str | None) -> str | None:
         print(f"🚀 {t('starting_claude')}")
         env_overrides = self._claude_env_overrides()
 
         try:
-            cmd_parts, run_cwd, has_history = self._claude_start_plan(instance)
+            cmd_parts, run_cwd, has_history = self._claude_start_plan()
         except FileNotFoundError as e:
             print(str(e))
             return None
@@ -3839,12 +2993,11 @@ class AILauncher:
             if has_history:
                 print(f"🔁 {t('resuming_claude', session_id='')}")
             else:
-                print(f"ℹ️ {t('no_history_fresh', provider=self._provider_display('claude', instance))}")
+                print(f"ℹ️ {t('no_claude_session')}")
 
         start_cmd = " ".join(cmd_parts)
-        pane_title_marker = self._pane_marker_for("claude", instance)
         full_cmd = (
-            _build_pane_title_cmd(pane_title_marker)
+            _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
             + self._build_env_prefix(env_overrides)
             + _build_export_path_cmd(self.script_dir / "bin")
             + start_cmd
@@ -3853,36 +3006,30 @@ class AILauncher:
         use_direction = (direction or "right").strip() or "right"
         use_parent = parent_pane
 
-        session_snapshot = self._snapshot_claude_sessions()
-
         if self.terminal_type == "wezterm":
             backend = WeztermBackend()
             pane_id = backend.create_pane(full_cmd, run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
-            self.wezterm_panes[self._instance_key("claude", instance)] = pane_id
+            self.wezterm_panes["claude"] = pane_id
         else:
             backend = TmuxBackend()
             pane_id = backend.create_pane("", run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
             backend.respawn_pane(pane_id, cmd=full_cmd, cwd=run_cwd, remain_on_exit=True)
-            backend.set_pane_title(pane_id, pane_title_marker)
+            backend.set_pane_title(pane_id, f"CCB-Claude-{self.project_id[:8]}")
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
-            self.tmux_panes[self._instance_key("claude", instance)] = pane_id
+            self.tmux_panes["claude"] = pane_id
 
         try:
             self._write_local_claude_session(
-                session_id=self._read_local_claude_session_id() if not normalize_instance_name(instance) else None,
+                session_id=self._read_local_claude_session_id(),
                 active=True,
                 pane_id=str(pane_id or ""),
-                pane_title_marker=pane_title_marker,
+                pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
                 terminal=self.terminal_type,
-                instance=instance,
-                start_cmd=start_cmd,
             )
         except Exception:
             pass
 
-        self._bind_new_claude_session_from_snapshot(session_snapshot, instance)
-
-        print(f"✅ {t('started_backend', provider=self._provider_display('claude', instance), terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider='Claude', terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
         return pane_id
 
     def cleanup(
@@ -3940,20 +3087,12 @@ class AILauncher:
                         backend.kill_pane(pane_id)
 
         if clear_sessions:
-            session_files = [
+            for session_file in [
                 self._project_session_file(".codex-session"),
                 self._project_session_file(".gemini-session"),
                 self._project_session_file(".opencode-session"),
                 self._project_session_file(".claude-session"),
-                self._project_session_file(".droid-session"),
-            ]
-            for spec in self.provider_instances:
-                if isinstance(spec, dict):
-                    provider = str(spec.get("provider") or "").strip().lower()
-                    instance = normalize_instance_name(str(spec.get("instance") or ""))
-                    if provider and instance:
-                        session_files.append(self._project_session_file_for_provider(provider, instance))
-            for session_file in session_files:
+            ]:
                 if session_file.exists():
                     try:
                         data = self._read_json_file(session_file)
@@ -4036,48 +3175,29 @@ class AILauncher:
             return 2
 
         cmd_settings = self._cmd_settings()
-        base_spawn_items: list[object] = []
+        spawn_items: list[str] = []
         if cmd_settings.get("enabled"):
-            base_spawn_items.append("cmd")
-        base_spawn_items.extend(list(reversed(self.providers[:-1])))
-        total_panes = 1 + len(base_spawn_items)
+            spawn_items.append("cmd")
+        spawn_items.extend(list(reversed(self.providers[:-1])))
+        total_panes = 1 + len(spawn_items)
         left_count = 1 if total_panes <= 1 else max(1, total_panes // 2)
         right_count = total_panes - left_count
 
-        extras = list(base_spawn_items)
+        extras = list(spawn_items)
         right_top_item = extras[0] if right_count > 0 and extras else None
         remaining = extras[1:] if right_top_item else extras
 
         left_slots = max(0, left_count - 1)
         right_slots = max(0, right_count - (1 if right_top_item else 0))
 
-        left_items: list[object] = [self.anchor_provider]
+        left_items = [self.anchor_provider]
         left_items.extend(remaining[:left_slots])
 
-        right_items: list[object] = []
+        right_items: list[str] = []
         if right_top_item:
             right_items.append(right_top_item)
         if right_slots:
             right_items.extend(remaining[left_slots:left_slots + right_slots])
-
-        instances_by_provider: dict[str, list[dict]] = {}
-        for spec in self.provider_instances:
-            provider = str(spec.get("provider") or "").strip().lower()
-            instances_by_provider.setdefault(provider, []).append(dict(spec))
-
-        def _with_provider_instances(items: list[object]) -> list[object]:
-            expanded: list[object] = []
-            for item in items:
-                expanded.append(item)
-                if isinstance(item, str) and item != "cmd":
-                    provider = str(item).strip().lower()
-                    expanded.extend(instances_by_provider.pop(provider, []))
-            return expanded
-
-        left_items = _with_provider_instances(left_items)
-        right_items = _with_provider_instances(right_items)
-        for specs in instances_by_provider.values():
-            left_items.extend(specs)
 
         cleanup_kwargs = {}
 
@@ -4136,22 +3256,14 @@ class AILauncher:
             except Exception:
                 pass
 
-        def _start_item(item: object, *, parent: str | None, direction: str | None) -> str | None:
+        def _start_item(item: str, *, parent: str | None, direction: str | None) -> str | None:
             if item == "cmd":
                 return self._start_cmd_pane(parent_pane=parent, direction=direction, cmd_settings=cmd_settings)
-            if isinstance(item, dict):
-                provider = str(item.get("provider") or "").strip().lower()
-                instance = normalize_instance_name(str(item.get("instance") or ""))
-                key = self._instance_key(provider, instance)
-            else:
-                provider = str(item or "").strip().lower()
-                instance = None
-                key = provider
-            if provider == "claude":
-                return self._start_claude_pane(parent_pane=parent, direction=direction, instance=instance)
-            pane_id = self._start_provider(provider, parent_pane=parent, direction=direction, instance=instance)
+            if item == "claude":
+                return self._start_claude_pane(parent_pane=parent, direction=direction)
+            pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
             if pane_id:
-                self._warmup_provider(key)
+                self._warmup_provider(item)
             return pane_id
 
         right_top: str | None = None
@@ -4324,13 +3436,13 @@ def cmd_start(args):
             return 2
 
     # Parse explicit provider args early so lock-collision path can reuse an existing pane.
-    requested_providers, requested_instances, _requested_cmd_enabled = _parse_provider_specs_with_cmd(args.providers or [])
-    requested_raw_parts = _split_provider_tokens(args.providers or [])
+    requested_providers, _requested_cmd_enabled, providers_valid = _parse_providers_with_cmd(args.providers or [])
+    if not providers_valid:
+        return 2
 
     def _existing_provider_pane_for_project(project_work_dir: Path, provider: str) -> tuple[dict | None, str]:
         prov = (provider or "").strip().lower()
-        base_provider, _instance = parse_qualified_provider(prov)
-        if not base_provider:
+        if not prov:
             return None, ""
         try:
             project_id = compute_ccb_project_id(project_work_dir)
@@ -4338,7 +3450,7 @@ def cmd_start(args):
             return None, ""
         if not project_id:
             return None, ""
-        record = load_registry_by_project_id(project_id, base_provider)
+        record = load_registry_by_project_id(project_id, prov)
         if not isinstance(record, dict):
             return None, ""
         providers_map = record.get("providers")
@@ -4363,14 +3475,7 @@ def cmd_start(args):
 
         # Fast-path: if user requests a single provider, try activating its existing pane
         # in the already-running instance instead of hard failing.
-        focus_provider = ""
-        if len(requested_raw_parts) == 1:
-            raw_focus = requested_raw_parts[0]
-            base_focus, inst_focus = parse_qualified_provider(raw_focus)
-            if inst_focus and requested_instances:
-                focus_provider = requested_instances[0].get("key", "")
-            elif base_focus in requested_providers:
-                focus_provider = base_focus
+        focus_provider = requested_providers[0] if len(requested_providers) == 1 else ""
         if focus_provider:
             record, pane_id = _existing_provider_pane_for_project(work_dir, focus_provider)
             if record and pane_id:
@@ -4395,12 +3500,11 @@ def cmd_start(args):
         return 2
     atexit.register(ccb_lock.release)
 
-    providers, provider_instances, cmd_enabled = requested_providers, list(requested_instances), _requested_cmd_enabled
+    providers, cmd_enabled = requested_providers, _requested_cmd_enabled
     config = load_start_config(work_dir)
     config_data = config.data if isinstance(config.data, dict) else {}
 
-    using_config_providers = not providers
-    if using_config_providers:
+    if not providers:
         raw_providers = config_data.get("providers")
         if isinstance(raw_providers, str):
             raw_providers = [raw_providers]
@@ -4412,11 +3516,7 @@ def cmd_start(args):
                 created_path, created = ensure_default_start_config(work_dir)
                 if created and created_path:
                     print(f"✅ Created default config: {created_path}", file=sys.stderr)
-        providers, provider_instances, _config_cmd_enabled = _parse_provider_specs([str(p) for p in raw_providers])
-        if _config_cmd_enabled:
-            cmd_enabled = True
-        if not provider_instances and isinstance(config_data.get("provider_instances"), list):
-            provider_instances = [dict(item) for item in config_data.get("provider_instances") if isinstance(item, dict)]
+        providers = _parse_providers([str(p) for p in raw_providers])
 
     if not providers:
         print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
@@ -4437,13 +3537,9 @@ def cmd_start(args):
     launch_args = raw_launch_args if isinstance(raw_launch_args, dict) else None
     raw_launch_env = config_data.get("launch_env")
     launch_env = raw_launch_env if isinstance(raw_launch_env, dict) else None
-    raw_instances = config_data.get("instances")
-    instance_overrides = raw_instances if isinstance(raw_instances, dict) else None
 
     launcher = AILauncher(
         providers=providers,
-        provider_instances=provider_instances,
-        instance_overrides=instance_overrides,
         resume=resume,
         auto=auto,
         cmd_config=cmd_config,
@@ -4456,7 +3552,7 @@ def cmd_start(args):
 def _find_all_zombie_sessions() -> list[dict]:
     """Find all zombie tmux sessions (CCB sessions whose parent process is dead)."""
     import re
-    pattern = re.compile(r"^(codex|gemini|opencode|claude|droid)-(\d+)-")
+    pattern = re.compile(r"^(codex|gemini|opencode|claude)-(\d+)-")
     zombies = []
 
     if os.name == "nt" or not shutil.which("tmux"):
@@ -4681,62 +3777,25 @@ def cmd_kill(args):
         yes = getattr(args, "yes", False)
         return _kill_global_zombies(yes=yes)
 
-    project_root = Path.cwd()
-    requested: set[str] | None = None
-    raw_providers = getattr(args, "providers", None) or []
-    if raw_providers:
-        requested = set()
-        for token in _split_provider_tokens(raw_providers):
-            base, instance = parse_qualified_provider(token)
-            if not base:
-                continue
-            requested.add(make_qualified_key(base, normalize_instance_name(instance)))
-        if not requested:
-            return 2
+    # Project-level cleanup (original behavior)
+    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude"], allow_unknown=True)
+    if not providers:
+        return 2
 
-    matched = 0
-    for session_file in _project_session_files(project_root):
-        data = _read_json_session(session_file)
-        provider, instance = _session_file_provider_key(session_file, data)
-        if not provider:
-            continue
-        provider_key = make_qualified_key(provider, instance)
-        if requested and provider_key not in requested and provider not in requested:
-            continue
-        if not _session_file_matches_project(session_file, data, project_root):
-            continue
-        matched += 1
+    for provider in providers:
+        # 1. Kill UI sessions (tmux/wezterm)
+        session_file = find_project_session_file(Path.cwd(), f".{provider}-session")
+        if session_file and session_file.exists():
+            try:
+                data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+                terminal = data.get("terminal", "tmux")
+                pane_id = data.get("pane_id") if terminal == "wezterm" else (data.get("pane_id") or data.get("tmux_session") or "")
 
-        try:
-            terminal = str(data.get("terminal") or "tmux").strip().lower()
-            pane_id = data.get("pane_id") if terminal == "wezterm" else (data.get("pane_id") or data.get("tmux_session") or "")
-            pane_id = str(pane_id or "").strip()
-            killed = False
-
-            if terminal == "wezterm" and pane_id:
-                backend = WeztermBackend()
-                try:
-                    pane_alive = bool(backend.is_alive(pane_id))
-                except Exception:
-                    pane_alive = True
-                cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
-                if pane_alive and callable(cwd_check) and not bool(cwd_check(pane_id, str(project_root))):
-                    print(f"⚠️ {provider_key}: pane cwd does not match current project; skipped")
-                    continue
-                if pane_alive:
+                if terminal == "wezterm" and pane_id:
+                    backend = WeztermBackend()
                     backend.kill_pane(pane_id)
-                    killed = True
-            elif pane_id and shutil.which("tmux"):
-                backend = TmuxBackend()
-                try:
-                    pane_alive = bool(backend.is_alive(str(pane_id)))
-                except Exception:
-                    pane_alive = True
-                cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
-                if pane_alive and callable(cwd_check) and str(pane_id).startswith("%") and not bool(cwd_check(str(pane_id), str(project_root))):
-                    print(f"⚠️ {provider_key}: pane cwd does not match current project; skipped")
-                    continue
-                if pane_alive:
+                elif pane_id and shutil.which("tmux"):
+                    backend = TmuxBackend()
                     if str(pane_id).startswith("%"):
                         backend.kill_pane(str(pane_id))
                     else:
@@ -4746,39 +3805,15 @@ def cmd_kill(args):
                             subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_session}"], stderr=subprocess.DEVNULL)
                         else:
                             backend.kill_pane(str(pane_id))
-                    killed = True
 
-            data["active"] = False
-            data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
-            try:
-                ccb_session_id = str(data.get("ccb_session_id") or data.get("session_id") or "").strip()
-                if ccb_session_id:
-                    upsert_registry({
-                        "ccb_session_id": ccb_session_id,
-                        "ccb_project_id": data.get("ccb_project_id") or compute_ccb_project_id(project_root),
-                        "work_dir": str(project_root),
-                        "terminal": terminal,
-                        "providers": {
-                            provider_key: {
-                                "pane_id": pane_id or None,
-                                "pane_title_marker": data.get("pane_title_marker"),
-                                "session_file": str(session_file),
-                                "active": False,
-                                "ended_at": data["ended_at"],
-                            }
-                        },
-                    })
-            except Exception:
-                pass
-            suffix = "terminated" if killed else "marked inactive"
-            print(f"✅ {provider_key} session {suffix}")
-        except Exception as e:
-            print(f"❌ {provider_key}: {e}")
-
-    if matched == 0:
-        target = ", ".join(sorted(requested)) if requested else "project"
-        print(f"ℹ️  {target}: No active session file found")
+                data["active"] = False
+                data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+                print(f"✅ {provider.capitalize()} session terminated")
+            except Exception as e:
+                print(f"❌ {provider}: {e}")
+        else:
+            print(f"ℹ️  {provider}: No active session file found")
 
     if daemon:
         _shutdown_shared_askd_for_project_kill(Path.cwd())
@@ -4797,63 +3832,18 @@ def _parse_duration_seconds(value: str | int | float) -> int:
         if seconds < 0:
             raise argparse.ArgumentTypeError("duration must be non-negative")
         return seconds
-    text = str(value or "").strip()
-    match = _DURATION_RE.match(text)
+    match = _DURATION_RE.match(str(value or ""))
     if not match:
         raise argparse.ArgumentTypeError("duration must be like 3600, 12h, 7d, or 2w")
-    amount = int(match.group(1))
-    unit = match.group(2).lower()
-    multipliers = {
-        "": 1,
-        "s": 1,
-        "m": 60,
-        "h": 60 * 60,
-        "d": 24 * 60 * 60,
-        "w": 7 * 24 * 60 * 60,
-    }
-    return amount * multipliers[unit]
+    units = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    return int(match.group(1)) * units[match.group(2).lower()]
 
 
 def _format_duration(seconds: int) -> str:
-    if seconds % (7 * 24 * 60 * 60) == 0 and seconds:
-        return f"{seconds // (7 * 24 * 60 * 60)}w"
-    if seconds % (24 * 60 * 60) == 0 and seconds:
-        return f"{seconds // (24 * 60 * 60)}d"
-    if seconds % (60 * 60) == 0 and seconds:
-        return f"{seconds // (60 * 60)}h"
-    if seconds % 60 == 0 and seconds:
-        return f"{seconds // 60}m"
+    for suffix, divisor in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds and seconds % divisor == 0:
+            return f"{seconds // divisor}{suffix}"
     return f"{seconds}s"
-
-
-def _print_clean_summary(result) -> None:
-    plan = result.plan
-    action = "would delete" if result.dry_run else "deleted"
-    scope = "all projects" if not plan.project else f"project {plan.project}"
-    print("CCB clean")
-    print(f"scope: {scope}")
-    print(f"run_dir: {plan.run_dir}")
-    print(f"keep newest per project: {plan.keep}")
-    print(f"older than: {_format_duration(plan.older_than_seconds)}")
-    print(f"scanned: {result.scanned}")
-    print(f"kept: {result.kept}")
-    print(f"prunable: {result.planned}")
-    print(f"{action}: {result.planned if result.dry_run else result.deleted}")
-    if result.failed:
-        print(f"failed: {result.failed}", file=sys.stderr)
-    summary = plan.summary
-    print(
-        "kept reasons: "
-        f"newest={summary.get('skipped_keep_newest', 0)} "
-        f"not_old_enough={summary.get('skipped_not_old_enough', 0)} "
-        f"live={summary.get('skipped_live', 0)} "
-        f"running={summary.get('skipped_running', 0)} "
-        f"unknown={summary.get('skipped_unknown', 0)}"
-    )
-    if plan.prunable:
-        print("planned files:")
-        for record in plan.prunable:
-            print(f"  {record.path}")
 
 
 def cmd_clean(args) -> int:
@@ -4862,27 +3852,21 @@ def cmd_clean(args) -> int:
     except argparse.ArgumentTypeError as exc:
         print(f"❌ Invalid --older-than: {exc}", file=sys.stderr)
         return 2
-
-    keep = int(args.keep)
-    if keep < 0:
+    if args.keep < 0:
         print("❌ --keep must be non-negative", file=sys.stderr)
         return 2
-
-    if args.all_projects:
-        project = None
-    elif args.project:
-        project = Path(args.project).expanduser()
-    else:
-        project = Path.cwd()
-
-    plan = plan_prune(keep=keep, older_than_seconds=older_than, project=project)
-    result = run_prune(plan, dry_run=bool(args.dry_run))
-
+    project = None if args.all_projects else (Path(args.project).expanduser() if args.project else Path.cwd())
+    result = run_prune(
+        plan_prune(keep=args.keep, older_than_seconds=older_than, project=project),
+        dry_run=args.dry_run,
+    )
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
-        _print_clean_summary(result)
-
+        action = "would delete" if args.dry_run else "deleted"
+        print(f"CCB clean: scanned={result.scanned} kept={result.kept} {action}={result.planned if args.dry_run else result.deleted}")
+        for record in result.plan.prunable:
+            print(f"  {record.path}")
     return 1 if result.failed else 0
 
 
@@ -4903,71 +3887,72 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
     Parse providers from argv.
 
     Accept both:
-      - space-separated: `ccb codex gemini opencode claude droid`
-      - comma-separated: `ccb codex,gemini,opencode,claude,droid`
+      - space-separated: `ccb codex gemini opencode claude`
+      - comma-separated: `ccb codex,gemini,opencode,claude`
 
     Returns a de-duplicated list preserving order.
     """
-    providers, _instances, _cmd_enabled = _parse_provider_specs(values, allow_unknown=allow_unknown)
-    return providers
+    allowed = {"codex", "gemini", "opencode", "claude"}
+    raw_parts = _split_provider_tokens(values)
+
+    if not raw_parts:
+        return []
+
+    seen: set[str] = set()
+    parsed: list[str] = []
+    unknown: list[str] = []
+    for p in raw_parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p in allowed or allow_unknown:
+            parsed.append(p)
+        else:
+            unknown.append(p)
+
+    if unknown and not allow_unknown:
+        print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude  (spaces)  or  ccb codex,gemini,opencode,claude  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude", file=sys.stderr)
+        return []
+
+    return parsed
 
 
-def _parse_provider_specs(values: list[str], *, allow_unknown: bool = False) -> tuple[list[str], list[dict], bool]:
-    allowed = {"codex", "gemini", "opencode", "claude", "droid"}
+def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]:
+    """
+    Parse providers from argv and treat "cmd" as a separate flag.
+    Returns (providers, cmd_enabled, valid).
+    """
+    allowed = {"codex", "gemini", "opencode", "claude"}
     raw_parts = _split_provider_tokens(values)
     if not raw_parts:
-        return [], [], False
+        return [], False, True
 
-    if allow_unknown:
-        parsed: list[str] = []
-        seen: set[str] = set()
-        cmd_enabled = False
-        for token in raw_parts:
-            if token == "cmd":
-                cmd_enabled = True
-                continue
-            if token in seen:
-                continue
-            seen.add(token)
-            parsed.append(token)
-        return parsed, [], cmd_enabled
-
-    providers, instances, cmd_enabled = normalize_provider_tokens(raw_parts)
-
+    seen: set[str] = set()
+    parsed: list[str] = []
     unknown: list[str] = []
-    for token in raw_parts:
-        if token == "cmd":
+    cmd_enabled = False
+
+    for p in raw_parts:
+        if p == "cmd":
+            cmd_enabled = True
             continue
-        base, instance = parse_qualified_provider(token)
-        if base not in allowed:
-            unknown.append(token)
+        if p in seen:
             continue
-        if instance is not None and not normalize_instance_name(instance):
-            unknown.append(token)
-            continue
-        if instance is not None and base not in {"codex", "claude"}:
-            unknown.append(token)
+        seen.add(p)
+        if p in allowed:
+            parsed.append(p)
+        else:
+            unknown.append(p)
 
     if unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex codex:worker claude claude:worker cmd  (spaces)  or  ccb codex,codex:worker,claude,claude:worker,cmd  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid, cmd; instance names: [a-z0-9][a-z0-9_-]*", file=sys.stderr)
-        return [], [], cmd_enabled
+        print("💡 use: ccb codex gemini opencode claude cmd  (spaces)  or  ccb codex,gemini,opencode,claude,cmd  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, cmd", file=sys.stderr)
+        return [], cmd_enabled, False
 
-    return providers, instances, cmd_enabled
-
-
-def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
-    """
-    Parse providers from argv and treat "cmd" as a separate flag.
-    Returns (providers, cmd_enabled).
-    """
-    providers, _instances, cmd_enabled = _parse_provider_specs_with_cmd(values)
-    return providers, cmd_enabled
-
-
-def _parse_provider_specs_with_cmd(values: list[str]) -> tuple[list[str], list[dict], bool]:
-    return _parse_provider_specs(values)
+    return parsed, cmd_enabled, True
 
 
 def _get_version_info(dir_path: Path) -> dict:
@@ -5573,87 +4558,8 @@ def cmd_reinstall(_args) -> int:
     return _run_installer("install")
 
 
-def _droid_server_path() -> Path:
-    return script_dir / "mcp" / "ccb-delegation" / "server.py"
 
 
-def cmd_droid_setup_delegation(args) -> int:
-    server_path = _droid_server_path()
-    if not server_path.exists():
-        print(f"❌ MCP server not found: {server_path}", file=sys.stderr)
-        return 2
-
-    if args.force:
-        subprocess.run(["droid", "mcp", "remove", "ccb-delegation"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    cmd = [
-        "droid",
-        "mcp",
-        "add",
-        "ccb-delegation",
-        "--type",
-        "stdio",
-        sys.executable,
-        str(server_path),
-    ]
-    try:
-        rc = subprocess.run(cmd).returncode
-    except FileNotFoundError:
-        print("❌ `droid` not found in PATH.", file=sys.stderr)
-        return 2
-    if rc != 0:
-        print("❌ Failed to register MCP server. Ensure `droid` is installed and on PATH.", file=sys.stderr)
-        return rc or 1
-    print("✅ Registered MCP server: ccb-delegation")
-    print("Next: run `ccb droid test-delegation` to verify tools are visible.")
-    return 0
-
-
-def _extract_tool_name(tool: dict) -> str:
-    for key in ("id", "name", "toolName"):
-        value = tool.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
-
-
-def cmd_droid_test_delegation(_args) -> int:
-    cmd = ["droid", "exec", "--list-tools", "--output-format", "json"]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError:
-        print("❌ `droid` not found in PATH.", file=sys.stderr)
-        return 2
-    if res.returncode != 0:
-        err = res.stderr.strip() or res.stdout.strip()
-        print(f"❌ droid exec --list-tools failed: {err}", file=sys.stderr)
-        return res.returncode or 1
-
-    try:
-        tools = json.loads(res.stdout)
-    except Exception:
-        print("❌ Failed to parse tool list JSON from droid.", file=sys.stderr)
-        return 2
-
-    if not isinstance(tools, list):
-        print("❌ Tool list JSON is not an array.", file=sys.stderr)
-        return 2
-
-    names = {name for tool in tools if (name := _extract_tool_name(tool))}
-    required = {
-        "ccb_ask_codex",
-        "ccb_ask_gemini",
-        "ccb_ask_claude",
-        "ccb_ask_opencode",
-    }
-    missing = sorted(required - names)
-    if missing:
-        print("❌ MCP delegation tools missing:", ", ".join(missing), file=sys.stderr)
-        print("Hint: run `ccb droid setup-delegation`.", file=sys.stderr)
-        return 2
-
-    print("✅ MCP delegation tools detected.")
-    return 0
 
 
 def cmd_mail(argv: list[str]) -> int:
@@ -5756,23 +4662,6 @@ def cmd_mail(argv: list[str]) -> int:
     return 1
 
 
-def cmd_droid_subcommand(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="ccb droid", description="Droid-specific commands")
-    subparsers = parser.add_subparsers(dest="subcommand", help="Droid subcommands")
-
-    setup_parser = subparsers.add_parser("setup-delegation", help="Register MCP delegation tools for Droid")
-    setup_parser.add_argument("--force", action="store_true", help="Re-register MCP server")
-
-    subparsers.add_parser("test-delegation", help="Verify MCP delegation tools are available")
-
-    args = parser.parse_args(argv)
-    if args.subcommand == "setup-delegation":
-        return cmd_droid_setup_delegation(args)
-    if args.subcommand == "test-delegation":
-        return cmd_droid_test_delegation(args)
-    parser.print_help()
-    return 1
-
 
 def main():
     argv = sys.argv[1:]
@@ -5788,31 +4677,24 @@ def main():
         print("💡 Use: ccb [providers...]  (or configure ccb.config)", file=sys.stderr)
         return 2
 
-    if argv and argv[0] == "droid" and len(argv) > 1 and argv[1] in {"setup-delegation", "test-delegation"}:
-        return cmd_droid_subcommand(argv[1:])
-
     if argv and argv[0] in {"kill", "clean", "update", "version", "uninstall", "reinstall"}:
         parser = argparse.ArgumentParser(description="Claude AI unified launcher", add_help=True)
         subparsers = parser.add_subparsers(dest="command", help="Subcommands")
 
         kill_parser = subparsers.add_parser("kill", help="Terminate session or clean up zombies")
-        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude/droid)")
+        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude)")
         kill_parser.add_argument("--daemon", action="store_true", help="Also stop the shared askd daemon when ownership checks allow it")
         kill_parser.add_argument("-f", "--force", action="store_true", help="Clean up all zombie tmux sessions globally")
         kill_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt (with -f)")
 
         clean_parser = subparsers.add_parser("clean", help="Prune stale dead CCB session records")
-        clean_parser.add_argument("--dry-run", action="store_true", help="Preview files without deleting anything")
-        clean_parser.add_argument("--keep", type=int, default=DEFAULT_KEEP_NEWEST, help="Newest records to keep per project")
-        clean_parser.add_argument(
-            "--older-than",
-            default=_format_duration(DEFAULT_TTL_SECONDS),
-            help="Only prune records older than this duration (examples: 3600, 12h, 7d, 2w)",
-        )
+        clean_parser.add_argument("--dry-run", action="store_true")
+        clean_parser.add_argument("--keep", type=int, default=DEFAULT_KEEP_NEWEST)
+        clean_parser.add_argument("--older-than", default=_format_duration(DEFAULT_TTL_SECONDS))
         clean_scope = clean_parser.add_mutually_exclusive_group()
-        clean_scope.add_argument("--all-projects", action="store_true", help="Scan all project hashes")
-        clean_scope.add_argument("--project", help="Project path or project id to clean")
-        clean_parser.add_argument("--json", action="store_true", help="Emit JSON result")
+        clean_scope.add_argument("--all-projects", action="store_true")
+        clean_scope.add_argument("--project")
+        clean_parser.add_argument("--json", action="store_true")
 
         update_parser = subparsers.add_parser("update", help="Update to latest or specified version")
         update_parser.add_argument("target", nargs="?",
@@ -5845,12 +4727,12 @@ def main():
     start_parser = argparse.ArgumentParser(
         description="Claude AI unified launcher",
         add_help=True,
-        epilog="Other commands: ccb clean | ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup",
+        epilog="Other commands: ccb clean | ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb mail setup",
     )
     start_parser.add_argument(
         "providers",
         nargs="*",
-        help="Backends to start (space or comma separated): codex, gemini, opencode, claude, droid (add cmd for a shell pane)",
+        help="Backends to start (space or comma separated): codex, gemini, opencode, claude (add cmd for a shell pane)",
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")

@@ -59,7 +59,7 @@ def _load_claude_skills() -> str:
         _SKILL_CACHE = ""
         return _SKILL_CACHE
     parts: list[str] = []
-    # Load short skill files (aligned with droid)
+    # Load short skill files.
     for name in ("ask.md",):
         path = skills_dir / name
         if not path.is_file():

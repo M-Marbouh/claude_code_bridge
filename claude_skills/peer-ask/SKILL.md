@@ -1,6 +1,6 @@
 ---
 name: peer-ask
-description: Send a message to Claude in ANOTHER active CCB project using natural language. Use when the user says things like "Ask PRG Claude about X", "Tell content-automation Claude...", or "Ask [project] Claude...". NOT for asking Codex/Gemini/OpenCode/Droid — use the ask skill for those. Discovers active projects via ccb-list, matches by alias/name, asks for clarification if ambiguous, and remembers confirmed aliases.
+description: Send a message to Claude in another active CCB project. Use ask for same-project Claude, Codex, Gemini, or OpenCode.
 metadata:
   short-description: Natural-language cross-project Claude messaging
 ---
@@ -35,7 +35,7 @@ use that path as the peer target. Do not run `ccb-list` or rediscover the sender
 2. **Do the work first, then reply.** If the request requires research, code review, analysis, or implementation: complete it before sending the reply. Use direct tools and normal CCB delegation only:
    - **Codex** (`/ask codex`) for implementation, code changes, or detailed technical work
    - Local tools for codebase searches, file lookups, pattern scanning, and planning
-   Do not use Claude sub-agents unless the user explicitly asks for them.
+   Do not use Claude sub-agents; CCB supports only the mounted provider panes.
 
 3. **Reply with substance.** The reverse peer message should contain the actual answer, findings, or outcome — not a status update. If a task is genuinely too large for one turn, break it into a concrete first result plus explicit follow-up questions.
 

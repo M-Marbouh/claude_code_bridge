@@ -192,21 +192,28 @@ def _provider_alive(terminal: str, provider_data: dict[str, Any], work_dir: str,
 
 def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
+    pane_cache: dict[str, dict[str, dict[str, Any]]] = {}
     for project in list_project_runtime_statuses(include_stale=include_stale):
         project_dict = project.to_dict()
+        terminal = str(project_dict.get("terminal") or "")
+        if terminal not in pane_cache:
+            pane_cache[terminal] = _tmux_panes() if terminal == "tmux" else (_wezterm_panes() if terminal == "wezterm" else {})
+        live_panes = pane_cache[terminal]
+        work_dir = str(project_dict.get("work_dir") or "")
         providers: dict[str, dict[str, Any]] = {}
         for provider_key, status in project_dict.get("providers", {}).items():
             if not isinstance(status, dict):
                 continue
+            pane_alive = _provider_alive(terminal, status, work_dir, live_panes)
             providers[provider_key] = {
                 "pane_id": status.get("pane_id") or "",
                 "pane_title_marker": status.get("pane_title_marker") or "",
-                "alive": bool(status.get("pane_alive")),
+                "alive": pane_alive,
                 "mounted": bool(status.get("mounted")),
                 "capable": bool(status.get("capable")),
                 "configured": bool(status.get("configured")),
                 "registered": bool(status.get("registered")),
-                "pane_alive": bool(status.get("pane_alive")),
+                "pane_alive": pane_alive,
                 "session_bound": bool(status.get("session_bound")),
                 "daemon_online": bool(status.get("daemon_online")),
                 "reason": status.get("reason") or "",

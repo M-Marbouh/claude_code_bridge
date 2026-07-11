@@ -150,7 +150,6 @@ def _drive_handle_task(
     req_id: str,
     events: list[tuple[str, str, str]],
     *,
-    instance: str | None = None,
     show_tier: bool = False,
     include_anchor: bool = True,
     timeout_s: float = 5.0,
@@ -163,7 +162,7 @@ def _drive_handle_task(
         scripted = [("user", f"{REQ_ID_PREFIX} {req_id}", "")] + scripted
 
     session = session_obj or _FakeSession(tmp_path)
-    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd, inst: session)
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd: session)
     monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: _FakeBackend())
     monkeypatch.setattr(codex_adapter, "CodexLogReader", lambda **kw: _ScriptedReader(scripted, log_path=log_path))
     monkeypatch.setattr(codex_adapter, "notify_completion", lambda **kw: None)
@@ -171,7 +170,7 @@ def _drive_handle_task(
 
     req = ProviderRequest(
         client_id="c", work_dir=str(tmp_path), timeout_s=timeout_s, quiet=True,
-        message="do the thing", caller="claude", req_id=req_id, instance=instance,
+        message="do the thing", caller="claude", req_id=req_id,
         show_tier=show_tier,
     )
     task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
@@ -229,13 +228,7 @@ def test_handle_task_legacy_event_only_falls_back(monkeypatch, tmp_path: Path) -
     assert result.reply == "Legacy reply body."
 
 
-def test_handle_task_multi_instance_unbound_requires_anchor(monkeypatch, tmp_path: Path) -> None:
-    cfg = tmp_path / ".ccb"
-    cfg.mkdir(parents=True, exist_ok=True)
-    (cfg / ".codex-worker-session").write_text(
-        json.dumps({"provider": "codex", "instance": "worker", "work_dir": str(tmp_path)}),
-        encoding="utf-8",
-    )
+def test_handle_task_unbound_requires_anchor(monkeypatch, tmp_path: Path) -> None:
     req_id = make_req_id()
 
     result = _drive_handle_task(
@@ -272,7 +265,7 @@ def test_handle_task_anchor_confirmed_completion_repairs_binding(monkeypatch, tm
     assert session.bindings == [{"log_path": str(log_path), "session_id": sid}]
 
 
-def test_scan_latest_candidate_excludes_sibling_and_requires_anchor(monkeypatch, tmp_path: Path) -> None:
+def test_scan_latest_candidate_requires_anchor_and_honors_exclusions(monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "codex-root"
     root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CODEX_SESSION_ROOT", str(root))
@@ -366,7 +359,7 @@ def test_handle_task_footer_on_unknown_when_context_missing(monkeypatch, tmp_pat
     assert result.reply == "Plain reply.\n[codex model=unknown effort=unknown sandbox=unknown]"
 
 
-def test_handle_task_footer_uses_qualified_worker_key(monkeypatch, tmp_path: Path) -> None:
+def test_handle_task_footer_uses_single_provider_key(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("CCB_CODEX_SHOW_TIER", "1")
     monkeypatch.setattr(
         codex_adapter,
@@ -376,7 +369,7 @@ def test_handle_task_footer_uses_qualified_worker_key(monkeypatch, tmp_path: Pat
     req_id = make_req_id()
 
     result = _drive_handle_task(monkeypatch, tmp_path, req_id, [
-        ("assistant", f"Worker reply.\nCCB_DONE: {req_id}", "final_answer"),
-    ], instance="worker")
+        ("assistant", f"Codex reply.\nCCB_DONE: {req_id}", "final_answer"),
+    ])
 
-    assert result.reply == "Worker reply.\n[codex:worker model=gpt-5.4-mini effort=medium sandbox=workspace-write]"
+    assert result.reply == "Codex reply.\n[codex model=gpt-5.4-mini effort=medium sandbox=workspace-write]"

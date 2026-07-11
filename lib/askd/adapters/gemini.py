@@ -113,11 +113,11 @@ class GeminiAdapter(BaseProviderAdapter):
     def session_filename(self) -> str:
         return ".gemini-session"
 
-    def load_session(self, work_dir: Path, instance: Optional[str] = None) -> Optional[Any]:
-        return load_project_session(work_dir, instance)
+    def load_session(self, work_dir: Path) -> Optional[Any]:
+        return load_project_session(work_dir)
 
-    def compute_session_key(self, session: Any, instance: Optional[str] = None) -> str:
-        return compute_session_key(session, instance) if session else "gemini:unknown"
+    def compute_session_key(self, session: Any) -> str:
+        return compute_session_key(session) if session else "gemini:unknown"
 
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
@@ -125,9 +125,8 @@ class GeminiAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=gemini req_id={task.req_id} work_dir={req.work_dir}")
 
-        instance = task.request.instance
-        session = load_project_session(work_dir, instance)
-        session_key = self.compute_session_key(session, instance)
+        session = load_project_session(work_dir)
+        session_key = self.compute_session_key(session)
 
         if not session:
             return ProviderResult(

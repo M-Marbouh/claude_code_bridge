@@ -43,7 +43,13 @@ class ProviderLock:
     Lock files are stored in ~/.ccb/run/{provider}-{cwd_hash}.lock
     """
 
-    def __init__(self, provider: str, timeout: float = 60.0, cwd: str = None):
+    def __init__(
+        self,
+        provider: str,
+        timeout: float = 60.0,
+        cwd: str = None,
+        lock_dir: Optional[Path] = None,
+    ):
         """Initialize lock for a specific provider and working directory.
 
         Args:
@@ -53,7 +59,7 @@ class ProviderLock:
         """
         self.provider = provider
         self.timeout = timeout
-        self.lock_dir = Path.home() / ".ccb" / "run"
+        self.lock_dir = lock_dir or (Path.home() / ".ccb" / "run")
 
         # Use working directory hash for per-directory locking
         if cwd is None:

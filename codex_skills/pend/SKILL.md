@@ -1,6 +1,6 @@
 ---
 name: pend
-description: View latest reply from AI provider (gemini/codex/opencode/droid/claude).
+description: View an exact CCB task reply or the current caller's latest provider task.
 metadata:
   short-description: View latest AI provider reply
 ---
@@ -15,10 +15,7 @@ The first argument must be the provider name:
 - `gemini` - View Gemini reply
 - `codex` - View Codex reply
 - `opencode` - View OpenCode reply
-- `droid` - View Droid reply
 - `claude` - View Claude reply
-
-Optional: Add a number N to show the latest N conversations.
 
 ## Execution (MANDATORY)
 
@@ -29,5 +26,5 @@ pend $ARGUMENTS
 ## Examples
 
 - `/pend gemini`
-- `/pend codex 3`
+- `/pend 20260711-120000-001-99`
 - `/pend claude`

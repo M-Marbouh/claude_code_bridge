@@ -15,11 +15,7 @@ import pytest
 from gaskd_session import GeminiProjectSession
 from caskd_session import CodexProjectSession
 from oaskd_session import OpenCodeProjectSession
-from daskd_session import DroidProjectSession
-from baskd_session import CodebuddyProjectSession
-from haskd_session import CopilotProjectSession
 from laskd_session import ClaudeProjectSession
-from qaskd_session import QwenProjectSession
 
 
 class _FakeBackend:
@@ -78,11 +74,7 @@ SESSION_CLASSES = [
     GeminiProjectSession,
     CodexProjectSession,
     OpenCodeProjectSession,
-    DroidProjectSession,
-    CodebuddyProjectSession,
-    CopilotProjectSession,
     ClaudeProjectSession,
-    QwenProjectSession,
 ]
 
 

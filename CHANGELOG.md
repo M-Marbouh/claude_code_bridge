@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.12.0 (2026-07-11)
+
+### Changed
+
+- Retired provider instances, `:worker` targets, routing tags, abstract roles, and sub-agent skills.
+- Reduced the supported provider set to Claude, Codex, Gemini, and OpenCode.
+- Added structured async task receipts and deterministic `pend <task-id>` retrieval.
+- Scoped `pend <provider>` to the current caller session and fail on ambiguous same-project callers.
+- Made `ask` preflight the provider session, pane, binding, and daemon before reporting async submission.
+- Required a matching `CCB_REQ_ID` anchor before Codex may switch or persist a session-log binding.
+- Preserved Linux, Windows/PowerShell, WezTerm, and tmux support.
+
 ## v5.2.8 (2026-03-07)
 
 ### 📝 Documentation

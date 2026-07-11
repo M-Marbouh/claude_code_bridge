@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen
+    gemini, codex, opencode, claude
 
 Modes:
     Default (async):  Background task with hook callback
@@ -48,8 +48,8 @@ setup_windows_encoding()
 
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import ProviderRuntimeStatus, provider_status_for_target
-from providers import make_qualified_key, parse_qualified_provider
 from session_utils import find_project_session_file
+from task_receipts import new_receipt, receipt_path, write_receipt
 
 
 # Provider to daemon command mapping
@@ -57,11 +57,7 @@ PROVIDER_DAEMONS = {
     "gemini": "gask",
     "codex": "cask",
     "opencode": "oask",
-    "droid": "dask",
     "claude": "lask",
-    "copilot": "hask",
-    "codebuddy": "bask",
-    "qwen": "qask",
 }
 
 CALLER_SESSION_FILES = {
@@ -69,33 +65,21 @@ CALLER_SESSION_FILES = {
     "codex": ".codex-session",
     "gemini": ".gemini-session",
     "opencode": ".opencode-session",
-    "droid": ".droid-session",
-    "copilot": ".copilot-session",
-    "codebuddy": ".codebuddy-session",
-    "qwen": ".qwen-session",
 }
 
 CALLER_PANE_ENV_HINTS = {
     "codex": ("CODEX_TMUX_SESSION", "CODEX_WEZTERM_PANE"),
     "gemini": ("GEMINI_TMUX_SESSION", "GEMINI_WEZTERM_PANE"),
     "opencode": ("OPENCODE_TMUX_SESSION", "OPENCODE_WEZTERM_PANE"),
-    "droid": ("DROID_TMUX_SESSION", "DROID_WEZTERM_PANE"),
-    "copilot": ("COPILOT_TMUX_SESSION", "COPILOT_WEZTERM_PANE"),
-    "codebuddy": ("CODEBUDDY_TMUX_SESSION", "CODEBUDDY_WEZTERM_PANE"),
-    "qwen": ("QWEN_TMUX_SESSION", "QWEN_WEZTERM_PANE"),
 }
 
 CALLER_ENV_HINTS = {
     "codex": ("CODEX_SESSION_ID", "CODEX_RUNTIME_DIR"),
     "gemini": ("GEMINI_SESSION_ID", "GEMINI_RUNTIME_DIR"),
     "opencode": ("OPENCODE_SESSION_ID", "OPENCODE_RUNTIME_DIR"),
-    "droid": ("DROID_SESSION_ID", "DROID_RUNTIME_DIR"),
-    "copilot": ("COPILOT_SESSION_ID", "COPILOT_RUNTIME_DIR"),
-    "codebuddy": ("CODEBUDDY_SESSION_ID", "CODEBUDDY_RUNTIME_DIR"),
-    "qwen": ("QWEN_SESSION_ID", "QWEN_RUNTIME_DIR"),
 }
 
-_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGNORECASE)
+_REMOVED_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGNORECASE)
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
 
@@ -138,7 +122,7 @@ def _cleanup_task_logs(log_dir: Path) -> None:
         logs.sort(key=lambda p: p.name, reverse=True)
     for path in logs[max_files:]:
         prefix = path.name[:-4]  # strip .log
-        for ext in (".log", ".sh", ".ps1", ".msg", ".status"):
+        for ext in (".log", ".sh", ".ps1", ".msg", ".status", ".json"):
             try:
                 (log_dir / f"{prefix}{ext}").unlink(missing_ok=True)
             except Exception:
@@ -241,15 +225,6 @@ def _use_unified_daemon() -> bool:
     return True  # Default to unified daemon
 
 
-def _extract_leading_route_tag(message: str) -> tuple[str | None, str]:
-    match = _ROUTE_TAG_RE.match(message or "")
-    if not match:
-        return None, message
-    tag = match.group(1).upper()
-    stripped = (message or "")[match.end():].lstrip()
-    return tag, stripped
-
-
 def _route_bool(value: bool) -> str:
     return "true" if bool(value) else "false"
 
@@ -265,42 +240,12 @@ def _route_error_line(target: str, status: ProviderRuntimeStatus, *, reason: str
     )
 
 
-def _resolve_tagged_route(provider: str, message: str, *, allow_fallback: bool) -> tuple[str, str, bool]:
-    tag, stripped_message = _extract_leading_route_tag(message)
-    if not tag:
-        return provider, message, True
-    if not stripped_message:
-        print(f"CCB_ROUTE_ERROR target={provider} reason=empty_message", file=sys.stderr)
-        return provider, stripped_message, False
-
-    base_provider, explicit_instance = parse_qualified_provider(provider)
-    requested_instance = "worker" if tag == "WORKER" else None
-    requested_target = make_qualified_key(base_provider, requested_instance)
-    explicit_target = make_qualified_key(base_provider, explicit_instance)
-
-    if explicit_instance is not None and explicit_target != requested_target:
-        print(f"CCB_ROUTE_ERROR target={explicit_target} reason=tag_conflict tag={tag}", file=sys.stderr)
-        return provider, stripped_message, False
-
-    target = explicit_target if explicit_instance is not None else requested_target
-
-    if _use_unified_daemon():
-        _maybe_start_unified_daemon()
-
-    status = provider_status_for_target(target, work_dir=Path.cwd())
+def _preflight_target(provider: str) -> bool:
+    status = provider_status_for_target(provider, work_dir=Path.cwd())
     if status.mounted:
-        return target, stripped_message, True
-
-    fallback_enabled = allow_fallback or _env_bool("CCB_ROUTE_FALLBACK", False)
-    fallback_target = base_provider
-    if fallback_enabled and target != fallback_target:
-        fallback_status = provider_status_for_target(fallback_target, work_dir=Path.cwd())
-        if fallback_status.mounted:
-            print(f"CCB_ROUTE_FALLBACK from={target} to={fallback_target}", file=sys.stderr)
-            return fallback_target, stripped_message, True
-
-    print(_route_error_line(target, status), file=sys.stderr)
-    return target, stripped_message, False
+        return True
+    print(_route_error_line(provider, status), file=sys.stderr)
+    return False
 
 
 def _maybe_start_unified_daemon() -> bool:
@@ -521,7 +466,7 @@ def _default_foreground() -> bool:
     if _env_bool("CCB_ASK_FOREGROUND", False):
         return True
     # Default async only for Claude caller to preserve historical guardrail behavior.
-    # Other callers (codex/gemini/opencode/droid/manual) default to foreground.
+    # Other callers (codex/gemini/opencode/manual) default to foreground.
     caller = _detect_caller()
     if caller == "claude":
         return False
@@ -568,7 +513,7 @@ def _usage() -> None:
     print("       ask --peer <target> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen", file=sys.stderr)
+    print("  gemini, codex, opencode, claude", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)
@@ -577,7 +522,6 @@ def _usage() -> None:
     print("  --foreground            Run in foreground (no nohup/background)", file=sys.stderr)
     print("  --background            Force background mode", file=sys.stderr)
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
-    print("  --route-fallback        Explicitly allow tagged worker route fallback to base provider", file=sys.stderr)
     print("  --peer TARGET           Send to Claude in another CCB project", file=sys.stderr)
 
 
@@ -787,22 +731,23 @@ def main(argv: list[str]) -> int:
         _usage()
         return EXIT_OK
 
-    base_provider, instance = parse_qualified_provider(raw_provider)
+    if ":" in raw_provider:
+        print(f"[ERROR] Provider instances are no longer supported: {raw_provider}", file=sys.stderr)
+        return EXIT_ERROR
 
-    if base_provider not in PROVIDER_DAEMONS:
-        print(f"[ERROR] Unknown provider: {base_provider}", file=sys.stderr)
+    if raw_provider not in PROVIDER_DAEMONS:
+        print(f"[ERROR] Unknown provider: {raw_provider}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(PROVIDER_DAEMONS.keys())}", file=sys.stderr)
         return EXIT_ERROR
 
-    daemon_cmd = PROVIDER_DAEMONS[base_provider]
-    provider = raw_provider  # keep full qualified key for daemon routing
+    daemon_cmd = PROVIDER_DAEMONS[raw_provider]
+    provider = raw_provider
 
     # Parse remaining arguments
     timeout: float = 3600.0
     notify_mode = False
     no_wrap = False
     peer_target = ""
-    route_fallback = False
     foreground_mode = _default_foreground()
     parts: list[str] = []
 
@@ -833,9 +778,6 @@ def main(argv: list[str]) -> int:
         if token == "--no-wrap":
             no_wrap = True
             continue
-        if token == "--route-fallback":
-            route_fallback = True
-            continue
         if token == "--peer":
             try:
                 peer_target = next(it)
@@ -852,14 +794,24 @@ def main(argv: list[str]) -> int:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
 
-    provider, message, route_ok = _resolve_tagged_route(provider, message, allow_fallback=route_fallback)
-    if not route_ok:
+    if _REMOVED_ROUTE_TAG_RE.match(message):
+        print("[ERROR] [WORKER]/[ARCHITECT] routing tags are no longer supported", file=sys.stderr)
         return EXIT_ERROR
-    base_provider, instance = parse_qualified_provider(provider)
-    daemon_cmd = PROVIDER_DAEMONS[base_provider]
 
     if peer_target:
         return _run_peer_bridge(peer_target, timeout, message, foreground_mode)
+
+    if not notify_mode:
+        if _use_unified_daemon():
+            from askd_runtime import state_file_path
+            from askd.daemon import ping_daemon
+
+            state_file = state_file_path("askd.json")
+            if not ping_daemon(timeout_s=0.5, state_file=state_file) and not _maybe_start_unified_daemon():
+                print("[ERROR] Unified askd daemon not running", file=sys.stderr)
+                return EXIT_ERROR
+        if not _preflight_target(provider):
+            return EXIT_ERROR
 
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:
@@ -934,6 +886,22 @@ def main(argv: list[str]) -> int:
 
     # Detect caller from environment or default to "claude"
     caller = _require_caller()
+    receipt_file = receipt_path(provider, task_id, root=log_dir)
+    try:
+        write_receipt(
+            receipt_file,
+            new_receipt(
+                task_id=task_id,
+                provider=provider,
+                caller=caller,
+                work_dir=Path.cwd(),
+                status_file=status_file,
+                log_file=log_file,
+            ),
+        )
+    except Exception as exc:
+        print(f"[ERROR] Failed to create task receipt: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     _append_task_status_line(
         status_file,
         f"submitted task={task_id} provider={provider} caller={caller} work_dir={os.getcwd()}",
@@ -944,15 +912,16 @@ def main(argv: list[str]) -> int:
     bg_pid: int | None = None
 
     # Platform-specific background execution
+    # Use a message file on every platform. Embedding arbitrary prompt text in a
+    # generated shell heredoc lets a line matching the delimiter alter the script.
+    msg_file = log_dir / f"ask-{provider}-{task_id}.msg"
+    msg_file.write_text(message, encoding="utf-8")
+
     if os.name == "nt":
         # Windows: use PowerShell script
         DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = 0x08000000
         CREATE_NEW_PROCESS_GROUP = 0x00000200
-
-        # Write message to temp file to avoid escaping issues
-        msg_file = log_dir / f"ask-{provider}-{task_id}.msg"
-        msg_file.write_text(message, encoding="utf-8")
 
         # Write PowerShell script - call ask --foreground to use unified daemon
         script_file = log_dir / f"ask-{provider}-{task_id}.ps1"
@@ -1035,6 +1004,7 @@ exit $rc
         quoted_status = shlex.quote(str(status_file))
         quoted_ask_cmd = shlex.quote(ask_cmd)
         quoted_provider = shlex.quote(provider)
+        quoted_message = shlex.quote(str(msg_file))
         bg_script = f'''#!/bin/sh
 set +e
 _now() {{
@@ -1045,9 +1015,7 @@ echo "[CCB_TASK_START] task={task_id} provider={provider} caller={caller} pid=$$
 export CCB_REQ_ID="{task_id}"
 export CCB_CALLER="{caller}"
 export CCB_WORK_DIR="{os.getcwd()}"
-{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout} <<'ASKEOF'
-{message}
-ASKEOF
+{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout} < {quoted_message}
 rc=$?
 echo "[CCB_TASK_END] task={task_id} provider={provider} exit_code=$rc"
 echo "$(_now) finished exit_code=$rc" >> {quoted_status}
@@ -1084,6 +1052,7 @@ exit "$rc"
         print(f"[CCB_ASYNC_PID task={task_id} pid={bg_pid}]")
     print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
     print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
+    print(f"[CCB_ASYNC_RECEIPT_FILE task={task_id}] {receipt_file}")
     if _should_emit_async_guardrail(caller):
         print(
             f"MANDATORY: END YOUR TURN NOW. Reply ONLY '{display_name(provider)} processing...', then stop. See 'Async Guardrail' in CLAUDE.md."

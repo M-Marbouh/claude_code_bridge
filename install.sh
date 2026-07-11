@@ -112,18 +112,6 @@ SCRIPTS_TO_LINK=(
   bin/lask
   bin/lpend
   bin/lping
-  bin/dask
-  bin/dpend
-  bin/dping
-  bin/hask
-  bin/hpend
-  bin/hping
-  bin/bask
-  bin/bpend
-  bin/bping
-  bin/qask
-  bin/qpend
-  bin/qping
   bin/ask
   bin/ccb-list
   bin/ccb-mounted
@@ -157,6 +145,18 @@ LEGACY_SCRIPTS=(
   oaskd
   laskd
   daskd
+  dask
+  dpend
+  dping
+  hask
+  hpend
+  hping
+  bask
+  bpend
+  bping
+  qask
+  qpend
+  qping
 )
 
 usage() {
@@ -169,8 +169,6 @@ Optional environment variables:
   CODEX_INSTALL_PREFIX     Install directory (default: ~/.local/share/codex-dual)
   CODEX_BIN_DIR            Executable directory (default: ~/.local/bin)
   CODEX_CLAUDE_COMMAND_DIR Custom Claude commands directory (default: auto-detect)
-  CCB_DROID_AUTOINSTALL    Auto-register Droid MCP tools if droid exists (default: 1)
-  CCB_DROID_AUTOINSTALL_FORCE Re-register Droid MCP tools (default: 0)
   CCB_CLAUDE_MD_MODE       CLAUDE.md injection mode: "inline" (default) or "route"
                            inline = full config in CLAUDE.md (~57 lines)
                            route  = minimal pointer in CLAUDE.md, full config in ~/.claude/rules/ccb-config.md
@@ -711,7 +709,7 @@ install_claude_skills() {
   mkdir -p "$skills_dst"
 
   # Clean up obsolete CCB skills (replaced by unified ask/cping/pend)
-  local obsolete_skills="cask gask oask dask lask cpend gpend opend dpend lpend cping gping oping dping lping ping auto"
+  local obsolete_skills="cask gask oask dask lask cpend gpend opend dpend lpend gping oping dping lping ping auto delegate mounted all-plan tp tr file-op review"
   for obs_skill in $obsolete_skills; do
     if [[ -d "$skills_dst/$obs_skill" ]]; then
       rm -rf "$skills_dst/$obs_skill"
@@ -759,12 +757,6 @@ install_claude_skills() {
     echo "  Installed skills docs: docs/"
   fi
 
-  # Make autoloop scripts executable
-  local autoloop_sh="$skills_dst/tr/scripts/autoloop.sh"
-  local autoloop_py="$skills_dst/tr/scripts/autoloop.py"
-  [[ -f "$autoloop_sh" ]] && chmod +x "$autoloop_sh"
-  [[ -f "$autoloop_py" ]] && chmod +x "$autoloop_py"
-
   echo "Updated Claude skills directory: $skills_dst"
 }
 
@@ -779,7 +771,7 @@ install_codex_skills() {
   mkdir -p "$skills_dst"
 
   # Clean up obsolete CCB skills (replaced by unified ask/ping/pend)
-  local obsolete_skills="cask gask oask dask lask cpend gpend opend dpend lpend cping gping oping dping lping"
+  local obsolete_skills="cask gask oask dask lask cpend gpend opend dpend lpend cping gping oping dping lping delegate mounted all-plan file-op"
   for obs_skill in $obsolete_skills; do
     if [[ -d "$skills_dst/$obs_skill" ]]; then
       rm -rf "$skills_dst/$obs_skill"
@@ -821,88 +813,7 @@ install_codex_skills() {
   echo "Updated Codex skills directory: $skills_dst"
 }
 
-install_droid_skills() {
-  local skills_src="$REPO_ROOT/droid_skills"
-  local skills_dst="${FACTORY_HOME:-$HOME/.factory}/skills"
 
-  if [[ ! -d "$skills_src" ]]; then
-    return
-  fi
-
-  if ! command -v droid >/dev/null 2>&1; then
-    return
-  fi
-
-  mkdir -p "$skills_dst"
-
-  # Clean up obsolete CCB skills (replaced by unified ask/ping/pend)
-  local obsolete_skills="cask gask oask dask lask cpend gpend opend dpend lpend cping gping oping dping lping"
-  for obs_skill in $obsolete_skills; do
-    if [[ -d "$skills_dst/$obs_skill" ]]; then
-      rm -rf "$skills_dst/$obs_skill"
-      echo "  Removed obsolete skill: $obs_skill"
-    fi
-  done
-
-  echo "Installing Droid/Factory skills..."
-  for skill_dir in "$skills_src"/*/; do
-    [[ -d "$skill_dir" ]] || continue
-    local skill_name
-    skill_name=$(basename "$skill_dir")
-
-    local src_skill_md=""
-    if [[ -f "$skill_dir/SKILL.md" ]]; then
-      src_skill_md="$skill_dir/SKILL.md"
-    else
-      continue
-    fi
-
-    local dst_dir="$skills_dst/$skill_name"
-    local dst_skill_md="$dst_dir/SKILL.md"
-    mkdir -p "$dst_dir"
-    cp -f "$src_skill_md" "$dst_skill_md"
-
-    # Copy additional subdirectories (e.g., references/) if they exist
-    for subdir in "$skill_dir"*/; do
-      if [[ -d "$subdir" ]]; then
-        local subdir_name
-        subdir_name=$(basename "$subdir")
-        cp -rf "$subdir" "$dst_dir/$subdir_name"
-      fi
-    done
-
-    echo "  Updated Factory skill: $skill_name"
-  done
-  echo "Updated Factory skills directory: $skills_dst"
-}
-
-install_droid_delegation() {
-  if [[ "${CCB_DROID_AUTOINSTALL:-1}" == "0" ]]; then
-    return
-  fi
-  if ! command -v droid >/dev/null 2>&1; then
-    return
-  fi
-  local py
-  py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-  if [[ -z "$py" ]]; then
-    echo "WARN: python required for Droid MCP setup; skipping"
-    return
-  fi
-  local server="$INSTALL_PREFIX/mcp/ccb-delegation/server.py"
-  if [[ ! -f "$server" ]]; then
-    echo "WARN: Droid MCP server not found at $server; skipping"
-    return
-  fi
-  if [[ "${CCB_DROID_AUTOINSTALL_FORCE:-0}" == "1" ]]; then
-    droid mcp remove ccb-delegation >/dev/null 2>&1 || true
-  fi
-  if droid mcp add ccb-delegation --type stdio "$py" "$server" >/dev/null 2>&1; then
-    echo "OK: Droid MCP delegation registered"
-  else
-    echo "WARN: Failed to register Droid MCP delegation (already registered or droid config unavailable)"
-  fi
-}
 
 CCB_START_MARKER="<!-- CCB_CONFIG_START -->"
 CCB_END_MARKER="<!-- CCB_CONFIG_END -->"
@@ -1071,6 +982,8 @@ CCB_ROLES_START_MARKER="<!-- CCB_ROLES_START -->"
 CCB_ROLES_END_MARKER="<!-- CCB_ROLES_END -->"
 CCB_RUBRICS_START_MARKER="<!-- REVIEW_RUBRICS_START -->"
 CCB_RUBRICS_END_MARKER="<!-- REVIEW_RUBRICS_END -->"
+CCB_RATIFICATION_START_MARKER="<!-- MUTUAL_RATIFICATION_START -->"
+CCB_RATIFICATION_END_MARKER="<!-- MUTUAL_RATIFICATION_END -->"
 
 install_agents_md_config() {
   local agents_md="$INSTALL_PREFIX/AGENTS.md"
@@ -1089,7 +1002,8 @@ install_agents_md_config() {
     # Replace existing CCB blocks if present
     local updated=false
     if grep -q "$CCB_ROLES_START_MARKER" "$agents_md" 2>/dev/null || \
-       grep -q "$CCB_RUBRICS_START_MARKER" "$agents_md" 2>/dev/null; then
+       grep -q "$CCB_RUBRICS_START_MARKER" "$agents_md" 2>/dev/null || \
+       grep -q "$CCB_RATIFICATION_START_MARKER" "$agents_md" 2>/dev/null; then
       echo "Updating existing CCB blocks in AGENTS.md..."
       "$PYTHON_BIN" -c "
 import re, sys
@@ -1107,6 +1021,9 @@ content = re.sub(
 content = re.sub(
     r'<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->',
     '', content, flags=re.DOTALL)
+content = re.sub(
+    r'<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->',
+    '', content, flags=re.DOTALL)
 content = content.rstrip() + '\n\n' + new_block + '\n'
 with open(sys.argv[1], 'w', encoding='utf-8') as f:
     f.write(content)
@@ -1122,47 +1039,6 @@ with open(sys.argv[1], 'w', encoding='utf-8') as f:
   fi
 
   echo "Updated AGENTS.md: $agents_md"
-}
-
-install_clinerules_config() {
-  local clinerules="$INSTALL_PREFIX/.clinerules"
-  local template="$INSTALL_PREFIX/config/clinerules-ccb.md"
-
-  if ! pick_python_bin; then
-    echo "WARN: python required to update .clinerules; skipping"
-    return 1
-  fi
-  if [[ ! -f "$template" ]]; then
-    echo "WARN: Template not found: $template; skipping .clinerules injection"
-    return 1
-  fi
-
-  if [[ -f "$clinerules" ]]; then
-    if grep -q "$CCB_ROLES_START_MARKER" "$clinerules" 2>/dev/null; then
-      echo "Updating existing CCB roles block in .clinerules..."
-      "$PYTHON_BIN" -c "
-import re, sys
-
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    content = f.read()
-with open(sys.argv[2], 'r', encoding='utf-8') as f:
-    new_block = f.read().strip()
-
-content = re.sub(
-    r'<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->',
-    new_block, content, flags=re.DOTALL)
-with open(sys.argv[1], 'w', encoding='utf-8') as f:
-    f.write(content)
-" "$clinerules" "$template"
-    else
-      echo "" >> "$clinerules"
-      cat "$template" >> "$clinerules"
-    fi
-  else
-    cat "$template" > "$clinerules"
-  fi
-
-  echo "Updated .clinerules: $clinerules"
 }
 
 install_settings_permissions() {
@@ -1550,11 +1426,8 @@ install_all() {
   install_claude_commands
   install_claude_skills
   install_codex_skills
-  install_droid_skills
-  install_droid_delegation
   install_claude_md_config
   install_agents_md_config
-  install_clinerules_config
   install_settings_permissions
   install_tmux_config
   echo "OK: Installation complete"
@@ -1568,7 +1441,6 @@ install_all() {
     echo "   Global CLAUDE.md configured with CCB collaboration rules (inline)"
   fi
   echo "   AGENTS.md configured with Mutual Ratification protocol"
-  echo "   .clinerules configured with role assignments"
   echo "   Global settings.json permissions added"
 }
 
@@ -1745,50 +1617,8 @@ uninstall_codex_skills() {
   done
 }
 
-uninstall_droid_skills() {
-  local skills_dst="${FACTORY_HOME:-$HOME/.factory}/skills"
-  local ccb_skills="ask ping pend autonew mounted all-plan"
 
-  if [[ ! -d "$skills_dst" ]]; then
-    return
-  fi
 
-  echo "Removing CCB Droid skills..."
-  for skill in $ccb_skills; do
-    if [[ -d "$skills_dst/$skill" ]]; then
-      rm -rf "$skills_dst/$skill"
-      echo "  Removed skill: $skill"
-    fi
-  done
-}
-
-uninstall_droid_delegation() {
-  if ! command -v droid >/dev/null 2>&1; then
-    return
-  fi
-
-  echo "Removing Droid MCP delegation..."
-  if droid mcp remove ccb-delegation >/dev/null 2>&1; then
-    echo "  Removed ccb-delegation MCP"
-  fi
-}
-
-uninstall_droid_commands() {
-  local cmds_dst="${FACTORY_HOME:-$HOME/.factory}/commands"
-  local ccb_cmds="ask.md ping.md pend.md"
-
-  if [[ ! -d "$cmds_dst" ]]; then
-    return
-  fi
-
-  echo "Removing CCB Droid commands..."
-  for cmd in $ccb_cmds; do
-    if [[ -f "$cmds_dst/$cmd" ]]; then
-      rm -f "$cmds_dst/$cmd"
-      echo "  Removed command: $cmd"
-    fi
-  done
-}
 
 uninstall_all() {
   echo "INFO: Starting ccb uninstall..."
@@ -1843,13 +1673,10 @@ uninstall_all() {
   uninstall_codex_skills
 
   # 9. Remove Droid skills
-  uninstall_droid_skills
 
   # 10. Remove Droid MCP delegation
-  uninstall_droid_delegation
 
   # 11. Remove Droid commands
-  uninstall_droid_commands
 
   echo "OK: Uninstall complete"
   echo "   NOTE: Dependencies (python, tmux, wezterm) were not removed"

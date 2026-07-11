@@ -189,17 +189,11 @@ class ClaudeLogReader:
         work_dir: Optional[Path] = None,
         *,
         use_sessions_index: bool = True,
-        include_subagents: bool = False,
-        include_subagent_user: bool = False,
-        subagent_tag: str = "[subagent]",
     ):
         self.root = Path(root).expanduser()
         self.work_dir = work_dir or Path.cwd()
         self._preferred_session: Optional[Path] = None
         self._use_sessions_index = bool(use_sessions_index)
-        self._include_subagents = bool(include_subagents)
-        self._include_subagent_user = bool(include_subagent_user)
-        self._subagent_tag = str(subagent_tag or "").strip()
         try:
             poll = float(os.environ.get("CLAUDE_POLL_INTERVAL", "0.05"))
         except Exception:
@@ -388,10 +382,7 @@ class ClaudeLogReader:
                 offset = session.stat().st_size
             except OSError:
                 offset = 0
-        state: Dict[str, Any] = {"session_path": session, "offset": offset, "carry": b""}
-        if self._include_subagents and session:
-            state["subagents"] = self._subagent_state_for_session(session, start_from_end=True)
-        return state
+        return {"session_path": session, "offset": offset, "carry": b""}
 
     def wait_for_message(self, state: Dict[str, Any], timeout: float) -> Tuple[Optional[str], Dict[str, Any]]:
         return self._read_since(state, timeout=timeout, block=True)
@@ -539,17 +530,9 @@ class ClaudeLogReader:
                 current_state["session_path"] = session
                 current_state["offset"] = 0
                 current_state["carry"] = b""
-                if self._include_subagents:
-                    current_state["subagents"] = self._subagent_state_for_session(session, start_from_end=False)
 
             events, current_state = self._read_new_events(session, current_state)
-            sub_events: list[tuple[str, str]] = []
-            if self._include_subagents:
-                sub_events, sub_state = self._read_new_subagent_events(session, current_state)
-                current_state["subagents"] = sub_state
-            if events or sub_events:
-                if sub_events:
-                    events.extend(sub_events)
+            if events:
                 return events, current_state
 
             if not block or time.time() >= deadline:
@@ -603,115 +586,6 @@ class ClaudeLogReader:
         new_state = {"session_path": session, "offset": new_offset, "carry": carry}
         return events, new_state
 
-    def _subagent_state_for_session(self, session: Path, *, start_from_end: bool) -> Dict[str, Dict[str, Any]]:
-        logs = self._list_subagent_logs(session)
-        state: Dict[str, Dict[str, Any]] = {}
-        for log_path in logs:
-            key = str(log_path)
-            try:
-                size = log_path.stat().st_size
-            except OSError:
-                size = 0
-            state[key] = {"offset": size if start_from_end else 0, "carry": b""}
-        return state
-
-    def _list_subagent_logs(self, session: Path) -> list[Path]:
-        session_dir = session.with_suffix("")
-        sub_dir = session_dir / "subagents"
-        if not sub_dir.exists():
-            return []
-        return sorted([p for p in sub_dir.glob("*.jsonl") if p.is_file()])
-
-    def _format_subagent_text(self, text: str, entry: dict) -> str:
-        if not self._subagent_tag:
-            return text
-        agent_id = str(entry.get("agentId") or "").strip()
-        slug = str(entry.get("slug") or "").strip()
-        label = self._subagent_tag
-        if agent_id:
-            label = f"{label}:{agent_id}"
-        if slug:
-            label = f"{label} {slug}"
-        return f"{label}\n{text}"
-
-    def _read_new_subagent_events(self, session: Path, state: Dict[str, Any]) -> Tuple[list[tuple[str, str]], Dict[str, Any]]:
-        sub_state = state.get("subagents")
-        if not isinstance(sub_state, dict):
-            sub_state = {}
-        logs = self._list_subagent_logs(session)
-        new_state: Dict[str, Dict[str, Any]] = {}
-        events: list[tuple[str, str]] = []
-
-        for log_path in logs:
-            key = str(log_path)
-            log_state = sub_state.get(key) if isinstance(sub_state, dict) else None
-            offset = 0
-            carry = b""
-            if isinstance(log_state, dict):
-                offset = int(log_state.get("offset") or 0)
-                carry = log_state.get("carry") or b""
-            else:
-                # New log discovered: start from beginning.
-                offset = 0
-                carry = b""
-
-            sub_events, updated = self._read_new_events_for_file(log_path, offset, carry)
-            for role, text, entry in sub_events:
-                if role == "user" and not self._include_subagent_user:
-                    continue
-                events.append((role, self._format_subagent_text(text, entry)))
-
-            new_state[key] = {"offset": updated["offset"], "carry": updated["carry"]}
-
-        return events, new_state
-
-    def _read_new_events_for_file(
-        self, path: Path, offset: int, carry: bytes
-    ) -> Tuple[list[tuple[str, str, dict]], Dict[str, Any]]:
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return [], {"offset": offset, "carry": carry}
-
-        if size < offset:
-            offset = 0
-            carry = b""
-
-        try:
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                data = handle.read()
-        except OSError:
-            return [], {"offset": offset, "carry": carry}
-
-        new_offset = offset + len(data)
-        buf = carry + data
-        lines = buf.split(b"\n")
-        if buf and not buf.endswith(b"\n"):
-            carry = lines.pop()
-        else:
-            carry = b""
-
-        events: list[tuple[str, str, dict]] = []
-        for raw in lines:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line.decode("utf-8", errors="replace"))
-            except Exception:
-                continue
-            user_msg = _extract_message(entry, "user")
-            if user_msg:
-                events.append(("user", user_msg, entry))
-                continue
-            assistant_msg = _extract_message(entry, "assistant")
-            if assistant_msg:
-                events.append(("assistant", assistant_msg, entry))
-
-        return events, {"offset": new_offset, "carry": carry}
-
-
 class ClaudeCommunicator:
     """Communicate with Claude via terminal and read replies from session logs."""
 
@@ -760,15 +634,7 @@ class ClaudeCommunicator:
             return
         work_dir_hint = self.session_info.get("work_dir")
         log_work_dir = Path(work_dir_hint) if isinstance(work_dir_hint, str) and work_dir_hint else None
-        include_subagents = os.environ.get("CLAUDE_LOG_INCLUDE_SUBAGENTS", "").strip().lower() in ("1", "true", "yes")
-        include_subagent_user = os.environ.get("CLAUDE_LOG_INCLUDE_SUBAGENT_USER", "").strip().lower() in ("1", "true", "yes")
-        subagent_tag = os.environ.get("CLAUDE_LOG_SUBAGENT_TAG", "[subagent]")
-        self._log_reader = ClaudeLogReader(
-            work_dir=log_work_dir,
-            include_subagents=include_subagents,
-            include_subagent_user=include_subagent_user,
-            subagent_tag=subagent_tag,
-        )
+        self._log_reader = ClaudeLogReader(work_dir=log_work_dir)
         preferred_session = self.session_info.get("claude_session_path")
         if preferred_session:
             self._log_reader.set_preferred_session(Path(str(preferred_session)))

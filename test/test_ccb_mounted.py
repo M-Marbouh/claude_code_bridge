@@ -22,11 +22,9 @@ def _load_mounted_module():
 
 
 def _status(key: str, *, mounted: bool, reason: str = "") -> ProviderRuntimeStatus:
-    provider, instance = key.split(":", 1) if ":" in key else (key, None)
     return ProviderRuntimeStatus(
         key=key,
-        provider=provider,
-        instance=instance,
+        provider=key,
         capable=True,
         configured=True,
         registered=True,
@@ -38,7 +36,7 @@ def _status(key: str, *, mounted: bool, reason: str = "") -> ProviderRuntimeStat
     )
 
 
-def test_ccb_mounted_outputs_qualified_mounted_keys(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_ccb_mounted_outputs_mounted_providers(monkeypatch, tmp_path: Path, capsys) -> None:
     mounted = _load_mounted_module()
     project = ProjectRuntimeStatus(
         work_dir=str(tmp_path),
@@ -47,9 +45,7 @@ def test_ccb_mounted_outputs_qualified_mounted_keys(monkeypatch, tmp_path: Path,
         updated_at=1,
         providers={
             "codex": _status("codex", mounted=True),
-            "codex:worker": _status("codex:worker", mounted=True),
             "claude": _status("claude", mounted=False, reason="daemon_offline"),
-            "claude:worker": _status("claude:worker", mounted=False, reason="pane_dead"),
         },
     )
     monkeypatch.setattr(mounted, "resolve_project_runtime_status", lambda _work_dir: project)
@@ -58,12 +54,11 @@ def test_ccb_mounted_outputs_qualified_mounted_keys(monkeypatch, tmp_path: Path,
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["mounted"] == ["codex", "codex:worker"]
+    assert payload["mounted"] == ["codex"]
     assert payload["reasons"]["claude"] == "daemon_offline"
-    assert payload["reasons"]["claude:worker"] == "pane_dead"
 
 
-def test_ccb_mounted_simple_outputs_space_separated_qualified_keys(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_ccb_mounted_simple_outputs_space_separated_providers(monkeypatch, tmp_path: Path, capsys) -> None:
     mounted = _load_mounted_module()
     project = ProjectRuntimeStatus(
         work_dir=str(tmp_path),
@@ -72,7 +67,6 @@ def test_ccb_mounted_simple_outputs_space_separated_qualified_keys(monkeypatch, 
         updated_at=1,
         providers={
             "claude": _status("claude", mounted=True),
-            "claude:worker": _status("claude:worker", mounted=True),
         },
     )
     monkeypatch.setattr(mounted, "resolve_project_runtime_status", lambda _work_dir: project)
@@ -80,4 +74,4 @@ def test_ccb_mounted_simple_outputs_space_separated_qualified_keys(monkeypatch, 
     rc = mounted.main(["--simple", str(tmp_path)])
 
     assert rc == 0
-    assert capsys.readouterr().out.strip() == "claude claude:worker"
+    assert capsys.readouterr().out.strip() == "claude"

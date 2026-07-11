@@ -27,25 +27,6 @@ $script:CCB_END_MARKER = "<!-- CCB_CONFIG_END -->"
 $script:CCB_WEZTERM_START_MARKER = "-- CCB_WEZTERM_START"
 $script:CCB_WEZTERM_END_MARKER = "-- CCB_WEZTERM_END"
 
-$script:SCRIPTS_TO_LINK = @(
-  "ccb",
-  "cask", "cpend", "cping",
-  "gask", "gpend", "gping",
-  "oask", "opend", "oping",
-  "lask", "lpend", "lping",
-  "dask", "dpend", "dping",
-  "ask", "ccb-ping", "pend", "autonew", "ccb-completion-hook", "maild"
-)
-
-$script:CLAUDE_MARKDOWN = @(
-  # Old CCB commands removed - replaced by unified ask/ping/pend skills
-)
-
-$script:LEGACY_SCRIPTS = @(
-  "cast", "cast-w", "codex-ask", "codex-pending", "codex-ping",
-  "claude-codex-dual", "claude_codex", "claude_ai", "claude_bridge"
-)
-
 # i18n support
 function Get-CCBLang {
   $lang = $env:CCB_LANG
@@ -221,7 +202,7 @@ function Install-Native {
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
   }
 
-  $items = @("ccb", "lib", "bin", "commands", "mcp", "droid_skills")
+  $items = @("ccb", "lib", "bin")
   foreach ($item in $items) {
     $src = Join-Path $repoRoot $item
     $dst = Join-Path $InstallPrefix $item
@@ -257,8 +238,8 @@ function Install-Native {
     "gask", "gping", "gpend",
     "oask", "oping", "opend",
     "lask", "lping", "lpend",
-    "dask", "dping", "dpend",
-    "ask", "ccb-ping", "pend", "autonew", "ccb-completion-hook", "maild"
+    "ask", "ccb-list", "ccb-mounted", "ccb-bridge-ask", "ccb-ping", "pend",
+    "autonew", "ccb-completion-hook", "maild", "ctx-transfer"
   )
 
   # In MSYS/Git-Bash, invoking the script file directly will honor the shebang.
@@ -266,6 +247,8 @@ function Install-Native {
   foreach ($script in $scripts) {
     if ($script -eq "ccb") {
       Fix-PythonShebang (Join-Path $InstallPrefix "ccb")
+    } elseif ($script -eq "ccb-mounted") {
+      Fix-PythonShebang (Join-Path $InstallPrefix "bin\ccb-mounted.py")
     } else {
       Fix-PythonShebang (Join-Path $InstallPrefix ("bin\\" + $script))
     }
@@ -276,6 +259,8 @@ function Install-Native {
     $cmdPath = Join-Path $binDir "$script.cmd"
     if ($script -eq "ccb") {
       $relPath = "..\\ccb"
+    } elseif ($script -eq "ccb-mounted") {
+      $relPath = "ccb-mounted.py"
     } else {
       # Script is installed alongside the wrapper under $InstallPrefix\bin
       $relPath = $script
@@ -350,8 +335,6 @@ function Install-Native {
   }
   Install-CodexSkills
   Install-ClaudeConfig
-  Install-DroidSkills
-  Install-DroidDelegation -PythonCmd $pythonCmd -InstallPrefix $InstallPrefix
   Cleanup-LegacyFiles -InstallPrefix $InstallPrefix
 
   try {
@@ -437,6 +420,10 @@ function Install-CodexSkills {
   if (-not (Test-Path $skillsDst)) {
     New-Item -ItemType Directory -Path $skillsDst -Force | Out-Null
   }
+  foreach ($removedSkill in @("delegate", "mounted", "all-plan", "file-op")) {
+    $removedPath = Join-Path $skillsDst $removedSkill
+    if (Test-Path $removedPath) { Remove-Item -Recurse -Force $removedPath }
+  }
 
   Write-Host "Installing Codex skills (PowerShell SKILL.md templates)..."
   Get-ChildItem -Path $skillsSrc -Directory | ForEach-Object {
@@ -472,78 +459,7 @@ function Install-CodexSkills {
   Write-Host "Updated Codex skills directory: $skillsDst"
 }
 
-function Install-DroidSkills {
-  $skillsSrc = Join-Path $repoRoot "droid_skills"
-  $factoryHome = if ($env:FACTORY_HOME) { $env:FACTORY_HOME } else { Join-Path $env:USERPROFILE ".factory" }
-  $skillsDst = Join-Path $factoryHome "skills"
 
-  if (-not (Test-Path $skillsSrc)) {
-    return
-  }
-
-  if (-not (Get-Command droid -ErrorAction SilentlyContinue)) {
-    return
-  }
-
-  if (-not (Test-Path $skillsDst)) {
-    New-Item -ItemType Directory -Path $skillsDst -Force | Out-Null
-  }
-
-  Write-Host "Installing Droid/Factory skills..."
-  Get-ChildItem -Path $skillsSrc -Directory | ForEach-Object {
-    $skillName = $_.Name
-    $srcDir = $_.FullName
-    $dstDir = Join-Path $skillsDst $skillName
-
-    $srcSkillMd = Join-Path $srcDir "SKILL.md"
-    if (-not (Test-Path $srcSkillMd)) {
-      return
-    }
-
-    if (-not (Test-Path $dstDir)) {
-      New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
-    }
-
-    Copy-Item -Force $srcSkillMd (Join-Path $dstDir "SKILL.md")
-
-    # Copy additional subdirectories
-    Get-ChildItem -Path $srcDir -Directory | ForEach-Object {
-      Copy-Item -Recurse -Force $_.FullName (Join-Path $dstDir $_.Name)
-    }
-
-    Write-Host "  Updated Factory skill: $skillName"
-  }
-  Write-Host "Updated Factory skills directory: $skillsDst"
-}
-
-function Install-DroidDelegation {
-  param(
-    [string]$PythonCmd,
-    [string]$InstallPrefix
-  )
-
-  if ($env:CCB_DROID_AUTOINSTALL -eq "0") {
-    return
-  }
-  $droidCmd = Get-Command droid -ErrorAction SilentlyContinue
-  if (-not $droidCmd) {
-    return
-  }
-  $serverPath = Join-Path $InstallPrefix "mcp\\ccb-delegation\\server.py"
-  if (-not (Test-Path $serverPath)) {
-    Write-Host "WARN: Droid MCP server not found at $serverPath; skipping"
-    return
-  }
-  if ($env:CCB_DROID_AUTOINSTALL_FORCE -eq "1") {
-    try { & $droidCmd.Source "mcp" "remove" "ccb-delegation" | Out-Null } catch {}
-  }
-  try {
-    & $droidCmd.Source "mcp" "add" "ccb-delegation" "--type" "stdio" $PythonCmd $serverPath | Out-Null
-    Write-Host "OK: Droid MCP delegation registered"
-  } catch {
-    Write-Warning "Droid MCP delegation setup failed: $_"
-  }
-}
 
 function Install-ClaudeConfig {
   $claudeDir = Join-Path $env:USERPROFILE ".claude"
@@ -571,6 +487,10 @@ function Install-ClaudeConfig {
   if (Test-Path $srcSkills) {
     if (-not (Test-Path $skillsDir)) {
       New-Item -ItemType Directory -Path $skillsDir -Force | Out-Null
+    }
+    foreach ($removedSkill in @("delegate", "mounted", "all-plan", "tp", "tr", "file-op", "review")) {
+      $removedPath = Join-Path $skillsDir $removedSkill
+      if (Test-Path $removedPath) { Remove-Item -Recurse -Force $removedPath }
     }
     Write-Host "Installing Claude skills (PowerShell SKILL.md templates)..."
     Get-ChildItem -Path $srcSkills -Directory | ForEach-Object {
@@ -697,9 +617,10 @@ function Install-ClaudeConfig {
     $templateContent = Get-Content -Raw $agentsMdTemplate
     if (Test-Path $agentsMd) {
       $agentsContent = Get-Content -Raw $agentsMd
-      if ($agentsContent -match '<!-- CCB_ROLES_START -->' -or $agentsContent -match '<!-- REVIEW_RUBRICS_START -->') {
+      if ($agentsContent -match '<!-- CCB_ROLES_START -->' -or $agentsContent -match '<!-- REVIEW_RUBRICS_START -->' -or $agentsContent -match '<!-- MUTUAL_RATIFICATION_START -->') {
         $agentsContent = [regex]::Replace($agentsContent, '(?s)<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->', '')
         $agentsContent = [regex]::Replace($agentsContent, '(?s)<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->', '')
+        $agentsContent = [regex]::Replace($agentsContent, '(?s)<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->', '')
         $agentsContent = $agentsContent.TrimEnd() + "`n`n" + $templateContent.Trim() + "`n"
         $agentsContent | Out-File -Encoding UTF8 -FilePath $agentsMd
       } else {
@@ -711,24 +632,6 @@ function Install-ClaudeConfig {
     Write-Host "Updated AGENTS.md with review rubrics"
   }
 
-  # --- .clinerules injection ---
-  $clinerulesTpl = Join-Path $installPrefix "config\clinerules-ccb.md"
-  $clinerules = Join-Path $installPrefix ".clinerules"
-  if (Test-Path $clinerulesTpl) {
-    $tplContent = Get-Content -Raw $clinerulesTpl
-    if (Test-Path $clinerules) {
-      $crContent = Get-Content -Raw $clinerules
-      if ($crContent -match '<!-- CCB_ROLES_START -->') {
-        $crContent = [regex]::Replace($crContent, '(?s)<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->', $tplContent.Trim())
-        $crContent | Out-File -Encoding UTF8 -FilePath $clinerules
-      } else {
-        Add-Content -Path $clinerules -Value ("`n" + $tplContent)
-      }
-    } else {
-      $tplContent | Out-File -Encoding UTF8 -FilePath $clinerules
-    }
-    Write-Host "Updated .clinerules with role assignments"
-  }
 }
 
 function Set-WezTermDefaultShellToPowerShell {
@@ -854,7 +757,7 @@ function Uninstall-Native {
 
   # 3. Remove Claude skills
   $claudeSkillsDir = Join-Path $env:USERPROFILE ".claude\skills"
-  $ccbSkills = @("ask", "cping", "ping", "pend", "autonew", "mounted", "all-plan", "docs")
+  $ccbSkills = @("ask", "cping", "ping", "pend", "autonew", "delegate", "mounted", "all-plan", "docs", "tp", "tr", "file-op", "review")
   if (Test-Path $claudeSkillsDir) {
     Write-Host "Removing CCB Claude skills..."
     foreach ($skill in $ccbSkills) {

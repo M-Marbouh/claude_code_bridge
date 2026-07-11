@@ -31,8 +31,6 @@ class ProviderRequest:
     email_req_id: str = ""
     email_msg_id: str = ""
     email_from: str = ""
-    # Multi-instance support: optional instance identifier (e.g., 'auth', 'payment')
-    instance: Optional[str] = None
     # Caller pane ID for direct routing back to the originating terminal pane
     caller_pane_id: str = ""
     caller_terminal: str = ""
@@ -78,14 +76,14 @@ class BaseProviderAdapter(ABC):
     """
     Abstract base class for provider adapters.
 
-    Each provider (codex, gemini, opencode, droid, claude) implements
+    Each provider (codex, gemini, opencode, claude) implements
     this interface to integrate with the unified daemon.
     """
 
     @property
     @abstractmethod
     def key(self) -> str:
-        """Provider key (e.g., 'codex', 'gemini', 'opencode', 'droid', 'claude')."""
+        """Provider key (codex, gemini, opencode, or claude)."""
         ...
 
     @property
@@ -101,12 +99,12 @@ class BaseProviderAdapter(ABC):
         ...
 
     @abstractmethod
-    def load_session(self, work_dir: Path, instance: Optional[str] = None) -> Optional[Any]:
+    def load_session(self, work_dir: Path) -> Optional[Any]:
         """Load session for the given work directory."""
         ...
 
     @abstractmethod
-    def compute_session_key(self, session: Any, instance: Optional[str] = None) -> str:
+    def compute_session_key(self, session: Any) -> str:
         """Compute a unique session key for routing."""
         ...
 

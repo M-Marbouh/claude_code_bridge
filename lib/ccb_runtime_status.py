@@ -17,30 +17,18 @@ from pane_registry import (
     _provider_pane_alive,
 )
 from project_id import compute_ccb_project_id
-from providers import make_qualified_key, normalize_instance_name, parse_qualified_provider, session_filename_for_instance
 from session_utils import find_project_session_file
 
 
-CAPABLE_MULTI_INSTANCE = True
-CAPABLE_TAG_ROUTING = True
-
-_SESSION_FILENAMES = {
-    "codex": ".codex-session",
-    "gemini": ".gemini-session",
-    "opencode": ".opencode-session",
-    "claude": ".claude-session",
-    "droid": ".droid-session",
-    "copilot": ".copilot-session",
-    "codebuddy": ".codebuddy-session",
-    "qwen": ".qwen-session",
-}
+SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode")
+SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
 
 
 @dataclass(frozen=True)
 class RegistryProviderRecord:
     project_id: str
     work_dir: str
-    provider_key: str
+    provider: str
     provider_entry: dict[str, Any]
     registry_record: dict[str, Any]
     updated_at: int
@@ -51,7 +39,6 @@ class RegistryProviderRecord:
 class ProviderRuntimeStatus:
     key: str
     provider: str
-    instance: str | None
     capable: bool
     configured: bool
     registered: bool
@@ -70,7 +57,6 @@ class ProviderRuntimeStatus:
         return {
             "key": self.key,
             "provider": self.provider,
-            "instance": self.instance,
             "capable": self.capable,
             "configured": self.configured,
             "registered": self.registered,
@@ -106,67 +92,47 @@ class ProjectRuntimeStatus:
 
 
 def _project_run_dir(project_id: str) -> Path:
-    project_hash = (project_id or "")[:16] or "unknown"
-    return Path.home() / ".cache" / "ccb" / "projects" / project_hash
+    return Path.home() / ".cache" / "ccb" / "projects" / ((project_id or "")[:16] or "unknown")
 
 
 def _state_file_candidates(project_id: str) -> list[Path]:
     candidates: list[Path] = []
-    raw_run_dir = (os.environ.get("CCB_RUN_DIR") or "").strip()
-    if raw_run_dir:
-        candidates.append(Path(raw_run_dir).expanduser() / "askd.json")
+    override = (os.environ.get("CCB_RUN_DIR") or "").strip()
+    if override:
+        candidates.append(Path(override).expanduser() / "askd.json")
     candidates.append(_project_run_dir(project_id) / "askd.json")
-    seen: set[str] = set()
-    out: list[Path] = []
-    for path in candidates:
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(path)
-    return out
-
-
-def _state_matches_project(state: dict[str, Any] | None, work_dir: Path, project_id: str) -> bool:
-    if not isinstance(state, dict):
-        return False
-    raw_work_dir = str(state.get("work_dir") or "").strip()
-    if raw_work_dir:
-        try:
-            return compute_ccb_project_id(Path(raw_work_dir)) == project_id
-        except Exception:
-            return False
-    return True
+    return list(dict.fromkeys(candidates))
 
 
 def is_project_askd_online(work_dir: Path, project_id: str, *, timeout_s: float = 0.2) -> bool:
     for state_file in _state_file_candidates(project_id):
         state = askd_rpc.read_state(state_file)
-        if not _state_matches_project(state, work_dir, project_id):
+        if not isinstance(state, dict):
             continue
+        state_work_dir = str(state.get("work_dir") or "").strip()
+        if state_work_dir:
+            try:
+                if compute_ccb_project_id(Path(state_work_dir)) != project_id:
+                    continue
+            except Exception:
+                continue
         if askd_rpc.ping_daemon("ask", timeout_s=timeout_s, state_file=state_file):
             return True
     return False
 
 
 def _effective_project_id(record: dict[str, Any]) -> str:
-    existing = str(record.get("ccb_project_id") or "").strip()
-    if existing:
-        return existing
+    project_id = str(record.get("ccb_project_id") or "").strip()
+    if project_id:
+        return project_id
     work_dir = str(record.get("work_dir") or "").strip()
-    if not work_dir:
-        return ""
     try:
-        return compute_ccb_project_id(Path(work_dir))
+        return compute_ccb_project_id(Path(work_dir)) if work_dir else ""
     except Exception:
         return ""
 
 
-def iter_registry_provider_records(
-    *,
-    project_id: str | None = None,
-    include_stale: bool = False,
-) -> list[RegistryProviderRecord]:
+def iter_registry_provider_records(*, project_id: str | None = None, include_stale: bool = False) -> list[RegistryProviderRecord]:
     records: list[RegistryProviderRecord] = []
     for path in _iter_registry_files():
         record = _load_registry_file(path)
@@ -176,77 +142,41 @@ def iter_registry_provider_records(
         timestamp_stale = _is_stale(updated_at)
         if timestamp_stale and not include_stale:
             continue
-        effective_project_id = _effective_project_id(record)
-        if not effective_project_id:
-            continue
-        if project_id and effective_project_id != project_id:
+        effective = _effective_project_id(record)
+        if not effective or (project_id and effective != project_id):
             continue
         work_dir = str(record.get("work_dir") or "").strip()
         if not work_dir:
             continue
-        providers = _get_providers_map(record)
-        for provider_key, entry in providers.items():
-            if not isinstance(entry, dict):
+        for provider, entry in _get_providers_map(record).items():
+            if provider not in SUPPORTED_PROVIDERS or not isinstance(entry, dict):
                 continue
-            records.append(
-                RegistryProviderRecord(
-                    project_id=effective_project_id,
-                    work_dir=work_dir,
-                    provider_key=str(provider_key).strip().lower(),
-                    provider_entry=dict(entry),
-                    registry_record=record,
-                    updated_at=updated_at,
-                    timestamp_stale=timestamp_stale,
-                )
-            )
+            records.append(RegistryProviderRecord(effective, work_dir, provider, dict(entry), record, updated_at, timestamp_stale))
     return records
 
 
-def _configured_provider_keys(work_dir: Path) -> set[str]:
+def _configured_providers(work_dir: Path) -> set[str]:
     try:
-        config = load_start_config(work_dir).data
+        providers = load_start_config(work_dir).data.get("providers")
     except Exception:
-        config = {}
-    keys: set[str] = set()
-    providers = config.get("providers") if isinstance(config, dict) else None
-    if isinstance(providers, list):
-        for item in providers:
-            base, _instance = parse_qualified_provider(str(item or ""))
-            if base:
-                keys.add(base)
-    instances = config.get("provider_instances") if isinstance(config, dict) else None
-    if isinstance(instances, list):
-        for item in instances:
-            if not isinstance(item, dict):
-                continue
-            provider = str(item.get("provider") or "").strip().lower()
-            instance = normalize_instance_name(str(item.get("instance") or ""))
-            if provider and instance:
-                keys.add(make_qualified_key(provider, instance))
-    return keys
+        providers = []
+    if not isinstance(providers, list):
+        return set()
+    return {str(provider).strip().lower() for provider in providers if str(provider).strip().lower() in SUPPORTED_PROVIDERS}
 
 
-def _select_provider_records(records: Iterable[RegistryProviderRecord]) -> dict[str, RegistryProviderRecord]:
+def _select_records(records: Iterable[RegistryProviderRecord]) -> dict[str, RegistryProviderRecord]:
     selected: dict[str, RegistryProviderRecord] = {}
     for record in records:
-        current = selected.get(record.provider_key)
-        if current is None:
-            selected[record.provider_key] = record
-            continue
-        if current.timestamp_stale and not record.timestamp_stale:
-            selected[record.provider_key] = record
-            continue
-        if current.timestamp_stale == record.timestamp_stale and record.updated_at > current.updated_at:
-            selected[record.provider_key] = record
+        current = selected.get(record.provider)
+        if current is None or (current.timestamp_stale and not record.timestamp_stale) or (
+            current.timestamp_stale == record.timestamp_stale and record.updated_at > current.updated_at
+        ):
+            selected[record.provider] = record
     return selected
 
 
-def _session_filename_for_key(provider: str, instance: str | None) -> str:
-    base = _SESSION_FILENAMES.get(provider, f".{provider}-session")
-    return session_filename_for_instance(base, instance)
-
-
-def _load_json_dict(path: Path) -> dict[str, Any]:
+def _load_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
@@ -254,70 +184,35 @@ def _load_json_dict(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _session_file_from_entry(work_dir: Path, provider: str, instance: str | None, entry: dict[str, Any]) -> Path | None:
+def _session_bound(work_dir: Path, project_id: str, provider: str, entry: dict[str, Any]) -> tuple[bool, str]:
     raw = str(entry.get("session_file") or "").strip()
-    if raw:
-        return Path(raw).expanduser()
-    filename = _session_filename_for_key(provider, instance)
-    return find_project_session_file(work_dir, filename)
-
-
-def _session_bound(
-    *,
-    work_dir: Path,
-    project_id: str,
-    key: str,
-    provider: str,
-    instance: str | None,
-    entry: dict[str, Any],
-) -> tuple[bool, str]:
-    session_file = _session_file_from_entry(work_dir, provider, instance, entry)
-    if not session_file or not session_file.exists() or not session_file.is_file():
+    session_file = Path(raw).expanduser() if raw else find_project_session_file(work_dir, SESSION_FILENAMES[provider])
+    if not session_file or not session_file.is_file():
         return False, str(session_file or "")
-    data = _load_json_dict(session_file)
+    data = _load_json(session_file)
     if not data:
         return False, str(session_file)
-
     recorded_project = str(data.get("ccb_project_id") or "").strip()
     if recorded_project and recorded_project != project_id:
         return False, str(session_file)
-
-    recorded_key = str(data.get("qualified_provider") or "").strip().lower()
-    if recorded_key and recorded_key != key:
-        return False, str(session_file)
-
     recorded_provider = str(data.get("provider") or "").strip().lower()
     if recorded_provider and recorded_provider != provider:
         return False, str(session_file)
-
-    recorded_instance = normalize_instance_name(str(data.get("instance") or ""))
-    if recorded_instance != normalize_instance_name(instance):
-        return False, str(session_file)
-
     entry_pane = str(entry.get("pane_id") or "").strip()
     session_pane = str(data.get("pane_id") or data.get("tmux_session") or "").strip()
     if entry_pane and session_pane and entry_pane != session_pane:
         return False, str(session_file)
-
     return True, str(session_file)
 
 
-def _status_reason(
-    *,
-    configured: bool,
-    registered: bool,
-    timestamp_stale: bool,
-    pane_alive: bool,
-    session_bound: bool,
-    daemon_online: bool,
-) -> str:
-    if registered and not timestamp_stale and pane_alive and session_bound and daemon_online:
+def _reason(configured: bool, registered: bool, stale: bool, pane_alive: bool, session_bound: bool, daemon_online: bool) -> str:
+    if registered and not stale and pane_alive and session_bound and daemon_online:
         return ""
     if not configured and not registered:
         return "not_configured"
     if not registered:
         return "not_registered"
-    if timestamp_stale:
+    if stale:
         return "registry_stale"
     if not pane_alive:
         return "pane_dead"
@@ -335,97 +230,45 @@ def resolve_project_runtime_status(
     include_stale: bool = False,
     check_daemon: bool = True,
 ) -> ProjectRuntimeStatus:
-    resolved_work_dir: Path | None = None
-    if work_dir is not None:
-        try:
-            resolved_work_dir = Path(work_dir).expanduser().resolve()
-        except Exception:
-            resolved_work_dir = Path(work_dir).expanduser().absolute()
-    if not project_id and resolved_work_dir is not None:
-        try:
-            project_id = compute_ccb_project_id(resolved_work_dir)
-        except Exception:
-            project_id = ""
-    project_id = (project_id or "").strip()
-
-    records = iter_registry_provider_records(project_id=project_id or None, include_stale=include_stale)
-    if resolved_work_dir is None and records:
-        try:
-            resolved_work_dir = Path(records[0].work_dir).expanduser().resolve()
-        except Exception:
-            resolved_work_dir = Path(records[0].work_dir).expanduser().absolute()
-    if resolved_work_dir is None:
-        resolved_work_dir = Path.cwd().resolve()
-    if not project_id:
-        try:
-            project_id = compute_ccb_project_id(resolved_work_dir)
-        except Exception:
-            project_id = ""
-    if project_id:
-        records = [record for record in records if record.project_id == project_id]
-
-    configured_keys = _configured_provider_keys(resolved_work_dir)
-    selected_records = _select_provider_records(records)
-    keys = set(configured_keys) | set(selected_records)
-
-    daemon_online = is_project_askd_online(resolved_work_dir, project_id) if check_daemon and project_id else False
-    provider_statuses: dict[str, ProviderRuntimeStatus] = {}
-
-    for key in sorted(keys):
-        provider, instance = parse_qualified_provider(key)
-        record = selected_records.get(key)
+    resolved = Path(work_dir or Path.cwd()).expanduser().resolve()
+    project_id = (project_id or compute_ccb_project_id(resolved)).strip()
+    records = iter_registry_provider_records(project_id=project_id, include_stale=include_stale)
+    configured = _configured_providers(resolved)
+    selected = _select_records(records)
+    daemon_online = is_project_askd_online(resolved, project_id) if check_daemon else False
+    statuses: dict[str, ProviderRuntimeStatus] = {}
+    for provider in sorted(configured | set(selected)):
+        record = selected.get(provider)
         entry = record.provider_entry if record else {}
         registered = record is not None
-        timestamp_stale = bool(record.timestamp_stale) if record else False
-        pane_alive = bool(_provider_pane_alive(record.registry_record, key)) if record else False
-        session_ok, session_file = _session_bound(
-            work_dir=resolved_work_dir,
-            project_id=project_id,
-            key=key,
+        stale = bool(record.timestamp_stale) if record else False
+        pane_alive = bool(_provider_pane_alive(record.registry_record, provider)) if record else False
+        bound, session_file = _session_bound(resolved, project_id, provider, entry) if record else (False, "")
+        mounted = bool(registered and not stale and pane_alive and bound and daemon_online)
+        statuses[provider] = ProviderRuntimeStatus(
+            key=provider,
             provider=provider,
-            instance=instance,
-            entry=entry,
-        ) if record else (False, "")
-        mounted = bool(registered and not timestamp_stale and pane_alive and session_ok and daemon_online)
-        reason = _status_reason(
-            configured=(key in configured_keys),
-            registered=registered,
-            timestamp_stale=timestamp_stale,
-            pane_alive=pane_alive,
-            session_bound=session_ok,
-            daemon_online=daemon_online,
-        )
-        provider_statuses[key] = ProviderRuntimeStatus(
-            key=key,
-            provider=provider,
-            instance=instance,
-            capable=CAPABLE_MULTI_INSTANCE and CAPABLE_TAG_ROUTING,
-            configured=(key in configured_keys),
+            capable=True,
+            configured=provider in configured,
             registered=registered,
             pane_alive=pane_alive,
-            session_bound=session_ok,
+            session_bound=bound,
             daemon_online=daemon_online,
             mounted=mounted,
-            reason=reason,
+            reason=_reason(provider in configured, registered, stale, pane_alive, bound, daemon_online),
             pane_id=str(entry.get("pane_id") or "").strip(),
             pane_title_marker=str(entry.get("pane_title_marker") or "").strip(),
             session_file=session_file,
-            timestamp_stale=timestamp_stale,
-            updated_at=int(record.updated_at) if record else 0,
+            timestamp_stale=stale,
+            updated_at=record.updated_at if record else 0,
         )
-
-    terminal = ""
-    updated_at = 0
-    if records:
-        newest = max(records, key=lambda record: record.updated_at)
-        terminal = str(newest.registry_record.get("terminal") or "").strip()
-        updated_at = int(newest.updated_at)
+    newest = max(records, key=lambda record: record.updated_at) if records else None
     return ProjectRuntimeStatus(
-        work_dir=str(resolved_work_dir),
+        work_dir=str(resolved),
         ccb_project_id=project_id,
-        terminal=terminal or "tmux",
-        updated_at=updated_at,
-        providers=provider_statuses,
+        terminal=str(newest.registry_record.get("terminal") or "tmux") if newest else "tmux",
+        updated_at=newest.updated_at if newest else 0,
+        providers=statuses,
     )
 
 
@@ -434,26 +277,12 @@ def list_project_runtime_statuses(*, include_stale: bool = False, check_daemon: 
     grouped: dict[str, list[RegistryProviderRecord]] = {}
     for record in records:
         grouped.setdefault(record.project_id, []).append(record)
-
-    projects: list[ProjectRuntimeStatus] = []
-    for project_id, project_records in grouped.items():
-        newest = max(project_records, key=lambda record: record.updated_at)
-        work_dir = newest.work_dir
-        try:
-            if not Path(work_dir).expanduser().exists():
-                continue
-        except Exception:
-            continue
-        projects.append(
-            resolve_project_runtime_status(
-                work_dir,
-                project_id=project_id,
-                include_stale=include_stale,
-                check_daemon=check_daemon,
-            )
-        )
-    projects.sort(key=lambda project: project.updated_at, reverse=True)
-    return projects
+    projects = [
+        resolve_project_runtime_status(items[0].work_dir, project_id=project_id, include_stale=include_stale, check_daemon=check_daemon)
+        for project_id, items in grouped.items()
+        if Path(items[0].work_dir).expanduser().exists()
+    ]
+    return sorted(projects, key=lambda project: project.updated_at, reverse=True)
 
 
 def provider_status_for_target(
@@ -463,22 +292,20 @@ def provider_status_for_target(
     include_stale: bool = False,
     check_daemon: bool = True,
 ) -> ProviderRuntimeStatus:
-    base, instance = parse_qualified_provider(target)
-    key = make_qualified_key(base, instance)
+    provider = str(target or "").strip().lower()
     project = resolve_project_runtime_status(work_dir or Path.cwd(), include_stale=include_stale, check_daemon=check_daemon)
-    status = project.providers.get(key)
+    status = project.providers.get(provider)
     if status:
         return status
     return ProviderRuntimeStatus(
-        key=key,
-        provider=base,
-        instance=instance,
-        capable=CAPABLE_MULTI_INSTANCE and CAPABLE_TAG_ROUTING,
+        key=provider,
+        provider=provider,
+        capable=provider in SUPPORTED_PROVIDERS,
         configured=False,
         registered=False,
         pane_alive=False,
         session_bound=False,
-        daemon_online=any(s.daemon_online for s in project.providers.values()),
+        daemon_online=any(item.daemon_online for item in project.providers.values()),
         mounted=False,
         reason="not_configured",
     )

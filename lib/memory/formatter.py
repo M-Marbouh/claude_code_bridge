@@ -30,7 +30,6 @@ class ContextFormatter:
             "codex": "Codex",
             "gemini": "Gemini",
             "opencode": "OpenCode",
-            "droid": "Droid",
             "auto": "Auto",
         }
         if key in mapping:

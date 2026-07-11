@@ -23,16 +23,15 @@ from .formatter import ContextFormatter
 class ContextTransfer:
     """Orchestrate context transfer between providers."""
 
-    SUPPORTED_PROVIDERS = ("codex", "gemini", "opencode", "droid")
-    SUPPORTED_SOURCES = ("auto", "claude", "codex", "gemini", "opencode", "droid")
+    SUPPORTED_PROVIDERS = ("codex", "gemini", "opencode")
+    SUPPORTED_SOURCES = ("auto", "claude", "codex", "gemini", "opencode")
     SOURCE_SESSION_FILES = {
         "claude": ".claude-session",
         "codex": ".codex-session",
         "gemini": ".gemini-session",
         "opencode": ".opencode-session",
-        "droid": ".droid-session",
     }
-    DEFAULT_SOURCE_ORDER = ("claude", "codex", "gemini", "opencode", "droid")
+    DEFAULT_SOURCE_ORDER = ("claude", "codex", "gemini", "opencode")
     DEFAULT_FALLBACK_PAIRS = 50
 
     def __init__(
@@ -245,12 +244,6 @@ class ContextTransfer:
                 session_id=source_session_id,
                 project_id=source_project_id,
             )
-        if provider == "droid":
-            return self._extract_from_droid(
-                last_n=last_n,
-                session_path=session_path,
-                session_id=source_session_id,
-            )
         raise SessionNotFoundError(f"Unsupported source provider: {provider}")
 
     def _extract_from_claude(
@@ -392,56 +385,6 @@ class ContextTransfer:
             last_n=last_n,
         )
 
-    def _extract_from_droid(
-        self,
-        *,
-        last_n: int,
-        session_path: Optional[Path] = None,
-        session_id: Optional[str] = None,
-    ) -> TransferContext:
-        session_file, data = self._load_session_data("droid")
-        # Only use current active session, not old_* fallback to prevent "amnesia"
-        session_id = session_id or (
-            data.get("droid_session_id")
-            or data.get("session_id")
-            or ""
-        )
-        preferred_path = session_path or data.get("droid_session_path")
-        preferred_path_obj: Optional[Path] = None
-        if preferred_path:
-            try:
-                preferred_path_obj = Path(str(preferred_path)).expanduser()
-            except Exception:
-                preferred_path_obj = None
-
-        from droid_comm import DroidLogReader
-
-        log_reader = DroidLogReader(work_dir=self.work_dir)
-        if preferred_path_obj and preferred_path_obj.exists():
-            log_reader.set_preferred_session(preferred_path_obj)
-        if session_id:
-            log_reader.set_session_id_hint(session_id)
-
-        session_path = log_reader.current_session_path()
-        if not session_path or not session_path.exists():
-            raise SessionNotFoundError("No Droid session found")
-
-        fetch_n = last_n if last_n > 0 else self._default_fetch_n()
-        pairs = log_reader.latest_conversations(fetch_n)
-
-        if not session_id and session_path:
-            session_id = session_path.stem
-        if not session_id:
-            session_id = "unknown"
-
-        return self._context_from_pairs(
-            pairs,
-            provider="droid",
-            session_id=session_id,
-            session_path=session_path,
-            last_n=last_n,
-        )
-
     def _extract_from_opencode(
         self,
         *,
@@ -526,7 +469,6 @@ class ContextTransfer:
             "codex": "cask",
             "gemini": "gask",
             "opencode": "oask",
-            "droid": "dask",
         }
         cmd = cmd_map.get(provider, "ask")
 

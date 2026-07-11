@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -25,9 +24,8 @@ from completion_hook import (
     default_reply_for_status,
     notify_completion,
 )
-from project_id import compute_ccb_project_id, normalize_work_dir
-from providers import CASKD_SPEC, make_qualified_key, parse_qualified_provider
-from session_utils import resolve_project_config_dir
+from project_id import normalize_work_dir
+from providers import CASKD_SPEC
 from terminal import get_backend_for_session, is_windows
 
 
@@ -84,92 +82,6 @@ def _append_tier_footer(reply: str, footer: str) -> str:
     return f"{base}\n{footer}"
 
 
-def _read_json(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _session_work_dir_matches(data: dict, work_dir: Path) -> bool:
-    if not isinstance(data, dict):
-        return False
-    try:
-        expected_pid = compute_ccb_project_id(work_dir)
-    except Exception:
-        expected_pid = ""
-    recorded_pid = str(data.get("ccb_project_id") or "").strip()
-    if recorded_pid and expected_pid and recorded_pid != expected_pid:
-        return False
-    raw_norm = str(data.get("work_dir_norm") or "").strip()
-    raw_dir = str(data.get("work_dir") or "").strip()
-    try:
-        current_norm = normalize_work_dir(work_dir)
-    except Exception:
-        current_norm = str(work_dir)
-    recorded_norm = ""
-    if raw_norm:
-        recorded_norm = normalize_work_dir(raw_norm)
-    elif raw_dir:
-        recorded_norm = normalize_work_dir(raw_dir)
-    if recorded_norm:
-        return recorded_norm == current_norm
-    return not recorded_pid
-
-
-def _provider_instance_from_session(path: Path, data: dict) -> tuple[str, str | None]:
-    qualified = str(data.get("qualified_provider") or "").strip().lower()
-    if qualified:
-        return parse_qualified_provider(qualified)
-    provider = str(data.get("provider") or "").strip().lower()
-    instance = str(data.get("instance") or "").strip().lower() or None
-    if provider:
-        return provider, instance
-    match = re.fullmatch(r"\.([a-z0-9]+)(?:-([a-z0-9_-]+))?-session", path.name)
-    if not match:
-        return "", None
-    return match.group(1), match.group(2)
-
-
-def _codex_instance_session_files(work_dir: Path) -> list[tuple[Path, dict, str | None]]:
-    cfg = resolve_project_config_dir(work_dir)
-    if not cfg.is_dir():
-        return []
-    out: list[tuple[Path, dict, str | None]] = []
-    try:
-        files = sorted(p for p in cfg.glob(".codex*-session") if p.is_file())
-    except Exception:
-        files = []
-    for path in files:
-        data = _read_json(path)
-        provider, instance = _provider_instance_from_session(path, data)
-        if provider != "codex" or not instance:
-            continue
-        if not _session_work_dir_matches(data, work_dir):
-            continue
-        out.append((path, data, instance))
-    return out
-
-
-def _project_has_codex_instances(work_dir: Path, instance: Optional[str] = None) -> bool:
-    if instance:
-        return True
-    return bool(_codex_instance_session_files(work_dir))
-
-
-def _bound_sibling_codex_session_ids(work_dir: Path, instance: Optional[str]) -> set[str]:
-    current = (instance or "").strip().lower() or None
-    out: set[str] = set()
-    for _path, data, sibling in _codex_instance_session_files(work_dir):
-        if sibling == current:
-            continue
-        sid = str(data.get("codex_session_id") or "").strip()
-        if sid:
-            out.add(sid)
-    return out
-
-
 def _log_contains_req_anchor(log_path: Path, req_id: str, *, tail_bytes: int = 2 * 1024 * 1024) -> bool:
     marker = f"{REQ_ID_PREFIX} {req_id}"
     try:
@@ -220,13 +132,6 @@ def _codex_log_work_dir_matches(log_path: Path, work_dir: Path) -> bool:
     return False
 
 
-def _scan_latest_any_log(work_dir: Path) -> Optional[Path]:
-    try:
-        return CodexLogReader(log_path=None, session_id_filter=None, work_dir=work_dir).current_log_path()
-    except Exception:
-        return None
-
-
 def _scan_latest_candidate_log(
     work_dir: Path,
     *,
@@ -251,8 +156,8 @@ def _scan_latest_candidate_log(
             continue
         if not _codex_log_work_dir_matches(candidate, work_dir):
             continue
-        # Multi-instance stale rebinds must prove this request wrote to the
-        # candidate before we switch away from the current reader.
+        # Never switch logs based only on cwd: the exact request anchor proves
+        # that this Codex session received the task.
         if req_id and not _log_contains_req_anchor(candidate, req_id):
             continue
         return candidate
@@ -289,11 +194,11 @@ class CodexAdapter(BaseProviderAdapter):
     def session_filename(self) -> str:
         return ".codex-session"
 
-    def load_session(self, work_dir: Path, instance: Optional[str] = None) -> Optional[CodexProjectSession]:
-        return load_project_session(work_dir, instance)
+    def load_session(self, work_dir: Path) -> Optional[CodexProjectSession]:
+        return load_project_session(work_dir)
 
-    def compute_session_key(self, session: Any, instance: Optional[str] = None) -> str:
-        return compute_session_key(session, instance) if session else "codex:unknown"
+    def compute_session_key(self, session: Any) -> str:
+        return compute_session_key(session) if session else "codex:unknown"
 
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
@@ -302,9 +207,8 @@ class CodexAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=codex req_id={task.req_id} work_dir={req.work_dir} caller={req.caller}")
 
-        instance = task.request.instance
-        session = load_project_session(work_dir, instance)
-        session_key = self.compute_session_key(session, instance)
+        session = load_project_session(work_dir)
+        session_key = self.compute_session_key(session)
 
         if not session:
             return ProviderResult(
@@ -342,13 +246,12 @@ class CodexAdapter(BaseProviderAdapter):
         prompt = wrap_codex_prompt(req.message, task.req_id)
         preferred_log = session.codex_session_path or None
         codex_session_id = session.codex_session_id or None
-        multi_instance = _project_has_codex_instances(Path(session.work_dir), instance)
-        require_anchor_before_collect = bool(multi_instance and not codex_session_id)
+        require_anchor_before_collect = True
         reader = CodexLogReader(
             log_path=preferred_log,
             session_id_filter=codex_session_id,
             work_dir=Path(session.work_dir),
-            allow_stale_switch=not multi_instance,
+            allow_stale_switch=False,
         )
         state = reader.capture_state()
         backend.send_text(pane_id, prompt)
@@ -427,14 +330,10 @@ class CodexAdapter(BaseProviderAdapter):
                     now = time.time()
                     if now - started_at >= stale_grace_s and now - last_stale_check >= stale_check_interval:
                         last_stale_check = now
-                        if multi_instance:
-                            latest_log = _scan_latest_candidate_log(
-                                Path(session.work_dir),
-                                exclude_session_ids=_bound_sibling_codex_session_ids(Path(session.work_dir), instance),
-                                req_id=task.req_id,
-                            )
-                        else:
-                            latest_log = _scan_latest_any_log(Path(session.work_dir))
+                        latest_log = _scan_latest_candidate_log(
+                            Path(session.work_dir),
+                            req_id=task.req_id,
+                        )
                         current_log = state.get("log_path")
                         if isinstance(current_log, str):
                             current_log = Path(current_log)
@@ -443,7 +342,7 @@ class CodexAdapter(BaseProviderAdapter):
                                 log_path=latest_log,
                                 session_id_filter=None,
                                 work_dir=Path(session.work_dir),
-                                allow_stale_switch=not multi_instance,
+                                allow_stale_switch=False,
                             )
                             state = reader.capture_state()
                             fallback_scan = True
@@ -474,8 +373,7 @@ class CodexAdapter(BaseProviderAdapter):
             if role != "assistant":
                 continue
 
-            # Use grace window in legacy/single-instance mode. In multi-instance
-            # unbound mode, never collect assistant text before the request anchor.
+            # Never collect assistant text before this request's anchor.
             if (not anchor_seen) and (require_anchor_before_collect or time.time() < anchor_collect_grace):
                 continue
 
@@ -538,7 +436,7 @@ class CodexAdapter(BaseProviderAdapter):
                 pass
 
         if req.show_tier or _show_tier_footer():
-            provider_key = make_qualified_key("codex", instance)
+            provider_key = "codex"
             ctx = read_latest_turn_context(
                 codex_log_path,
                 session_id_filter=codex_session_id,

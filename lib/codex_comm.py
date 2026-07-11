@@ -839,7 +839,6 @@ class CodexCommunicator:
 
         # Lazy initialization: defer log reader and health check
         self._log_reader: Optional[CodexLogReader] = None
-        self._log_reader_primed = False
         if self.terminal == "wezterm" and self.backend and self.pane_title_marker:
             resolver = getattr(self.backend, "find_pane_by_title_marker", None)
             if callable(resolver):
@@ -867,9 +866,6 @@ class CodexCommunicator:
         preferred_log = self.session_info.get("codex_session_path")
         bound_session_id = self.session_info.get("codex_session_id")
         self._log_reader = CodexLogReader(log_path=preferred_log, session_id_filter=bound_session_id)
-        if not self._log_reader_primed:
-            self._prime_log_binding()
-            self._log_reader_primed = True
 
     def _find_session_file(self) -> Optional[Path]:
         env_session = (os.environ.get("CCB_SESSION_FILE") or "").strip()
@@ -944,13 +940,6 @@ class CodexCommunicator:
 
         except Exception:
             return None
-
-    def _prime_log_binding(self) -> None:
-        """Ensure log path and session ID are bound early at session start"""
-        log_hint = self.log_reader.current_log_path()
-        if not log_hint:
-            return
-        self._remember_codex_session(log_hint)
 
     def _check_session_health(self):
         return self._check_session_health_impl(probe_terminal=True)
@@ -1082,8 +1071,6 @@ class CodexCommunicator:
                 raise RuntimeError(f"❌ Session error: {status}")
 
             marker, state = self._send_message(question)
-            log_hint = state.get("log_path") or self.log_reader.current_log_path()
-            self._remember_codex_session(log_hint)
             print(f"✅ Sent to Codex (marker: {marker[:12]}...)")
             print("Tip: Use /cpend to view latest reply")
             return True
@@ -1110,7 +1097,6 @@ class CodexCommunicator:
                     log_hint = (new_state or {}).get("log_path") if isinstance(new_state, dict) else None
                     if not log_hint:
                         log_hint = self.log_reader.current_log_path()
-                    self._remember_codex_session(log_hint)
                     if message:
                         print(f"🤖 {t('reply_from', provider='Codex')}")
                         print(message)
@@ -1125,7 +1111,6 @@ class CodexCommunicator:
             log_hint = (new_state or {}).get("log_path") if isinstance(new_state, dict) else None
             if not log_hint:
                 log_hint = self.log_reader.current_log_path()
-            self._remember_codex_session(log_hint)
             if message:
                 print(f"🤖 {t('reply_from', provider='Codex')}")
                 print(message)
@@ -1138,9 +1123,6 @@ class CodexCommunicator:
             return None
 
     def consume_pending(self, display: bool = True, n: int = 1):
-        current_path = self.log_reader.current_log_path()
-        self._remember_codex_session(current_path)
-
         if n > 1:
             conversations = self.log_reader.latest_conversations(n)
             if not conversations:
@@ -1157,8 +1139,6 @@ class CodexCommunicator:
             return conversations
 
         message = self.log_reader.latest_message()
-        if message:
-            self._remember_codex_session(self.log_reader.current_log_path())
         if not message:
             if display:
                 print(t('no_reply_available', provider='Codex'))
@@ -1191,168 +1171,6 @@ class CodexCommunicator:
 
         return info
 
-    def _remember_codex_session(self, log_path: Optional[Path]) -> None:
-        if not log_path:
-            log_path = self.log_reader.current_log_path()
-            if not log_path:
-                return
-
-        try:
-            log_path_obj = log_path if isinstance(log_path, Path) else Path(str(log_path)).expanduser()
-        except Exception:
-            return
-
-        self.log_reader.set_preferred_log(log_path_obj)
-
-        if not self.project_session_file:
-            return
-
-        project_file = Path(self.project_session_file)
-        if not project_file.exists():
-            return
-        try:
-            with project_file.open("r", encoding="utf-8-sig") as handle:
-                data = json.load(handle)
-        except Exception:
-            return
-
-        ccb_project_id = ""
-        try:
-            wd_hint = self.session_info.get("work_dir")
-            if isinstance(wd_hint, str) and wd_hint.strip():
-                ccb_project_id = compute_ccb_project_id(Path(wd_hint.strip()))
-        except Exception:
-            ccb_project_id = ""
-
-        path_str = str(log_path_obj)
-        session_id = self._extract_session_id(log_path_obj)
-        resume_cmd = f"codex resume {session_id}" if session_id else None
-        old_path = str(data.get("codex_session_path") or "").strip()
-        old_id = str(data.get("codex_session_id") or "").strip()
-        updated = False
-
-        started_at = data.get("started_at")
-        if started_at and not data.get("codex_session_path") and not data.get("codex_session_id"):
-            try:
-                started_ts = time.mktime(time.strptime(started_at, "%Y-%m-%d %H:%M:%S"))
-            except Exception:
-                started_ts = None
-            if started_ts:
-                try:
-                    log_mtime = log_path_obj.stat().st_mtime
-                except OSError:
-                    log_mtime = None
-                if log_mtime is not None and log_mtime < started_ts:
-                    if os.environ.get("CCB_DEBUG") in ("1", "true", "yes"):
-                        print(
-                            f"[DEBUG] Skip binding log older than session start: {log_path_obj}",
-                            file=sys.stderr,
-                        )
-                    return
-
-        binding_changed = False
-        if data.get("codex_session_path") != path_str:
-            data["codex_session_path"] = path_str
-            updated = True
-            binding_changed = True
-        if session_id and data.get("codex_session_id") != session_id:
-            data["codex_session_id"] = session_id
-            updated = True
-            binding_changed = True
-        if ccb_project_id and data.get("ccb_project_id") != ccb_project_id:
-            data["ccb_project_id"] = ccb_project_id
-            updated = True
-        if resume_cmd:
-            if data.get("codex_start_cmd") != resume_cmd:
-                data["codex_start_cmd"] = resume_cmd
-                updated = True
-        elif data.get("codex_start_cmd", "").startswith("codex resume "):
-            # keep existing command if we cannot derive a better one
-            pass
-        if data.get("active") is False:
-            data["active"] = True
-            updated = True
-
-        if updated:
-            new_id = str(session_id or "").strip()
-            if not new_id and path_str:
-                try:
-                    new_id = Path(path_str).stem
-                except Exception:
-                    new_id = ""
-            if old_id and old_id != new_id:
-                data["old_codex_session_id"] = old_id
-            if old_path and (old_path != path_str or (old_id and old_id != new_id)):
-                data["old_codex_session_path"] = old_path
-            if (old_path or old_id) and binding_changed:
-                data["old_updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    from ctx_transfer_utils import maybe_auto_transfer
-
-                    old_path_obj = None
-                    if old_path:
-                        try:
-                            old_path_obj = Path(old_path).expanduser()
-                        except Exception:
-                            old_path_obj = None
-                    wd_hint = data.get("work_dir") or self.session_info.get("work_dir")
-                    work_dir = Path(wd_hint) if isinstance(wd_hint, str) and wd_hint else Path.cwd()
-                    maybe_auto_transfer(
-                        provider="codex",
-                        work_dir=work_dir,
-                        session_path=old_path_obj,
-                        session_id=old_id or None,
-                    )
-                except Exception:
-                    pass
-            tmp_file = project_file.with_suffix(".tmp")
-            try:
-                with tmp_file.open("w", encoding="utf-8") as handle:
-                    json.dump(data, handle, ensure_ascii=False, indent=2)
-                os.replace(tmp_file, project_file)
-            except PermissionError as e:
-                print(f"⚠️  Cannot update {project_file.name}: {e}", file=sys.stderr)
-                print(f"💡 Try: sudo chown $USER:$USER {project_file}", file=sys.stderr)
-                if tmp_file.exists():
-                    tmp_file.unlink(missing_ok=True)
-            except Exception as e:
-                print(f"⚠️  Failed to update {project_file.name}: {e}", file=sys.stderr)
-                if tmp_file.exists():
-                    tmp_file.unlink(missing_ok=True)
-
-        registry_path = registry_path_for_session(self.session_id)
-        if registry_path.exists():
-            ok = upsert_registry(
-                {
-                    "ccb_session_id": self.session_id,
-                    "ccb_project_id": ccb_project_id or None,
-                    "work_dir": self.session_info.get("work_dir"),
-                    "terminal": self.terminal,
-                    "providers": {
-                        "codex": {
-                            "pane_id": self.pane_id or None,
-                            "pane_title_marker": self.pane_title_marker or None,
-                            "session_file": self.project_session_file,
-                            "codex_session_id": session_id,
-                            "codex_session_path": path_str,
-                        }
-                    },
-                    # Legacy duplicates (older tools might read these flat keys).
-                    "codex_pane_id": self.pane_id or None,
-                    "codex_session_id": session_id,
-                    "codex_session_path": path_str,
-                }
-            )
-            if not ok:
-                print("⚠️  Failed to update cpend registry", file=sys.stderr)
-
-        self.session_info["codex_session_path"] = path_str
-        if session_id:
-            self.session_info["codex_session_id"] = session_id
-        if resume_cmd:
-            self.session_info["codex_start_cmd"] = resume_cmd
-
-    @staticmethod
     def _extract_session_id(log_path: Path) -> Optional[str]:
         for source in (log_path.stem, log_path.name):
             match = SESSION_ID_PATTERN.search(source)

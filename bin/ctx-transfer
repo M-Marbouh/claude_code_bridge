@@ -46,14 +46,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--source",
         dest="source_provider",
         default="auto",
-        choices=["auto", "claude", "codex", "gemini", "opencode", "droid"],
+        choices=["auto", "claude", "codex", "gemini", "opencode"],
         help="Source provider (default: auto)",
     )
     parser.add_argument(
         "-t", "--to",
         dest="provider",
         default="codex",
-        choices=["codex", "gemini", "opencode", "droid"],
+        choices=["codex", "gemini", "opencode"],
         help="Target provider (default: codex)",
     )
     parser.add_argument(

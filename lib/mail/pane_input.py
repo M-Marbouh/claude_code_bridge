@@ -144,8 +144,6 @@ class PaneInputHandler:
                 title_patterns = ["Claude Code", "CCB-Claude"]
             elif provider == "codex":
                 title_patterns = ["CCB-Codex"]
-            elif provider == "droid":
-                title_patterns = ["CCB-Droid"]
             elif provider == "opencode":
                 title_patterns = ["OpenCode", "OC |", "CCB-Opencode"]
             elif provider == "gemini":

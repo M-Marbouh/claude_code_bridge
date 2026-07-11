@@ -94,7 +94,12 @@ class AskDaemonServer:
     def serve_forever(self) -> int:
         run_dir().mkdir(parents=True, exist_ok=True)
 
-        lock = ProviderLock(self.spec.lock_name, cwd=str(self.state_file.parent), timeout=0.1)
+        lock = ProviderLock(
+            self.spec.lock_name,
+            cwd=str(self.state_file.parent),
+            timeout=0.1,
+            lock_dir=self.state_file.parent,
+        )
         if not lock.try_acquire():
             return 2
 

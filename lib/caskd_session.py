@@ -15,10 +15,8 @@ from terminal import get_backend_for_session
 apply_backend_env()
 
 
-def find_project_session_file(work_dir: Path, instance: Optional[str] = None) -> Optional[Path]:
-    from providers import session_filename_for_instance
-    filename = session_filename_for_instance(".codex-session", instance)
-    return _find_project_session_file(work_dir, filename)
+def find_project_session_file(work_dir: Path) -> Optional[Path]:
+    return _find_project_session_file(work_dir, ".codex-session")
 
 
 def _read_json(path: Path) -> dict:
@@ -220,8 +218,8 @@ class CodexProjectSession:
             _ = err
 
 
-def load_project_session(work_dir: Path, instance: Optional[str] = None) -> Optional[CodexProjectSession]:
-    session_file = find_project_session_file(work_dir, instance)
+def load_project_session(work_dir: Path) -> Optional[CodexProjectSession]:
+    session_file = find_project_session_file(work_dir)
     if not session_file:
         return None
     data = _read_json(session_file)
@@ -230,7 +228,7 @@ def load_project_session(work_dir: Path, instance: Optional[str] = None) -> Opti
     return CodexProjectSession(session_file=session_file, data=data)
 
 
-def compute_session_key(session: CodexProjectSession, instance: Optional[str] = None) -> str:
+def compute_session_key(session: CodexProjectSession) -> str:
     """
     Compute the daemon routing/serialization key for this provider.
 
@@ -242,7 +240,4 @@ def compute_session_key(session: CodexProjectSession, instance: Optional[str] = 
             pid = compute_ccb_project_id(Path(session.work_dir))
         except Exception:
             pid = ""
-    prefix = "codex"
-    if instance:
-        prefix = f"codex:{instance}"
-    return f"{prefix}:{pid}" if pid else f"{prefix}:unknown"
+    return f"codex:{pid}" if pid else "codex:unknown"

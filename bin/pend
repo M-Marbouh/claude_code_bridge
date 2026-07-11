@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -16,6 +17,8 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
+from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text
+from codex_comm import CodexLogReader
 from project_id import compute_ccb_project_id
 from task_receipts import caller_pane, caller_session_id, find_receipt, iter_receipts
 
@@ -40,13 +43,6 @@ def _legacy_pend(provider: str, extra: list[str]) -> int:
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return EXIT_ERROR
-
-
-def _receipt_route_identity(receipt: dict) -> tuple[str, str]:
-    return (
-        str(receipt.get("caller_terminal") or "").strip(),
-        str(receipt.get("caller_pane_id") or "").strip(),
-    )
 
 
 def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
@@ -89,20 +85,9 @@ def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
     if not matches:
         return None
 
-    # A CCB restart changes its session ID, so an exact caller match is no
-    # longer possible. Recover only when all same-project receipts route back
-    # to one terminal pane. Different panes mean another same-folder CCB may
-    # own the task, and guessing would recreate the cross-tab pend bug.
-    routes = {_receipt_route_identity(data) for _path, data in matches}
-    routes.discard(("", ""))
-    if len(routes) > 1:
-        print(
-            f"[ERROR] Ambiguous {provider} tasks for this project; use pend <task-id>:",
-            file=sys.stderr,
-        )
-        for _path, data in matches[:8]:
-            print(f"  {data.get('task_id')}  {data.get('submitted_at', '')}", file=sys.stderr)
-        raise RuntimeError("ambiguous task receipts")
+    # CCB enforces one provider instance per project. After a restart, pane and
+    # session IDs legitimately change, so the newest same-project receipt is
+    # the only stable provider-level identity.
     return matches[0]
 
 
@@ -153,11 +138,100 @@ def _clean_task_log(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _codex_log_work_dir(log_path: Path) -> str:
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            entry = json.loads(handle.readline())
+    except Exception:
+        return ""
+    if entry.get("type") != "session_meta":
+        return ""
+    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return ""
+    try:
+        return str(Path(cwd).expanduser().resolve())
+    except Exception:
+        return cwd.strip()
+
+
+def _recover_codex_reply(receipt: dict) -> str | None:
+    """Recover an exact completed reply when the transport waiter failed."""
+    task_id = str(receipt.get("task_id") or "").strip()
+    work_dir = str(receipt.get("work_dir") or "").strip()
+    if not task_id or not work_dir:
+        return None
+    try:
+        expected_work_dir = str(Path(work_dir).expanduser().resolve())
+    except Exception:
+        expected_work_dir = work_dir
+    root = Path(os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
+    if not root.is_dir():
+        return None
+    marker = f"{REQ_ID_PREFIX} {task_id}"
+    try:
+        candidates = sorted(
+            (path for path in root.glob("**/*.jsonl") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates[:400]:
+        if _codex_log_work_dir(candidate) != expected_work_dir:
+            continue
+        anchor_seen = False
+        chunks: list[str] = []
+        final_chunks: list[str] = []
+        try:
+            with candidate.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    event = CodexLogReader._extract_event(entry)
+                    if event is None:
+                        continue
+                    role, text, phase = event
+                    if role == "user":
+                        if marker in text:
+                            anchor_seen = True
+                            chunks = []
+                            final_chunks = []
+                        continue
+                    if role != "assistant" or not anchor_seen:
+                        continue
+                    chunks.append(text)
+                    combined = "\n".join(chunks)
+                    done_now = is_done_text(combined, task_id)
+                    if (phase == "final_answer" or done_now) and (not final_chunks or final_chunks[-1] != text):
+                        final_chunks.append(text)
+                    if done_now:
+                        reply = "\n".join(final_chunks) if final_chunks else combined
+                        return strip_done_text(reply, task_id).strip()
+        except OSError:
+            continue
+    return None
+
+
+def _recover_provider_reply(receipt: dict) -> str | None:
+    if str(receipt.get("provider") or "").strip().lower() == "codex":
+        return _recover_codex_reply(receipt)
+    return None
+
+
 def _show_receipt(receipt: dict) -> int:
     task_id = str(receipt.get("task_id") or "")
     status_path = Path(str(receipt.get("status_file") or ""))
     log_path = Path(str(receipt.get("log_file") or ""))
     finished, exit_code = _status_finished(status_path)
+    if not finished or exit_code != 0:
+        recovered = _recover_provider_reply(receipt)
+        if recovered:
+            print(recovered)
+            return EXIT_OK
     if not finished:
         pid = _status_pid(status_path)
         if pid is not None and not _pid_is_alive(pid):
@@ -177,6 +251,10 @@ def _show_receipt(receipt: dict) -> int:
     if output:
         print(output)
     elif exit_code == 0:
+        recovered = _recover_provider_reply(receipt)
+        if recovered:
+            print(recovered)
+            return EXIT_OK
         print(f"[ERROR] Task {task_id} completed without a reply", file=sys.stderr)
         return EXIT_NO_REPLY
     return EXIT_OK if exit_code == 0 else EXIT_ERROR

@@ -5,8 +5,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-import pytest
-
 from task_receipts import find_receipt, iter_receipts, new_receipt, receipt_path, write_receipt
 
 
@@ -121,7 +119,7 @@ def test_pend_provider_without_current_receipt_does_not_use_legacy(monkeypatch, 
     assert "No codex task receipt for the current caller" in capsys.readouterr().err
 
 
-def test_pend_refuses_ambiguous_same_project_receipts(monkeypatch, capsys) -> None:
+def test_pend_restart_uses_latest_same_project_receipt_across_old_panes(monkeypatch) -> None:
     pend = _load_pend_module()
     records = [
         (Path("a.json"), _receipt("a", "codex", session="old-1", pane="1", project="p", submitted="2")),
@@ -132,14 +130,15 @@ def test_pend_refuses_ambiguous_same_project_receipts(monkeypatch, capsys) -> No
     monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
     monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
-    with pytest.raises(RuntimeError):
-        pend._latest_for_current_caller("codex")
+    found = pend._latest_for_current_caller("codex")
 
-    assert "use pend <task-id>" in capsys.readouterr().err
+    assert found is not None
+    assert found[1]["task_id"] == "a"
 
 
 def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:
     pend = _load_pend_module()
+    pend._recover_provider_reply = lambda _receipt: None
     status = tmp_path / "task.status"
     log = tmp_path / "task.log"
     status.write_text("submitted\nfinished exit_code=0\n", encoding="utf-8")
@@ -153,6 +152,7 @@ def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:
 
 def test_pend_reports_dead_waiter_as_incomplete(tmp_path: Path, monkeypatch, capsys) -> None:
     pend = _load_pend_module()
+    monkeypatch.setattr(pend, "_recover_provider_reply", lambda _receipt: None)
     status = tmp_path / "task.status"
     log = tmp_path / "task.log"
     status.write_text("submitted\nrunning pid=12345\n", encoding="utf-8")
@@ -167,3 +167,35 @@ def test_pend_reports_dead_waiter_as_incomplete(tmp_path: Path, monkeypatch, cap
     output = capsys.readouterr().err
     assert "[INCOMPLETE]" in output
     assert "waiter_pid=12345" in output
+
+
+def test_pend_recovers_exact_codex_done_after_waiter_failed(tmp_path: Path, monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    req_id = "20260711-232834-787-461101"
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    rollout = session_root / "rollout.jsonl"
+    entries = [
+        {"type": "session_meta", "payload": {"cwd": str(tmp_path)}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": f"CCB_REQ_ID: {req_id}\n\ntask"}},
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": f"Recovered reply.\nCCB_DONE: {req_id}"}},
+    ]
+    rollout.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8")
+    status = tmp_path / "task.status"
+    log = tmp_path / "task.log"
+    status.write_text("finished exit_code=1\n", encoding="utf-8")
+    log.write_text("Codex pane died during request\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(session_root))
+
+    rc = pend._show_receipt(
+        {
+            "task_id": req_id,
+            "provider": "codex",
+            "work_dir": str(tmp_path),
+            "status_file": str(status),
+            "log_file": str(log),
+        }
+    )
+
+    assert rc == pend.EXIT_OK
+    assert capsys.readouterr().out.strip() == "Recovered reply."

@@ -131,3 +131,21 @@ def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == "exact reply"
+
+
+def test_pend_reports_dead_waiter_as_incomplete(tmp_path: Path, monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    status = tmp_path / "task.status"
+    log = tmp_path / "task.log"
+    status.write_text("submitted\nrunning pid=12345\n", encoding="utf-8")
+    log.write_text("", encoding="utf-8")
+    monkeypatch.setattr(pend, "_pid_is_alive", lambda _pid: False)
+
+    rc = pend._show_receipt(
+        {"task_id": "x", "provider": "codex", "status_file": str(status), "log_file": str(log)}
+    )
+
+    assert rc == pend.EXIT_ERROR
+    output = capsys.readouterr().err
+    assert "[INCOMPLETE]" in output
+    assert "waiter_pid=12345" in output

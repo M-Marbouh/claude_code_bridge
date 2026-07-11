@@ -95,6 +95,26 @@ def _log_contains_req_anchor(log_path: Path, req_id: str, *, tail_bytes: int = 2
         return False
 
 
+def _state_at_req_anchor(log_path: Path, req_id: str, *, tail_bytes: int = 2 * 1024 * 1024) -> dict:
+    """Return reader state positioned at the exact request's JSONL entry."""
+    marker = f"{REQ_ID_PREFIX} {req_id}".encode("utf-8")
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - tail_bytes)
+            handle.seek(start, os.SEEK_SET)
+            data = handle.read(tail_bytes)
+        marker_at = data.find(marker)
+        if marker_at < 0:
+            return {"log_path": log_path, "offset": 0}
+        line_at = data.rfind(b"\n", 0, marker_at)
+        offset = start if line_at < 0 else start + line_at + 1
+        return {"log_path": log_path, "offset": offset}
+    except OSError:
+        return {"log_path": log_path, "offset": 0}
+
+
 def _codex_log_session_id(log_path: Path) -> Optional[str]:
     try:
         return CodexCommunicator._extract_session_id(log_path)
@@ -344,7 +364,10 @@ class CodexAdapter(BaseProviderAdapter):
                                 work_dir=Path(session.work_dir),
                                 allow_stale_switch=False,
                             )
-                            state = reader.capture_state()
+                            # The prompt can land in a newly-created rollout before
+                            # stale-log discovery runs. Starting at EOF would skip
+                            # that anchor forever and reject the later CCB_DONE.
+                            state = _state_at_req_anchor(latest_log, task.req_id)
                             fallback_scan = True
                             try:
                                 new_session_id = CodexCommunicator._extract_session_id(latest_log)

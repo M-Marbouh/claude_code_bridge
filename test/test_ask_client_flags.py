@@ -81,6 +81,14 @@ def test_unified_daemon_request_omits_show_tier_by_default(monkeypatch, tmp_path
     assert "show_tier" not in sent
 
 
+def test_unified_daemon_preserves_outer_async_request_id(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CCB_REQ_ID", "20260711-220118-845-190737")
+
+    sent = _capture_unified_request(monkeypatch, tmp_path, show_tier_env=None)
+
+    assert sent["req_id"] == "20260711-220118-845-190737"
+
+
 def test_ask_rejects_provider_instances_before_dispatch(capsys) -> None:
     ask = _load_ask_module()
 

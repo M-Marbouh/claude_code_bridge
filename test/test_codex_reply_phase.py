@@ -301,6 +301,23 @@ def test_scan_latest_candidate_requires_anchor_and_honors_exclusions(monkeypatch
     assert missing is None
 
 
+def test_state_at_req_anchor_replays_anchor_written_before_log_switch(tmp_path: Path) -> None:
+    req_id = make_req_id()
+    log_path = tmp_path / "rollout.jsonl"
+    prefix = json.dumps({"type": "session_meta", "payload": {"cwd": str(tmp_path)}}) + "\n"
+    anchor = json.dumps(_user_message(f"CCB_REQ_ID: {req_id}\n\nrequest")) + "\n"
+    final = json.dumps(_event_agent_message(f"Finished.\nCCB_DONE: {req_id}")) + "\n"
+    log_path.write_text(prefix + anchor + final, encoding="utf-8")
+
+    state = codex_adapter._state_at_req_anchor(log_path, req_id)
+    reader = CodexLogReader(log_path=log_path, work_dir=tmp_path, allow_stale_switch=False)
+    event, state = reader.try_get_event(state)
+
+    assert event == ("user", f"CCB_REQ_ID: {req_id}\n\nrequest", "")
+    event, _state = reader.try_get_event(state)
+    assert event == ("assistant", f"Finished.\nCCB_DONE: {req_id}", "event")
+
+
 def test_read_latest_turn_context_reads_bound_log(tmp_path: Path) -> None:
     log_path = tmp_path / "codex.jsonl"
     log_path.write_text(

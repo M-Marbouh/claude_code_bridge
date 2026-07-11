@@ -374,6 +374,12 @@ def _send_via_unified_daemon(
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,
     }
+    # Async callers create the durable task ID before entering foreground mode.
+    # Preserve it as the provider request ID so receipts, CCB_REQ_ID, completion
+    # hooks, and `pend <task-id>` all refer to one canonical identity.
+    outer_req_id = (os.environ.get("CCB_REQ_ID") or "").strip()
+    if outer_req_id:
+        req["req_id"] = outer_req_id
     if _env_bool("CCB_CODEX_SHOW_TIER", False):
         req["show_tier"] = True
 

@@ -113,6 +113,31 @@ def _status_finished(status_path: Path) -> tuple[bool, int | None]:
     return exit_code is not None, exit_code
 
 
+def _status_pid(status_path: Path) -> int | None:
+    try:
+        lines = status_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except Exception:
+        return None
+    pid: int | None = None
+    for line in lines:
+        match = re.search(r"(?:running|spawned) pid=(\d+)", line)
+        if match:
+            pid = int(match.group(1))
+    return pid
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
 def _clean_task_log(text: str) -> str:
     lines = []
     for line in text.splitlines():
@@ -128,6 +153,14 @@ def _show_receipt(receipt: dict) -> int:
     log_path = Path(str(receipt.get("log_file") or ""))
     finished, exit_code = _status_finished(status_path)
     if not finished:
+        pid = _status_pid(status_path)
+        if pid is not None and not _pid_is_alive(pid):
+            print(
+                f"[INCOMPLETE] task={task_id} provider={receipt.get('provider', '')} "
+                f"waiter_pid={pid} is no longer running",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
         print(f"[PENDING] task={task_id} provider={receipt.get('provider', '')}", file=sys.stderr)
         return EXIT_NO_REPLY
     try:

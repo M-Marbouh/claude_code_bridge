@@ -151,7 +151,9 @@ def wrap_claude_delivery_prompt(message: str, req_id: str) -> str:
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "This is an asynchronous peer message delivered by CCB.\n"
-        "If you reply, use CCB_REPLY_TARGET from the message and send the reply with ask --peer.\n"
+        "Read CCB_PEER_INTENT and CCB_REPLY_EXPECTED in the message.\n"
+        "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message.\n"
+        "If a reply is expected, use CCB_REPLY_TARGET and send the completed result with ask --peer --notify.\n"
         "Do not wait to produce a local CCB_DONE for this delivery.\n"
     )
 

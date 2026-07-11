@@ -4,6 +4,7 @@ import re
 
 from ccb_protocol import DONE_PREFIX, REQ_ID_PREFIX, is_done_text, make_req_id, strip_done_text, wrap_codex_prompt
 from ccb_protocol import strip_trailing_markers
+from laskd_protocol import wrap_claude_delivery_prompt
 
 
 def test_make_req_id_format_and_uniqueness() -> None:
@@ -65,3 +66,10 @@ def test_strip_trailing_markers_removes_done_and_harness_trailers() -> None:
     req_id = make_req_id()
     text = f"line1\nline2\n{DONE_PREFIX} {req_id}\nHARNESS_DONE\n\n"
     assert strip_trailing_markers(text) == "line1\nline2"
+
+
+def test_claude_delivery_prompt_respects_peer_reply_intent() -> None:
+    prompt = wrap_claude_delivery_prompt("hello", "req-1")
+
+    assert "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message." in prompt
+    assert "ask --peer --notify" in prompt

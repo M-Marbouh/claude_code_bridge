@@ -22,6 +22,18 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 
+def _write_background_status(line: str) -> None:
+    raw = (os.environ.get("CCB_PEER_STATUS_FILE") or "").strip()
+    if not raw:
+        return
+    try:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with Path(raw).open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {line}\n")
+    except Exception:
+        pass
+
+
 def _task_id() -> str:
     now = datetime.now()
     ms = now.microsecond // 1000
@@ -116,6 +128,8 @@ def _send_to_daemon(
     caller_pane_id: str,
     caller_terminal: str,
     sender_work_dir: str,
+    intent: str,
+    peer_task_id: str,
 ) -> tuple[int, str, dict[str, Any]]:
     state = askd_rpc.read_state(state_file_path("askd.json"))
     if not state:
@@ -127,7 +141,7 @@ def _send_to_daemon(
     except Exception as exc:
         raise RuntimeError("Invalid askd state") from exc
 
-    message_for_target = _append_reply_target(message, sender_work_dir)
+    message_for_target = _append_peer_context(message, sender_work_dir, intent, peer_task_id)
 
     req = {
         "type": "ask.request",
@@ -171,12 +185,18 @@ def _send_to_daemon(
     return int(resp.get("exit_code") or 0), str(resp.get("reply") or ""), meta
 
 
-def _append_reply_target(message: str, sender_work_dir: str) -> str:
+def _append_peer_context(message: str, sender_work_dir: str, intent: str, peer_task_id: str = "") -> str:
     sender = str(sender_work_dir or "").strip()
     body = (message or "").rstrip()
-    if not sender:
-        return body
-    return f"{body}\n\nCCB_REPLY_TARGET: {sender}"
+    mode = intent if intent in {"wait", "background", "notify"} else "wait"
+    metadata = [f"CCB_PEER_INTENT: {mode}"]
+    if peer_task_id:
+        metadata.append(f"CCB_PEER_TASK_ID: {peer_task_id}")
+    if mode == "notify":
+        metadata.append("CCB_REPLY_EXPECTED: no")
+    elif sender:
+        metadata.extend([f"CCB_REPLY_TARGET: {sender}", "CCB_REPLY_EXPECTED: yes"])
+    return f"{body}\n\n" + "\n".join(metadata)
 
 
 def _print_bridge_diagnostics(meta: dict[str, Any]) -> None:
@@ -198,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--caller-pane-id", default=os.environ.get("CCB_CALLER_PANE_ID", ""), help=argparse.SUPPRESS)
     parser.add_argument("--caller-terminal", default=os.environ.get("CCB_CALLER_TERMINAL", ""), help=argparse.SUPPRESS)
     parser.add_argument("--sender-work-dir", default=os.environ.get("CCB_WORK_DIR", os.getcwd()), help=argparse.SUPPRESS)
+    parser.add_argument("--intent", choices=("wait", "background", "notify"), default="wait", help=argparse.SUPPRESS)
+    parser.add_argument("--peer-task-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
 
@@ -225,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.caller_pane_id or ""),
                 str(args.caller_terminal or ""),
                 str(args.sender_work_dir or ""),
+                str(args.intent or "wait"),
+                str(args.peer_task_id or ""),
             )
         finally:
             try:
@@ -242,4 +266,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _write_background_status(f"running pid={os.getpid()}")
+    exit_code = main()
+    _write_background_status(f"finished exit_code={exit_code}")
+    if exit_code != 0:
+        _write_background_status(f"failed exit_code={exit_code}")
+    sys.exit(exit_code)

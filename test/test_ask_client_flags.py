@@ -97,3 +97,31 @@ def test_ask_rejects_removed_route_tags_before_dispatch(capsys) -> None:
 
     assert rc == 1
     assert "routing tags are no longer supported" in capsys.readouterr().err
+
+
+def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+
+    def _capture(target: str, timeout: float, message: str, foreground: bool, intent: str) -> int:
+        captured.update(
+            target=target,
+            timeout=timeout,
+            message=message,
+            foreground=foreground,
+            intent=intent,
+        )
+        return 0
+
+    monkeypatch.setattr(ask, "_run_peer_bridge", _capture)
+
+    rc = ask._handle_peer_mode(["--peer", "/tmp/peer", "--notify", "result"])
+
+    assert rc == 0
+    assert captured == {
+        "target": "/tmp/peer",
+        "timeout": 3600.0,
+        "message": "result",
+        "foreground": True,
+        "intent": "notify",
+    }

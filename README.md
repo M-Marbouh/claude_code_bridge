@@ -85,11 +85,13 @@ ccb-ping codex
 ## Cross-project Claude messaging
 
 ```bash
-ask --peer ~/dev/another-project "Summarize the current state"
-ask --peer b0e3 "Review this handoff"
+ask --peer ~/dev/another-project --wait "Answer needed before I continue"
+ask --peer b0e3 --background "Review this while I continue locally"
+ask --peer ~/dev/another-project --notify "FYI: deployment completed"
 ```
 
 Targets may be an exact path, a `ccb-list` index, or a project-hash prefix of at least four characters.
+Plain `ask --peer` retains the historical `--wait` behavior. Background consultations do not trigger the end-turn guardrail, and notifications do not include a reply target.
 
 ## Session safety
 

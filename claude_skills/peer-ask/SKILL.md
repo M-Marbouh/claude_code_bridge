@@ -28,9 +28,15 @@ CCB_REPLY_TARGET: /path/to/sender/project
 
 use that path as the peer target. Do not run `ccb-list` or rediscover the sender unless the send fails or the user asks you to choose a different target.
 
+Read `CCB_PEER_INTENT` and `CCB_REPLY_EXPECTED` in the message metadata:
+- `notify` / `no`: consume the information and do not send a reverse peer message.
+- `wait` / `yes`: the sender is blocked; complete the requested work and reply promptly.
+- `background` / `yes`: complete the work normally and reply when ready; the sender has continued other work.
+- Missing metadata with `CCB_REPLY_TARGET`: treat as legacy `wait`.
+
 **Rules for inbound peer messages — read carefully:**
 
-1. **No acknowledgements.** Do NOT reply with "Got it", "Thanks for reaching out", "I'll look into that", or any variant. The sender is waiting for results, not confirmation. Every peer round-trip has latency cost — waste none of it.
+1. **No acknowledgements.** Do NOT reply with "Got it", "Thanks for reaching out", "I'll look into that", or any variant. For reply-bearing requests, send only the completed result; notifications require no reverse message.
 
 2. **Do the work first, then reply.** If the request requires research, code review, analysis, or implementation: complete it before sending the reply. Use direct tools and normal CCB delegation only:
    - **Codex** (`/ask codex`) for implementation, code changes, or detailed technical work
@@ -41,10 +47,10 @@ use that path as the peer target. Do not run `ccb-list` or rediscover the sender
 
 Reply with:
 ```
-Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" "<result>")
+Bash(CCB_CALLER=claude ask --peer "/path/to/sender/project" --notify "<result>")
 ```
 
-Follow the **Async Guardrail** in CLAUDE.md — if output contains `CCB_ASYNC_SUBMITTED`, end turn immediately.
+The reverse result is a notification, so it must not make this Claude wait for another reply.
 
 Do not add a local `CCB_DONE` for the inbound peer delivery. CCB treats peer delivery as complete once the message lands in your pane; the real answer is the reverse `ask --peer` message.
 
@@ -87,33 +93,40 @@ Once a target is confirmed (by match or user selection), save the alias for this
 
 ### Step 4 — Send the message
 
+Choose intent before sending:
+- `--wait` only when the current task cannot proceed without the answer.
+- `--background` when a later answer is useful but current work can continue. This is the default choice for consultations and reviews during an active plan.
+- `--notify` for FYI messages, status updates, and handoffs that require no answer.
+
 ```
-Bash(CCB_CALLER=claude ask --peer "<work_dir>" "<message>")
+Bash(CCB_CALLER=claude ask --peer "<work_dir>" --background "<message>")
 ```
 
 Use the exact `work_dir` from `ccb-list --json` as the target. Pass the full message the user wanted to convey.
 
-Follow the **Async Guardrail** in CLAUDE.md — if output contains `CCB_ASYNC_SUBMITTED`, end turn immediately.
+- For `--wait`, follow the Async Guardrail and end the turn when `CCB_ASYNC_SUBMITTED` appears.
+- For `--background`, `CCB_BACKGROUND_SUBMITTED` means continue the current plan; do not stop or call `pend` immediately.
+- For `--notify`, continue after delivery confirmation.
 
 ### Step 5 — Report back
 
-When the reply arrives (via `/pend` or completion hook), summarize what the other Claude said and continue the conversation.
+When a reverse peer result arrives, incorporate it into the active task. Background mode must not pause the plan while waiting.
 
 ## Examples
 
 User: "Ask PRG Claude if the discount validation logic is thread-safe"
-→ ccb-list → match "PRG" to product-review-generator → ask --peer
+→ if blocked on the answer: ccb-list → match → ask --peer --wait
 
 User: "Tell content-automation Claude we're using the new schema"
-→ ccb-list → match "content-automation" → ask --peer
+→ ccb-list → match "content-automation" → ask --peer --notify
 
 User: "Ask Claude in project 3 about the current task"
-→ ccb-list → use index 3 directly → ask --peer
+→ if other work can continue: ccb-list → use index 3 → ask --peer --background
 
 ## Notes
 
 - Only Claude panes are targeted (providers.claude). Other providers are not reachable via this skill.
 - If the target Claude pane is stale (not alive), report the error and show the live options.
 - The `--peer` flag accepts the full `work_dir` path — always use path form for reliability.
-- Inbound peer messages include `CCB_REPLY_TARGET: <sender_work_dir>` when the sender is known. Use it as the direct reply path.
+- Reply-bearing inbound messages include `CCB_REPLY_TARGET: <sender_work_dir>`. Use it as the direct reply path and send the result with `--notify`.
 - Peer delivery is asynchronous: receiving Claude should reply by sending a reverse peer message, not by trying to complete the original delivery request locally.

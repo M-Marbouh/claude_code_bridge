@@ -47,11 +47,39 @@ def test_peer_mode_defaults_async_for_claude_caller(tmp_path: Path) -> None:
     proc = _run_ask(["--peer", "abcd", "hello"], cwd=tmp_path, env=env)
 
     assert proc.returncode == 0
-    assert "[CCB_ASYNC_SUBMITTED provider=peer-claude]" in proc.stdout
+    assert "[CCB_ASYNC_SUBMITTED provider=peer-claude intent=wait]" in proc.stdout
     assert "[CCB_ASYNC_PID task=" in proc.stdout
     assert "[CCB_ASYNC_STATUS_FILE task=" in proc.stdout
     assert "[CCB_ASYNC_LOG_FILE task=" in proc.stdout
     assert "MANDATORY: END YOUR TURN NOW. Reply ONLY 'Peer Claude processing...', then stop." in proc.stdout
+
+
+def test_peer_background_mode_does_not_emit_wait_guardrail(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["CCB_CALLER"] = "claude"
+    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+    env["CCB_CALLER_PANE_ID"] = "%cnt"
+    env["CCB_CALLER_TERMINAL"] = "tmux"
+
+    proc = _run_ask(["--peer", "abcd", "--background", "hello"], cwd=tmp_path, env=env)
+
+    assert proc.returncode == 0
+    assert "[CCB_BACKGROUND_SUBMITTED provider=peer-claude intent=background]" in proc.stdout
+    assert "continue current work" in proc.stdout
+    assert "[CCB_ASYNC_SUBMITTED" not in proc.stdout
+    assert "MANDATORY: END YOUR TURN NOW" not in proc.stdout
+
+
+def test_provider_peer_form_honors_background_intent(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["CCB_CALLER"] = "claude"
+    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+
+    proc = _run_ask(["claude", "--peer", "abcd", "--background", "hello"], cwd=tmp_path, env=env)
+
+    assert proc.returncode == 0
+    assert "[CCB_BACKGROUND_SUBMITTED provider=peer-claude intent=background]" in proc.stdout
+    assert "[CCB_ASYNC_SUBMITTED" not in proc.stdout
 
 
 def test_peer_mode_foreground_blocks_without_async_markers(tmp_path: Path) -> None:

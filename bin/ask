@@ -518,11 +518,12 @@ def _usage() -> None:
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)
     print("  -t, --timeout SECONDS   Request timeout (default: 3600)", file=sys.stderr)
-    print("  --notify                Sync send, no wait for reply (for notifications)", file=sys.stderr)
+    print("  --notify                One-way notification; peer messages expect no reply", file=sys.stderr)
     print("  --foreground            Run in foreground (no nohup/background)", file=sys.stderr)
-    print("  --background            Force background mode", file=sys.stderr)
+    print("  --background            Background task or non-blocking peer consultation", file=sys.stderr)
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
     print("  --peer TARGET           Send to Claude in another CCB project", file=sys.stderr)
+    print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
 
 
 def _peer_caller_pane_info() -> tuple[str, str]:
@@ -540,9 +541,11 @@ def _peer_bridge_cmd(
     caller_pane_id: str,
     caller_terminal: str,
     sender_work_dir: str,
+    intent: str,
+    task_id: str = "",
 ) -> list[str]:
     bridge_cmd = Path(__file__).resolve().parent / "ccb-bridge-ask"
-    return [
+    cmd = [
         sys.executable,
         str(bridge_cmd),
         "--target",
@@ -555,13 +558,18 @@ def _peer_bridge_cmd(
         caller_terminal,
         "--sender-work-dir",
         sender_work_dir,
+        "--intent",
+        intent,
     ]
+    if task_id:
+        cmd.extend(["--peer-task-id", task_id])
+    return cmd
 
 
-def _run_peer_bridge_foreground(peer_target: str, timeout: float, message: str, caller: str) -> int:
+def _run_peer_bridge_foreground(peer_target: str, timeout: float, message: str, caller: str, intent: str) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir = os.getcwd()
-    cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal, sender_work_dir)
+    cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal, sender_work_dir, intent)
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
     env["CCB_WORK_DIR"] = sender_work_dir
@@ -577,14 +585,13 @@ def _run_peer_bridge_foreground(peer_target: str, timeout: float, message: str, 
         return EXIT_ERROR
 
 
-def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, caller: str) -> int:
+def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, caller: str, intent: str) -> int:
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"ask-peer-claude-{task_id}.log"
     status_file = log_dir / f"ask-peer-claude-{task_id}.status"
     msg_file = log_dir / f"ask-peer-claude-{task_id}.msg"
-    script_file = log_dir / f"ask-peer-claude-{task_id}.sh"
 
     try:
         log_file.touch(exist_ok=True)
@@ -597,51 +604,42 @@ def _run_peer_bridge_background(peer_target: str, timeout: float, message: str, 
 
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir = os.getcwd()
-    bridge_cmd = _peer_bridge_cmd(peer_target, timeout, caller_pane_id, caller_terminal, sender_work_dir)
-    quoted_status = shlex.quote(str(status_file))
-    quoted_log = shlex.quote(str(log_file))
-    quoted_msg = shlex.quote(str(msg_file))
-    quoted_cmd = " ".join(shlex.quote(part) for part in bridge_cmd)
-    script_content = f"""#!/bin/sh
-set +e
-_now() {{
-  date '+%Y-%m-%dT%H:%M:%S%z'
-}}
-echo "$(_now) running pid=$$" >> {quoted_status}
-{quoted_cmd} < {quoted_msg} > {quoted_log} 2>&1
-rc=$?
-echo "$(_now) finished exit_code=$rc" >> {quoted_status}
-if [ "$rc" -ne 0 ]; then
-  echo "$(_now) failed exit_code=$rc" >> {quoted_status}
-fi
-exit "$rc"
-"""
-    try:
-        script_file.write_text(script_content, encoding="utf-8")
-        script_file.chmod(0o755)
-    except Exception as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        return EXIT_ERROR
-
+    bridge_cmd = _peer_bridge_cmd(
+        peer_target,
+        timeout,
+        caller_pane_id,
+        caller_terminal,
+        sender_work_dir,
+        intent,
+        task_id,
+    )
     env = os.environ.copy()
     env["CCB_REQ_ID"] = task_id
     env["CCB_CALLER"] = caller
     env["CCB_WORK_DIR"] = sender_work_dir
+    env["CCB_PEER_STATUS_FILE"] = str(status_file)
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
     if caller_terminal:
         env["CCB_CALLER_TERMINAL"] = caller_terminal
 
     try:
-        proc = subprocess.Popen(
-            ["sh", str(script_file)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
+        with msg_file.open("r", encoding="utf-8") as msg_handle, log_file.open("a", encoding="utf-8") as log_handle:
+            kwargs = {
+                "stdin": msg_handle,
+                "stdout": log_handle,
+                "stderr": subprocess.STDOUT,
+                "close_fds": True,
+                "env": env,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+            else:
+                kwargs["start_new_session"] = True
+            proc = subprocess.Popen(bridge_cmd, **kwargs)
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         return EXIT_ERROR
@@ -652,26 +650,32 @@ exit "$rc"
     )
     _append_task_status_line(status_file, f"spawned pid={proc.pid}")
 
-    print("[CCB_ASYNC_SUBMITTED provider=peer-claude]")
+    if intent == "background":
+        print("[CCB_BACKGROUND_SUBMITTED provider=peer-claude intent=background]")
+        print(f"Peer Claude consulted in background (task: {task_id}); continue current work.")
+    else:
+        print("[CCB_ASYNC_SUBMITTED provider=peer-claude intent=wait]")
+        print(f"Peer Claude processing (task: {task_id})")
     print(f"[CCB_ASYNC_PID task={task_id} pid={proc.pid}]")
     print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
     print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
-    if _should_emit_async_guardrail(caller):
+    if intent == "wait" and _should_emit_async_guardrail(caller):
         print("MANDATORY: END YOUR TURN NOW. Reply ONLY 'Peer Claude processing...', then stop.")
     return EXIT_OK
 
 
-def _run_peer_bridge(peer_target: str, timeout: float, message: str, foreground_mode: bool) -> int:
+def _run_peer_bridge(peer_target: str, timeout: float, message: str, foreground_mode: bool, intent: str) -> int:
     caller = _require_caller()
     if foreground_mode:
-        return _run_peer_bridge_foreground(peer_target, timeout, message, caller)
-    return _run_peer_bridge_background(peer_target, timeout, message, caller)
+        return _run_peer_bridge_foreground(peer_target, timeout, message, caller, intent)
+    return _run_peer_bridge_background(peer_target, timeout, message, caller, intent)
 
 
 def _handle_peer_mode(argv: list[str]) -> int:
     timeout: float = 3600.0
     peer_target = ""
     foreground_mode = _default_foreground()
+    peer_intent = "wait"
     parts: list[str] = []
 
     it = iter(argv)
@@ -699,8 +703,17 @@ def _handle_peer_mode(argv: list[str]) -> int:
         if token == "--foreground":
             foreground_mode = True
             continue
-        if token == "--background":
+        if token == "--wait":
+            peer_intent = "wait"
             foreground_mode = False
+            continue
+        if token == "--background":
+            peer_intent = "background"
+            foreground_mode = False
+            continue
+        if token == "--notify":
+            peer_intent = "notify"
+            foreground_mode = True
             continue
         parts.append(token)
 
@@ -713,7 +726,7 @@ def _handle_peer_mode(argv: list[str]) -> int:
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
-    return _run_peer_bridge(peer_target, timeout, message, foreground_mode)
+    return _run_peer_bridge(peer_target, timeout, message, foreground_mode, peer_intent)
 
 
 def main(argv: list[str]) -> int:
@@ -749,6 +762,7 @@ def main(argv: list[str]) -> int:
     no_wrap = False
     peer_target = ""
     foreground_mode = _default_foreground()
+    peer_intent = "wait"
     parts: list[str] = []
 
     it = iter(argv[2:])
@@ -768,11 +782,17 @@ def main(argv: list[str]) -> int:
             continue
         if token == "--notify":
             notify_mode = True
+            peer_intent = "notify"
             continue
         if token == "--foreground":
             foreground_mode = True
             continue
+        if token == "--wait":
+            peer_intent = "wait"
+            foreground_mode = False
+            continue
         if token == "--background":
+            peer_intent = "background"
             foreground_mode = False
             continue
         if token == "--no-wrap":
@@ -799,7 +819,9 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
 
     if peer_target:
-        return _run_peer_bridge(peer_target, timeout, message, foreground_mode)
+        if peer_intent == "notify":
+            foreground_mode = True
+        return _run_peer_bridge(peer_target, timeout, message, foreground_mode, peer_intent)
 
     if not notify_mode:
         if _use_unified_daemon():

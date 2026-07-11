@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Added explicit `--wait`, `--background`, and `--notify` intent for cross-project Claude messages.
+- Made background peer consultations non-blocking and reverse peer results one-way, preventing unrelated plans from being abandoned while waiting.
+
 ## v0.12.0 (2026-07-11)
 
 ### Changed

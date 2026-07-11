@@ -42,9 +42,8 @@ def _legacy_pend(provider: str, extra: list[str]) -> int:
         return EXIT_ERROR
 
 
-def _receipt_identity(receipt: dict) -> tuple[str, str, str]:
+def _receipt_route_identity(receipt: dict) -> tuple[str, str]:
     return (
-        str(receipt.get("caller_session_id") or "").strip(),
         str(receipt.get("caller_terminal") or "").strip(),
         str(receipt.get("caller_pane_id") or "").strip(),
     )
@@ -65,10 +64,12 @@ def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
             and str(item[1].get("caller_pane_id") or "") == pane_id
             and str(item[1].get("caller_terminal") or "") == terminal
         ]
-        return matches[0] if matches else None
+        if matches:
+            return matches[0]
     if session_id:
         matches = [item for item in records if str(item[1].get("caller_session_id") or "") == session_id]
-        return matches[0] if matches else None
+        if matches:
+            return matches[0]
 
     if pane_id:
         matches = [
@@ -77,7 +78,8 @@ def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
             if str(item[1].get("caller_pane_id") or "") == pane_id
             and str(item[1].get("caller_terminal") or "") == terminal
         ]
-        return matches[0] if matches else None
+        if matches:
+            return matches[0]
 
     try:
         project_id = compute_ccb_project_id(Path.cwd())
@@ -87,9 +89,13 @@ def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
     if not matches:
         return None
 
-    identities = {_receipt_identity(data) for _path, data in matches}
-    identities.discard(("", "", ""))
-    if len(identities) > 1:
+    # A CCB restart changes its session ID, so an exact caller match is no
+    # longer possible. Recover only when all same-project receipts route back
+    # to one terminal pane. Different panes mean another same-folder CCB may
+    # own the task, and guessing would recreate the cross-tab pend bug.
+    routes = {_receipt_route_identity(data) for _path, data in matches}
+    routes.discard(("", ""))
+    if len(routes) > 1:
         print(
             f"[ERROR] Ambiguous {provider} tasks for this project; use pend <task-id>:",
             file=sys.stderr,

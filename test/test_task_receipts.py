@@ -76,7 +76,7 @@ def test_pend_latest_is_scoped_to_caller_session(monkeypatch) -> None:
     assert found[1]["task_id"] == "old"
 
 
-def test_pend_does_not_fall_back_to_another_caller(monkeypatch) -> None:
+def test_pend_does_not_fall_back_to_another_project(monkeypatch) -> None:
     pend = _load_pend_module()
     records = [
         (Path("other.json"), _receipt("other", "codex", session="ccb-2", pane="2", project="p", submitted="2")),
@@ -84,8 +84,26 @@ def test_pend_does_not_fall_back_to_another_caller(monkeypatch) -> None:
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
     monkeypatch.setattr(pend, "caller_pane", lambda: ("1", "wezterm"))
+    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "different-project")
 
     assert pend._latest_for_current_caller("codex") is None
+
+
+def test_pend_recovers_latest_same_pane_receipt_after_session_restart(monkeypatch) -> None:
+    pend = _load_pend_module()
+    records = [
+        (Path("new.json"), _receipt("new", "codex", session="old-2", pane="5", project="p", submitted="2")),
+        (Path("old.json"), _receipt("old", "codex", session="old-1", pane="5", project="p", submitted="1")),
+    ]
+    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
+    monkeypatch.setattr(pend, "caller_session_id", lambda: "restarted")
+    monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
+    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
+
+    found = pend._latest_for_current_caller("codex")
+
+    assert found is not None
+    assert found[1]["task_id"] == "new"
 
 
 def test_pend_provider_without_current_receipt_does_not_use_legacy(monkeypatch, capsys) -> None:
@@ -106,12 +124,12 @@ def test_pend_provider_without_current_receipt_does_not_use_legacy(monkeypatch, 
 def test_pend_refuses_ambiguous_same_project_receipts(monkeypatch, capsys) -> None:
     pend = _load_pend_module()
     records = [
-        (Path("a.json"), _receipt("a", "codex", session="ccb-1", pane="1", project="p", submitted="2")),
-        (Path("b.json"), _receipt("b", "codex", session="ccb-2", pane="2", project="p", submitted="1")),
+        (Path("a.json"), _receipt("a", "codex", session="old-1", pane="1", project="p", submitted="2")),
+        (Path("b.json"), _receipt("b", "codex", session="old-2", pane="2", project="p", submitted="1")),
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("", ""))
+    monkeypatch.setattr(pend, "caller_session_id", lambda: "restarted")
+    monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
     monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
     with pytest.raises(RuntimeError):

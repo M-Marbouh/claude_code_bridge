@@ -23,14 +23,23 @@ def test_cmd_kill_is_local_only_by_default(monkeypatch, tmp_path: Path) -> None:
     session_dir = tmp_path / ".ccb"
     session_dir.mkdir(parents=True, exist_ok=True)
     session_file = session_dir / ".codex-session"
-    session_file.write_text(
-        json.dumps({"active": True, "terminal": "tmux", "pane_id": "%1"}, ensure_ascii=True),
-        encoding="utf-8",
-    )
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "tmux",
+        "pane_id": "%1",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }, ensure_ascii=True), encoding="utf-8")
 
     killed: list[str] = []
 
     class _FakeTmuxBackend:
+        def find_pane_by_title_marker(self, pane_marker: str, cwd_hint: str = "") -> str | None:
+            return "%1" if pane_marker == marker and cwd_hint == str(tmp_path) else None
+
         def kill_pane(self, pane_id: str) -> None:
             killed.append(pane_id)
 
@@ -50,6 +59,129 @@ def test_cmd_kill_is_local_only_by_default(monkeypatch, tmp_path: Path) -> None:
     data = json.loads(session_file.read_text(encoding="utf-8"))
     assert data["active"] is False
     assert data["ended_at"]
+
+
+def test_cmd_kill_skips_inactive_stale_wezterm_pane(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    session_file = session_dir / ".gemini-session"
+    session_file.write_text(json.dumps({
+        "active": False,
+        "terminal": "wezterm",
+        "pane_id": "2",
+        "pane_title_marker": f"CCB-Gemini-{project_id[:8]}",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+
+    class _NeverKillBackend:
+        def __init__(self) -> None:
+            raise AssertionError("inactive sessions must not inspect or kill live panes")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "WeztermBackend", _NeverKillBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["gemini"]))
+
+    assert rc == 0
+
+
+def test_cmd_kill_skips_reused_wezterm_pane_id_with_wrong_marker(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "wezterm",
+        "pane_id": "7",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+    killed: list[str] = []
+
+    class _FakeWeztermBackend:
+        def find_pane_by_title_marker(self, _marker: str, _cwd_hint: str = "") -> None:
+            return None
+
+        def kill_pane(self, pane_id: str) -> None:
+            killed.append(pane_id)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "WeztermBackend", _FakeWeztermBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
+    assert killed == []
+    assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is True
+
+
+def test_cmd_kill_kills_verified_active_wezterm_pane(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "wezterm",
+        "pane_id": "7",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+    killed: list[str] = []
+
+    class _FakeWeztermBackend:
+        def find_pane_by_title_marker(self, pane_marker: str, cwd_hint: str = "") -> str | None:
+            return "7" if pane_marker == marker and cwd_hint == str(tmp_path) else None
+
+        def kill_pane(self, pane_id: str) -> None:
+            killed.append(pane_id)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "WeztermBackend", _FakeWeztermBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
+    assert killed == ["7"]
+    assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is False
+
+
+def test_cmd_kill_refuses_legacy_whole_tmux_session(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "tmux",
+        "pane_id": "ccb-shared-session",
+        "tmux_session": "ccb-shared-session",
+        "pane_title_marker": f"CCB-Codex-{project_id[:8]}",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+
+    class _NeverKillBackend:
+        def __init__(self) -> None:
+            raise AssertionError("whole tmux sessions must not be inspected or killed")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "TmuxBackend", _NeverKillBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
 
 
 def test_cmd_kill_daemon_uses_shared_ask_prefix(monkeypatch, tmp_path: Path) -> None:

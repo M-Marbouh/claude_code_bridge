@@ -3768,6 +3768,63 @@ def _shutdown_shared_askd_for_project_kill(work_dir: Path) -> bool:
     return False
 
 
+def _session_project_root(session_file: Path) -> Path:
+    parent = session_file.parent
+    if parent.name in {".ccb", ".ccb_config"}:
+        return parent.parent
+    return parent
+
+
+def _verified_kill_target(provider: str, session_file: Path, data: dict):
+    """Resolve a pane only when the session record still owns that live pane."""
+    if data.get("active") is not True:
+        return None, "inactive session record"
+
+    project_root = _session_project_root(session_file)
+    project_norm = _normalize_path_for_match(str(project_root))
+    record_work_dir = _extract_session_work_dir_norm(data)
+    if not project_norm or record_work_dir != project_norm:
+        return None, "session work directory does not match this project"
+
+    try:
+        project_id = compute_ccb_project_id(project_root)
+    except Exception:
+        return None, "project identity could not be computed"
+    record_project_id = str(data.get("ccb_project_id") or "").strip()
+    if not record_project_id or record_project_id != project_id:
+        return None, "session project identity does not match"
+
+    pane_id = str(data.get("pane_id") or "").strip()
+    marker = str(data.get("pane_title_marker") or "").strip()
+    provider_label = {"opencode": "OpenCode"}.get(provider, provider.capitalize())
+    expected_marker = f"CCB-{provider_label}-{project_id[:8]}"
+    if not pane_id or marker.casefold() != expected_marker.casefold():
+        return None, "session pane identity is incomplete or invalid"
+
+    terminal = str(data.get("terminal") or "").strip().lower()
+    if terminal == "wezterm":
+        backend = WeztermBackend()
+    elif terminal == "tmux":
+        if not pane_id.startswith("%"):
+            return None, "ordinary kill refuses whole tmux sessions"
+        backend = TmuxBackend()
+    else:
+        return None, f"unsupported terminal {terminal or 'unknown'}"
+
+    resolver = getattr(backend, "find_pane_by_title_marker", None)
+    if not callable(resolver):
+        return None, "terminal cannot verify pane ownership"
+    try:
+        resolved_pane = str(resolver(marker, str(project_root)) or "").strip()
+    except Exception:
+        resolved_pane = ""
+    if not resolved_pane:
+        return None, "live pane marker was not found"
+    if resolved_pane != pane_id:
+        return None, f"stored pane {pane_id} no longer owns marker {marker}"
+    return (backend, pane_id), ""
+
+
 def cmd_kill(args):
     force = getattr(args, "force", False)
     daemon = getattr(args, "daemon", False)
@@ -3788,23 +3845,12 @@ def cmd_kill(args):
         if session_file and session_file.exists():
             try:
                 data = json.loads(session_file.read_text(encoding="utf-8-sig"))
-                terminal = data.get("terminal", "tmux")
-                pane_id = data.get("pane_id") if terminal == "wezterm" else (data.get("pane_id") or data.get("tmux_session") or "")
-
-                if terminal == "wezterm" and pane_id:
-                    backend = WeztermBackend()
-                    backend.kill_pane(pane_id)
-                elif pane_id and shutil.which("tmux"):
-                    backend = TmuxBackend()
-                    if str(pane_id).startswith("%"):
-                        backend.kill_pane(str(pane_id))
-                    else:
-                        tmux_session = str(data.get("tmux_session") or "").strip()
-                        if tmux_session and not tmux_session.startswith("%"):
-                            subprocess.run(["tmux", "kill-session", "-t", tmux_session], stderr=subprocess.DEVNULL)
-                            subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_session}"], stderr=subprocess.DEVNULL)
-                        else:
-                            backend.kill_pane(str(pane_id))
+                target, reason = _verified_kill_target(provider, session_file, data)
+                if target is None:
+                    print(f"ℹ️  {provider}: Skipped ({reason})")
+                    continue
+                backend, pane_id = target
+                backend.kill_pane(pane_id)
 
                 data["active"] = False
                 data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")

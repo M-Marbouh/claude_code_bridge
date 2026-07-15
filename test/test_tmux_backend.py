@@ -57,6 +57,35 @@ def test_tmux_find_pane_by_title_marker_parses_list_panes(monkeypatch: pytest.Mo
     assert backend.find_pane_by_title_marker("NOPE") is None
 
 
+def test_tmux_pane_shares_window_compares_session_and_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    identities = {"%1": "$1:@2\n", "%2": "$1:@2\n", "%3": "$1:@3\n"}
+
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
+                      input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        assert args[:4] == ["display-message", "-p", "-t", args[3]]
+        assert args[4] == "#{session_id}:#{window_id}"
+        return _cp(stdout=identities[args[3]])
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+
+    assert backend.pane_shares_window("%1", "%2") is True
+    assert backend.pane_shares_window("%1", "%3") is False
+
+
+def test_tmux_pane_belongs_to_cwd_compares_current_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
+                      input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        assert args == ["display-message", "-p", "-t", "%1", "#{pane_current_path}"]
+        return _cp(stdout="/home/musta/dev/project\n")
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+
+    assert backend.pane_belongs_to_cwd("%1", "/home/musta/dev/project") is True
+    assert backend.pane_belongs_to_cwd("%1", "/home/musta/dev/other") is False
+
+
 @pytest.mark.parametrize(
     ("stdout", "expected"),
     [

@@ -625,6 +625,33 @@ class TmuxBackend(TerminalBackend):
         except Exception:
             return False
 
+    def pane_matches_cwd_strict(self, pane_id: str, work_dir: str) -> bool:
+        """Strict CWD check used before destructive pane operations."""
+        return self.pane_belongs_to_cwd(pane_id, work_dir)
+
+    def pane_shares_window(self, pane_id: str, other_pane_id: str) -> bool:
+        """Return True only when both pane IDs belong to the same tmux window."""
+        pane_id = (pane_id or "").strip()
+        other_pane_id = (other_pane_id or "").strip()
+        if not self._looks_like_pane_id(pane_id) or not self._looks_like_pane_id(other_pane_id):
+            return False
+
+        identities: list[str] = []
+        for target in (pane_id, other_pane_id):
+            try:
+                cp = self._tmux_run(
+                    ["display-message", "-p", "-t", target, "#{session_id}:#{window_id}"],
+                    capture=True,
+                    timeout=0.5,
+                )
+            except Exception:
+                return False
+            identity = (cp.stdout or "").strip()
+            if cp.returncode != 0 or not identity:
+                return False
+            identities.append(identity)
+        return identities[0] == identities[1]
+
     def get_pane_content(self, pane_id: str, lines: int = 20) -> Optional[str]:
         if not pane_id:
             return None
@@ -1226,6 +1253,39 @@ class WeztermBackend(TerminalBackend):
                     return True  # No CWD info — assume OK
                 return self._cwd_matches(cwd, work_dir)
         return False  # Pane not found in list
+
+    def pane_matches_cwd_strict(self, pane_id: str, work_dir: str) -> bool:
+        """Return True only when WezTerm reports an exact pane CWD match."""
+        panes = self._list_panes()
+        if not panes:
+            return False
+        for pane in panes:
+            if str(pane.get("pane_id")) == str(pane_id):
+                cwd = pane.get("cwd", "")
+                return bool(cwd) and self._cwd_matches(cwd, work_dir)
+        return False
+
+    def pane_shares_window(self, pane_id: str, other_pane_id: str) -> bool:
+        """Return True only when both pane IDs belong to the same WezTerm tab."""
+        pane_id = str(pane_id or "").strip()
+        other_pane_id = str(other_pane_id or "").strip()
+        if not pane_id or not other_pane_id:
+            return False
+        panes = self._list_panes()
+        if not panes:
+            return False
+
+        by_id = {str(pane.get("pane_id")): pane for pane in panes if pane.get("pane_id") is not None}
+        pane = by_id.get(pane_id)
+        other = by_id.get(other_pane_id)
+        if pane is None or other is None:
+            return False
+
+        pane_tab = pane.get("tab_id")
+        other_tab = other.get("tab_id")
+        if pane_tab is None or other_tab is None:
+            return False
+        return str(pane_tab) == str(other_tab)
 
     def is_alive(self, pane_id: str) -> bool:
         panes = self._list_panes()

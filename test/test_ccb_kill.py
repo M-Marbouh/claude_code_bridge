@@ -40,10 +40,20 @@ def test_cmd_kill_is_local_only_by_default(monkeypatch, tmp_path: Path) -> None:
         def find_pane_by_title_marker(self, pane_marker: str, cwd_hint: str = "") -> str | None:
             return "%1" if pane_marker == marker and cwd_hint == str(tmp_path) else None
 
+        def is_alive(self, pane_id: str) -> bool:
+            return pane_id == "%1"
+
+        def pane_matches_cwd_strict(self, pane_id: str, work_dir: str) -> bool:
+            return pane_id == "%1" and work_dir == str(tmp_path)
+
+        def pane_shares_window(self, pane_id: str, caller_pane_id: str) -> bool:
+            return (pane_id, caller_pane_id) == ("%1", "%0")
+
         def kill_pane(self, pane_id: str) -> None:
             killed.append(pane_id)
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TMUX_PANE", "%0")
     monkeypatch.setattr(ccb, "TmuxBackend", _FakeTmuxBackend)
     monkeypatch.setattr(ccb.shutil, "which", lambda _name: "/usr/bin/tmux")
     monkeypatch.setattr(
@@ -143,16 +153,202 @@ def test_cmd_kill_kills_verified_active_wezterm_pane(monkeypatch, tmp_path: Path
         def find_pane_by_title_marker(self, pane_marker: str, cwd_hint: str = "") -> str | None:
             return "7" if pane_marker == marker and cwd_hint == str(tmp_path) else None
 
+        def is_alive(self, pane_id: str) -> bool:
+            return pane_id == "7"
+
+        def pane_matches_cwd_strict(self, pane_id: str, work_dir: str) -> bool:
+            return pane_id == "7" and work_dir == str(tmp_path)
+
+        def pane_shares_window(self, pane_id: str, caller_pane_id: str) -> bool:
+            return (pane_id, caller_pane_id) == ("7", "6")
+
         def kill_pane(self, pane_id: str) -> None:
             killed.append(pane_id)
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEZTERM_PANE", "6")
     monkeypatch.setattr(ccb, "WeztermBackend", _FakeWeztermBackend)
 
     rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
 
     assert rc == 0
     assert killed == ["7"]
+    assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is False
+
+
+def test_cmd_kill_rejects_marker_match_in_another_wezterm_tab(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "wezterm",
+        "pane_id": "7",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+    killed: list[str] = []
+
+    class _FakeWeztermBackend:
+        def find_pane_by_title_marker(self, _marker: str, _cwd_hint: str = "") -> str:
+            return "7"
+
+        def is_alive(self, _pane_id: str) -> bool:
+            return True
+
+        def pane_matches_cwd_strict(self, _pane_id: str, _work_dir: str) -> bool:
+            return True
+
+        def pane_shares_window(self, _pane_id: str, _caller_pane_id: str) -> bool:
+            return False
+
+        def kill_pane(self, pane_id: str) -> None:
+            killed.append(pane_id)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEZTERM_PANE", "6")
+    monkeypatch.setattr(ccb, "WeztermBackend", _FakeWeztermBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
+    assert killed == []
+    assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is True
+
+
+def test_cmd_kill_accepts_overwritten_wezterm_title_in_callers_tab(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "wezterm",
+        "pane_id": "7",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+    killed: list[str] = []
+
+    class _FakeWeztermBackend:
+        def find_pane_by_title_marker(self, _marker: str, _cwd_hint: str = "") -> None:
+            return None
+
+        def is_alive(self, pane_id: str) -> bool:
+            return pane_id == "7"
+
+        def pane_matches_cwd_strict(self, pane_id: str, work_dir: str) -> bool:
+            return pane_id == "7" and work_dir == str(tmp_path)
+
+        def pane_shares_window(self, pane_id: str, caller_pane_id: str) -> bool:
+            return (pane_id, caller_pane_id) == ("7", "6")
+
+        def kill_pane(self, pane_id: str) -> None:
+            killed.append(pane_id)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEZTERM_PANE", "6")
+    monkeypatch.setattr(ccb, "WeztermBackend", _FakeWeztermBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
+    assert killed == ["7"]
+    assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is False
+
+
+def test_cmd_kill_rejects_overwritten_wezterm_title_in_another_tab(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "wezterm",
+        "pane_id": "7",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+    killed: list[str] = []
+
+    class _FakeWeztermBackend:
+        def find_pane_by_title_marker(self, _marker: str, _cwd_hint: str = "") -> None:
+            return None
+
+        def is_alive(self, _pane_id: str) -> bool:
+            return True
+
+        def pane_matches_cwd_strict(self, _pane_id: str, _work_dir: str) -> bool:
+            return True
+
+        def pane_shares_window(self, _pane_id: str, _caller_pane_id: str) -> bool:
+            return False
+
+        def kill_pane(self, pane_id: str) -> None:
+            killed.append(pane_id)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEZTERM_PANE", "6")
+    monkeypatch.setattr(ccb, "WeztermBackend", _FakeWeztermBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
+    assert killed == []
+    assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is True
+
+
+def test_cmd_kill_accepts_overwritten_tmux_title_in_callers_window(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    session_dir = tmp_path / ".ccb"
+    session_dir.mkdir(parents=True)
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    marker = f"CCB-Codex-{project_id[:8]}"
+    session_file = session_dir / ".codex-session"
+    session_file.write_text(json.dumps({
+        "active": True,
+        "terminal": "tmux",
+        "pane_id": "%7",
+        "pane_title_marker": marker,
+        "work_dir": str(tmp_path),
+        "ccb_project_id": project_id,
+    }), encoding="utf-8")
+    killed: list[str] = []
+
+    class _FakeTmuxBackend:
+        def find_pane_by_title_marker(self, _marker: str, _cwd_hint: str = "") -> None:
+            return None
+
+        def is_alive(self, pane_id: str) -> bool:
+            return pane_id == "%7"
+
+        def pane_matches_cwd_strict(self, pane_id: str, work_dir: str) -> bool:
+            return pane_id == "%7" and work_dir == str(tmp_path)
+
+        def pane_shares_window(self, pane_id: str, caller_pane_id: str) -> bool:
+            return (pane_id, caller_pane_id) == ("%7", "%6")
+
+        def kill_pane(self, pane_id: str) -> None:
+            killed.append(pane_id)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TMUX_PANE", "%6")
+    monkeypatch.setattr(ccb, "TmuxBackend", _FakeTmuxBackend)
+
+    rc = ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"]))
+
+    assert rc == 0
+    assert killed == ["%7"]
     assert json.loads(session_file.read_text(encoding="utf-8"))["active"] is False
 
 

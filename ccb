@@ -3775,6 +3775,39 @@ def _session_project_root(session_file: Path) -> Path:
     return parent
 
 
+def _pane_matches_caller_context(backend, terminal: str, pane_id: str, project_root: Path) -> bool:
+    """Verify a pane without relying on its mutable terminal title."""
+    if terminal == "wezterm":
+        caller_pane_id = (os.environ.get("WEZTERM_PANE") or "").strip()
+    else:
+        caller_pane_id = (os.environ.get("TMUX_PANE") or "").strip()
+        if not caller_pane_id:
+            getter = getattr(backend, "get_current_pane_id", None)
+            if callable(getter):
+                try:
+                    caller_pane_id = str(getter() or "").strip()
+                except Exception:
+                    caller_pane_id = ""
+    if not caller_pane_id:
+        return False
+
+    exists_check = getattr(backend, "pane_exists", None)
+    if not callable(exists_check):
+        exists_check = getattr(backend, "is_alive", None)
+    cwd_check = getattr(backend, "pane_matches_cwd_strict", None)
+    window_check = getattr(backend, "pane_shares_window", None)
+    if not callable(exists_check) or not callable(cwd_check) or not callable(window_check):
+        return False
+    try:
+        return (
+            bool(exists_check(pane_id))
+            and bool(cwd_check(pane_id, str(project_root)))
+            and bool(window_check(pane_id, caller_pane_id))
+        )
+    except Exception:
+        return False
+
+
 def _verified_kill_target(provider: str, session_file: Path, data: dict):
     """Resolve a pane only when the session record still owns that live pane."""
     if data.get("active") is not True:
@@ -3819,9 +3852,13 @@ def _verified_kill_target(provider: str, session_file: Path, data: dict):
     except Exception:
         resolved_pane = ""
     if not resolved_pane:
-        return None, "live pane marker was not found"
+        if _pane_matches_caller_context(backend, terminal, pane_id, project_root):
+            return (backend, pane_id), ""
+        return None, "live pane marker was not found and caller context did not match"
     if resolved_pane != pane_id:
         return None, f"stored pane {pane_id} no longer owns marker {marker}"
+    if not _pane_matches_caller_context(backend, terminal, pane_id, project_root):
+        return None, "live pane belongs to another terminal window or could not be verified"
     return (backend, pane_id), ""
 
 

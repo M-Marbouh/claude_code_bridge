@@ -95,6 +95,40 @@ def test_bridge_rejects_notify_that_asks_for_reply(capsys) -> None:
     assert "use --background or --wait" in capsys.readouterr().err
 
 
+def test_bridge_rejects_codex_only_project(monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    target = {
+        "index": 1,
+        "work_dir": "/tmp/project",
+        "ccb_project_id": "abcd1234",
+        "peer_capable": False,
+        "providers": {"codex": {"alive": True}},
+    }
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+
+    rc = bridge.main(["--target", "1", "hello"])
+
+    assert rc == 1
+    assert "no peer-capable Claude pane" in capsys.readouterr().err
+
+
+def test_bridge_rejects_unmounted_claude_project(monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    target = {
+        "index": 1,
+        "work_dir": "/tmp/project",
+        "ccb_project_id": "abcd1234",
+        "peer_capable": False,
+        "providers": {"claude": {"alive": True, "mounted": False}},
+    }
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+
+    rc = bridge.main(["--target", "1", "hello"])
+
+    assert rc == 1
+    assert "no peer-capable Claude pane" in capsys.readouterr().err
+
+
 def test_bridge_request_is_delivery_only(monkeypatch) -> None:
     bridge = _load_bridge_module()
     sent: dict = {}

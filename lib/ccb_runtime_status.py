@@ -190,7 +190,7 @@ def _session_bound(work_dir: Path, project_id: str, provider: str, entry: dict[s
     if not session_file or not session_file.is_file():
         return False, str(session_file or "")
     data = _load_json(session_file)
-    if not data:
+    if not data or data.get("active") is not True:
         return False, str(session_file)
     recorded_project = str(data.get("ccb_project_id") or "").strip()
     if recorded_project and recorded_project != project_id:

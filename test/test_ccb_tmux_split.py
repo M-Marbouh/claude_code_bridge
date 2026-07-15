@@ -91,6 +91,8 @@ def test_run_up_sorts_providers_in_tmux(monkeypatch, tmp_path: Path) -> None:
 
 def test_start_codex_tmux_writes_bridge_pid(monkeypatch, tmp_path: Path) -> None:
     ccb = _load_ccb_module()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".ccb").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TMUX_PANE", "%0")

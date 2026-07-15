@@ -36,6 +36,7 @@ def _write_session(work_dir: Path, filename: str, *, provider: str, pane_id: str
     (cfg / filename).write_text(
         json.dumps(
             {
+                "active": True,
                 "provider": provider,
                 "ccb_project_id": project_id,
                 "work_dir": str(work_dir),
@@ -119,6 +120,39 @@ def test_runtime_status_registered_but_pane_dead(runtime_env, monkeypatch: pytes
     assert status.pane_alive is False
     assert status.mounted is False
     assert status.reason == "pane_dead"
+
+
+def test_runtime_status_inactive_session_is_not_bound(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    session_file = work_dir / ".ccb" / ".codex-session"
+    data = json.loads(session_file.read_text(encoding="utf-8"))
+    data["active"] = False
+    session_file.write_text(json.dumps(data), encoding="utf-8")
+    _write_registry(
+        home,
+        "inactive",
+        {
+            "ccb_session_id": "inactive",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.pane_alive is True
+    assert status.session_bound is False
+    assert status.mounted is False
+    assert status.reason == "session_unbound"
 
 
 def test_runtime_status_configured_but_not_registered(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:

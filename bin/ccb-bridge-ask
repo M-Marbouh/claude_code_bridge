@@ -252,8 +252,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         target = _resolve_target(_load_targets(), args.target)
         claude = (target.get("providers") or {}).get("claude")
-        if not isinstance(claude, dict) or not claude.get("alive"):
-            print("[ERROR] Target project has no live Claude pane", file=sys.stderr)
+        peer_capable = target.get("peer_capable")
+        if peer_capable is False or not isinstance(claude, dict) or not claude.get("alive"):
+            print("[ERROR] Target project has no peer-capable Claude pane", file=sys.stderr)
             return 1
 
         target_hash = str(target.get("ccb_project_id") or "")

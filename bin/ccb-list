@@ -15,11 +15,16 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
-from ccb_runtime_status import list_project_runtime_statuses
-from pane_registry import _is_stale, _iter_registry_files
+from ccb_runtime_status import is_project_askd_online
+from ccb_start_config import load_start_config
+from pane_registry import _get_providers_map, _is_stale, _iter_registry_files
 from project_id import compute_ccb_project_id
+from session_utils import find_project_session_file
 
 setup_windows_encoding()
+
+SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode")
+SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
 
 
 def _load_json_dict(path: Path) -> dict[str, Any] | None:
@@ -52,7 +57,13 @@ def _updated_at(data: dict[str, Any], fallback_path: Path) -> float:
 def _tmux_panes() -> dict[str, dict[str, str]]:
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}\t#{pane_current_path}\t#{pane_dead}"],
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{pane_title}\t#{pane_current_path}\t#{pane_dead}\t#{session_id}\t#{window_id}",
+            ],
             capture_output=True,
             text=True,
             timeout=2,
@@ -67,10 +78,10 @@ def _tmux_panes() -> dict[str, dict[str, str]]:
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
-        parts = line.split("\t", 3)
-        if len(parts) < 4:
+        parts = line.split("\t", 5)
+        if len(parts) < 6:
             continue
-        pane_id, title, cwd, dead = parts
+        pane_id, title, cwd, dead, session_id, window_id = parts
         pane_id = pane_id.strip()
         if not pane_id:
             continue
@@ -79,13 +90,18 @@ def _tmux_panes() -> dict[str, dict[str, str]]:
             "title": title.strip(),
             "cwd": cwd.strip(),
             "dead": dead.strip(),
+            "session_id": session_id.strip(),
+            "window_id": window_id.strip(),
         }
     return panes
 
 
 def _collect_wezterm_panes(value: Any, found: dict[str, dict[str, Any]]) -> None:
     if isinstance(value, dict):
-        pane_id = value.get("pane_id") or value.get("paneId") or value.get("pane")
+        pane_id = next(
+            (value.get(key) for key in ("pane_id", "paneId", "pane") if value.get(key) is not None),
+            None,
+        )
         if pane_id is not None:
             found[str(pane_id)] = value
         for child in value.values():
@@ -152,8 +168,8 @@ def _cwd_matches(pane_cwd: str, work_dir: str) -> bool:
         return False
 
 
-def _title_matches_marker(pane: dict[str, Any], marker: str) -> bool:
-    if not marker:
+def _title_matches_marker(pane: dict[str, Any] | None, marker: str) -> bool:
+    if not isinstance(pane, dict) or not marker:
         return False
     for key in ("title", "pane_title", "window_title", "tab_title"):
         value = pane.get(key)
@@ -163,7 +179,10 @@ def _title_matches_marker(pane: dict[str, Any], marker: str) -> bool:
 
 
 def _provider_alive(terminal: str, provider_data: dict[str, Any], work_dir: str, panes: dict[str, dict[str, Any]]) -> bool:
-    pane_id = str(provider_data.get("pane_id") or provider_data.get("tmux_session") or "").strip()
+    pane_raw = provider_data.get("pane_id")
+    if pane_raw is None:
+        pane_raw = provider_data.get("tmux_session")
+    pane_id = str(pane_raw if pane_raw is not None else "").strip()
     if not pane_id:
         return False
 
@@ -171,73 +190,319 @@ def _provider_alive(terminal: str, provider_data: dict[str, Any], work_dir: str,
     if not pane:
         return False
 
-    marker = str(provider_data.get("pane_title_marker") or "").strip()
     if terminal == "tmux":
         if str(pane.get("dead") or "").strip() not in {"", "0"}:
             return False
-        if marker:
-            return _title_matches_marker(pane, marker)
-        return False
+        return _cwd_matches(str(pane.get("cwd") or ""), work_dir)
 
     if terminal == "wezterm":
         cwd = str(pane.get("cwd") or "").strip()
-        if cwd:
-            return _cwd_matches(cwd, work_dir)
-        if marker:
-            return _title_matches_marker(pane, marker)
-        return False
+        return bool(cwd) and _cwd_matches(cwd, work_dir)
 
     return False
 
 
-def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
+def _configured_providers(work_dir: Path) -> set[str]:
+    try:
+        providers = load_start_config(work_dir).data.get("providers")
+    except Exception:
+        providers = []
+    if not isinstance(providers, list):
+        return set()
+    return {
+        str(provider).strip().lower()
+        for provider in providers
+        if str(provider).strip().lower() in SUPPORTED_PROVIDERS
+    }
+
+
+def _provider_group(terminal: str, pane: dict[str, Any] | None) -> str:
+    if not isinstance(pane, dict):
+        return ""
+    if terminal == "wezterm":
+        tab_id = pane.get("tab_id")
+        if tab_id is not None:
+            return f"tab:{tab_id}"
+        window_id = pane.get("window_id")
+        if window_id is not None:
+            return f"window:{window_id}"
+        pane_id = pane.get("pane_id")
+        return f"pane:{pane_id}" if pane_id is not None else ""
+    if terminal == "tmux":
+        session_id = str(pane.get("session_id") or "").strip()
+        window_id = str(pane.get("window_id") or "").strip()
+        return f"window:{session_id}:{window_id}" if session_id and window_id else ""
+    return ""
+
+
+def _session_binding(
+    work_dir: Path,
+    project_id: str,
+    session_id: str,
+    provider: str,
+    provider_data: dict[str, Any],
+) -> tuple[bool, str]:
+    raw = str(provider_data.get("session_file") or "").strip()
+    session_file = Path(raw).expanduser() if raw else find_project_session_file(work_dir, SESSION_FILENAMES[provider])
+    if not session_file or not session_file.is_file():
+        return False, str(session_file or "")
+    data = _load_json_dict(session_file)
+    if not data or data.get("active") is not True:
+        return False, str(session_file)
+    recorded_project = str(data.get("ccb_project_id") or "").strip()
+    if recorded_project and recorded_project != project_id:
+        return False, str(session_file)
+    recorded_provider = str(data.get("provider") or "").strip().lower()
+    if recorded_provider and recorded_provider != provider:
+        return False, str(session_file)
+    pane_raw = provider_data.get("pane_id")
+    if pane_raw is None:
+        pane_raw = provider_data.get("tmux_session")
+    pane_id = str(pane_raw if pane_raw is not None else "").strip()
+    recorded_pane = str(data.get("pane_id") or data.get("tmux_session") or "").strip()
+    if pane_id and recorded_pane and pane_id != recorded_pane:
+        return False, str(session_file)
+    recorded_session = str(data.get("ccb_session_id") or data.get("session_id") or "").strip()
+    if session_id and recorded_session and session_id != recorded_session:
+        return False, str(session_file)
+    return True, str(session_file)
+
+
+def _provider_status(
+    *,
+    provider: str,
+    provider_data: dict[str, Any],
+    terminal: str,
+    work_dir: Path,
+    project_id: str,
+    session_id: str,
+    updated_at: int,
+    timestamp_stale: bool,
+    configured: set[str],
+    panes: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    pane_raw = provider_data.get("pane_id")
+    if pane_raw is None:
+        pane_raw = provider_data.get("tmux_session")
+    pane_id = str(pane_raw if pane_raw is not None else "").strip()
+    pane = panes.get(pane_id)
+    candidate_alive = _provider_alive(terminal, provider_data, str(work_dir), panes)
+    bound, session_file = _session_binding(work_dir, project_id, session_id, provider, provider_data)
+    marker = str(provider_data.get("pane_title_marker") or "").strip()
+    status = {
+        "pane_id": pane_id,
+        "pane_title_marker": marker,
+        "alive": False,
+        "mounted": False,
+        "capable": True,
+        "configured": provider in configured if configured else True,
+        "registered": True,
+        "pane_alive": False,
+        "session_bound": bound,
+        "daemon_online": False,
+        "reason": "pane_dead",
+        "timestamp_stale": timestamp_stale,
+        "session_file": session_file,
+        "updated_at": updated_at,
+        "_candidate_alive": candidate_alive,
+        "_identity_proven": bool(candidate_alive and (bound or _title_matches_marker(pane, marker))),
+    }
+    return status, _provider_group(terminal, pane) if candidate_alive else ""
+
+
+def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
     pane_cache: dict[str, dict[str, dict[str, Any]]] = {}
-    for project in list_project_runtime_statuses(include_stale=include_stale):
-        project_dict = project.to_dict()
-        terminal = str(project_dict.get("terminal") or "")
-        if terminal not in pane_cache:
-            pane_cache[terminal] = _tmux_panes() if terminal == "tmux" else (_wezterm_panes() if terminal == "wezterm" else {})
-        live_panes = pane_cache[terminal]
-        work_dir = str(project_dict.get("work_dir") or "")
-        providers: dict[str, dict[str, Any]] = {}
-        for provider_key, status in project_dict.get("providers", {}).items():
-            if not isinstance(status, dict):
-                continue
-            pane_alive = _provider_alive(terminal, status, work_dir, live_panes)
-            providers[provider_key] = {
-                "pane_id": status.get("pane_id") or "",
-                "pane_title_marker": status.get("pane_title_marker") or "",
-                "alive": pane_alive,
-                "mounted": bool(status.get("mounted")),
-                "capable": bool(status.get("capable")),
-                "configured": bool(status.get("configured")),
-                "registered": bool(status.get("registered")),
-                "pane_alive": pane_alive,
-                "session_bound": bool(status.get("session_bound")),
-                "daemon_online": bool(status.get("daemon_online")),
-                "reason": status.get("reason") or "",
-                "timestamp_stale": bool(status.get("timestamp_stale")),
-                "session_file": status.get("session_file") or "",
-                "updated_at": int(status.get("updated_at") or 0),
-            }
-
-        claude_entry = providers.get("claude") or {}
-        claude_alive = bool(claude_entry.get("alive")) if isinstance(claude_entry, dict) else False
-        if not include_stale and not claude_alive:
+    sessions: list[dict[str, Any]] = []
+    for path in _iter_registry_files():
+        record = _load_json_dict(path)
+        if not record:
             continue
+        work_dir_raw = str(record.get("work_dir") or "").strip()
+        if not work_dir_raw:
+            continue
+        work_dir = Path(work_dir_raw).expanduser()
+        if not work_dir.exists():
+            continue
+        project_id = str(record.get("ccb_project_id") or "").strip()
+        if not project_id:
+            try:
+                project_id = compute_ccb_project_id(work_dir)
+            except Exception:
+                continue
+        terminal = str(record.get("terminal") or "tmux").strip().lower() or "tmux"
+        if terminal not in pane_cache:
+            pane_cache[terminal] = (
+                _tmux_panes() if terminal == "tmux" else (_wezterm_panes() if terminal == "wezterm" else {})
+            )
+        panes = pane_cache[terminal]
+        session_id = str(record.get("ccb_session_id") or record.get("session_id") or path.stem).strip()
+        updated_at = int(_updated_at(record, path))
+        timestamp_stale = _is_stale(updated_at)
+        configured = _configured_providers(work_dir)
 
-        entries.append(
+        statuses: dict[str, tuple[dict[str, Any], str]] = {}
+        for provider, provider_data in _get_providers_map(record).items():
+            if provider not in SUPPORTED_PROVIDERS or not isinstance(provider_data, dict):
+                continue
+            statuses[provider] = _provider_status(
+                provider=provider,
+                provider_data=provider_data,
+                terminal=terminal,
+                work_dir=work_dir,
+                project_id=project_id,
+                session_id=session_id,
+                updated_at=updated_at,
+                timestamp_stale=timestamp_stale,
+                configured=configured,
+                panes=panes,
+            )
+
+        live_groups = {
+            group for status, group in statuses.values() if status.get("_candidate_alive") and group
+        }
+        appended_live = False
+        for group_id in live_groups:
+            members = [
+                (provider, status)
+                for provider, (status, provider_group) in statuses.items()
+                if status.get("_candidate_alive") and provider_group == group_id
+            ]
+            cohort_proven = len(members) >= 2
+            providers: dict[str, dict[str, Any]] = {}
+            for provider, status in members:
+                eligible = bool(
+                    include_stale or status.get("configured") or status.get("session_bound")
+                )
+                alive = bool(eligible and (status.get("_identity_proven") or cohort_proven))
+                status = dict(status)
+                status["alive"] = alive
+                status["pane_alive"] = alive
+                if alive:
+                    status["reason"] = ""
+                elif not eligible:
+                    status["reason"] = "not_configured"
+                else:
+                    status["reason"] = "pane_identity_unverified"
+                status.pop("_candidate_alive", None)
+                status.pop("_identity_proven", None)
+                if alive:
+                    providers[provider] = status
+            if not providers:
+                continue
+            sessions.append(
+                {
+                    "session_id": session_id,
+                    "work_dir": str(work_dir.resolve()),
+                    "ccb_project_id": project_id,
+                    "terminal": terminal,
+                    "window_id": group_id,
+                    "updated_at": updated_at,
+                    "timestamp_stale": timestamp_stale,
+                    "alive": True,
+                    "providers": providers,
+                }
+            )
+            appended_live = True
+
+        if include_stale and not appended_live and statuses:
+            historical: dict[str, dict[str, Any]] = {}
+            for provider, (status, _group) in statuses.items():
+                status = dict(status)
+                status.pop("_candidate_alive", None)
+                status.pop("_identity_proven", None)
+                historical[provider] = status
+            sessions.append(
+                {
+                    "session_id": session_id,
+                    "work_dir": str(work_dir.resolve()),
+                    "ccb_project_id": project_id,
+                    "terminal": terminal,
+                    "window_id": f"history:{session_id}",
+                    "updated_at": updated_at,
+                    "timestamp_stale": timestamp_stale,
+                    "alive": False,
+                    "providers": historical,
+                }
+            )
+    return sessions
+
+
+def _dedupe_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for session in sessions:
+        key = (
+            str(session.get("ccb_project_id") or ""),
+            str(session.get("terminal") or ""),
+            str(session.get("window_id") or ""),
+        )
+        current = selected.get(key)
+        if current is None:
+            selected[key] = session
+            continue
+        if int(session.get("updated_at") or 0) > int(current.get("updated_at") or 0):
+            newer, older = session, current
+        else:
+            newer, older = current, session
+        providers = dict(older.get("providers") or {})
+        providers.update(newer.get("providers") or {})
+        merged = dict(newer)
+        merged["providers"] = providers
+        selected[key] = merged
+    return list(selected.values())
+
+
+def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
+    projects: dict[str, dict[str, Any]] = {}
+    for session in _dedupe_sessions(_registry_sessions(include_stale)):
+        project_id = str(session.get("ccb_project_id") or "")
+        project = projects.setdefault(
+            project_id,
             {
                 "index": 0,
-                "work_dir": project_dict.get("work_dir") or "",
-                "ccb_project_id": project_dict.get("ccb_project_id") or "",
-                "terminal": project_dict.get("terminal") or "",
-                "updated_at": int(project_dict.get("updated_at") or 0),
-                "providers": providers,
-            }
+                "work_dir": session.get("work_dir") or "",
+                "ccb_project_id": project_id,
+                "terminal": session.get("terminal") or "",
+                "updated_at": 0,
+                "providers": {},
+                "sessions": [],
+                "peer_capable": False,
+            },
         )
+        project["sessions"].append(session)
+        if int(session.get("updated_at") or 0) > int(project.get("updated_at") or 0):
+            project["updated_at"] = int(session.get("updated_at") or 0)
+            project["terminal"] = session.get("terminal") or ""
 
+    entries: list[dict[str, Any]] = []
+    for project in projects.values():
+        project_id = str(project.get("ccb_project_id") or "")
+        work_dir = Path(str(project.get("work_dir") or "")).expanduser()
+        daemon_online = is_project_askd_online(work_dir, project_id)
+        sessions = sorted(project["sessions"], key=lambda item: int(item.get("updated_at") or 0), reverse=True)
+        aggregated: dict[str, dict[str, Any]] = {}
+        for session in sessions:
+            for provider, provider_status in (session.get("providers") or {}).items():
+                provider_status["daemon_online"] = daemon_online
+                provider_status["mounted"] = bool(
+                    provider_status.get("alive") and provider_status.get("session_bound") and daemon_online
+                )
+                if provider_status.get("alive"):
+                    if not provider_status.get("session_bound"):
+                        provider_status["reason"] = "session_unbound"
+                    elif not daemon_online:
+                        provider_status["reason"] = "daemon_offline"
+                    else:
+                        provider_status["reason"] = ""
+                if provider not in aggregated:
+                    aggregated[provider] = dict(provider_status)
+        project["sessions"] = sessions
+        project["providers"] = aggregated
+        project["peer_capable"] = bool((aggregated.get("claude") or {}).get("mounted"))
+        project["session_count"] = sum(1 for session in sessions if session.get("alive"))
+        if include_stale or any(status.get("alive") for status in aggregated.values()):
+            entries.append(project)
+
+    entries.sort(key=lambda entry: int(entry.get("updated_at") or 0), reverse=True)
     for index, entry in enumerate(entries, start=1):
         entry["index"] = index
     return entries
@@ -251,16 +516,20 @@ def _print_human(entries: list[dict[str, Any]]) -> None:
 
     for entry in entries:
         project_hash = str(entry.get("ccb_project_id") or "")[:8]
-        print(f"  [{entry['index']}] {entry['work_dir']}  ({project_hash})")
-        providers = entry.get("providers") or {}
-        for provider in sorted(providers):
-            provider_data = providers[provider]
-            pane_id = provider_data.get("pane_id") or ""
-            state = "mounted" if provider_data.get("mounted") else ("alive" if provider_data.get("alive") else "stale")
-            dot = "●" if provider_data.get("mounted") else ("◐" if provider_data.get("alive") else "○")
-            reason = provider_data.get("reason") or ""
-            suffix = f" reason:{reason}" if reason and not provider_data.get("mounted") else ""
-            print(f"      {provider:<14} pane:{pane_id}  {dot} {state}{suffix}")
+        peer = "yes" if entry.get("peer_capable") else "no"
+        print(f"  [{entry['index']}] {entry['work_dir']}  ({project_hash}) peer:{peer}")
+        for position, session in enumerate(entry.get("sessions") or [], start=1):
+            session_id = str(session.get("session_id") or "")
+            window_id = str(session.get("window_id") or "")
+            print(f"      window {position}  {session.get('terminal') or ''} {window_id} session:{session_id}")
+            for provider in sorted(session.get("providers") or {}):
+                provider_data = session["providers"][provider]
+                pane_id = provider_data.get("pane_id") or ""
+                state = "mounted" if provider_data.get("mounted") else ("alive" if provider_data.get("alive") else "stale")
+                dot = "●" if provider_data.get("mounted") else ("◐" if provider_data.get("alive") else "○")
+                reason = provider_data.get("reason") or ""
+                suffix = f" reason:{reason}" if reason and not provider_data.get("mounted") else ""
+                print(f"          {provider:<14} pane:{pane_id}  {dot} {state}{suffix}")
 
 
 def main(argv: list[str] | None = None) -> int:

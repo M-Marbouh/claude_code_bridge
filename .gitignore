@@ -32,3 +32,5 @@ GEMINI.md
 openspec
 *.log
 .hippocampus
+.serena/
+plans/

@@ -39,7 +39,7 @@ from session_utils import (
     resolve_project_config_dir,
     safe_write_session,
 )
-from pane_registry import upsert_registry, load_registry_by_project_id
+from pane_registry import upsert_registry, load_registry_by_project_id, load_registry_by_session_id
 from project_id import compute_ccb_project_id
 from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC
 from process_lock import ProviderLock
@@ -3775,37 +3775,62 @@ def _session_project_root(session_file: Path) -> Path:
     return parent
 
 
-def _pane_matches_caller_context(backend, terminal: str, pane_id: str, project_root: Path) -> bool:
-    """Verify a pane without relying on its mutable terminal title."""
-    if terminal == "wezterm":
-        caller_pane_id = (os.environ.get("WEZTERM_PANE") or "").strip()
-    else:
-        caller_pane_id = (os.environ.get("TMUX_PANE") or "").strip()
-        if not caller_pane_id:
-            getter = getattr(backend, "get_current_pane_id", None)
-            if callable(getter):
-                try:
-                    caller_pane_id = str(getter() or "").strip()
-                except Exception:
-                    caller_pane_id = ""
-    if not caller_pane_id:
-        return False
-
+def _pane_matches_session_record(backend, pane_id: str, project_root: Path) -> bool:
+    """Verify a recorded pane without relying on its mutable terminal title or the caller tab."""
     exists_check = getattr(backend, "pane_exists", None)
     if not callable(exists_check):
         exists_check = getattr(backend, "is_alive", None)
     cwd_check = getattr(backend, "pane_matches_cwd_strict", None)
-    window_check = getattr(backend, "pane_shares_window", None)
-    if not callable(exists_check) or not callable(cwd_check) or not callable(window_check):
+    if not callable(exists_check) or not callable(cwd_check):
         return False
     try:
         return (
             bool(exists_check(pane_id))
             and bool(cwd_check(pane_id, str(project_root)))
-            and bool(window_check(pane_id, caller_pane_id))
         )
     except Exception:
         return False
+
+
+def _registry_matches_kill_target(
+    provider: str,
+    data: dict,
+    project_root: Path,
+    project_id: str,
+    pane_id: str,
+    marker: str,
+) -> bool:
+    """Reject a kill target when its current session registry record disagrees."""
+    session_id = str(data.get("ccb_session_id") or data.get("session_id") or "").strip()
+    if not session_id:
+        return True
+    try:
+        registry = load_registry_by_session_id(session_id)
+    except Exception:
+        return False
+    if registry is None:
+        # Older sessions predate the global registry. Their local session record
+        # is still verified by project identity, pane liveness, and exact CWD.
+        return True
+
+    if str(registry.get("ccb_session_id") or "").strip() != session_id:
+        return False
+    if str(registry.get("ccb_project_id") or "").strip() != project_id:
+        return False
+    registry_work_dir = _normalize_path_for_match(str(registry.get("work_dir") or ""))
+    if registry_work_dir != _normalize_path_for_match(str(project_root)):
+        return False
+
+    providers = registry.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    entry = providers.get(provider)
+    if not isinstance(entry, dict):
+        return False
+    return (
+        str(entry.get("pane_id") or "").strip() == pane_id
+        and str(entry.get("pane_title_marker") or "").strip().casefold() == marker.casefold()
+    )
 
 
 def _verified_kill_target(provider: str, session_file: Path, data: dict):
@@ -3834,6 +3859,9 @@ def _verified_kill_target(provider: str, session_file: Path, data: dict):
     if not pane_id or marker.casefold() != expected_marker.casefold():
         return None, "session pane identity is incomplete or invalid"
 
+    if not _registry_matches_kill_target(provider, data, project_root, project_id, pane_id, marker):
+        return None, "session registry does not own the recorded pane"
+
     terminal = str(data.get("terminal") or "").strip().lower()
     if terminal == "wezterm":
         backend = WeztermBackend()
@@ -3852,13 +3880,13 @@ def _verified_kill_target(provider: str, session_file: Path, data: dict):
     except Exception:
         resolved_pane = ""
     if not resolved_pane:
-        if _pane_matches_caller_context(backend, terminal, pane_id, project_root):
+        if _pane_matches_session_record(backend, pane_id, project_root):
             return (backend, pane_id), ""
-        return None, "live pane marker was not found and caller context did not match"
+        return None, "live pane marker was not found and recorded pane could not be verified"
     if resolved_pane != pane_id:
         return None, f"stored pane {pane_id} no longer owns marker {marker}"
-    if not _pane_matches_caller_context(backend, terminal, pane_id, project_root):
-        return None, "live pane belongs to another terminal window or could not be verified"
+    if not _pane_matches_session_record(backend, pane_id, project_root):
+        return None, "recorded pane is not live in this project"
     return (backend, pane_id), ""
 
 

@@ -155,6 +155,9 @@ def _drive_handle_task(
     timeout_s: float = 5.0,
     log_path: Path | None = None,
     session_obj: _FakeSession | None = None,
+    suppress_completion_hook: bool = False,
+    notifications: list[dict] | None = None,
+    caller_work_dir: str = "",
 ):
     # Prepend the user anchor so anchor_seen flips before assistant events.
     scripted = list(events)
@@ -165,13 +168,19 @@ def _drive_handle_task(
     monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd: session)
     monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: _FakeBackend())
     monkeypatch.setattr(codex_adapter, "CodexLogReader", lambda **kw: _ScriptedReader(scripted, log_path=log_path))
-    monkeypatch.setattr(codex_adapter, "notify_completion", lambda **kw: None)
+    monkeypatch.setattr(
+        codex_adapter,
+        "notify_completion",
+        lambda **kw: notifications.append(kw) if notifications is not None else None,
+    )
     monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
 
     req = ProviderRequest(
         client_id="c", work_dir=str(tmp_path), timeout_s=timeout_s, quiet=True,
         message="do the thing", caller="claude", req_id=req_id,
         show_tier=show_tier,
+        suppress_completion_hook=suppress_completion_hook,
+        caller_work_dir=caller_work_dir,
     )
     task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
 
@@ -215,6 +224,42 @@ def test_handle_task_final_answer_carries_done(monkeypatch, tmp_path: Path) -> N
     assert result.done_seen is True
     assert result.reply == "Implemented the fix.\nFiles: a.ts"
     assert "Working on it" not in result.reply
+
+
+def test_handle_task_can_suppress_completion_hook(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    notifications: list[dict] = []
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", f"Acknowledged.\nCCB_DONE: {req_id}", "final_answer")],
+        suppress_completion_hook=True,
+        notifications=notifications,
+    )
+
+    assert result.done_seen is True
+    assert notifications == []
+
+
+def test_handle_task_routes_completion_fallback_to_caller_work_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    req_id = make_req_id()
+    notifications: list[dict] = []
+    caller_work_dir = str(tmp_path / "sender")
+
+    _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", f"Done.\nCCB_DONE: {req_id}", "final_answer")],
+        notifications=notifications,
+        caller_work_dir=caller_work_dir,
+    )
+
+    assert notifications[0]["work_dir"] == caller_work_dir
 
 
 def test_handle_task_legacy_event_only_falls_back(monkeypatch, tmp_path: Path) -> None:

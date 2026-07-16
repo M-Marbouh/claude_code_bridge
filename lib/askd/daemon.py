@@ -191,6 +191,7 @@ class UnifiedAskDaemon:
                 email_from=str(msg.get("email_from") or ""),
                 caller_pane_id=str(msg.get("caller_pane_id") or ""),
                 caller_terminal=str(msg.get("caller_terminal") or ""),
+                caller_work_dir=str(msg.get("caller_work_dir") or ""),
             )
         except Exception as exc:
             return {

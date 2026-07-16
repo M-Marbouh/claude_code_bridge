@@ -34,6 +34,7 @@ class ProviderRequest:
     # Caller pane ID for direct routing back to the originating terminal pane
     caller_pane_id: str = ""
     caller_terminal: str = ""
+    caller_work_dir: str = ""
 
 
 @dataclass

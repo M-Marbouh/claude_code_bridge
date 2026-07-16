@@ -23,6 +23,7 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+PEER_PROVIDERS = ("claude", "codex")
 
 
 def _write_background_status(line: str) -> None:
@@ -106,7 +107,7 @@ def _resolve_target(entries: list[dict[str, Any]], target: str) -> dict[str, Any
     raise ValueError(f"no active CCB project matches target: {raw}")
 
 
-def _acquire_lock(target_hash: str):
+def _acquire_lock(target_hash: str, provider: str):
     try:
         import fcntl
     except Exception as exc:
@@ -114,13 +115,13 @@ def _acquire_lock(target_hash: str):
 
     lock_dir = run_dir()
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"bridge-{target_hash[:8]}.lock"
+    lock_path = lock_dir / f"bridge-{target_hash[:8]}-{provider}.lock"
     lock_handle = lock_path.open("w", encoding="utf-8")
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         lock_handle.close()
-        raise RuntimeError(f"target is busy: {target_hash[:8]}") from exc
+        raise RuntimeError(f"target provider is busy: {target_hash[:8]} {provider}") from exc
     return lock_handle, fcntl
 
 
@@ -134,6 +135,9 @@ def _send_to_daemon(
     intent: str,
     peer_task_id: str,
     reply_to: str,
+    provider: str = "claude",
+    caller: str = "claude",
+    foreground: bool = False,
 ) -> tuple[int, str, dict[str, Any]]:
     state = askd_rpc.read_state(state_file_path("askd.json"))
     if not state:
@@ -145,24 +149,38 @@ def _send_to_daemon(
     except Exception as exc:
         raise RuntimeError("Invalid askd state") from exc
 
-    message_for_target = _append_peer_context(message, sender_work_dir, intent, peer_task_id, reply_to)
+    message_for_target = _append_peer_context(
+        message,
+        sender_work_dir,
+        intent,
+        peer_task_id,
+        reply_to,
+        provider=provider,
+        caller=caller,
+    )
+
+    delivery_only = provider == "claude"
+    suppress_completion_hook = delivery_only or foreground or intent == "notify"
 
     req = {
         "type": "ask.request",
         "v": 1,
         "id": _task_id(),
         "token": token,
-        "provider": "claude",
+        "provider": provider,
         "work_dir": str(target.get("work_dir") or ""),
         "timeout_s": timeout,
         "message": message_for_target,
         "no_wrap": False,
-        "delivery_only": True,
-        "suppress_completion_hook": True,
-        "caller": "claude",
+        "delivery_only": delivery_only,
+        "suppress_completion_hook": suppress_completion_hook,
+        "caller": caller,
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,
+        "caller_work_dir": sender_work_dir,
     }
+    if peer_task_id:
+        req["req_id"] = peer_task_id
 
     with socket.create_connection((host, port), timeout=5.0) as sock:
         sock.settimeout(timeout + 10 if timeout > 0 else None)
@@ -195,6 +213,9 @@ def _append_peer_context(
     intent: str,
     peer_task_id: str = "",
     reply_to: str = "",
+    *,
+    provider: str = "claude",
+    caller: str = "claude",
 ) -> str:
     sender = str(sender_work_dir or "").strip()
     body = (message or "").rstrip()
@@ -204,10 +225,21 @@ def _append_peer_context(
         metadata.append(f"CCB_PEER_TASK_ID: {peer_task_id}")
     if reply_to:
         metadata.append(f"CCB_PEER_REPLY_TO: {reply_to}")
+    if provider == "claude" and caller in PEER_PROVIDERS and caller != "claude":
+        metadata.append(f"CCB_REPLY_PROVIDER: {caller}")
+    if provider == "codex":
+        metadata.append("CCB_REPLY_MODE: automatic-capture")
     if mode == "notify":
         metadata.append("CCB_REPLY_EXPECTED: no")
     elif sender:
-        metadata.extend([f"CCB_REPLY_TARGET: {sender}", "CCB_REPLY_EXPECTED: yes"])
+        if provider == "claude":
+            metadata.append(f"CCB_REPLY_TARGET: {sender}")
+        metadata.append("CCB_REPLY_EXPECTED: yes")
+    if provider == "codex":
+        metadata.append(
+            "Finish this turn normally; CCB captures the response automatically. "
+            "Do not send a reverse peer message."
+        )
     return f"{body}\n\n" + "\n".join(metadata)
 
 
@@ -224,15 +256,18 @@ def _print_bridge_diagnostics(meta: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Send a message to Claude in another CCB project.")
+    parser = argparse.ArgumentParser(description="Send a message to a provider in another CCB project.")
     parser.add_argument("--target", required=True, help="Target project path, hash prefix, or list index.")
+    parser.add_argument("--provider", choices=PEER_PROVIDERS, default="claude", help="Target provider.")
     parser.add_argument("--timeout", type=float, default=3600.0, help="Request timeout in seconds.")
     parser.add_argument("--caller-pane-id", default=os.environ.get("CCB_CALLER_PANE_ID", ""), help=argparse.SUPPRESS)
     parser.add_argument("--caller-terminal", default=os.environ.get("CCB_CALLER_TERMINAL", ""), help=argparse.SUPPRESS)
     parser.add_argument("--sender-work-dir", default=os.environ.get("CCB_WORK_DIR", os.getcwd()), help=argparse.SUPPRESS)
+    parser.add_argument("--caller", default=os.environ.get("CCB_CALLER", "claude"), help=argparse.SUPPRESS)
     parser.add_argument("--intent", choices=("wait", "background", "notify"), default="wait", help=argparse.SUPPRESS)
     parser.add_argument("--peer-task-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--reply-to", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
 
@@ -251,14 +286,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         target = _resolve_target(_load_targets(), args.target)
-        claude = (target.get("providers") or {}).get("claude")
-        peer_capable = target.get("peer_capable")
-        if peer_capable is False or not isinstance(claude, dict) or not claude.get("alive"):
-            print("[ERROR] Target project has no peer-capable Claude pane", file=sys.stderr)
+        provider_status = (target.get("providers") or {}).get(args.provider)
+        provider_alive = isinstance(provider_status, dict) and bool(provider_status.get("alive"))
+        provider_mounted = isinstance(provider_status, dict) and provider_status.get("mounted") is not False
+        legacy_claude_block = args.provider == "claude" and target.get("peer_capable") is False
+        if not provider_alive or not provider_mounted or legacy_claude_block:
+            print(
+                f"[ERROR] Target project has no mounted {args.provider.capitalize()} pane",
+                file=sys.stderr,
+            )
             return 1
 
         target_hash = str(target.get("ccb_project_id") or "")
-        lock_handle, fcntl_mod = _acquire_lock(target_hash)
+        lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
         try:
             exit_code, reply, meta = _send_to_daemon(
                 target,
@@ -270,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.intent or "wait"),
                 str(args.peer_task_id or ""),
                 str(args.reply_to or ""),
+                str(args.provider or "claude"),
+                str(args.caller or "claude"),
+                bool(args.foreground),
             )
         finally:
             try:

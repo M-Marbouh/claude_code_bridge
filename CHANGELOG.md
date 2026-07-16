@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Added provider-aware cross-project peer routing for mounted Codex panes while preserving Claude's reverse-reply protocol.
+- Added `peer_providers` discovery, provider-scoped bridge locks, and sender-project completion fallback routing.
 - Added explicit `--wait`, `--background`, and `--notify` intent for cross-project Claude messages.
 - Made background peer consultations non-blocking and reverse peer results one-way, preventing unrelated plans from being abandoned while waiting.
 - Treat successful pane injection as peer-delivery success even when Claude's session-log anchor is delayed or unavailable.

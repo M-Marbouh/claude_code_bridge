@@ -113,6 +113,7 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
 
     def _capture(
         target: str,
+        provider: str,
         timeout: float,
         message: str,
         foreground: bool,
@@ -121,6 +122,7 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
     ) -> int:
         captured.update(
             target=target,
+            provider=provider,
             timeout=timeout,
             message=message,
             foreground=foreground,
@@ -136,6 +138,7 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
     assert rc == 0
     assert captured == {
         "target": "/tmp/peer",
+        "provider": "claude",
         "timeout": 3600.0,
         "message": "result",
         "foreground": True,
@@ -164,8 +167,9 @@ def test_peer_reply_to_is_forwarded(monkeypatch) -> None:
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge",
-        lambda target, timeout, message, foreground, intent, reply_to: captured.update(
+        lambda target, provider, timeout, message, foreground, intent, reply_to: captured.update(
             target=target,
+            provider=provider,
             intent=intent,
             reply_to=reply_to,
         ) or 0,
@@ -178,3 +182,37 @@ def test_peer_reply_to_is_forwarded(monkeypatch) -> None:
     assert rc == 0
     assert captured["intent"] == "notify"
     assert captured["reply_to"] == "20260711-212112-453-72347"
+
+
+def test_codex_peer_notify_runs_in_background_and_preserves_provider(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda target, provider, timeout, message, foreground, intent, reply_to: captured.update(
+            target=target,
+            provider=provider,
+            foreground=foreground,
+            intent=intent,
+        ) or 0,
+    )
+
+    rc = ask.main(["ask", "codex", "--peer", "/tmp/peer", "--notify", "FYI"])
+
+    assert rc == 0
+    assert captured == {
+        "target": "/tmp/peer",
+        "provider": "codex",
+        "foreground": False,
+        "intent": "notify",
+    }
+
+
+def test_peer_routing_rejects_unsupported_provider(capsys) -> None:
+    ask = _load_ask_module()
+
+    rc = ask.main(["ask", "gemini", "--peer", "/tmp/peer", "hello"])
+
+    assert rc == 1
+    assert "does not support cross-project peer routing: gemini" in capsys.readouterr().err

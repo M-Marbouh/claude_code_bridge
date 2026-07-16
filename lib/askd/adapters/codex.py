@@ -484,6 +484,10 @@ class CodexAdapter(BaseProviderAdapter):
             f"anchor={result.anchor_seen} done={result.done_seen}"
         )
 
+        if req.suppress_completion_hook:
+            _write_log(f"[INFO] completion hook suppressed req_id={task.req_id}")
+            return result
+
         reply_for_hook = reply
         if not reply_for_hook.strip():
             reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
@@ -499,7 +503,7 @@ class CodexAdapter(BaseProviderAdapter):
             email_req_id=req.email_req_id,
             email_msg_id=req.email_msg_id,
             email_from=req.email_from,
-            work_dir=req.work_dir,
+            work_dir=req.caller_work_dir or req.work_dir,
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
         )

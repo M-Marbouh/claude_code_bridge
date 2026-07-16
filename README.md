@@ -83,22 +83,26 @@ ccb-ping codex
 `ccb-list` reports any project with a verified live provider, including Codex-only projects. Multiple
 WezTerm tabs or tmux windows for the same project appear under one project entry as separate `sessions`;
 the existing top-level `index`, `work_dir`, `ccb_project_id`, and `providers` fields remain available in
-JSON output. `peer:yes` / `peer_capable: true` means the project has a mounted Claude pane and can receive
-`ask --peer`. Use `ccb-list --stale` only when historical or inactive records are needed for diagnostics.
+JSON output. `peer_providers` lists mounted Claude and Codex peer targets. The legacy
+`peer_capable: true` field retains its original Claude-specific meaning. Use `ccb-list --stale` only when
+historical or inactive records are needed for diagnostics.
 
 `ccb-mounted` is a human diagnostics command. Delegation does not require a separate mounted skill: `ask` validates the provider session, pane, binding, and daemon before reporting successful async submission.
 
-## Cross-project Claude messaging
+## Cross-project provider messaging
 
 ```bash
 ask --peer ~/dev/another-project --wait "Answer needed before I continue"
 ask --peer b0e3 --background "Review this while I continue locally"
 ask --peer ~/dev/another-project --notify "FYI: deployment completed"
+ask codex --peer ~/dev/codex-only-project --background "Review the parser"
 ```
 
 Targets may be an exact path, a `ccb-list` index, or a project-hash prefix of at least four characters.
 Plain `ask --peer` retains the historical `--wait` behavior. Background consultations do not trigger the end-turn guardrail, and notifications do not include a reply target.
 Peer responses preserve the original task with `--reply-to <task-id>`. A notification is terminal and cannot end with a direct question; use `--background` when a follow-up answer is expected.
+Claude targets retain asynchronous delivery with a reverse peer result. Codex targets use normal CCB
+completion capture and route the result directly back to the originating pane.
 
 ## Session safety
 

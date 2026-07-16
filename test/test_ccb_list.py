@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
@@ -11,6 +13,16 @@ from project_id import compute_ccb_project_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_ccb_list_module():
+    path = ROOT / "bin" / "ccb-list"
+    loader = importlib.machinery.SourceFileLoader("ccb_list_test", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 def _write_fake_tmux(bin_dir: Path, panes: list[dict[str, str]]) -> None:
@@ -196,6 +208,70 @@ def test_ccb_list_includes_codex_only_project_by_default(tmp_path: Path) -> None
     assert len(entries) == 1
     assert entries[0]["providers"]["codex"]["alive"] is True
     assert "claude" not in entries[0]["providers"]
+    assert entries[0]["peer_capable"] is False
+    assert entries[0]["peer_providers"] == []
+
+
+def test_ccb_list_reports_mounted_peer_providers(monkeypatch, tmp_path: Path) -> None:
+    ccb_list = _load_ccb_list_module()
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    project_id = compute_ccb_project_id(work_dir)
+    monkeypatch.setattr(
+        ccb_list,
+        "_registry_sessions",
+        lambda _include_stale: [
+            {
+                "session_id": "live",
+                "work_dir": str(work_dir),
+                "ccb_project_id": project_id,
+                "terminal": "tmux",
+                "window_id": "window:$1:@1",
+                "updated_at": int(time.time()),
+                "alive": True,
+                "providers": {
+                    "claude": {"alive": True, "session_bound": True},
+                    "codex": {"alive": True, "session_bound": True},
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(ccb_list, "is_project_askd_online", lambda *_args: True)
+
+    entries = ccb_list._session_entries(include_stale=False)
+
+    assert entries[0]["peer_providers"] == ["claude", "codex"]
+    assert entries[0]["peer_capable"] is True
+
+
+def test_ccb_list_marks_mounted_codex_only_project_peer_capable_by_provider(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ccb_list = _load_ccb_list_module()
+    work_dir = tmp_path / "codex-only"
+    work_dir.mkdir()
+    project_id = compute_ccb_project_id(work_dir)
+    monkeypatch.setattr(
+        ccb_list,
+        "_registry_sessions",
+        lambda _include_stale: [
+            {
+                "session_id": "live",
+                "work_dir": str(work_dir),
+                "ccb_project_id": project_id,
+                "terminal": "tmux",
+                "window_id": "window:$1:@1",
+                "updated_at": int(time.time()),
+                "alive": True,
+                "providers": {"codex": {"alive": True, "session_bound": True}},
+            }
+        ],
+    )
+    monkeypatch.setattr(ccb_list, "is_project_askd_online", lambda *_args: True)
+
+    entries = ccb_list._session_entries(include_stale=False)
+
+    assert entries[0]["peer_providers"] == ["codex"]
     assert entries[0]["peer_capable"] is False
 
 

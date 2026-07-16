@@ -82,6 +82,32 @@ def test_provider_peer_form_honors_background_intent(tmp_path: Path) -> None:
     assert "[CCB_ASYNC_SUBMITTED" not in proc.stdout
 
 
+def test_codex_peer_wait_uses_provider_specific_markers(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["CCB_CALLER"] = "claude"
+    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+    env["CCB_CALLER_PANE_ID"] = "%cnt"
+    env["CCB_CALLER_TERMINAL"] = "tmux"
+
+    proc = _run_ask(["codex", "--peer", "abcd", "--wait", "hello"], cwd=tmp_path, env=env)
+
+    assert proc.returncode == 0
+    assert "[CCB_ASYNC_SUBMITTED provider=peer-codex intent=wait]" in proc.stdout
+    assert "Reply ONLY 'Peer Codex processing...'" in proc.stdout
+
+
+def test_codex_peer_notify_is_non_blocking_without_wait_guardrail(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["CCB_CALLER"] = "claude"
+    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+
+    proc = _run_ask(["codex", "--peer", "abcd", "--notify", "FYI"], cwd=tmp_path, env=env)
+
+    assert proc.returncode == 0
+    assert "[CCB_NOTIFY_SUBMITTED provider=peer-codex intent=notify]" in proc.stdout
+    assert "MANDATORY: END YOUR TURN NOW" not in proc.stdout
+
+
 def test_peer_mode_foreground_blocks_without_async_markers(tmp_path: Path) -> None:
     env = dict(os.environ)
     env["CCB_CALLER"] = "claude"

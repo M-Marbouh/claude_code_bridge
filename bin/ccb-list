@@ -24,6 +24,7 @@ from session_utils import find_project_session_file
 setup_windows_encoding()
 
 SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode")
+PEER_PROVIDERS = ("claude", "codex")
 SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
 
 
@@ -466,6 +467,7 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
                 "providers": {},
                 "sessions": [],
                 "peer_capable": False,
+                "peer_providers": [],
             },
         )
         project["sessions"].append(session)
@@ -497,7 +499,13 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
                     aggregated[provider] = dict(provider_status)
         project["sessions"] = sessions
         project["providers"] = aggregated
-        project["peer_capable"] = bool((aggregated.get("claude") or {}).get("mounted"))
+        project["peer_providers"] = [
+            provider
+            for provider in PEER_PROVIDERS
+            if (aggregated.get(provider) or {}).get("mounted")
+        ]
+        # Preserve the legacy field's Claude-specific meaning for older peer clients.
+        project["peer_capable"] = "claude" in project["peer_providers"]
         project["session_count"] = sum(1 for session in sessions if session.get("alive"))
         if include_stale or any(status.get("alive") for status in aggregated.values()):
             entries.append(project)
@@ -516,7 +524,7 @@ def _print_human(entries: list[dict[str, Any]]) -> None:
 
     for entry in entries:
         project_hash = str(entry.get("ccb_project_id") or "")[:8]
-        peer = "yes" if entry.get("peer_capable") else "no"
+        peer = ",".join(entry.get("peer_providers") or []) or "no"
         print(f"  [{entry['index']}] {entry['work_dir']}  ({project_hash}) peer:{peer}")
         for position, session in enumerate(entry.get("sessions") or [], start=1):
             session_id = str(session.get("session_id") or "")

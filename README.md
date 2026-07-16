@@ -101,8 +101,8 @@ ask codex --peer ~/dev/codex-only-project --background "Review the parser"
 Targets may be an exact path, a `ccb-list` index, or a project-hash prefix of at least four characters.
 Plain `ask --peer` retains the historical `--wait` behavior. Background consultations do not trigger the end-turn guardrail, and notifications do not include a reply target.
 Peer responses preserve the original task with `--reply-to <task-id>`. A notification is terminal and cannot end with a direct question; use `--background` when a follow-up answer is expected.
-Claude targets retain asynchronous delivery with a reverse peer result. Codex targets use normal CCB
-completion capture and route the result directly back to the originating pane.
+Claude and Codex targets both use delivery-only transport. The receiving provider sends any result with
+an explicit reverse `ask --peer` message; CCB never captures a later local pane response as the peer reply.
 
 ## Session safety
 

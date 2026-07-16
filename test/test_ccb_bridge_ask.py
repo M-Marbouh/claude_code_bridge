@@ -73,7 +73,7 @@ def test_bridge_appends_wait_context() -> None:
 
     assert bridge._append_peer_context("hello", "/tmp/sender", "wait", "task-1", "parent-1") == (
         "hello\n\nCCB_PEER_INTENT: wait\nCCB_PEER_TASK_ID: task-1\nCCB_PEER_REPLY_TO: parent-1\n"
-        "CCB_REPLY_TARGET: /tmp/sender\nCCB_REPLY_EXPECTED: yes"
+        "CCB_REPLY_TARGET: /tmp/sender\nCCB_REPLY_PROVIDER: claude\nCCB_REPLY_EXPECTED: yes"
     )
 
 
@@ -198,11 +198,11 @@ def test_bridge_request_is_delivery_only(monkeypatch) -> None:
     assert sent["req_id"] == "task-2"
     assert sent["message"] == (
         "hello\n\nCCB_PEER_INTENT: background\nCCB_PEER_TASK_ID: task-2\nCCB_PEER_REPLY_TO: parent-2\n"
-        "CCB_REPLY_TARGET: /tmp/sender\nCCB_REPLY_EXPECTED: yes"
+        "CCB_REPLY_TARGET: /tmp/sender\nCCB_REPLY_PROVIDER: claude\nCCB_REPLY_EXPECTED: yes"
     )
 
 
-def test_codex_bridge_request_captures_reply_automatically(monkeypatch) -> None:
+def test_codex_bridge_request_is_delivery_only_with_explicit_reply_context(monkeypatch) -> None:
     bridge = _load_bridge_module()
     sent: dict = {}
 
@@ -220,7 +220,7 @@ def test_codex_bridge_request_captures_reply_automatically(monkeypatch) -> None:
             sent.update(json.loads(payload.decode("utf-8")))
 
         def recv(self, _size: int) -> bytes:
-            return b'{"exit_code":0,"reply":"Reviewed.","req_id":"task-3"}\n'
+            return b'{"exit_code":0,"reply":"Peer message delivered.","req_id":"task-3"}\n'
 
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
     monkeypatch.setattr(bridge.socket, "create_connection", lambda *_args, **_kwargs: _Socket())
@@ -241,16 +241,16 @@ def test_codex_bridge_request_captures_reply_automatically(monkeypatch) -> None:
     )
 
     assert exit_code == 0
-    assert reply == "Reviewed."
+    assert reply == "Peer message delivered."
     assert sent["provider"] == "codex"
     assert sent["caller"] == "claude"
     assert sent["caller_work_dir"] == "/tmp/sender"
     assert sent["req_id"] == "task-3"
-    assert sent["delivery_only"] is False
-    assert sent["suppress_completion_hook"] is False
-    assert "CCB_REPLY_TARGET" not in sent["message"]
-    assert "CCB_REPLY_MODE: automatic-capture" in sent["message"]
-    assert "Do not send a reverse peer message." in sent["message"]
+    assert sent["delivery_only"] is True
+    assert sent["suppress_completion_hook"] is True
+    assert "CCB_REPLY_TARGET: /tmp/sender" in sent["message"]
+    assert "CCB_REPLY_PROVIDER: claude" in sent["message"]
+    assert "CCB_REPLY_MODE: automatic-capture" not in sent["message"]
 
 
 def test_codex_notify_suppresses_completion_hook(monkeypatch) -> None:
@@ -291,9 +291,11 @@ def test_codex_notify_suppresses_completion_hook(monkeypatch) -> None:
         False,
     )
 
-    assert sent["delivery_only"] is False
+    assert sent["delivery_only"] is True
     assert sent["suppress_completion_hook"] is True
     assert "CCB_REPLY_EXPECTED: no" in sent["message"]
+    assert "CCB_REPLY_TARGET" not in sent["message"]
+    assert "CCB_REPLY_PROVIDER" not in sent["message"]
 
 
 def test_claude_peer_from_codex_names_reverse_reply_provider() -> None:
@@ -309,3 +311,20 @@ def test_claude_peer_from_codex_names_reverse_reply_provider() -> None:
     )
 
     assert "CCB_REPLY_PROVIDER: codex" in message
+
+
+def test_codex_peer_from_claude_names_reverse_reply_provider() -> None:
+    bridge = _load_bridge_module()
+
+    message = bridge._append_peer_context(
+        "hello",
+        "/tmp/sender",
+        "wait",
+        "task-6",
+        provider="codex",
+        caller="claude",
+    )
+
+    assert "CCB_REPLY_TARGET: /tmp/sender" in message
+    assert "CCB_REPLY_PROVIDER: claude" in message
+    assert "CCB_REPLY_MODE: automatic-capture" not in message

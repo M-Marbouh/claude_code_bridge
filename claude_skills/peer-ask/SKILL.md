@@ -20,10 +20,7 @@ Trigger this skill when the user references another project's Claude or Codex:
 
 ### Step 0 — Reply to an inbound peer message
 
-If the message contains `CCB_REPLY_MODE: automatic-capture`, complete the request and reply normally in
-the current turn. CCB captures that reply automatically; do not run a reverse `ask --peer` command.
-
-Otherwise, if the message you are responding to contains a line like:
+If the message you are responding to contains a line like:
 ```
 CCB_REPLY_TARGET: /path/to/sender/project
 ```
@@ -147,5 +144,5 @@ User: "Ask Claude in project 3 about the current task"
 - Reply-bearing inbound messages include `CCB_REPLY_TARGET: <sender_work_dir>`. Use it as the direct reply path and choose `--notify` or `--background` according to whether your response requests a follow-up.
 - Preserve `CCB_PEER_TASK_ID` as `--reply-to` so the response is correlated with the original consultation.
 - Do not narrate transport internals (`anchor_seen`, `fallback_scan`, confirmation levels) unless delivery actually fails. On exit code 0, continue normally.
-- Claude peer delivery is asynchronous and uses a reverse peer message. Codex replies are captured and
-  routed automatically; Codex must not send a reverse peer message.
+- Claude and Codex peer delivery is asynchronous and delivery-only. Both providers send replies with an
+  explicit reverse `ask --peer` message; later local output is never forwarded automatically.

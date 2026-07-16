@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import re
 
-from ccb_protocol import DONE_PREFIX, REQ_ID_PREFIX, is_done_text, make_req_id, strip_done_text, wrap_codex_prompt
-from ccb_protocol import strip_trailing_markers
+from ccb_protocol import (
+    DONE_PREFIX,
+    REQ_ID_PREFIX,
+    is_done_text,
+    make_req_id,
+    strip_done_text,
+    strip_trailing_markers,
+    wrap_codex_delivery_prompt,
+    wrap_codex_prompt,
+)
 from laskd_protocol import wrap_claude_delivery_prompt
 
 
@@ -26,6 +34,16 @@ def test_wrap_codex_prompt_structure() -> None:
     assert "- Reply normally." in prompt
     assert f"{DONE_PREFIX} {req_id}" in prompt
     assert prompt.endswith(f"{DONE_PREFIX} {req_id}\n")
+
+
+def test_codex_delivery_prompt_requires_explicit_reverse_reply() -> None:
+    prompt = wrap_codex_delivery_prompt("hello", "req-1")
+
+    assert f"{REQ_ID_PREFIX} req-1" in prompt
+    assert "send it explicitly with ask --peer" in prompt
+    assert "Preserve CCB_PEER_TASK_ID as --reply-to" in prompt
+    assert "CCB is not capturing this turn automatically" in prompt
+    assert DONE_PREFIX not in prompt
 
 
 def test_is_done_text_recognizes_last_nonempty_line() -> None:

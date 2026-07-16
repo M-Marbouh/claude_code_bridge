@@ -15,7 +15,7 @@ from pathlib import Path
 
 from askd.adapters import codex as codex_adapter
 from askd.adapters.base import ProviderRequest, QueuedTask
-from ccb_protocol import REQ_ID_PREFIX, make_req_id
+from ccb_protocol import DONE_PREFIX, REQ_ID_PREFIX, make_req_id
 from codex_comm import CodexLogReader, CodexTurnContext, read_latest_turn_context
 
 
@@ -241,6 +241,53 @@ def test_handle_task_can_suppress_completion_hook(monkeypatch, tmp_path: Path) -
 
     assert result.done_seen is True
     assert notifications == []
+
+
+def test_handle_task_delivery_only_stops_at_anchor_without_capturing_reply(
+    monkeypatch, tmp_path: Path
+) -> None:
+    req_id = make_req_id()
+    session = _FakeSession(tmp_path)
+    backend = _FakeBackend()
+    reader = _ScriptedReader(
+        [
+            ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+            ("assistant", "This later local output must not be captured.", "final_answer"),
+        ]
+    )
+    notifications: list[dict] = []
+
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd: session)
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: backend)
+    monkeypatch.setattr(codex_adapter, "CodexLogReader", lambda **kw: reader)
+    monkeypatch.setattr(codex_adapter, "notify_completion", lambda **kw: notifications.append(kw))
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c",
+        work_dir=str(tmp_path),
+        timeout_s=5.0,
+        quiet=True,
+        message="peer request\n\nCCB_REPLY_TARGET: /tmp/sender",
+        caller="claude",
+        req_id=req_id,
+        delivery_only=True,
+        suppress_completion_hook=False,
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert result.exit_code == 0
+    assert result.reply == "Peer message delivered."
+    assert result.anchor_seen is True
+    assert result.done_seen is False
+    assert result.extra == {"confirmation": "observed"}
+    assert notifications == []
+    assert reader._events == [("assistant", "This later local output must not be captured.", "final_answer")]
+    assert f"{REQ_ID_PREFIX} {req_id}" in backend.sent[0]
+    assert DONE_PREFIX not in backend.sent[0]
+    assert "send it explicitly with ask --peer" in backend.sent[0]
 
 
 def test_handle_task_routes_completion_fallback_to_caller_work_dir(

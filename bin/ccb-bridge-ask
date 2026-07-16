@@ -159,8 +159,8 @@ def _send_to_daemon(
         caller=caller,
     )
 
-    delivery_only = provider == "claude"
-    suppress_completion_hook = delivery_only or foreground or intent == "notify"
+    delivery_only = provider in PEER_PROVIDERS
+    suppress_completion_hook = True
 
     req = {
         "type": "ask.request",
@@ -225,21 +225,14 @@ def _append_peer_context(
         metadata.append(f"CCB_PEER_TASK_ID: {peer_task_id}")
     if reply_to:
         metadata.append(f"CCB_PEER_REPLY_TO: {reply_to}")
-    if provider == "claude" and caller in PEER_PROVIDERS and caller != "claude":
-        metadata.append(f"CCB_REPLY_PROVIDER: {caller}")
-    if provider == "codex":
-        metadata.append("CCB_REPLY_MODE: automatic-capture")
     if mode == "notify":
         metadata.append("CCB_REPLY_EXPECTED: no")
-    elif sender:
-        if provider == "claude":
+    else:
+        if sender:
             metadata.append(f"CCB_REPLY_TARGET: {sender}")
+        if caller in PEER_PROVIDERS:
+            metadata.append(f"CCB_REPLY_PROVIDER: {caller}")
         metadata.append("CCB_REPLY_EXPECTED: yes")
-    if provider == "codex":
-        metadata.append(
-            "Finish this turn normally; CCB captures the response automatically. "
-            "Do not send a reverse peer message."
-        )
     return f"{body}\n\n" + "\n".join(metadata)
 
 

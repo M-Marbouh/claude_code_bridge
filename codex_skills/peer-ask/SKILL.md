@@ -19,16 +19,23 @@ Do not use this skill for a provider in the current project; use `ask` instead.
 
 ## Inbound Peer Requests
 
-When a message contains `CCB_REPLY_MODE: automatic-capture`, complete the requested work and reply
-normally in the current turn. CCB captures and routes the reply automatically. Do not invoke a reverse
-`ask --peer` command.
-
 Read the intent metadata:
-- `notify` / `CCB_REPLY_EXPECTED: no`: consume the information; do not ask for follow-up.
-- `wait` / `CCB_REPLY_EXPECTED: yes`: the sender is blocked; return the completed result promptly.
-- `background` / `CCB_REPLY_EXPECTED: yes`: complete the work normally; the sender continued other work.
+- `notify` / `CCB_REPLY_EXPECTED: no`: consume the information and do not send a reverse peer message.
+- `wait` / `CCB_REPLY_EXPECTED: yes`: the sender is blocked; complete the work and send the result promptly.
+- `background` / `CCB_REPLY_EXPECTED: yes`: complete the work and send the result; the sender continued other work.
 
-Return substantive results, not transport acknowledgements.
+For a reply-bearing request, use `CCB_REPLY_TARGET` directly and use `CCB_REPLY_PROVIDER` when present
+(otherwise default to `claude`). Complete the work first, then send a substantive explicit reply:
+
+```bash
+CCB_CALLER=codex ask "<reply-provider>" --peer "<CCB_REPLY_TARGET>" --notify --reply-to "<CCB_PEER_TASK_ID>" <<'EOF'
+<terminal result>
+EOF
+```
+
+Use `--background` instead of `--notify` when the response asks a follow-up question or requests
+confirmation. If `CCB_PEER_TASK_ID` is missing, omit `--reply-to` rather than inventing an ID. Do not
+produce a local `CCB_DONE`; peer delivery is complete once the message reaches this pane.
 
 ## Send a Peer Request
 
@@ -73,6 +80,6 @@ Use the exact `work_dir` returned by `ccb-list`.
 ## Notes
 
 - Supported peer targets are Claude and Codex. Gemini and OpenCode remain same-project only.
-- Claude uses asynchronous delivery and a reverse peer result.
-- Codex uses normal CCB completion capture and routes its response directly to the originating pane.
+- Claude and Codex peer messages are delivery-only; replies are explicit reverse peer messages.
+- A local Codex answer is never captured or forwarded merely because it followed an inbound peer message.
 - Do not narrate transport diagnostics unless delivery fails.

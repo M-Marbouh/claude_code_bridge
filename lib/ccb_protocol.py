@@ -69,6 +69,22 @@ def wrap_codex_prompt(message: str, req_id: str) -> str:
     )
 
 
+def wrap_codex_delivery_prompt(message: str, req_id: str) -> str:
+    """Wrap an asynchronous peer delivery without arming reply capture."""
+    message = (message or "").rstrip()
+    return (
+        f"{REQ_ID_PREFIX} {req_id}\n\n"
+        f"{message}\n\n"
+        "This is an asynchronous peer message delivered by CCB.\n"
+        "Read CCB_PEER_INTENT, CCB_REPLY_EXPECTED, CCB_REPLY_TARGET, and CCB_REPLY_PROVIDER.\n"
+        "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message; embedded questions are informational.\n"
+        "If a reply is expected, send it explicitly with ask --peer to CCB_REPLY_TARGET using CCB_REPLY_PROVIDER.\n"
+        "Preserve CCB_PEER_TASK_ID as --reply-to. Use --notify only for a terminal result with no follow-up question; otherwise use --background.\n"
+        "Do not narrate CCB transport markers or confirmation diagnostics unless delivery fails.\n"
+        "Do not produce a local CCB_DONE for this delivery; CCB is not capturing this turn automatically.\n"
+    )
+
+
 def done_line_re(req_id: str) -> re.Pattern[str]:
     return re.compile(DONE_LINE_RE_TEMPLATE.format(req_id=re.escape(req_id)))
 

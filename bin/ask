@@ -49,7 +49,7 @@ setup_windows_encoding()
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import ProviderRuntimeStatus, provider_status_for_target
 from session_utils import find_project_session_file
-from task_receipts import new_receipt, receipt_path, write_receipt
+from task_receipts import new_peer_receipt, new_receipt, receipt_path, write_receipt
 
 
 # Provider to daemon command mapping
@@ -125,7 +125,7 @@ def _cleanup_task_logs(log_dir: Path) -> None:
         logs.sort(key=lambda p: p.name, reverse=True)
     for path in logs[max_files:]:
         prefix = path.name[:-4]  # strip .log
-        for ext in (".log", ".sh", ".ps1", ".msg", ".status", ".json"):
+        for ext in (".log", ".sh", ".ps1", ".msg", ".status", ".json", ".reply"):
             try:
                 (log_dir / f"{prefix}{ext}").unlink(missing_ok=True)
             except Exception:
@@ -650,13 +650,29 @@ def _run_peer_bridge_background(
     log_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.log"
     status_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.status"
     msg_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.msg"
+    reply_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.reply"
+    receipt_file = receipt_path(f"peer-{peer_provider}", task_id, root=log_dir)
 
     try:
         log_file.touch(exist_ok=True)
         status_file.touch(exist_ok=True)
         msg_file.write_text(message, encoding="utf-8")
+        reply_file.touch(exist_ok=True)
+        write_receipt(
+            receipt_file,
+            new_peer_receipt(
+                task_id=task_id,
+                peer_provider=peer_provider,
+                caller=caller,
+                intent=intent,
+                work_dir=Path.cwd(),
+                status_file=status_file,
+                log_file=log_file,
+                reply_file=reply_file,
+            ),
+        )
     except Exception as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
+        print(f"[ERROR] Failed to create peer task receipt: {e}", file=sys.stderr)
         return EXIT_ERROR
     _cleanup_task_logs(log_dir)
 

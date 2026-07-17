@@ -20,7 +20,7 @@ from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text
 from codex_comm import CodexLogReader
 from project_id import compute_ccb_project_id
-from task_receipts import caller_pane, caller_session_id, find_receipt, iter_receipts
+from task_receipts import caller_pane, caller_session_id, find_receipt, iter_receipts, read_peer_reply
 
 
 PROVIDER_PENDS = {
@@ -226,6 +226,10 @@ def _show_receipt(receipt: dict) -> int:
     task_id = str(receipt.get("task_id") or "")
     status_path = Path(str(receipt.get("status_file") or ""))
     log_path = Path(str(receipt.get("log_file") or ""))
+    peer_reply = read_peer_reply(receipt)
+    if peer_reply:
+        print(peer_reply)
+        return EXIT_OK
     finished, exit_code = _status_finished(status_path)
     if not finished or exit_code != 0:
         recovered = _recover_provider_reply(receipt)
@@ -242,6 +246,16 @@ def _show_receipt(receipt: dict) -> int:
             )
             return EXIT_ERROR
         print(f"[PENDING] task={task_id} provider={receipt.get('provider', '')}", file=sys.stderr)
+        return EXIT_NO_REPLY
+    if (
+        exit_code == 0
+        and str(receipt.get("provider") or "").startswith("peer-")
+        and bool(receipt.get("reply_expected"))
+    ):
+        print(
+            f"[PENDING] task={task_id} provider={receipt.get('provider', '')} awaiting peer reply",
+            file=sys.stderr,
+        )
         return EXIT_NO_REPLY
     try:
         output = _clean_task_log(log_path.read_text(encoding="utf-8-sig", errors="replace"))

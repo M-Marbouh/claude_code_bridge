@@ -328,3 +328,209 @@ def test_codex_peer_from_claude_names_reverse_reply_provider() -> None:
     assert "CCB_REPLY_TARGET: /tmp/sender" in message
     assert "CCB_REPLY_PROVIDER: claude" in message
     assert "CCB_REPLY_MODE: automatic-capture" not in message
+
+
+class _DirectBackend:
+    def __init__(self, pane_id: str = "%7") -> None:
+        self.pane_id = pane_id
+        self.sent: list[tuple[str, str]] = []
+
+    def is_alive(self, pane_id: str) -> bool:
+        return pane_id == self.pane_id
+
+    def pane_matches_cwd_strict(self, pane_id: str, _work_dir: str) -> bool:
+        return pane_id == self.pane_id
+
+    def find_pane_by_title_marker(self, _marker: str, _work_dir: str) -> str:
+        return self.pane_id
+
+    def send_text(self, pane_id: str, prompt: str) -> None:
+        self.sent.append((pane_id, prompt))
+
+
+def test_direct_reply_fallback_wraps_claude_and_codex_delivery_prompts() -> None:
+    bridge = _load_bridge_module()
+
+    for provider in ("claude", "codex"):
+        backend = _DirectBackend()
+        target = {
+            "work_dir": "/tmp/sender",
+            "ccb_project_id": "abcd1234",
+            "providers": {provider: {"pane_id": "%7"}},
+        }
+
+        exit_code, reply, meta = bridge._send_to_direct_reply_target(
+            target,
+            backend,
+            "terminal result",
+            "/tmp/responder",
+            "notify",
+            "",
+            "task-1",
+            provider,
+            "codex" if provider == "claude" else "claude",
+        )
+
+        assert exit_code == 0
+        assert reply == "Peer reply delivered directly."
+        assert meta["direct_reply_fallback"] is True
+        assert backend.sent[0][0] == "%7"
+        assert "terminal result" in backend.sent[0][1]
+        assert "CCB_REPLY_EXPECTED: no" in backend.sent[0][1]
+        if provider == "codex":
+            assert "CCB is not capturing this turn automatically" in backend.sent[0][1]
+
+
+def test_reverse_reply_uses_validated_receipt_when_project_is_not_live(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    bridge = _load_bridge_module()
+    reply_file = tmp_path / "ask-peer-codex-task-1.reply"
+    status_file = tmp_path / "ask-peer-codex-task-1.status"
+    reply_file.touch()
+    status_file.touch()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude",
+        "caller_pane_id": "%7",
+        "caller_terminal": "tmux",
+        "caller_pane_title_marker": "ccb-claude-sender",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "reply_expected": True,
+        "peer_reply_file": str(reply_file),
+        "status_file": str(status_file),
+    }
+    backend = _DirectBackend()
+
+    monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [])
+    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
+    monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
+
+    rc = bridge.main(
+        [
+            "--target",
+            str(tmp_path),
+            "--provider",
+            "claude",
+            "--caller",
+            "codex",
+            "--sender-work-dir",
+            "/tmp/responder",
+            "--intent",
+            "notify",
+            "--reply-to",
+            "task-1",
+            "terminal result",
+        ]
+    )
+
+    assert rc == 0
+    assert reply_file.read_text(encoding="utf-8").strip() == "terminal result"
+    assert "delivery=direct exit_code=0" in status_file.read_text(encoding="utf-8")
+    assert backend.sent and backend.sent[0][0] == "%7"
+    assert "Peer reply delivered directly." in capsys.readouterr().out
+
+
+def test_reverse_reply_prefers_live_project_and_saves_correlated_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    bridge = _load_bridge_module()
+    reply_file = tmp_path / "ask-peer-codex-task-live.reply"
+    status_file = tmp_path / "ask-peer-codex-task-live.status"
+    reply_file.touch()
+    status_file.touch()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "reply_expected": True,
+        "peer_reply_file": str(reply_file),
+        "status_file": str(status_file),
+    }
+    target = {
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "providers": {"claude": {"alive": True, "mounted": True}},
+    }
+    sent: dict = {}
+
+    monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
+    monkeypatch.setattr(
+        bridge,
+        "_send_to_daemon",
+        lambda *args: sent.update(target=args[0], message=args[1]) or (0, "Peer message delivered.", {}),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "get_backend_for_session",
+        lambda _session: (_ for _ in ()).throw(AssertionError("direct fallback must not run")),
+    )
+
+    rc = bridge.main(
+        [
+            "--target",
+            str(tmp_path),
+            "--provider",
+            "claude",
+            "--reply-to",
+            "task-live",
+            "live result",
+        ]
+    )
+
+    assert rc == 0
+    assert sent == {"target": target, "message": "live result"}
+    assert reply_file.read_text(encoding="utf-8").strip() == "live result"
+    assert "delivery=live exit_code=0" in status_file.read_text(encoding="utf-8")
+
+
+def test_reverse_reply_rejects_reused_pane_but_preserves_result(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    bridge = _load_bridge_module()
+    reply_file = tmp_path / "ask-peer-codex-task-2.reply"
+    status_file = tmp_path / "ask-peer-codex-task-2.status"
+    reply_file.touch()
+    status_file.touch()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude",
+        "caller_pane_id": "%7",
+        "caller_terminal": "tmux",
+        "caller_pane_title_marker": "ccb-claude-sender",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "reply_expected": True,
+        "peer_reply_file": str(reply_file),
+        "status_file": str(status_file),
+    }
+    backend = _DirectBackend()
+    backend.pane_matches_cwd_strict = lambda _pane, _work_dir: False
+
+    monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [])
+    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
+
+    rc = bridge.main(
+        [
+            "--target",
+            str(tmp_path),
+            "--provider",
+            "claude",
+            "--reply-to",
+            "task-2",
+            "recoverable result",
+        ]
+    )
+
+    assert rc == 1
+    assert backend.sent == []
+    assert reply_file.read_text(encoding="utf-8").strip() == "recoverable result"
+    captured = capsys.readouterr()
+    assert "no longer matches the receipt project" in captured.err
+    assert f"pend task-2" in captured.err

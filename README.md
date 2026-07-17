@@ -104,6 +104,12 @@ Peer responses preserve the original task with `--reply-to <task-id>`. A notific
 Claude and Codex targets both use delivery-only transport. The receiving provider sends any result with
 an explicit reverse `ask --peer` message; CCB never captures a later local pane response as the peer reply.
 
+Reply-bearing peer requests also store a task-correlated return receipt. Reverse replies first use normal
+live-project discovery. If the sender has dropped out of `ccb-list`, CCB can fall back to the original pane
+only after validating the expected provider, project path, live pane, exact pane CWD, and stored CCB pane
+marker. CCB never routes through an unvalidated stale session. If the pane is genuinely unavailable, the
+reply remains recoverable with `pend <original-task-id>` and the reverse command reports that delivery failed.
+
 ## Session safety
 
 CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.

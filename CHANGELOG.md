@@ -11,6 +11,8 @@
 - Made background peer consultations non-blocking and reverse peer results one-way, preventing unrelated plans from being abandoned while waiting.
 - Treat successful pane injection as peer-delivery success even when Claude's session-log anchor is delayed or unavailable.
 - Added `--reply-to` task correlation and rejected notifications that end with reply-requiring questions.
+- Made explicit peer replies retain a validated caller-pane return route when the sender drops out of live project discovery.
+- Preserved correlated peer results for `pend <task-id>` recovery when the original pane is no longer deliverable.
 
 ## v0.12.0 (2026-07-11)
 

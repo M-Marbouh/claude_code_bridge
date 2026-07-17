@@ -18,7 +18,11 @@ sys.path.insert(0, str(lib_dir))
 
 import askd_rpc
 from askd_runtime import run_dir, state_file_path
+from ccb_protocol import wrap_codex_delivery_prompt
 from compat import read_stdin_text, setup_windows_encoding
+from laskd_protocol import wrap_claude_delivery_prompt
+from task_receipts import find_receipt, write_peer_reply
+from terminal import get_backend_for_session
 
 setup_windows_encoding()
 
@@ -105,6 +109,122 @@ def _resolve_target(entries: list[dict[str, Any]], target: str) -> dict[str, Any
             raise ValueError(f"target hash prefix is ambiguous: {raw}")
 
     raise ValueError(f"no active CCB project matches target: {raw}")
+
+
+def _correlated_reply_receipt(reply_to: str, target: str, provider: str) -> dict[str, Any] | None:
+    if not reply_to:
+        return None
+    found = find_receipt(reply_to)
+    if not found:
+        return None
+    receipt = found[1]
+    if not str(receipt.get("provider") or "").startswith("peer-"):
+        return None
+    if not bool(receipt.get("reply_expected")):
+        raise ValueError(f"peer task does not expect a reply: {reply_to}")
+
+    expected_provider = str(receipt.get("caller") or "").strip().lower()
+    if expected_provider != provider:
+        raise ValueError(
+            f"reply provider mismatch for task {reply_to}: expected {expected_provider or 'unknown'}"
+        )
+
+    work_dir = str(receipt.get("work_dir") or "").strip()
+    project_id = str(receipt.get("ccb_project_id") or "").strip().lower()
+    raw_target = (target or "").strip()
+    project_match = (
+        len(raw_target) >= 4
+        and all(ch in "0123456789abcdefABCDEF" for ch in raw_target)
+        and project_id.startswith(raw_target.lower())
+    )
+    if not work_dir or not (_same_path(work_dir, raw_target) or project_match):
+        raise ValueError(f"reply target mismatch for task {reply_to}")
+    return receipt
+
+
+def _validated_direct_reply_target(
+    receipt: dict[str, Any], provider: str
+) -> tuple[dict[str, Any], Any]:
+    pane_id = str(receipt.get("caller_pane_id") or "").strip()
+    terminal = str(receipt.get("caller_terminal") or "").strip().lower()
+    work_dir = str(receipt.get("work_dir") or "").strip()
+    project_id = str(receipt.get("ccb_project_id") or "").strip()
+    if not pane_id or terminal not in {"tmux", "wezterm"} or not work_dir or not project_id:
+        raise RuntimeError("peer reply receipt has no complete direct return address")
+
+    backend = get_backend_for_session({"terminal": terminal})
+    if backend is None:
+        raise RuntimeError(f"terminal backend is unavailable: {terminal}")
+    try:
+        pane_alive = bool(backend.is_alive(pane_id))
+    except Exception:
+        pane_alive = False
+    if not pane_alive:
+        raise RuntimeError(f"original {provider.capitalize()} pane is no longer alive")
+
+    cwd_check = getattr(backend, "pane_matches_cwd_strict", None)
+    if not callable(cwd_check) or not bool(cwd_check(pane_id, work_dir)):
+        raise RuntimeError("original peer pane no longer matches the receipt project")
+
+    marker = str(receipt.get("caller_pane_title_marker") or "").strip()
+    if not marker:
+        raise RuntimeError("peer reply receipt has no CCB pane marker")
+    resolver = getattr(backend, "find_pane_by_title_marker", None)
+    if not callable(resolver) or str(resolver(marker, work_dir) or "").strip() != pane_id:
+        raise RuntimeError("original peer pane no longer matches its CCB marker")
+
+    target = {
+        "work_dir": work_dir,
+        "ccb_project_id": project_id,
+        "providers": {provider: {"alive": True, "mounted": True, "pane_id": pane_id}},
+    }
+    return target, backend
+
+
+def _send_to_direct_reply_target(
+    target: dict[str, Any],
+    backend: Any,
+    message: str,
+    sender_work_dir: str,
+    intent: str,
+    peer_task_id: str,
+    reply_to: str,
+    provider: str,
+    caller: str,
+) -> tuple[int, str, dict[str, Any]]:
+    req_id = peer_task_id or _task_id()
+    message_for_target = _append_peer_context(
+        message,
+        sender_work_dir,
+        intent,
+        peer_task_id,
+        reply_to,
+        provider=provider,
+        caller=caller,
+    )
+    if provider == "codex":
+        prompt = wrap_codex_delivery_prompt(message_for_target, req_id)
+    else:
+        prompt = wrap_claude_delivery_prompt(message_for_target, req_id)
+    pane_id = str(((target.get("providers") or {}).get(provider) or {}).get("pane_id") or "")
+    backend.send_text(pane_id, prompt)
+    return (
+        0,
+        "Peer reply delivered directly.",
+        {"status": "completed", "req_id": req_id, "direct_reply_fallback": True},
+    )
+
+
+def _write_correlated_status(receipt: dict[str, Any], line: str) -> None:
+    raw = str(receipt.get("status_file") or "").strip()
+    if not raw:
+        return
+    try:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with Path(raw).open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {line}\n")
+    except Exception:
+        pass
 
 
 def _acquire_lock(target_hash: str, provider: str):
@@ -277,48 +397,97 @@ def main(argv: list[str] | None = None) -> int:
         print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
         return 1
 
+    reply_receipt: dict[str, Any] | None = None
     try:
-        target = _resolve_target(_load_targets(), args.target)
-        provider_status = (target.get("providers") or {}).get(args.provider)
-        provider_alive = isinstance(provider_status, dict) and bool(provider_status.get("alive"))
-        provider_mounted = isinstance(provider_status, dict) and provider_status.get("mounted") is not False
-        legacy_claude_block = args.provider == "claude" and target.get("peer_capable") is False
-        if not provider_alive or not provider_mounted or legacy_claude_block:
-            print(
-                f"[ERROR] Target project has no mounted {args.provider.capitalize()} pane",
-                file=sys.stderr,
-            )
-            return 1
+        reply_receipt = _correlated_reply_receipt(
+            str(args.reply_to or ""), str(args.target or ""), str(args.provider or "")
+        )
+        if reply_receipt is not None:
+            write_peer_reply(reply_receipt, message)
+            _write_correlated_status(reply_receipt, "peer_reply_saved delivery=pending")
+
+        direct_backend = None
+        try:
+            target = _resolve_target(_load_targets(), args.target)
+        except Exception:
+            if reply_receipt is None:
+                raise
+            target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
+
+        if direct_backend is None:
+            provider_status = (target.get("providers") or {}).get(args.provider)
+            provider_alive = isinstance(provider_status, dict) and bool(provider_status.get("alive"))
+            provider_mounted = isinstance(provider_status, dict) and provider_status.get("mounted") is not False
+            legacy_claude_block = args.provider == "claude" and target.get("peer_capable") is False
+            if not provider_alive or not provider_mounted or legacy_claude_block:
+                if reply_receipt is None:
+                    print(
+                        f"[ERROR] Target project has no mounted {args.provider.capitalize()} pane",
+                        file=sys.stderr,
+                    )
+                    return 1
+                target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
 
         target_hash = str(target.get("ccb_project_id") or "")
         lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
         try:
-            exit_code, reply, meta = _send_to_daemon(
-                target,
-                message,
-                args.timeout,
-                str(args.caller_pane_id or ""),
-                str(args.caller_terminal or ""),
-                str(args.sender_work_dir or ""),
-                str(args.intent or "wait"),
-                str(args.peer_task_id or ""),
-                str(args.reply_to or ""),
-                str(args.provider or "claude"),
-                str(args.caller or "claude"),
-                bool(args.foreground),
-            )
+            if direct_backend is not None:
+                exit_code, reply, meta = _send_to_direct_reply_target(
+                    target,
+                    direct_backend,
+                    message,
+                    str(args.sender_work_dir or ""),
+                    str(args.intent or "wait"),
+                    str(args.peer_task_id or ""),
+                    str(args.reply_to or ""),
+                    str(args.provider or "claude"),
+                    str(args.caller or "claude"),
+                )
+            else:
+                exit_code, reply, meta = _send_to_daemon(
+                    target,
+                    message,
+                    args.timeout,
+                    str(args.caller_pane_id or ""),
+                    str(args.caller_terminal or ""),
+                    str(args.sender_work_dir or ""),
+                    str(args.intent or "wait"),
+                    str(args.peer_task_id or ""),
+                    str(args.reply_to or ""),
+                    str(args.provider or "claude"),
+                    str(args.caller or "claude"),
+                    bool(args.foreground),
+                )
         finally:
             try:
                 fcntl_mod.flock(lock_handle.fileno(), fcntl_mod.LOCK_UN)
             finally:
                 lock_handle.close()
+        if reply_receipt is not None:
+            delivery = "direct" if direct_backend is not None else "live"
+            _write_correlated_status(
+                reply_receipt,
+                f"peer_reply_saved delivery={delivery} exit_code={exit_code}",
+            )
         if exit_code != 0 or not reply:
             _print_bridge_diagnostics(meta)
+        if exit_code != 0 and reply_receipt is not None:
+            print(
+                f"[RECOVERABLE] Reply saved for task {args.reply_to}; the sender can run pend {args.reply_to}",
+                file=sys.stderr,
+            )
         if reply:
             print(reply)
         return exit_code
     except Exception as exc:
+        if reply_receipt is not None:
+            _write_correlated_status(reply_receipt, "peer_reply_saved delivery=failed exit_code=1")
         print(f"[ERROR] {exc}", file=sys.stderr)
+        if reply_receipt is not None:
+            print(
+                f"[RECOVERABLE] Reply saved for task {args.reply_to}; the sender can run pend {args.reply_to}",
+                file=sys.stderr,
+            )
         return 1
 
 

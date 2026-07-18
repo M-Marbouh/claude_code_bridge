@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import time
 import types
@@ -97,11 +98,38 @@ def test_daemon_server_writes_state_file(daemon: tuple[ProviderDaemonSpec, Path,
     # connect_host should exist (AskDaemonServer writes it)
     assert isinstance(st.get("connect_host"), str)
     assert st.get("connect_host")
+    if os.name != "nt":
+        mailbox_path = Path(str(st.get("mailbox_dir") or ""))
+        assert mailbox_path.is_dir()
+        assert stat.S_IMODE(mailbox_path.stat().st_mode) == 0o700
+        assert (mailbox_path / "requests").is_dir()
+        assert (mailbox_path / "responses").is_dir()
 
 
 def test_daemon_ping_pong(daemon: tuple[ProviderDaemonSpec, Path, Thread]) -> None:
     spec, state_file, _thread = daemon
     assert askd_rpc.ping_daemon(spec.protocol_prefix, timeout_s=0.5, state_file=state_file) is True
+
+
+def test_daemon_mailbox_rejects_wrong_token(
+    daemon: tuple[ProviderDaemonSpec, Path, Thread], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec, state_file, _thread = daemon
+    state = askd_rpc.read_state(state_file)
+    assert isinstance(state, dict)
+    if not state.get("mailbox_dir"):
+        pytest.skip("filesystem mailbox is unavailable on this platform")
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+
+    response = askd_rpc.request_daemon(
+        state,
+        {"type": f"{spec.protocol_prefix}.ping", "v": 1, "id": "bad-token", "token": "wrong"},
+        connect_timeout_s=0.5,
+        response_timeout_s=0.5,
+    )
+
+    assert response["exit_code"] == 1
+    assert response["reply"] == "Unauthorized"
 
 
 def test_daemon_shutdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,11 +158,15 @@ def test_daemon_shutdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     thread = Thread(target=server.serve_forever, name="itest-daemon-shutdown", daemon=True)
     thread.start()
     _wait_for_file(state_file, timeout_s=3.0)
+    state = askd_rpc.read_state(state_file) or {}
+    mailbox_path = Path(str(state.get("mailbox_dir") or "")) if state.get("mailbox_dir") else None
 
     assert askd_rpc.ping_daemon(spec.protocol_prefix, timeout_s=0.5, state_file=state_file) is True
     assert askd_rpc.shutdown_daemon(spec.protocol_prefix, timeout_s=0.5, state_file=state_file) is True
     thread.join(timeout=3.0)
     assert askd_rpc.ping_daemon(spec.protocol_prefix, timeout_s=0.2, state_file=state_file) is False
+    if mailbox_path is not None:
+        assert not mailbox_path.exists()
 
 
 def test_client_try_daemon_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -214,4 +246,3 @@ def test_client_try_daemon_request(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert askd_rpc.shutdown_daemon(spec.protocol_prefix, timeout_s=0.5, state_file=state_file) is True
     thread.join(timeout=3.0)
-

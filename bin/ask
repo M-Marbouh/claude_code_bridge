@@ -325,9 +325,6 @@ def _send_via_unified_daemon(
     caller: str,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
-    import json
-    import socket
-
     from askd_runtime import state_file_path
     import askd_rpc
 
@@ -344,8 +341,6 @@ def _send_via_unified_daemon(
             print("[ERROR] Unified askd daemon not running", file=sys.stderr)
             return EXIT_ERROR
 
-    host = state.get("connect_host") or state.get("host") or "127.0.0.1"
-    port = int(state.get("port") or 0)
     token = state.get("token") or ""
     # Use daemon's work_dir from state file
     # This ensures consistency with CCB session (pane id, work_dir, hash)
@@ -356,7 +351,7 @@ def _send_via_unified_daemon(
             print(f"[WARN] daemon work_dir not found: {daemon_work_dir}, falling back to cwd", file=sys.stderr)
         daemon_work_dir = os.getcwd()
 
-    if not port:
+    if not token:
         print("[ERROR] Invalid askd state", file=sys.stderr)
         return EXIT_ERROR
 
@@ -392,71 +387,33 @@ def _send_via_unified_daemon(
         req["email_from"] = os.environ.get("CCB_EMAIL_FROM", "")
 
     # Try to send request, with one retry on connection failure only
-    request_sent = False
     for attempt in range(2):
-        sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout + 10 if timeout > 0 else 3610)
-            sock.connect((host, port))
-
-            # Mark that connection succeeded - no retry after this point
-            request_sent = True
-
-            sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-
-            data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in data:
-                    break
-
-            resp = json.loads(data.decode("utf-8").strip())
+            resp = askd_rpc.request_daemon(
+                state,
+                req,
+                connect_timeout_s=5.0,
+                response_timeout_s=timeout + 10 if timeout > 0 else None,
+            )
             exit_code = int(resp.get("exit_code") or 0)
             reply = resp.get("reply") or ""
             if reply:
                 print(reply)
             return exit_code
-        except (ConnectionRefusedError, ConnectionResetError) as e:
-            # Only retry if connection failed before request was sent
-            if attempt == 0 and not request_sent:
+        except askd_rpc.DaemonConnectionError as e:
+            if attempt == 0:
                 if _maybe_start_unified_daemon():
                     # Re-read state for new daemon
                     state = askd_rpc.read_state(state_file)
                     if state:
-                        host = state.get("connect_host") or state.get("host") or "127.0.0.1"
-                        port = int(state.get("port") or 0)
                         token = state.get("token") or ""
                         req["token"] = token
                         continue  # Retry with new connection info
             print(f"[ERROR] {e}", file=sys.stderr)
             return EXIT_ERROR
-        except OSError as e:
-            # For other OS errors, only retry if connection not yet established
-            if attempt == 0 and not request_sent:
-                if _maybe_start_unified_daemon():
-                    state = askd_rpc.read_state(state_file)
-                    if state:
-                        host = state.get("connect_host") or state.get("host") or "127.0.0.1"
-                        port = int(state.get("port") or 0)
-                        token = state.get("token") or ""
-                        req["token"] = token
-                        continue
-            print(f"[ERROR] {e}", file=sys.stderr)
-            return EXIT_ERROR
         except Exception as e:
             print(f"[ERROR] {e}", file=sys.stderr)
             return EXIT_ERROR
-        finally:
-            # Always close socket to prevent leaks
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
 
     return EXIT_ERROR
 

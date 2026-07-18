@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import time
@@ -27,6 +28,20 @@ def state_file_path(name: str) -> Path:
     if name.endswith(".json"):
         return run_dir() / name
     return run_dir() / f"{name}.json"
+
+
+def mailbox_dir(state_file: Path) -> Path | None:
+    """Return a private, sandbox-visible mailbox directory for a daemon."""
+    if os.name == "nt" or not hasattr(os, "getuid"):
+        return None
+    override = (os.environ.get("CCB_ASKD_MAILBOX_ROOT") or "").strip()
+    base = Path(override).expanduser() if override else Path("/tmp") / f"ccb-askd-{os.getuid()}"
+    try:
+        identity = str(state_file.expanduser().resolve())
+    except Exception:
+        identity = str(state_file.expanduser().absolute())
+    digest = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()[:20]
+    return base / digest
 
 
 def log_path(name: str) -> Path:

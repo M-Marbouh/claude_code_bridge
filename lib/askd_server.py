@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import socketserver
+import stat
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from askd_runtime import log_path, normalize_connect_host, run_dir, write_log
+from askd_runtime import log_path, mailbox_dir, normalize_connect_host, run_dir, write_log
 from process_lock import ProviderLock
 from providers import ProviderDaemonSpec
 from session_utils import safe_write_session
@@ -54,6 +55,18 @@ def _is_pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing symlinked mailbox directory: {path}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = path.stat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"mailbox path is not a directory: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise RuntimeError(f"mailbox directory is owned by another user: {path}")
+    os.chmod(path, 0o700)
 
 
 class AskDaemonServer:
@@ -106,11 +119,71 @@ class AskDaemonServer:
         protocol_prefix = self.spec.protocol_prefix
         response_type = f"{protocol_prefix}.response"
 
+        def _dispatch_message(msg: dict) -> tuple[dict, bool]:
+            if msg.get("token") != self.token:
+                return {
+                    "type": response_type,
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "exit_code": 1,
+                    "reply": "Unauthorized",
+                }, False
+
+            msg_type = msg.get("type")
+            if msg_type == f"{protocol_prefix}.ping":
+                return {
+                    "type": f"{protocol_prefix}.pong",
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "exit_code": 0,
+                    "reply": "OK",
+                }, False
+
+            if msg_type == f"{protocol_prefix}.shutdown":
+                return {
+                    "type": response_type,
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "exit_code": 0,
+                    "reply": "OK",
+                }, True
+
+            if msg_type != f"{protocol_prefix}.request":
+                return {
+                    "type": response_type,
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "exit_code": 1,
+                    "reply": "Invalid request",
+                }, False
+
+            try:
+                response = self.request_handler(msg)
+            except Exception as exc:
+                write_log(log_path(self.spec.log_file_name), f"[ERROR] request handler error: {exc}")
+                return {
+                    "type": response_type,
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "exit_code": 1,
+                    "reply": f"Internal error: {exc}",
+                }, False
+
+            if isinstance(response, dict):
+                return response, False
+            return {
+                "type": response_type,
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Invalid response",
+            }, False
+
         class Handler(socketserver.StreamRequestHandler):
             def handle(self) -> None:
-                with self.server.activity_lock:
-                    self.server.active_requests += 1
-                    self.server.last_activity = time.time()
+                with self.server.activity.lock:
+                    self.server.activity.active_requests += 1
+                    self.server.activity.last_activity = time.time()
 
                 try:
                     line = self.rfile.readline()
@@ -119,39 +192,12 @@ class AskDaemonServer:
                     msg = json.loads(line.decode("utf-8", errors="replace"))
                 except Exception:
                     return
-
-                if msg.get("token") != self.server.token:
-                    self._write({"type": response_type, "v": 1, "id": msg.get("id"), "exit_code": 1, "reply": "Unauthorized"})
+                if not isinstance(msg, dict):
                     return
-
-                msg_type = msg.get("type")
-                if msg_type == f"{protocol_prefix}.ping":
-                    self._write({"type": f"{protocol_prefix}.pong", "v": 1, "id": msg.get("id"), "exit_code": 0, "reply": "OK"})
-                    return
-
-                if msg_type == f"{protocol_prefix}.shutdown":
-                    self._write({"type": response_type, "v": 1, "id": msg.get("id"), "exit_code": 0, "reply": "OK"})
-                    threading.Thread(target=self.server.shutdown, daemon=True).start()
-                    return
-
-                if msg_type != f"{protocol_prefix}.request":
-                    self._write({"type": response_type, "v": 1, "id": msg.get("id"), "exit_code": 1, "reply": "Invalid request"})
-                    return
-
-                try:
-                    resp = self.server.request_handler(msg)
-                except Exception as exc:
-                    try:
-                        write_log(log_path(self.server.spec.log_file_name), f"[ERROR] request handler error: {exc}")
-                    except Exception:
-                        pass
-                    self._write({"type": response_type, "v": 1, "id": msg.get("id"), "exit_code": 1, "reply": f"Internal error: {exc}"})
-                    return
-
-                if isinstance(resp, dict):
-                    self._write(resp)
-                else:
-                    self._write({"type": response_type, "v": 1, "id": msg.get("id"), "exit_code": 1, "reply": "Invalid response"})
+                response, shutdown_after = _dispatch_message(msg)
+                self._write(response)
+                if shutdown_after:
+                    threading.Thread(target=self.server.shutdown_all, daemon=True).start()
 
             def _write(self, obj: dict) -> None:
                 try:
@@ -159,8 +205,8 @@ class AskDaemonServer:
                     self.wfile.write(data)
                     self.wfile.flush()
                     try:
-                        with self.server.activity_lock:
-                            self.server.last_activity = time.time()
+                        with self.server.activity.lock:
+                            self.server.activity.last_activity = time.time()
                     except Exception:
                         pass
                 except Exception:
@@ -171,15 +217,21 @@ class AskDaemonServer:
                     super().finish()
                 finally:
                     try:
-                        with self.server.activity_lock:
-                            if self.server.active_requests > 0:
-                                self.server.active_requests -= 1
-                            self.server.last_activity = time.time()
+                        with self.server.activity.lock:
+                            if self.server.activity.active_requests > 0:
+                                self.server.activity.active_requests -= 1
+                            self.server.activity.last_activity = time.time()
                     except Exception:
                         pass
 
         class Server(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
+
+        class Activity:
+            def __init__(self) -> None:
+                self.active_requests = 0
+                self.last_activity = time.time()
+                self.lock = threading.Lock()
 
         if self.request_queue_size is not None:
             try:
@@ -187,14 +239,134 @@ class AskDaemonServer:
             except Exception:
                 pass
 
+        mailbox_path = None
+        mailbox_requests = None
+        mailbox_responses = None
+        mailbox_stop = threading.Event()
+        mailbox_thread = None
+        mailbox_workers: set[threading.Thread] = set()
+        mailbox_workers_lock = threading.Lock()
         try:
             with Server((self.host, self.port), Handler) as httpd:
+                candidate = mailbox_dir(self.state_file)
+                if candidate is not None:
+                    try:
+                        _ensure_private_directory(candidate.parent)
+                        _ensure_private_directory(candidate)
+                        mailbox_requests = candidate / "requests"
+                        mailbox_responses = candidate / "responses"
+                        for directory in (mailbox_requests, mailbox_responses):
+                            _ensure_private_directory(directory)
+                            for stale in directory.iterdir():
+                                if stale.is_file() or stale.is_symlink():
+                                    stale.unlink(missing_ok=True)
+                        mailbox_path = candidate
+                    except Exception as exc:
+                        mailbox_path = None
+                        mailbox_requests = None
+                        mailbox_responses = None
+                        write_log(
+                            log_path(self.spec.log_file_name),
+                            f"[WARN] {self.spec.daemon_key} filesystem mailbox unavailable: {exc}",
+                        )
+
+                activity = Activity()
+
+                def _shutdown_all() -> None:
+                    try:
+                        httpd.shutdown()
+                    except Exception:
+                        pass
+
                 httpd.spec = self.spec
                 httpd.token = self.token
                 httpd.request_handler = self.request_handler
-                httpd.active_requests = 0
-                httpd.last_activity = time.time()
-                httpd.activity_lock = threading.Lock()
+                httpd.activity = activity
+                httpd.shutdown_all = _shutdown_all
+
+                def _write_mailbox_response(path: Path, response: dict) -> None:
+                    temporary = path.with_name(
+                        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                    )
+                    try:
+                        with temporary.open("x", encoding="utf-8") as handle:
+                            os.chmod(temporary, 0o600)
+                            json.dump(response, handle, ensure_ascii=False)
+                            handle.write("\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.replace(temporary, path)
+                    finally:
+                        try:
+                            temporary.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                def _handle_mailbox_request(processing: Path, response_path: Path) -> None:
+                    current = threading.current_thread()
+                    with activity.lock:
+                        activity.active_requests += 1
+                        activity.last_activity = time.time()
+                    shutdown_after = False
+                    try:
+                        try:
+                            msg = json.loads(processing.read_text(encoding="utf-8"))
+                            if not isinstance(msg, dict):
+                                raise ValueError("request must be a JSON object")
+                            response, shutdown_after = _dispatch_message(msg)
+                        except Exception as exc:
+                            response = {
+                                "type": response_type,
+                                "v": 1,
+                                "id": None,
+                                "exit_code": 1,
+                                "reply": f"Invalid mailbox request: {exc}",
+                            }
+                        _write_mailbox_response(response_path, response)
+                        if shutdown_after:
+                            threading.Thread(target=_shutdown_all, daemon=True).start()
+                    except Exception as exc:
+                        write_log(
+                            log_path(self.spec.log_file_name),
+                            f"[ERROR] mailbox request failed: {exc}",
+                        )
+                    finally:
+                        try:
+                            processing.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        with activity.lock:
+                            if activity.active_requests > 0:
+                                activity.active_requests -= 1
+                            activity.last_activity = time.time()
+                        with mailbox_workers_lock:
+                            mailbox_workers.discard(current)
+
+                def _mailbox_loop() -> None:
+                    if mailbox_requests is None or mailbox_responses is None:
+                        return
+                    while not mailbox_stop.wait(0.05):
+                        try:
+                            pending = list(mailbox_requests.glob("*.json"))
+                        except Exception:
+                            continue
+                        for request_path in pending:
+                            processing = request_path.with_suffix(".processing")
+                            try:
+                                os.replace(request_path, processing)
+                            except (FileNotFoundError, FileExistsError):
+                                continue
+                            response_path = mailbox_responses / request_path.name
+                            worker = threading.Thread(
+                                target=_handle_mailbox_request,
+                                args=(processing, response_path),
+                                daemon=True,
+                                name=f"{self.spec.daemon_key}-mailbox-request",
+                            )
+                            with mailbox_workers_lock:
+                                mailbox_workers.add(worker)
+                            worker.start()
+
                 try:
                     httpd.idle_timeout_s = float(os.environ.get(self.spec.idle_timeout_env, "60") or "60")
                 except Exception:
@@ -211,9 +383,9 @@ class AskDaemonServer:
                     while True:
                         time.sleep(0.5)
                         try:
-                            with httpd.activity_lock:
-                                active = int(httpd.active_requests or 0)
-                                last = float(httpd.last_activity or time.time())
+                            with activity.lock:
+                                active = int(activity.active_requests or 0)
+                                last = float(activity.last_activity or time.time())
                         except Exception:
                             active = 0
                             last = time.time()
@@ -222,7 +394,7 @@ class AskDaemonServer:
                                 log_path(self.spec.log_file_name),
                                 f"[INFO] {self.spec.daemon_key} idle timeout ({int(timeout_s)}s) reached; shutting down",
                             )
-                            threading.Thread(target=httpd.shutdown, daemon=True).start()
+                            threading.Thread(target=_shutdown_all, daemon=True).start()
                             return
 
                 threading.Thread(target=_idle_monitor, daemon=True).start()
@@ -238,19 +410,27 @@ class AskDaemonServer:
                                     log_path(self.spec.log_file_name),
                                     f"[INFO] {self.spec.daemon_key} parent pid {parent_pid} exited; shutting down",
                                 )
-                                threading.Thread(target=httpd.shutdown, daemon=True).start()
+                                threading.Thread(target=_shutdown_all, daemon=True).start()
                                 return
 
                     threading.Thread(target=_parent_monitor, daemon=True).start()
 
                 actual_host, actual_port = httpd.server_address
-                self._write_state(str(actual_host), int(actual_port))
+                if mailbox_path is not None:
+                    mailbox_thread = threading.Thread(
+                        target=_mailbox_loop,
+                        daemon=True,
+                        name=f"{self.spec.daemon_key}-mailbox",
+                    )
+                    mailbox_thread.start()
+                self._write_state(str(actual_host), int(actual_port), mailbox_path=mailbox_path)
                 self._started_at = time.strftime("%Y-%m-%d %H:%M:%S")
                 self._write_persistent_state("running")
                 self._start_heartbeat_thread()
                 write_log(
                     log_path(self.spec.log_file_name),
-                    f"[INFO] {self.spec.daemon_key} started pid={os.getpid()} addr={actual_host}:{actual_port}",
+                    f"[INFO] {self.spec.daemon_key} started pid={os.getpid()} addr={actual_host}:{actual_port}"
+                    + (f" mailbox={mailbox_path}" if mailbox_path else ""),
                 )
 
                 crashed = False
@@ -277,13 +457,32 @@ class AskDaemonServer:
                         except Exception:
                             pass
         finally:
+            mailbox_stop.set()
+            if mailbox_thread is not None:
+                mailbox_thread.join(timeout=1.0)
+            with mailbox_workers_lock:
+                workers = list(mailbox_workers)
+            for worker in workers:
+                worker.join(timeout=1.0)
+            if mailbox_path is not None:
+                try:
+                    for directory in (mailbox_requests, mailbox_responses):
+                        if directory is None:
+                            continue
+                        for stale in directory.iterdir():
+                            if stale.is_file() or stale.is_symlink():
+                                stale.unlink(missing_ok=True)
+                        directory.rmdir()
+                    mailbox_path.rmdir()
+                except Exception:
+                    pass
             try:
                 lock.release()
             except Exception:
                 pass
         return 0
 
-    def _write_state(self, host: str, port: int) -> None:
+    def _write_state(self, host: str, port: int, *, mailbox_path: Path | None = None) -> None:
         payload = {
             "pid": os.getpid(),
             "host": host,
@@ -296,6 +495,8 @@ class AskDaemonServer:
             "managed": bool(self.managed),
             "work_dir": self.work_dir,
         }
+        if mailbox_path is not None:
+            payload["mailbox_dir"] = str(mailbox_path)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         ok, _err = safe_write_session(self.state_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         if ok:

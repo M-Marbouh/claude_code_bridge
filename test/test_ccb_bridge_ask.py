@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
-import json
 from pathlib import Path
 
 
@@ -160,24 +159,13 @@ def test_bridge_request_is_delivery_only(monkeypatch) -> None:
     bridge = _load_bridge_module()
     sent: dict = {}
 
-    class _Socket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args) -> None:
-            return None
-
-        def settimeout(self, _timeout) -> None:
-            return None
-
-        def sendall(self, payload: bytes) -> None:
-            sent.update(json.loads(payload.decode("utf-8")))
-
-        def recv(self, _size: int) -> bytes:
-            return b'{"exit_code":0,"reply":"Peer message delivered.","meta":{"status":"completed"}}\n'
-
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
-    monkeypatch.setattr(bridge.socket, "create_connection", lambda *_args, **_kwargs: _Socket())
+    monkeypatch.setattr(
+        bridge.askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request)
+        or {"exit_code": 0, "reply": "Peer message delivered.", "meta": {"status": "completed"}},
+    )
 
     exit_code, reply, _meta = bridge._send_to_daemon(
         {"work_dir": "/tmp/target"},
@@ -206,24 +194,13 @@ def test_codex_bridge_request_is_delivery_only_with_explicit_reply_context(monke
     bridge = _load_bridge_module()
     sent: dict = {}
 
-    class _Socket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args) -> None:
-            return None
-
-        def settimeout(self, _timeout) -> None:
-            return None
-
-        def sendall(self, payload: bytes) -> None:
-            sent.update(json.loads(payload.decode("utf-8")))
-
-        def recv(self, _size: int) -> bytes:
-            return b'{"exit_code":0,"reply":"Peer message delivered.","req_id":"task-3"}\n'
-
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
-    monkeypatch.setattr(bridge.socket, "create_connection", lambda *_args, **_kwargs: _Socket())
+    monkeypatch.setattr(
+        bridge.askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request)
+        or {"exit_code": 0, "reply": "Peer message delivered.", "req_id": "task-3"},
+    )
 
     exit_code, reply, _meta = bridge._send_to_daemon(
         {"work_dir": "/tmp/target"},
@@ -257,24 +234,13 @@ def test_codex_notify_suppresses_completion_hook(monkeypatch) -> None:
     bridge = _load_bridge_module()
     sent: dict = {}
 
-    class _Socket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args) -> None:
-            return None
-
-        def settimeout(self, _timeout) -> None:
-            return None
-
-        def sendall(self, payload: bytes) -> None:
-            sent.update(json.loads(payload.decode("utf-8")))
-
-        def recv(self, _size: int) -> bytes:
-            return b'{"exit_code":0,"reply":"Acknowledged."}\n'
-
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
-    monkeypatch.setattr(bridge.socket, "create_connection", lambda *_args, **_kwargs: _Socket())
+    monkeypatch.setattr(
+        bridge.askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request)
+        or {"exit_code": 0, "reply": "Acknowledged."},
+    )
 
     bridge._send_to_daemon(
         {"work_dir": "/tmp/target"},

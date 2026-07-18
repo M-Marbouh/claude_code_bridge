@@ -14,6 +14,8 @@ script_dir = Path(__file__).resolve().parent
 lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
+import askd_rpc
+from askd_runtime import state_file_path
 from compat import setup_windows_encoding
 from ccb_runtime_status import is_project_askd_online
 from ccb_start_config import load_start_config
@@ -26,6 +28,47 @@ setup_windows_encoding()
 SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode")
 PEER_PROVIDERS = ("claude", "codex")
 SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
+
+
+def _inside_codex_network_sandbox() -> bool:
+    raw = (os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") or "").strip().lower()
+    managed = (os.environ.get("CCB_MANAGED") or "").strip().lower()
+    caller = (os.environ.get("CCB_CALLER") or "").strip().lower()
+    return (
+        raw in {"1", "true", "yes", "on"}
+        and managed in {"1", "true", "yes", "on"}
+        and caller == "codex"
+        and bool((os.environ.get("CCB_RUN_DIR") or "").strip())
+    )
+
+
+def _daemon_session_entries(include_stale: bool) -> list[dict[str, Any]]:
+    state = askd_rpc.read_state(state_file_path("askd.json"))
+    if not state:
+        raise RuntimeError("Unified askd daemon state is unavailable")
+    token = str(state.get("token") or "")
+    if not token:
+        raise RuntimeError("Unified askd daemon state is invalid")
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"ccb-list-{os.getpid()}",
+        "token": token,
+        "operation": "list_projects",
+        "include_stale": include_stale,
+    }
+    response = askd_rpc.request_daemon(
+        state,
+        request,
+        connect_timeout_s=2.0,
+        response_timeout_s=12.0,
+    )
+    if response.get("type") != "ask.response" or int(response.get("exit_code", 1)) != 0:
+        raise RuntimeError(str(response.get("reply") or "askd rejected project discovery"))
+    entries = response.get("entries")
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("askd returned an invalid project list")
+    return entries
 
 
 def _load_json_dict(path: Path) -> dict[str, Any] | None:
@@ -544,9 +587,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="List active CCB projects and provider panes.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--stale", action="store_true", help="Include projects with only stale panes.")
+    parser.add_argument("--direct", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    entries = _session_entries(include_stale=args.stale)
+    if _inside_codex_network_sandbox() and not args.direct:
+        try:
+            entries = _daemon_session_entries(include_stale=args.stale)
+        except Exception as exc:
+            print(
+                "[ERROR] ccb-list cannot inspect terminal panes from the Codex sandbox and "
+                f"daemon discovery failed: {exc}. Restart CCB after installing the current build.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        entries = _session_entries(include_stale=args.stale)
     if args.json:
         print(json.dumps(entries, ensure_ascii=False, indent=2))
     else:

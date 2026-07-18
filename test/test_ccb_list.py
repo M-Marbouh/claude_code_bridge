@@ -553,3 +553,43 @@ def test_ccb_list_marks_inactive_session_file_unbound(tmp_path: Path) -> None:
     assert claude["mounted"] is False
     assert claude["reason"] == "session_unbound"
     assert entries[0]["peer_capable"] is False
+
+
+def test_ccb_list_delegates_discovery_from_managed_codex_sandbox(monkeypatch, capsys) -> None:
+    ccb_list = _load_ccb_list_module()
+    expected = [{"index": 1, "work_dir": "/tmp/peer"}]
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setenv("CCB_RUN_DIR", "/tmp/ccb-run")
+    monkeypatch.setattr(ccb_list, "_daemon_session_entries", lambda include_stale: expected)
+    monkeypatch.setattr(
+        ccb_list,
+        "_session_entries",
+        lambda include_stale: (_ for _ in ()).throw(AssertionError("direct discovery used")),
+    )
+
+    rc = ccb_list.main(["--json"])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == expected
+
+
+def test_ccb_list_reports_daemon_discovery_failure_in_codex_sandbox(monkeypatch, capsys) -> None:
+    ccb_list = _load_ccb_list_module()
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setenv("CCB_RUN_DIR", "/tmp/ccb-run")
+    monkeypatch.setattr(
+        ccb_list,
+        "_daemon_session_entries",
+        lambda include_stale: (_ for _ in ()).throw(RuntimeError("socket unavailable")),
+    )
+
+    rc = ccb_list.main(["--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "daemon discovery failed: socket unavailable" in captured.err

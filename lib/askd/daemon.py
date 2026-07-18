@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -133,6 +135,10 @@ class UnifiedAskDaemon:
 
     def _handle_request(self, msg: dict) -> dict:
         """Handle an incoming request."""
+        operation = str(msg.get("operation") or "").strip().lower()
+        if operation == "list_projects":
+            return self._handle_list_projects(msg)
+
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
             return {
@@ -251,6 +257,64 @@ class UnifiedAskDaemon:
                 "log_path": result.log_path,
                 "confirmation": (result.extra or {}).get("confirmation", ""),
             },
+        }
+
+    def _handle_list_projects(self, msg: dict) -> dict:
+        """Run terminal-aware project discovery outside a managed client sandbox."""
+        ccb_list = Path(__file__).resolve().parents[2] / "bin" / "ccb-list"
+        argv = [sys.executable, str(ccb_list), "--json", "--direct"]
+        if _request_bool(msg.get("include_stale")):
+            argv.append("--stale")
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Project discovery failed: {exc}",
+            }
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "ccb-list failed").strip()
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Project discovery failed: {detail}",
+            }
+        try:
+            entries = json.loads(result.stdout)
+        except Exception as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Project discovery returned invalid JSON: {exc}",
+            }
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Project discovery returned an invalid result",
+            }
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0,
+            "reply": "",
+            "entries": entries,
         }
 
     def serve_forever(self) -> int:

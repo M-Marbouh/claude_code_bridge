@@ -87,6 +87,14 @@ JSON output. `peer_providers` lists mounted Claude and Codex peer targets. The l
 `peer_capable: true` field retains its original Claude-specific meaning. Use `ccb-list --stale` only when
 historical or inactive records are needed for diagnostics.
 
+Managed Codex sessions cannot access the host terminal-multiplexer socket or loopback TCP directly.
+On Linux, CCB therefore records a private filesystem mailbox for each `askd` daemon under `/tmp`.
+Sandboxed `ccb-list` requests host-side discovery through that authenticated mailbox, while ordinary
+host clients retain the existing TCP transport. Mailbox directories are mode `0700`, request and response
+files are written atomically, and every request still requires the daemon's random token. After upgrading
+an active CCB session, restart it once so its daemon state advertises the mailbox; otherwise `ccb-list`
+reports an explicit transport error instead of incorrectly returning an empty list.
+
 `ccb-mounted` is a human diagnostics command. Delegation does not require a separate mounted skill: `ask` validates the provider session, pane, binding, and daemon before reporting successful async submission.
 
 ## Cross-project provider messaging
@@ -103,6 +111,8 @@ Plain `ask --peer` retains the historical `--wait` behavior. Background consulta
 Peer responses preserve the original task with `--reply-to <task-id>`. A notification is terminal and cannot end with a direct question; use `--background` when a follow-up answer is expected.
 Claude and Codex targets both use delivery-only transport. The receiving provider sends any result with
 an explicit reverse `ask --peer` message; CCB never captures a later local pane response as the peer reply.
+Outbound requests from managed Codex use the same private daemon mailbox, so both target discovery and
+message submission work without direct access to WezTerm, tmux, or a network socket.
 
 Reply-bearing peer requests also store a task-correlated return receipt. Reverse replies first use normal
 live-project discovery. If the sender has dropped out of `ccb-list`, CCB can fall back to the original pane

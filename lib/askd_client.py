@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -200,8 +198,6 @@ def try_daemon_request(
     if not st:
         return None
     try:
-        host = st.get("connect_host") or st.get("host")
-        port = int(st["port"])
         token = st["token"]
     except Exception:
         return None
@@ -229,28 +225,19 @@ def try_daemon_request(
         if caller:
             payload["caller"] = caller
         connect_timeout = min(1.0, max(0.1, float(timeout)))
-        with socket.create_connection((host, port), timeout=connect_timeout) as sock:
-            sock.settimeout(0.5)
-            sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-            buf = b""
-            deadline = None if float(timeout) < 0 else (time.time() + float(timeout) + 5.0)
-            while b"\n" not in buf and (deadline is None or time.time() < deadline):
-                try:
-                    chunk = sock.recv(65536)
-                except socket.timeout:
-                    continue
-                if not chunk:
-                    break
-                buf += chunk
-            if b"\n" not in buf:
-                return None
-            line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
-            resp = json.loads(line)
-            if resp.get("type") != f"{spec.protocol_prefix}.response":
-                return None
-            reply = str(resp.get("reply") or "")
-            exit_code = int(resp.get("exit_code", 1))
-            return reply, exit_code
+        import askd_rpc
+
+        resp = askd_rpc.request_daemon(
+            st,
+            payload,
+            connect_timeout_s=connect_timeout,
+            response_timeout_s=None if float(timeout) < 0 else float(timeout) + 5.0,
+        )
+        if resp.get("type") != f"{spec.protocol_prefix}.response":
+            return None
+        reply = str(resp.get("reply") or "")
+        exit_code = int(resp.get("exit_code", 1))
+        return reply, exit_code
     except Exception:
         return None
 

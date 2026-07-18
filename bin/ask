@@ -47,7 +47,11 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 from cli_output import EXIT_ERROR, EXIT_OK
-from ccb_runtime_status import ProviderRuntimeStatus, provider_status_for_target
+from ccb_runtime_status import (
+    ProviderRuntimeStatus,
+    inside_managed_codex_sandbox,
+    provider_status_for_target,
+)
 from session_utils import find_project_session_file
 from task_receipts import new_peer_receipt, new_receipt, receipt_path, write_receipt
 
@@ -244,7 +248,11 @@ def _route_error_line(target: str, status: ProviderRuntimeStatus, *, reason: str
 
 
 def _preflight_target(provider: str) -> bool:
-    status = provider_status_for_target(provider, work_dir=Path.cwd())
+    try:
+        status = provider_status_for_target(provider, work_dir=Path.cwd())
+    except Exception as exc:
+        print(f"[ERROR] Provider runtime status unavailable: {exc}", file=sys.stderr)
+        return False
     if status.mounted:
         return True
     print(_route_error_line(provider, status), file=sys.stderr)
@@ -267,6 +275,11 @@ def _maybe_start_unified_daemon() -> bool:
     state_file = state_file_path("askd.json")
     if ping_daemon(timeout_s=0.5, state_file=state_file):
         return True
+
+    # A managed Codex client cannot launch a useful terminal-aware daemon from
+    # inside its sandbox. The CCB-owned host daemon must be restarted instead.
+    if inside_managed_codex_sandbox():
+        return False
 
     # Find askd binary
     candidates: list[str] = []
@@ -323,6 +336,9 @@ def _send_via_unified_daemon(
     timeout: float,
     no_wrap: bool,
     caller: str,
+    *,
+    delivery_only: bool = False,
+    suppress_completion_hook: bool = False,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
     from askd_runtime import state_file_path
@@ -370,6 +386,8 @@ def _send_via_unified_daemon(
         "caller": caller,
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,
+        "delivery_only": delivery_only,
+        "suppress_completion_hook": suppress_completion_hook,
     }
     # Async callers create the durable task ID before entering foreground mode.
     # Preserve it as the provider request ID so receipts, CCB_REQ_ID, completion
@@ -931,12 +949,28 @@ def main(argv: list[str]) -> int:
 
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:
-        _require_caller()
+        caller = _require_caller()
+        if _use_unified_daemon() and provider in PEER_PROVIDERS:
+            from askd_runtime import state_file_path
+            from askd.daemon import ping_daemon
+
+            state_file = state_file_path("askd.json")
+            if not ping_daemon(timeout_s=0.5, state_file=state_file) and not _maybe_start_unified_daemon():
+                print("[ERROR] Unified askd daemon not running", file=sys.stderr)
+                return EXIT_ERROR
+            if not _preflight_target(provider):
+                return EXIT_ERROR
+            return _send_via_unified_daemon(
+                provider,
+                message,
+                timeout,
+                no_wrap,
+                caller,
+                delivery_only=True,
+                suppress_completion_hook=True,
+            )
         if _use_unified_daemon():
-            # TODO: Add fire-and-forget RPC mode for unified daemon
-            # For now, disable unified mode for notify and use legacy path
-            print("[WARN] Notify mode not yet supported with unified daemon, using legacy", file=sys.stderr)
-            # Fall through to legacy path below
+            print("[WARN] Unified notify is unavailable for this provider; using legacy", file=sys.stderr)
 
         # Legacy daemon path for notify mode
         cmd = [daemon_cmd, "--sync"]

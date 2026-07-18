@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import askd_rpc
+from askd_runtime import state_file_path
 from ccb_start_config import load_start_config
 from pane_registry import (
     _coerce_updated_at,
@@ -72,6 +73,26 @@ class ProviderRuntimeStatus:
             "updated_at": self.updated_at,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProviderRuntimeStatus":
+        return cls(
+            key=str(data.get("key") or ""),
+            provider=str(data.get("provider") or ""),
+            capable=bool(data.get("capable")),
+            configured=bool(data.get("configured")),
+            registered=bool(data.get("registered")),
+            pane_alive=bool(data.get("pane_alive")),
+            session_bound=bool(data.get("session_bound")),
+            daemon_online=bool(data.get("daemon_online")),
+            mounted=bool(data.get("mounted")),
+            reason=str(data.get("reason") or ""),
+            pane_id=str(data.get("pane_id") or ""),
+            pane_title_marker=str(data.get("pane_title_marker") or ""),
+            session_file=str(data.get("session_file") or ""),
+            timestamp_stale=bool(data.get("timestamp_stale")),
+            updated_at=_coerce_int(data.get("updated_at")),
+        )
+
 
 @dataclass(frozen=True)
 class ProjectRuntimeStatus:
@@ -89,6 +110,82 @@ class ProjectRuntimeStatus:
             "updated_at": self.updated_at,
             "providers": {key: status.to_dict() for key, status in sorted(self.providers.items())},
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProjectRuntimeStatus":
+        raw_providers = data.get("providers")
+        if not isinstance(raw_providers, dict):
+            raise ValueError("runtime status has no provider map")
+        providers: dict[str, ProviderRuntimeStatus] = {}
+        for key, raw_status in raw_providers.items():
+            if not isinstance(key, str) or not isinstance(raw_status, dict):
+                raise ValueError("runtime status has an invalid provider entry")
+            providers[key] = ProviderRuntimeStatus.from_dict(raw_status)
+        return cls(
+            work_dir=str(data.get("work_dir") or ""),
+            ccb_project_id=str(data.get("ccb_project_id") or ""),
+            terminal=str(data.get("terminal") or "tmux"),
+            updated_at=_coerce_int(data.get("updated_at")),
+            providers=providers,
+        )
+
+
+def _coerce_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def inside_managed_codex_sandbox() -> bool:
+    network_disabled = (os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") or "").strip().lower()
+    managed = (os.environ.get("CCB_MANAGED") or "").strip().lower()
+    caller = (os.environ.get("CCB_CALLER") or "").strip().lower()
+    return (
+        network_disabled in {"1", "true", "yes", "on"}
+        and managed in {"1", "true", "yes", "on"}
+        and caller == "codex"
+        and bool((os.environ.get("CCB_RUN_DIR") or "").strip())
+    )
+
+
+def _daemon_project_runtime_status(
+    work_dir: Path,
+    *,
+    include_stale: bool,
+    check_daemon: bool,
+) -> ProjectRuntimeStatus:
+    state = askd_rpc.read_state(state_file_path("askd.json"))
+    if not state:
+        raise RuntimeError("Unified askd daemon state is unavailable")
+    token = str(state.get("token") or "")
+    if not token:
+        raise RuntimeError("Unified askd daemon state is invalid")
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"runtime-status-{os.getpid()}",
+        "token": token,
+        "operation": "runtime_status",
+        "work_dir": str(work_dir),
+        "include_stale": include_stale,
+        "check_daemon": check_daemon,
+    }
+    response = askd_rpc.request_daemon(
+        state,
+        request,
+        connect_timeout_s=2.0,
+        response_timeout_s=8.0,
+    )
+    if response.get("type") != "ask.response" or int(response.get("exit_code", 1)) != 0:
+        raise RuntimeError(str(response.get("reply") or "askd rejected runtime status"))
+    project = response.get("project")
+    if not isinstance(project, dict):
+        raise RuntimeError("askd returned an invalid runtime status")
+    try:
+        return ProjectRuntimeStatus.from_dict(project)
+    except ValueError as exc:
+        raise RuntimeError(f"askd returned an invalid runtime status: {exc}") from exc
 
 
 def _project_run_dir(project_id: str) -> Path:
@@ -229,13 +326,25 @@ def resolve_project_runtime_status(
     project_id: str | None = None,
     include_stale: bool = False,
     check_daemon: bool = True,
+    _allow_daemon_proxy: bool = True,
+    _daemon_online_override: bool | None = None,
 ) -> ProjectRuntimeStatus:
     resolved = Path(work_dir or Path.cwd()).expanduser().resolve()
+    if _allow_daemon_proxy and inside_managed_codex_sandbox():
+        return _daemon_project_runtime_status(
+            resolved,
+            include_stale=include_stale,
+            check_daemon=check_daemon,
+        )
     project_id = (project_id or compute_ccb_project_id(resolved)).strip()
     records = iter_registry_provider_records(project_id=project_id, include_stale=include_stale)
     configured = _configured_providers(resolved)
     selected = _select_records(records)
-    daemon_online = is_project_askd_online(resolved, project_id) if check_daemon else False
+    daemon_online = (
+        _daemon_online_override
+        if _daemon_online_override is not None
+        else (is_project_askd_online(resolved, project_id) if check_daemon else False)
+    )
     statuses: dict[str, ProviderRuntimeStatus] = {}
     for provider in sorted(configured | set(selected)):
         record = selected.get(provider)

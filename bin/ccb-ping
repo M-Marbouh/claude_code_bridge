@@ -19,6 +19,7 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
+from ccb_runtime_status import inside_managed_codex_sandbox, provider_status_for_target
 setup_windows_encoding()
 
 
@@ -79,6 +80,18 @@ def main():
     if args.session_file:
         os.environ["CCB_SESSION_FILE"] = str(args.session_file)
     work_dir = _resolve_work_dir(args.session_file)
+
+    if inside_managed_codex_sandbox():
+        try:
+            status = provider_status_for_target(provider, work_dir=work_dir)
+        except Exception as exc:
+            print(f"[ERROR] {provider.capitalize()} connectivity test failed: {exc}", file=sys.stderr)
+            return 1
+        if status.mounted:
+            print(f"✅ {provider.capitalize()} connection OK (host runtime verified)")
+            return 0
+        print(f"❌ {provider.capitalize()} connection error: {status.reason or 'not_mounted'}")
+        return 1
 
     # Import and instantiate the communicator
     module_name, class_name = PROVIDER_COMMS[provider]

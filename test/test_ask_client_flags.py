@@ -67,6 +67,74 @@ def test_unified_daemon_preserves_outer_async_request_id(monkeypatch, tmp_path: 
     assert sent["req_id"] == "20260711-220118-845-190737"
 
 
+def test_unified_daemon_forwards_delivery_only_flags(monkeypatch, tmp_path: Path) -> None:
+    ask = _load_ask_module()
+    sent: dict = {}
+    monkeypatch.setattr(
+        askd_rpc,
+        "read_state",
+        lambda _path: {"host": "127.0.0.1", "port": 31337, "token": "tok", "work_dir": str(tmp_path)},
+    )
+    monkeypatch.setattr(
+        askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request) or {"exit_code": 0, "reply": ""},
+    )
+    monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("5", "wezterm"))
+
+    rc = ask._send_via_unified_daemon(
+        "claude",
+        "FYI",
+        1.0,
+        False,
+        "codex",
+        delivery_only=True,
+        suppress_completion_hook=True,
+    )
+
+    assert rc == 0
+    assert sent["delivery_only"] is True
+    assert sent["suppress_completion_hook"] is True
+
+
+def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_preflight_target", lambda _provider: True)
+    monkeypatch.setattr("askd.daemon.ping_daemon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda provider, message, timeout, no_wrap, caller, **kwargs: captured.update(
+            provider=provider,
+            message=message,
+            caller=caller,
+            kwargs=kwargs,
+        ) or 0,
+    )
+
+    rc = ask.main(["ask", "claude", "--notify", "FYI"])
+
+    assert rc == 0
+    assert captured["provider"] == "claude"
+    assert captured["caller"] == "codex"
+    assert captured["kwargs"] == {"delivery_only": True, "suppress_completion_hook": True}
+
+
+def test_preflight_reports_runtime_proxy_failure(monkeypatch, capsys) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("host status unavailable")),
+    )
+
+    assert ask._preflight_target("claude") is False
+    assert "Provider runtime status unavailable: host status unavailable" in capsys.readouterr().err
+
+
 def test_ask_rejects_provider_instances_before_dispatch(capsys) -> None:
     ask = _load_ask_module()
 

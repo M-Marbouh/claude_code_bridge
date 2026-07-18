@@ -30,10 +30,20 @@ def _load_pend_module():
     return module
 
 
-def _receipt(task_id: str, provider: str, *, session: str, pane: str, project: str, submitted: str) -> dict:
+def _receipt(
+    task_id: str,
+    provider: str,
+    *,
+    session: str,
+    pane: str,
+    project: str,
+    submitted: str,
+    caller: str = "claude",
+) -> dict:
     return {
         "task_id": task_id,
         "provider": provider,
+        "caller": caller,
         "caller_session_id": session,
         "caller_pane_id": pane,
         "caller_terminal": "wezterm",
@@ -142,6 +152,8 @@ def test_pend_latest_is_scoped_to_caller_session(monkeypatch) -> None:
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
     monkeypatch.setattr(pend, "caller_pane", lambda: ("1", "wezterm"))
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
     found = pend._latest_for_current_caller("codex")
 
@@ -157,6 +169,7 @@ def test_pend_does_not_fall_back_to_another_project(monkeypatch) -> None:
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
     monkeypatch.setattr(pend, "caller_pane", lambda: ("1", "wezterm"))
+    monkeypatch.setenv("CCB_CALLER", "claude")
     monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "different-project")
 
     assert pend._latest_for_current_caller("codex") is None
@@ -171,6 +184,7 @@ def test_pend_recovers_latest_same_pane_receipt_after_session_restart(monkeypatc
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "caller_session_id", lambda: "restarted")
     monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
+    monkeypatch.setenv("CCB_CALLER", "claude")
     monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
     found = pend._latest_for_current_caller("codex")
@@ -203,12 +217,55 @@ def test_pend_restart_uses_latest_same_project_receipt_across_old_panes(monkeypa
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "caller_session_id", lambda: "restarted")
     monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
+    monkeypatch.setenv("CCB_CALLER", "claude")
     monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
     found = pend._latest_for_current_caller("codex")
 
     assert found is not None
     assert found[1]["task_id"] == "a"
+
+
+def test_pend_same_session_does_not_cross_caller_panes(monkeypatch) -> None:
+    pend = _load_pend_module()
+    records = [
+        (
+            Path("claude.json"),
+            _receipt("claude-new", "codex", session="ccb-1", pane="4", project="p", submitted="3", caller="claude"),
+        ),
+        (
+            Path("codex.json"),
+            _receipt("codex-old", "codex", session="ccb-1", pane="5", project="p", submitted="2", caller="codex"),
+        ),
+    ]
+    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
+    monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
+    monkeypatch.setattr(pend, "caller_pane", lambda: ("5", "wezterm"))
+    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+
+    found = pend._latest_for_current_caller("codex")
+
+    assert found is not None
+    assert found[1]["task_id"] == "codex-old"
+
+
+def test_pend_same_session_does_not_cross_projects(monkeypatch) -> None:
+    pend = _load_pend_module()
+    records = [
+        (Path("other.json"), _receipt("other", "codex", session="ccb-1", pane="5", project="other", submitted="3", caller="codex")),
+        (Path("current.json"), _receipt("current", "codex", session="old", pane="1", project="p", submitted="2", caller="codex")),
+    ]
+    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
+    monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
+    monkeypatch.setattr(pend, "caller_pane", lambda: ("5", "wezterm"))
+    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+
+    found = pend._latest_for_current_caller("codex")
+
+    assert found is not None
+    assert found[1]["task_id"] == "current"
 
 
 def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:

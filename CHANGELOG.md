@@ -15,6 +15,10 @@
 - Preserved correlated peer results for `pend <task-id>` recovery when the original pane is no longer deliverable.
 - Added an authenticated filesystem-mailbox transport for managed Codex, allowing sandboxed `ask`, `ccb-list`, and peer messaging to reach the host `askd` without terminal-socket or loopback-network access.
 - Made sandboxed discovery fail explicitly when the running daemon predates mailbox support instead of returning a misleading empty project list.
+- Delegated provider runtime checks for `ask`, `ccb-ping`, and `ccb-mounted` to the host daemon so managed Codex does not misclassify live WezTerm or tmux panes as dead.
+- Routed one-way Claude and Codex `ask --notify` requests through unified `askd` instead of the sandbox-incompatible legacy terminal path.
+- Scoped implicit `pend <provider>` selection by both project and persisted caller identity, preventing Claude and Codex panes in the same CCB session from reading each other's latest receipts.
+- Isolated test subprocess temporary directories so peer-task tests no longer create receipts in the user's live `/tmp/ccb-tasks` directory.
 
 ## v0.12.0 (2026-07-11)
 

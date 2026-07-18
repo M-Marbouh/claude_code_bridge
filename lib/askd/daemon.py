@@ -138,6 +138,8 @@ class UnifiedAskDaemon:
         operation = str(msg.get("operation") or "").strip().lower()
         if operation == "list_projects":
             return self._handle_list_projects(msg)
+        if operation == "runtime_status":
+            return self._handle_runtime_status(msg)
 
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
@@ -315,6 +317,50 @@ class UnifiedAskDaemon:
             "exit_code": 0,
             "reply": "",
             "entries": entries,
+        }
+
+    def _handle_runtime_status(self, msg: dict) -> dict:
+        """Resolve terminal-aware provider status outside a managed client sandbox."""
+        raw_work_dir = msg.get("work_dir")
+        if not isinstance(raw_work_dir, str) or not raw_work_dir.strip():
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Runtime status requires a work_dir",
+            }
+        try:
+            from ccb_runtime_status import resolve_project_runtime_status
+            from project_id import compute_ccb_project_id
+
+            check_daemon = _request_bool(msg.get("check_daemon", True))
+            daemon_work_dir = self.work_dir or os.getcwd()
+            same_project = compute_ccb_project_id(Path(daemon_work_dir)) == compute_ccb_project_id(
+                Path(raw_work_dir)
+            )
+            project = resolve_project_runtime_status(
+                raw_work_dir,
+                include_stale=_request_bool(msg.get("include_stale")),
+                check_daemon=check_daemon,
+                _allow_daemon_proxy=False,
+                _daemon_online_override=(True if same_project else None) if check_daemon else False,
+            )
+        except Exception as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Runtime status failed: {exc}",
+            }
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0,
+            "reply": "",
+            "project": project.to_dict(),
         }
 
     def serve_forever(self) -> int:

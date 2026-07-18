@@ -8,7 +8,7 @@ import pytest
 
 import ccb_runtime_status
 import pane_registry
-from ccb_runtime_status import resolve_project_runtime_status
+from ccb_runtime_status import ProjectRuntimeStatus, ProviderRuntimeStatus, resolve_project_runtime_status
 from project_id import compute_ccb_project_id
 
 
@@ -223,3 +223,55 @@ def test_runtime_status_unknown_provider_is_not_exposed(runtime_env, monkeypatch
 
     assert project.providers["codex"].pane_alive is True
     assert set(project.providers) == {"claude", "codex"}
+
+
+def test_runtime_status_delegates_from_managed_codex_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    work_dir = tmp_path / "project"
+    run_dir = tmp_path / "run"
+    work_dir.mkdir()
+    run_dir.mkdir()
+    expected = ProjectRuntimeStatus(
+        work_dir=str(work_dir),
+        ccb_project_id="project-id",
+        terminal="wezterm",
+        updated_at=123,
+        providers={
+            "claude": ProviderRuntimeStatus(
+                key="claude",
+                provider="claude",
+                capable=True,
+                configured=True,
+                registered=True,
+                pane_alive=True,
+                session_bound=True,
+                daemon_online=True,
+                mounted=True,
+                reason="",
+                pane_id="4",
+            )
+        },
+    )
+    captured: dict = {}
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setenv("CCB_RUN_DIR", str(run_dir))
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "secret"})
+
+    def _request(_state, request, **kwargs):
+        captured.update(request=request, kwargs=kwargs)
+        return {"type": "ask.response", "exit_code": 0, "project": expected.to_dict()}
+
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "request_daemon", _request)
+    monkeypatch.setattr(
+        ccb_runtime_status,
+        "iter_registry_provider_records",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("sandbox performed direct terminal discovery")),
+    )
+
+    project = resolve_project_runtime_status(work_dir)
+
+    assert project == expected
+    assert captured["request"]["operation"] == "runtime_status"
+    assert captured["request"]["work_dir"] == str(work_dir)
+    assert captured["kwargs"]["response_timeout_s"] == 8.0

@@ -12,7 +12,7 @@ script_dir = Path(__file__).resolve().parent
 lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
-from ccb_runtime_status import resolve_project_runtime_status
+from ccb_runtime_status import inside_managed_codex_sandbox, resolve_project_runtime_status
 from session_utils import find_project_session_file
 
 
@@ -25,6 +25,8 @@ _BASE_SESSION_FILES = {
 
 
 def _autostart_daemons(work_dir: Path) -> None:
+    if inside_managed_codex_sandbox():
+        return
     ccb_ping = script_dir / "ccb-ping"
     for provider, filename in _BASE_SESSION_FILES.items():
         try:
@@ -75,7 +77,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.autostart:
         _autostart_daemons(work_dir)
 
-    payload = _payload(work_dir)
+    try:
+        payload = _payload(work_dir)
+    except Exception as exc:
+        print(f"[ERROR] Provider runtime status unavailable: {exc}", file=sys.stderr)
+        return 1
     if args.simple:
         print(" ".join(payload["mounted"]))
     else:

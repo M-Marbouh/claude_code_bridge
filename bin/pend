@@ -20,6 +20,7 @@ from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text
 from codex_comm import CodexLogReader
 from project_id import compute_ccb_project_id
+from session_utils import find_project_session_file
 from task_receipts import caller_pane, caller_session_id, find_receipt, iter_receipts, read_peer_reply
 
 
@@ -30,6 +31,13 @@ PROVIDER_PENDS = {
     "claude": "lpend",
 }
 TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-\d{3}-\d+(?:-\d+)?$")
+CALLER_SESSION_FILES = {
+    "claude": ".claude-session",
+    "codex": ".codex-session",
+    "gemini": ".gemini-session",
+    "opencode": ".opencode-session",
+}
+VALID_CALLERS = set(CALLER_SESSION_FILES) | {"email", "manual"}
 
 
 def _legacy_pend(provider: str, extra: list[str]) -> int:
@@ -45,50 +53,72 @@ def _legacy_pend(provider: str, extra: list[str]) -> int:
         return EXIT_ERROR
 
 
+def _current_caller(pane_id: str) -> str:
+    direct = (os.environ.get("CCB_CALLER") or "").strip().lower()
+    if direct in VALID_CALLERS:
+        return direct
+    if pane_id:
+        for caller, filename in CALLER_SESSION_FILES.items():
+            try:
+                session_file = find_project_session_file(Path.cwd(), filename)
+                data = json.loads(session_file.read_text(encoding="utf-8-sig")) if session_file else {}
+            except Exception:
+                data = {}
+            session_pane = str(data.get("pane_id") or data.get("tmux_session") or "").strip()
+            if session_pane == pane_id:
+                return caller
+    return "manual" if not pane_id else ""
+
+
 def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
-    records = [(path, data) for path, data in iter_receipts() if data.get("provider") == provider]
+    try:
+        project_id = compute_ccb_project_id(Path.cwd())
+    except Exception:
+        project_id = ""
+    records = [
+        (path, data)
+        for path, data in iter_receipts()
+        if data.get("provider") == provider
+        and project_id
+        and data.get("ccb_project_id") == project_id
+    ]
     if not records:
         return None
 
     session_id = caller_session_id()
     pane_id, terminal = caller_pane()
+    caller = _current_caller(pane_id)
+    caller_records = (
+        [item for item in records if str(item[1].get("caller") or "").strip().lower() == caller]
+        if caller
+        else []
+    )
+    legacy_records = [item for item in records if not str(item[1].get("caller") or "").strip()]
     if session_id and pane_id:
         matches = [
             item
-            for item in records
+            for item in caller_records + legacy_records
             if str(item[1].get("caller_session_id") or "") == session_id
             and str(item[1].get("caller_pane_id") or "") == pane_id
             and str(item[1].get("caller_terminal") or "") == terminal
         ]
         if matches:
             return matches[0]
-    if session_id:
-        matches = [item for item in records if str(item[1].get("caller_session_id") or "") == session_id]
-        if matches:
-            return matches[0]
 
     if pane_id:
         matches = [
             item
-            for item in records
+            for item in caller_records
             if str(item[1].get("caller_pane_id") or "") == pane_id
             and str(item[1].get("caller_terminal") or "") == terminal
         ]
         if matches:
             return matches[0]
 
-    try:
-        project_id = compute_ccb_project_id(Path.cwd())
-    except Exception:
-        project_id = ""
-    matches = [item for item in records if project_id and item[1].get("ccb_project_id") == project_id]
-    if not matches:
-        return None
-
     # CCB enforces one provider instance per project. After a restart, pane and
-    # session IDs legitimately change, so the newest same-project receipt is
-    # the only stable provider-level identity.
-    return matches[0]
+    # session IDs legitimately change. The persisted caller field is stable
+    # across that restart and prevents a sibling provider pane from winning.
+    return caller_records[0] if caller_records else None
 
 
 def _status_finished(status_path: Path) -> tuple[bool, int | None]:

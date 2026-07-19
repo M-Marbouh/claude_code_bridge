@@ -892,25 +892,6 @@ class AILauncher:
             else:
                 _emit(f"✅ {spec.daemon_bin_name} {action}")
 
-        def _matching_managed_child(state: dict, proc) -> bool:
-            """Accept state published by our live child even if one RPC probe misses."""
-            try:
-                child_pid = int(getattr(proc, "pid"))
-                state_pid = int(state.get("pid") or 0)
-            except Exception:
-                return False
-            try:
-                poll = getattr(proc, "poll", None)
-                if callable(poll) and poll() is not None:
-                    return False
-            except Exception:
-                return False
-            has_transport = bool(
-                (state.get("host") and state.get("port"))
-                or state.get("mailbox_dir")
-            )
-            return state_pid == child_pid and _owned_by_ccb(state) and has_transport
-
         if ping_daemon(state_file=state_file):
             st = _read_daemon_state()
             if spec.daemon_bin_name == "askd" and not self._askd_checked:
@@ -983,7 +964,6 @@ class AILauncher:
             kwargs["start_new_session"] = True
 
         proc = None
-        reused_process = False
         try:
             if spec.daemon_bin_name == "askd":
                 # Provider session hooks can call this method several times while
@@ -994,7 +974,6 @@ class AILauncher:
                     tracked_poll = getattr(tracked, "poll", None)
                     if tracked is not None and (not callable(tracked_poll) or tracked_poll() is None):
                         proc = tracked
-                        reused_process = True
                     else:
                         env = os.environ.copy()
                         env["CCB_PARENT_PID"] = str(os.getpid())
@@ -1016,10 +995,6 @@ class AILauncher:
             if ping_daemon(timeout_s=0.2, state_file=state_file):
                 _emit_started(_read_daemon_state())
                 return
-            st = _read_daemon_state()
-            if spec.daemon_bin_name == "askd" and _matching_managed_child(st, proc):
-                _emit_started(st, already_running=reused_process)
-                return
             poll = getattr(proc, "poll", None)
             exit_code = poll() if callable(poll) else None
             if exit_code is not None:
@@ -1035,10 +1010,6 @@ class AILauncher:
         # Avoid a false warning when the daemon becomes ready on the deadline.
         if ping_daemon(timeout_s=0.5, state_file=state_file):
             _emit_started(_read_daemon_state())
-            return
-        st = _read_daemon_state()
-        if spec.daemon_bin_name == "askd" and _matching_managed_child(st, proc):
-            _emit_started(st, already_running=reused_process)
             return
         _emit(f"⚠️ {spec.daemon_bin_name} process is running, but readiness state is unavailable")
 

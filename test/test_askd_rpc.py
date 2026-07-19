@@ -36,6 +36,26 @@ class _FakeSocket:
         return chunk
 
 
+def test_ping_daemon_accepts_valid_tcp_pong(monkeypatch, tmp_path: Path) -> None:
+    state_file = tmp_path / "askd.json"
+    fake_socket = _FakeSocket(
+        {"type": "ask.pong", "v": 1, "id": "ping", "exit_code": 0, "reply": "OK"}
+    )
+
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    monkeypatch.setattr(
+        askd_rpc,
+        "read_state",
+        lambda _path: {"host": "127.0.0.1", "port": 31337, "token": "tok"},
+    )
+    monkeypatch.setattr(askd_rpc.socket, "create_connection", lambda *_args, **_kwargs: fake_socket)
+
+    assert askd_rpc.ping_daemon("ask", timeout_s=0.5, state_file=state_file) is True
+
+    sent = json.loads(fake_socket.sent[0].decode("utf-8").strip())
+    assert sent["type"] == "ask.ping"
+
+
 def test_shutdown_daemon_rejects_wrong_response_type(monkeypatch, tmp_path: Path) -> None:
     state_file = tmp_path / "askd.json"
     fake_socket = _FakeSocket({"type": "other.response", "v": 1, "id": "shutdown", "exit_code": 0, "reply": "OK"})

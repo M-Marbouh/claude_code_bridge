@@ -106,8 +106,35 @@ def test_daemon_server_writes_state_file(daemon: tuple[ProviderDaemonSpec, Path,
         assert (mailbox_path / "responses").is_dir()
 
 
-def test_daemon_ping_pong(daemon: tuple[ProviderDaemonSpec, Path, Thread]) -> None:
+def test_daemon_ping_pong_via_tcp(
+    daemon: tuple[ProviderDaemonSpec, Path, Thread],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spec, state_file, _thread = daemon
+    state = askd_rpc.read_state(state_file)
+    assert isinstance(state, dict)
+    state.pop("mailbox_dir", None)
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    monkeypatch.setattr(askd_rpc, "read_state", lambda _path: state)
+
+    assert askd_rpc.ping_daemon(spec.protocol_prefix, timeout_s=0.5, state_file=state_file) is True
+
+
+def test_daemon_ping_pong_via_mailbox(
+    daemon: tuple[ProviderDaemonSpec, Path, Thread],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, state_file, _thread = daemon
+    state = askd_rpc.read_state(state_file)
+    assert isinstance(state, dict)
+    assert state.get("mailbox_dir")
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setattr(
+        askd_rpc,
+        "connect_daemon",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("TCP transport used")),
+    )
+
     assert askd_rpc.ping_daemon(spec.protocol_prefix, timeout_s=0.5, state_file=state_file) is True
 
 

@@ -206,7 +206,7 @@ def test_launcher_waits_long_enough_for_slow_askd_start(monkeypatch, tmp_path: P
     assert clock["now"] >= 3.0
 
 
-def test_launcher_accepts_owned_child_state_and_does_not_spawn_duplicates(
+def test_launcher_reuses_owned_child_but_requires_rpc_readiness(
     monkeypatch,
     tmp_path: Path,
     capsys,
@@ -216,6 +216,7 @@ def test_launcher_accepts_owned_child_state_and_does_not_spawn_duplicates(
     legacy_state = tmp_path / "caskd.json"
     popen_calls: list[object] = []
     ping_state_files: list[Path] = []
+    clock = {"now": 0.0}
 
     class _DummyProcess:
         pid = 2468
@@ -238,6 +239,7 @@ def test_launcher_accepts_owned_child_state_and_does_not_spawn_duplicates(
 
     monkeypatch.setenv("CCB_ASKD_STATE_FILE", str(unified_state))
     monkeypatch.setenv("CCB_CASKD_STATE_FILE", str(legacy_state))
+    monkeypatch.setenv("CCB_ASKD_START_TIMEOUT_S", "2")
     monkeypatch.setattr(askd_daemon, "ping_daemon", _fake_ping)
     monkeypatch.setattr(
         askd_daemon,
@@ -255,6 +257,8 @@ def test_launcher_accepts_owned_child_state_and_does_not_spawn_duplicates(
         "Popen",
         lambda *_args, **_kwargs: popen_calls.append(object()) or proc,
     )
+    monkeypatch.setattr(ccb.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(ccb.time, "sleep", lambda seconds: clock.update(now=clock["now"] + seconds))
 
     launcher._maybe_start_provider_daemon("codex")
     launcher._maybe_start_provider_daemon("codex")
@@ -264,9 +268,9 @@ def test_launcher_accepts_owned_child_state_and_does_not_spawn_duplicates(
     assert ping_state_files
     assert set(ping_state_files) == {unified_state}
     assert str(legacy_state) not in output
-    assert output.count("askd started at 127.0.0.1:31337") == 1
-    assert output.count("askd already running at 127.0.0.1:31337") == 1
-    assert "not reachable" not in output
+    assert "askd started" not in output
+    assert "askd already running" not in output
+    assert output.count("askd process is running, but readiness state is unavailable") == 2
     assert "exit code 2" not in output
 
 

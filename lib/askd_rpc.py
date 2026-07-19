@@ -122,6 +122,7 @@ def request_daemon(
             chunk = sock.recv(65536)
             if not chunk:
                 break
+            buf += chunk
     if b"\n" not in buf:
         raise DaemonResponseError("daemon returned no complete response")
     line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")

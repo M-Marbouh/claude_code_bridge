@@ -250,28 +250,66 @@ def load_registry_by_session_id(session_id: str) -> Optional[Dict[str, Any]]:
     return data
 
 
-def load_registry_by_claude_pane(pane_id: str) -> Optional[Dict[str, Any]]:
+def load_registry_by_pane(
+    pane_id: str,
+    *,
+    ccb_project_id: str = "",
+    terminal: str = "",
+    provider: str = "",
+    require_owner_alive: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Load the newest live registry record bound to an exact provider pane."""
     if not pane_id:
         return None
+    wanted_project = (ccb_project_id or "").strip()
+    wanted_terminal = (terminal or "").strip().lower()
+    wanted_provider = (provider or "").strip().lower()
     best: Optional[Dict[str, Any]] = None
     best_ts = -1
     for path in _iter_registry_files():
         data = _load_registry_file(path)
         if not data:
             continue
+        if wanted_project:
+            effective_project = str(data.get("ccb_project_id") or "").strip()
+            if not effective_project:
+                work_dir = str(data.get("work_dir") or "").strip()
+                if work_dir:
+                    try:
+                        effective_project = compute_ccb_project_id(Path(work_dir))
+                    except Exception:
+                        effective_project = ""
+            if effective_project != wanted_project:
+                continue
+        record_terminal = str(data.get("terminal") or "").strip().lower()
+        if wanted_terminal and record_terminal and record_terminal != wanted_terminal:
+            continue
         providers = _get_providers_map(data)
-        claude = providers.get("claude") if isinstance(providers, dict) else None
-        claude_pane = (claude or {}).get("pane_id") if isinstance(claude, dict) else None
-        if (claude_pane or data.get("claude_pane_id")) != pane_id:
+        candidates = (
+            {wanted_provider: providers.get(wanted_provider)}
+            if wanted_provider
+            else providers
+        )
+        if not any(
+            isinstance(entry, dict) and str(entry.get("pane_id") or "").strip() == pane_id
+            for entry in candidates.values()
+        ):
             continue
         updated_at = _coerce_updated_at(data.get("updated_at"), path)
         if _is_stale(updated_at):
             _debug(f"Registry stale for pane {pane_id}: {path}")
             continue
+        if require_owner_alive and _registry_owner_alive(data) is False:
+            _debug(f"Registry owner is not running for pane {pane_id}: {path}")
+            continue
         if updated_at > best_ts:
             best = data
             best_ts = updated_at
     return best
+
+
+def load_registry_by_claude_pane(pane_id: str) -> Optional[Dict[str, Any]]:
+    return load_registry_by_pane(pane_id, provider="claude")
 
 
 def load_registry_by_project_id(ccb_project_id: str, provider: str) -> Optional[Dict[str, Any]]:

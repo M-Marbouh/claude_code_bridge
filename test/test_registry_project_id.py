@@ -8,7 +8,7 @@ from typing import Optional
 import pytest
 
 import pane_registry
-from pane_registry import load_registry_by_project_id, upsert_registry
+from pane_registry import load_registry_by_pane, load_registry_by_project_id, upsert_registry
 from project_id import compute_ccb_project_id
 
 
@@ -137,6 +137,42 @@ def test_load_registry_by_project_id_filters_dead_panes(tmp_path: Path, monkeypa
     rec = load_registry_by_project_id(pid, "codex")
     assert rec is not None
     assert rec.get("ccb_session_id") == "old"
+
+
+def test_load_registry_by_pane_selects_exact_same_project_tab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    work_dir = tmp_path / "proj"
+    work_dir.mkdir()
+    pid = compute_ccb_project_id(work_dir)
+
+    for session_id, pane_id, updated_at in (
+        ("current-tab", "14", int(time.time()) - 10),
+        ("newer-other-tab", "22", int(time.time())),
+    ):
+        _write_registry_file(
+            tmp_path,
+            session_id,
+            {
+                "ccb_session_id": session_id,
+                "ccb_project_id": pid,
+                "work_dir": str(work_dir),
+                "terminal": "wezterm",
+                "updated_at": updated_at,
+                "providers": {
+                    "claude": {"pane_id": "2" if pane_id == "14" else "21"},
+                    "codex": {"pane_id": pane_id},
+                },
+            },
+        )
+
+    rec = load_registry_by_pane("14", ccb_project_id=pid, terminal="wezterm")
+
+    assert rec is not None
+    assert rec["ccb_session_id"] == "current-tab"
 
 
 def test_load_registry_by_project_id_infers_missing_project_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

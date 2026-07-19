@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Made implicit `pend` lookup strict to the current CCB tab, allowed paired panes to retrieve the same tab's tasks, and normalized `peer-<provider>` receipts by their responding provider.
+- Added context-first exact task guidance plus `pend peer`, `pend local`, and newest-first task history with task-ID prefixes. `pend <provider> N` now reads task receipts; legacy provider conversation history requires explicit `--legacy`.
+- Made pre-restart and otherwise unbound receipts exact-task-ID-only, with clear implicit-lookup guidance, while preserving the same-turn Async Guardrail.
 - Added provider-aware cross-project peer routing for mounted Codex panes using the same explicit reverse-reply protocol as Claude.
 - Made all peer delivery one-shot so later Codex pane responses cannot be captured and forwarded automatically.
 - Added `peer_providers` discovery, provider-scoped bridge locks, and sender-project completion fallback routing.
@@ -17,7 +20,7 @@
 - Made sandboxed discovery fail explicitly when the running daemon predates mailbox support instead of returning a misleading empty project list.
 - Delegated provider runtime checks for `ask`, `ccb-ping`, and `ccb-mounted` to the host daemon so managed Codex does not misclassify live WezTerm or tmux panes as dead.
 - Routed one-way Claude and Codex `ask --notify` requests through unified `askd` instead of the sandbox-incompatible legacy terminal path.
-- Scoped implicit `pend <provider>` selection by both project and persisted caller identity, preventing Claude and Codex panes in the same CCB session from reading each other's latest receipts.
+- Scoped implicit `pend <provider>` selection by the concrete CCB session instead of persisted caller identity, allowing paired Claude and Codex panes to share tab tasks without crossing into another tab.
 - Isolated test subprocess temporary directories so peer-task tests no longer create receipts in the user's live `/tmp/ccb-tasks` directory.
 - Made `ask`, `ccb-list`, runtime preflight, and peer delivery discover project-scoped `askd` state from the current working directory when `CCB_RUN_DIR` is not inherited.
 - Added automatic TCP-to-mailbox fallback for daemon RPC clients, covering restricted Claude and Codex command subprocesses without provider-specific environment assumptions.

@@ -3,7 +3,7 @@
 
 Use `/ask <provider>` to consult `codex`, `gemini`, `opencode`, or `claude` in the current CCB project.
 Use `/cping <provider>` to check connectivity.
-Use `/pend <task-id>` for an exact async result, or `/pend <provider>` for the current caller's latest task.
+Use `/pend <task-id>` for an exact async result. On a later turn, `/pend <provider>`, `/pend peer`, and `/pend local` retrieve current-tab tasks; prefer the exact contextual task ID whenever available.
 
 CCB uses one instance of each provider. Provider suffixes such as `:worker`, routing tags, abstract roles, and sub-agents are not supported.
 

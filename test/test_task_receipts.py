@@ -30,6 +30,18 @@ def _load_pend_module():
     return module
 
 
+def test_pend_skills_preserve_same_turn_async_guardrail() -> None:
+    for relative in (
+        "claude_skills/pend/SKILL.md",
+        "claude_skills/pend/SKILL.md.powershell",
+        "codex_skills/pend/SKILL.md",
+        "codex_skills/pend/SKILL.md.powershell",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "[CCB_ASYNC_SUBMITTED ...]" in source
+        assert "in the current turn, do not run `pend`" in source
+
+
 def _receipt(
     task_id: str,
     provider: str,
@@ -142,130 +154,191 @@ def test_peer_receipt_captures_live_marker_when_registry_discovery_is_missing(
     assert data["caller_pane_title_marker"] == f"CCB-Codex-{data['ccb_project_id'][:8]}"
 
 
-def test_pend_latest_is_scoped_to_caller_session(monkeypatch) -> None:
+def test_pend_receipts_are_scoped_to_current_session_not_caller_pane(monkeypatch) -> None:
     pend = _load_pend_module()
     records = [
-        (Path("new.json"), _receipt("new", "codex", session="ccb-2", pane="2", project="p", submitted="2")),
-        (Path("same-session-other-pane.json"), _receipt("wrong", "codex", session="ccb-1", pane="9", project="p", submitted="3")),
-        (Path("old.json"), _receipt("old", "codex", session="ccb-1", pane="1", project="p", submitted="1")),
+        (
+            Path("other-session.json"),
+            _receipt("other", "codex", session="ccb-2", pane="2", project="p", submitted="4"),
+        ),
+        (Path("peer.json"), _receipt("peer", "peer-codex", session="ccb-1", pane="2", project="p", submitted="3")),
+        (
+            Path("local.json"),
+            _receipt(
+                "local",
+                "codex",
+                session="ccb-1",
+                pane="14",
+                project="p",
+                submitted="2",
+                caller="codex",
+            ),
+        ),
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("1", "wezterm"))
-    monkeypatch.setenv("CCB_CALLER", "claude")
-    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
-    found = pend._latest_for_current_caller("codex")
+    found = pend._current_session_receipts("p", "ccb-1", "codex")
 
-    assert found is not None
-    assert found[1]["task_id"] == "old"
+    assert [data["task_id"] for _path, data in found] == ["peer", "local"]
 
 
-def test_pend_does_not_fall_back_to_another_project(monkeypatch) -> None:
+def test_pend_receipts_do_not_cross_projects(monkeypatch) -> None:
     pend = _load_pend_module()
     records = [
-        (Path("other.json"), _receipt("other", "codex", session="ccb-2", pane="2", project="p", submitted="2")),
+        (Path("other.json"), _receipt("other", "codex", session="ccb-1", pane="2", project="other", submitted="2")),
+        (Path("current.json"), _receipt("current", "codex", session="ccb-1", pane="2", project="p", submitted="1")),
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("1", "wezterm"))
-    monkeypatch.setenv("CCB_CALLER", "claude")
-    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "different-project")
 
-    assert pend._latest_for_current_caller("codex") is None
+    found = pend._current_session_receipts("p", "ccb-1", "codex")
+
+    assert [data["task_id"] for _path, data in found] == ["current"]
 
 
-def test_pend_recovers_latest_same_pane_receipt_after_session_restart(monkeypatch) -> None:
+def test_pend_restart_does_not_fall_back_to_old_session_receipts(monkeypatch) -> None:
     pend = _load_pend_module()
     records = [
         (Path("new.json"), _receipt("new", "codex", session="old-2", pane="5", project="p", submitted="2")),
         (Path("old.json"), _receipt("old", "codex", session="old-1", pane="5", project="p", submitted="1")),
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "restarted")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
-    monkeypatch.setenv("CCB_CALLER", "claude")
-    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
 
-    found = pend._latest_for_current_caller("codex")
+    found = pend._current_session_receipts("p", "restarted", "codex")
 
-    assert found is not None
-    assert found[1]["task_id"] == "new"
+    assert found == []
 
 
-def test_pend_provider_without_current_receipt_does_not_use_legacy(monkeypatch, capsys) -> None:
+def test_pend_session_resolution_prefers_environment(monkeypatch) -> None:
     pend = _load_pend_module()
-    monkeypatch.setattr(pend, "_latest_for_current_caller", lambda _provider: None)
+    monkeypatch.setattr(pend, "_current_project_id", lambda: "p")
+    monkeypatch.setattr(pend, "_executing_pane", lambda: ("14", "wezterm"))
+    monkeypatch.setattr(pend, "caller_session_id", lambda: "env-session")
+    monkeypatch.setattr(
+        pend,
+        "load_registry_by_pane",
+        lambda *_args, **_kwargs: {
+            "ccb_session_id": "registry-session",
+            "providers": {"codex": {"pane_id": "14"}},
+        },
+    )
+    monkeypatch.setenv("CCB_CALLER", "codex")
+
+    assert pend._current_session_context() == ("p", "env-session", "codex")
+
+
+def test_pend_session_resolution_falls_back_to_registry_pane(monkeypatch) -> None:
+    pend = _load_pend_module()
+    monkeypatch.setattr(pend, "_current_project_id", lambda: "p")
+    monkeypatch.setattr(pend, "_executing_pane", lambda: ("14", "wezterm"))
+    monkeypatch.setattr(pend, "caller_session_id", lambda: "")
+    monkeypatch.setattr(
+        pend,
+        "load_registry_by_pane",
+        lambda pane, **kwargs: {
+            "ccb_session_id": "registry-session",
+            "providers": {"codex": {"pane_id": pane}},
+        },
+    )
+
+    assert pend._current_session_context() == ("p", "registry-session", "codex")
+
+
+def test_pend_without_session_requires_exact_task_id(monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "", ""))
+
+    rc = pend.main(["pend", "codex"])
+
+    assert rc == pend.EXIT_NO_REPLY
+    assert "use an exact task ID" in capsys.readouterr().err
+
+
+def test_pend_restart_message_keeps_old_receipts_exact_id_only(monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    records = [
+        (Path("old.json"), _receipt("old", "codex", session="old-session", pane="2", project="p", submitted="1")),
+    ]
+    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "new-session", "claude"))
+
+    rc = pend.main(["pend", "codex"])
+
+    assert rc == pend.EXIT_NO_REPLY
+    assert "No codex task in current CCB session; use exact task ID" in capsys.readouterr().err
+
+
+def test_pend_relational_selectors_require_bound_model(monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("", "", ""))
+
+    rc = pend.main(["pend", "peer"])
+
+    assert rc == pend.EXIT_ERROR
+    assert "requires a bound model pane" in capsys.readouterr().err
+
+
+def test_pend_peer_and_local_resolve_relative_to_model() -> None:
+    pend = _load_pend_module()
+
+    assert pend._resolve_responder("peer", "claude") == ("codex", "")
+    assert pend._resolve_responder("local", "claude") == ("claude", "")
+    assert pend._resolve_responder("peer", "codex") == ("claude", "")
+    assert pend._resolve_responder("local", "codex") == ("codex", "")
+
+
+def test_pend_provider_count_is_task_history_not_legacy(monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    records = [
+        (Path("old.json"), _receipt("old", "codex", session="ccb-1", pane="2", project="p", submitted="1")),
+        (Path("new.json"), _receipt("new", "peer-codex", session="ccb-1", pane="2", project="p", submitted="2")),
+    ]
+    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "ccb-1", "claude"))
     monkeypatch.setattr(
         pend,
         "_legacy_pend",
         lambda *_args: (_ for _ in ()).throw(AssertionError("legacy pend must be explicit")),
     )
+    monkeypatch.setattr(pend, "_show_receipt", lambda receipt: print(f"reply-{receipt['task_id']}") or pend.EXIT_OK)
 
-    rc = pend.main(["pend", "codex"])
+    rc = pend.main(["pend", "codex", "2"])
 
-    assert rc == pend.EXIT_NO_REPLY
-    assert "No codex task receipt for the current caller" in capsys.readouterr().err
+    assert rc == pend.EXIT_OK
+    assert capsys.readouterr().out.splitlines() == [
+        "[TASK new]",
+        "reply-new",
+        "---",
+        "[TASK old]",
+        "reply-old",
+    ]
 
 
-def test_pend_restart_uses_latest_same_project_receipt_across_old_panes(monkeypatch) -> None:
+def test_pend_legacy_history_requires_explicit_flag(monkeypatch) -> None:
+    pend = _load_pend_module()
+    calls = []
+    monkeypatch.setattr(pend, "_legacy_pend", lambda provider, extra: calls.append((provider, extra)) or pend.EXIT_OK)
+
+    rc = pend.main(["pend", "codex", "--legacy", "3"])
+
+    assert rc == pend.EXIT_OK
+    assert calls == [("codex", ["3"])]
+
+
+def test_bare_pend_fails_when_current_session_has_multiple_tasks(monkeypatch, capsys) -> None:
     pend = _load_pend_module()
     records = [
-        (Path("a.json"), _receipt("a", "codex", session="old-1", pane="1", project="p", submitted="2")),
-        (Path("b.json"), _receipt("b", "codex", session="old-2", pane="2", project="p", submitted="1")),
+        (Path("a.json"), _receipt("a", "codex", session="ccb-1", pane="2", project="p", submitted="2")),
+        (Path("b.json"), _receipt("b", "claude", session="ccb-1", pane="14", project="p", submitted="1")),
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "restarted")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("9", "wezterm"))
-    monkeypatch.setenv("CCB_CALLER", "claude")
-    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "ccb-1", "codex"))
 
-    found = pend._latest_for_current_caller("codex")
+    rc = pend.main(["pend"])
 
-    assert found is not None
-    assert found[1]["task_id"] == "a"
-
-
-def test_pend_same_session_does_not_cross_caller_panes(monkeypatch) -> None:
-    pend = _load_pend_module()
-    records = [
-        (
-            Path("claude.json"),
-            _receipt("claude-new", "codex", session="ccb-1", pane="4", project="p", submitted="3", caller="claude"),
-        ),
-        (
-            Path("codex.json"),
-            _receipt("codex-old", "codex", session="ccb-1", pane="5", project="p", submitted="2", caller="codex"),
-        ),
-    ]
-    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("5", "wezterm"))
-    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
-    monkeypatch.setenv("CCB_CALLER", "codex")
-
-    found = pend._latest_for_current_caller("codex")
-
-    assert found is not None
-    assert found[1]["task_id"] == "codex-old"
-
-
-def test_pend_same_session_does_not_cross_projects(monkeypatch) -> None:
-    pend = _load_pend_module()
-    records = [
-        (Path("other.json"), _receipt("other", "codex", session="ccb-1", pane="5", project="other", submitted="3", caller="codex")),
-        (Path("current.json"), _receipt("current", "codex", session="old", pane="1", project="p", submitted="2", caller="codex")),
-    ]
-    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
-    monkeypatch.setattr(pend, "caller_session_id", lambda: "ccb-1")
-    monkeypatch.setattr(pend, "caller_pane", lambda: ("5", "wezterm"))
-    monkeypatch.setattr(pend, "compute_ccb_project_id", lambda _path: "p")
-    monkeypatch.setenv("CCB_CALLER", "codex")
-
-    found = pend._latest_for_current_caller("codex")
-
-    assert found is not None
-    assert found[1]["task_id"] == "current"
+    assert rc == pend.EXIT_ERROR
+    output = capsys.readouterr().err
+    assert "[AMBIGUOUS]" in output
+    assert "a, b" in output
 
 
 def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:

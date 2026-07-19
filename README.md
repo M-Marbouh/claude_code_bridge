@@ -57,22 +57,31 @@ Async submission prints a task ID and stores a structured receipt. Retrieve the 
 pend 20260711-120000-001-99
 ```
 
-For convenience, this resolves the latest task submitted by the current provider pane in the current CCB project:
+Provider and relational selectors resolve task receipts strictly within the current CCB tab:
 
 ```bash
 pend codex
+pend peer
+pend local
+pend codex 3
 ```
 
-Receipts are scoped by target provider, project, and persisted caller identity (`claude`, `codex`, and so on).
-Because Claude and Codex panes share one CCB session ID, the session ID alone is never used to select between
-them. Legacy receipts without a caller identity are accepted only for an exact current session-and-pane match;
-otherwise `pend` reports that no current-caller receipt exists instead of guessing.
+`peer` is relative to the current Claude or Codex pane; `local` is the provider in that pane. Provider lookup
+normalizes ordinary and peer receipts, so `pend codex` can retrieve either `codex` or `peer-codex` tasks.
+Both paired panes can retrieve receipts from their shared tab, while another same-project tab cannot win merely
+because it has a newer task. `pend codex 3` prints the newest three matching task replies with task IDs.
+
+Models prefer an exact task ID already present in conversation context. Bare `pend` succeeds only when the
+current tab has one unambiguous task. If the current session cannot be established, or a pre-restart receipt
+belongs to an older session, implicit lookup fails with guidance to use the exact task ID.
 
 Legacy conversation readers remain available temporarily:
 
 ```bash
-pend codex --legacy
+pend codex --legacy 3
 ```
+
+Legacy mode reads provider conversation history and is never selected merely because a numeric count is present.
 
 ## Runtime diagnostics
 
@@ -138,7 +147,7 @@ reply remains recoverable with `pend <original-task-id>` and the reverse command
 
 ## Session safety
 
-CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.
+CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Implicit `pend` lookup is strict to that session; pre-restart receipts remain available by exact task ID. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.
 
 ## Configuration
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""View the reply for an exact CCB task or the current caller's latest task."""
+"""View exact or current-session CCB task replies."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ sys.path.insert(0, str(lib_dir))
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text
 from codex_comm import CodexLogReader
+from pane_registry import load_registry_by_pane
 from project_id import compute_ccb_project_id
-from session_utils import find_project_session_file
-from task_receipts import caller_pane, caller_session_id, find_receipt, iter_receipts, read_peer_reply
+from task_receipts import caller_session_id, find_receipt, iter_receipts, read_peer_reply
 
 
 PROVIDER_PENDS = {
@@ -31,13 +31,10 @@ PROVIDER_PENDS = {
     "claude": "lpend",
 }
 TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-\d{3}-\d+(?:-\d+)?$")
-CALLER_SESSION_FILES = {
-    "claude": ".claude-session",
-    "codex": ".codex-session",
-    "gemini": ".gemini-session",
-    "opencode": ".opencode-session",
+PEER_PROVIDERS = {
+    "claude": "codex",
+    "codex": "claude",
 }
-VALID_CALLERS = set(CALLER_SESSION_FILES) | {"email", "manual"}
 
 
 def _legacy_pend(provider: str, extra: list[str]) -> int:
@@ -53,72 +50,115 @@ def _legacy_pend(provider: str, extra: list[str]) -> int:
         return EXIT_ERROR
 
 
-def _current_caller(pane_id: str) -> str:
-    direct = (os.environ.get("CCB_CALLER") or "").strip().lower()
-    if direct in VALID_CALLERS:
-        return direct
-    if pane_id:
-        for caller, filename in CALLER_SESSION_FILES.items():
-            try:
-                session_file = find_project_session_file(Path.cwd(), filename)
-                data = json.loads(session_file.read_text(encoding="utf-8-sig")) if session_file else {}
-            except Exception:
-                data = {}
-            session_pane = str(data.get("pane_id") or data.get("tmux_session") or "").strip()
-            if session_pane == pane_id:
-                return caller
-    return "manual" if not pane_id else ""
-
-
-def _latest_for_current_caller(provider: str) -> tuple[Path, dict] | None:
+def _current_project_id() -> str:
     try:
-        project_id = compute_ccb_project_id(Path.cwd())
+        return compute_ccb_project_id(Path.cwd())
     except Exception:
-        project_id = ""
+        return ""
+
+
+def _executing_pane() -> tuple[str, str]:
+    wezterm = (os.environ.get("WEZTERM_PANE") or "").strip()
+    if wezterm:
+        return wezterm, "wezterm"
+    tmux = (os.environ.get("TMUX_PANE") or "").strip()
+    if tmux:
+        return tmux, "tmux"
+    return "", ""
+
+
+def _provider_for_pane(record: dict | None, pane_id: str) -> str:
+    if not isinstance(record, dict) or not pane_id:
+        return ""
+    providers = record.get("providers")
+    if isinstance(providers, dict):
+        for provider, entry in providers.items():
+            if (
+                provider in PROVIDER_PENDS
+                and isinstance(entry, dict)
+                and str(entry.get("pane_id") or "").strip() == pane_id
+            ):
+                return provider
+    for provider in PROVIDER_PENDS:
+        if str(record.get(f"{provider}_pane_id") or "").strip() == pane_id:
+            return provider
+    return ""
+
+
+def _current_session_context() -> tuple[str, str, str]:
+    """Return project, strict CCB session, and the bound model provider."""
+    project_id = _current_project_id()
+    pane_id, terminal = _executing_pane()
+    session_id = caller_session_id()
+    direct_provider = (os.environ.get("CCB_CALLER") or "").strip().lower()
+    current_provider = direct_provider if direct_provider in PROVIDER_PENDS else ""
+
+    record = None
+    if project_id and pane_id:
+        record = load_registry_by_pane(
+            pane_id,
+            ccb_project_id=project_id,
+            terminal=terminal,
+            require_owner_alive=True,
+        )
+    if not session_id and isinstance(record, dict):
+        session_id = str(record.get("ccb_session_id") or record.get("session_id") or "").strip()
+    if not current_provider:
+        current_provider = _provider_for_pane(record, pane_id)
+    return project_id, session_id, current_provider
+
+
+def _receipt_session_id(receipt: dict) -> str:
+    return str(
+        receipt.get("caller_session_id")
+        or receipt.get("caller_registry_session_id")
+        or ""
+    ).strip()
+
+
+def _receipt_responder(receipt: dict) -> str:
+    provider = str(receipt.get("provider") or "").strip().lower()
+    if provider.startswith("peer-"):
+        return str(receipt.get("peer_provider") or provider[5:]).strip().lower()
+    return provider
+
+
+def _current_session_receipts(
+    project_id: str,
+    session_id: str,
+    responder: str = "",
+) -> list[tuple[Path, dict]]:
     records = [
         (path, data)
         for path, data in iter_receipts()
-        if data.get("provider") == provider
-        and project_id
-        and data.get("ccb_project_id") == project_id
+        if project_id
+        and session_id
+        and str(data.get("ccb_project_id") or "").strip() == project_id
+        and _receipt_session_id(data) == session_id
+        and (not responder or _receipt_responder(data) == responder)
     ]
-    if not records:
-        return None
-
-    session_id = caller_session_id()
-    pane_id, terminal = caller_pane()
-    caller = _current_caller(pane_id)
-    caller_records = (
-        [item for item in records if str(item[1].get("caller") or "").strip().lower() == caller]
-        if caller
-        else []
+    records.sort(
+        key=lambda item: str(item[1].get("submitted_at") or item[0].name),
+        reverse=True,
     )
-    legacy_records = [item for item in records if not str(item[1].get("caller") or "").strip()]
-    if session_id and pane_id:
-        matches = [
-            item
-            for item in caller_records + legacy_records
-            if str(item[1].get("caller_session_id") or "") == session_id
-            and str(item[1].get("caller_pane_id") or "") == pane_id
-            and str(item[1].get("caller_terminal") or "") == terminal
-        ]
-        if matches:
-            return matches[0]
+    return records
 
-    if pane_id:
-        matches = [
-            item
-            for item in caller_records
-            if str(item[1].get("caller_pane_id") or "") == pane_id
-            and str(item[1].get("caller_terminal") or "") == terminal
-        ]
-        if matches:
-            return matches[0]
 
-    # CCB enforces one provider instance per project. After a restart, pane and
-    # session IDs legitimately change. The persisted caller field is stable
-    # across that restart and prevents a sibling provider pane from winning.
-    return caller_records[0] if caller_records else None
+def _resolve_responder(target: str, current_provider: str) -> tuple[str, str]:
+    if target == "local":
+        if not current_provider:
+            return "", "'local' requires a bound model pane; use a provider name or exact task ID"
+        return current_provider, ""
+    if target == "peer":
+        if not current_provider:
+            return "", "'peer' requires a bound model pane; use a provider name or exact task ID"
+        peer = PEER_PROVIDERS.get(current_provider, "")
+        if not peer:
+            return "", f"'peer' is not defined for {current_provider}; use a provider name or exact task ID"
+        return peer, ""
+    if target in PROVIDER_PENDS:
+        return target, ""
+    return "", f"Unknown provider, relation, or task ID: {target}"
 
 
 def _status_finished(status_path: Path) -> tuple[bool, int | None]:
@@ -304,36 +344,100 @@ def _show_receipt(receipt: dict) -> int:
     return EXIT_OK if exit_code == 0 else EXIT_ERROR
 
 
+def _show_receipts(records: list[tuple[Path, dict]], *, prefix_task_ids: bool) -> int:
+    result = EXIT_OK
+    for index, (_path, receipt) in enumerate(records):
+        if prefix_task_ids:
+            print(f"[TASK {receipt.get('task_id', '')}]")
+        current = _show_receipt(receipt)
+        if current == EXIT_ERROR:
+            result = EXIT_ERROR
+        elif current == EXIT_NO_REPLY and result == EXIT_OK:
+            result = EXIT_NO_REPLY
+        if index < len(records) - 1:
+            print("---")
+    return result
+
+
+def _positive_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("count must be an integer") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("count must be at least 1")
+    return count
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="pend")
-    parser.add_argument("target", help="Provider name or exact task ID")
-    parser.add_argument("legacy_args", nargs="*", help=argparse.SUPPRESS)
+    parser.add_argument("target", nargs="?", default="", help="Provider, peer/local relation, or exact task ID")
+    parser.add_argument("count", nargs="?", type=_positive_count, help="Show the latest N task replies")
     parser.add_argument("--legacy", action="store_true", help="Use the provider's legacy conversation reader")
-    args = parser.parse_args(argv[1:])
+    args = parser.parse_intermixed_args(argv[1:])
 
     target = args.target.strip().lower()
     if TASK_ID_RE.match(target):
+        if args.legacy or args.count is not None:
+            print("[ERROR] Exact task lookup does not accept a count or --legacy", file=sys.stderr)
+            return EXIT_ERROR
         found = find_receipt(target)
         if not found:
             print(f"[ERROR] Unknown or ambiguous task ID: {target}", file=sys.stderr)
             return EXIT_ERROR
         return _show_receipt(found[1])
 
-    if target not in PROVIDER_PENDS:
-        print(f"[ERROR] Unknown provider or task ID: {target}", file=sys.stderr)
-        print(f"[ERROR] Available providers: {', '.join(PROVIDER_PENDS)}", file=sys.stderr)
-        return EXIT_ERROR
-    if args.legacy or args.legacy_args:
-        return _legacy_pend(target, args.legacy_args)
+    if args.legacy:
+        if target not in PROVIDER_PENDS:
+            print("[ERROR] --legacy requires an explicit provider name", file=sys.stderr)
+            return EXIT_ERROR
+        legacy_args = [str(args.count)] if args.count is not None else []
+        return _legacy_pend(target, legacy_args)
 
-    try:
-        found = _latest_for_current_caller(target)
-    except RuntimeError:
-        return EXIT_ERROR
-    if found:
-        return _show_receipt(found[1])
-    print(f"[NO TASK] No {target} task receipt for the current caller", file=sys.stderr)
-    return EXIT_NO_REPLY
+    project_id, session_id, current_provider = _current_session_context()
+    responder = ""
+    if target:
+        responder, error = _resolve_responder(target, current_provider)
+        if error:
+            print(f"[ERROR] {error}", file=sys.stderr)
+            print(f"[ERROR] Available providers: {', '.join(PROVIDER_PENDS)}", file=sys.stderr)
+            return EXIT_ERROR
+    if not project_id or not session_id:
+        print(
+            "[NO SESSION] Implicit pend unavailable for the current CCB session; "
+            "use an exact task ID",
+            file=sys.stderr,
+        )
+        return EXIT_NO_REPLY
+
+    if not target:
+        records = _current_session_receipts(project_id, session_id)
+        if not records:
+            print(
+                "[NO TASK] No task in current CCB session; use exact task ID",
+                file=sys.stderr,
+            )
+            return EXIT_NO_REPLY
+        if len(records) > 1:
+            candidates = ", ".join(str(data.get("task_id") or "") for _path, data in records[:5])
+            print(
+                f"[AMBIGUOUS] Multiple tasks match the current CCB session: {candidates}; "
+                "use an exact task ID, provider, peer, or local",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        return _show_receipt(records[0][1])
+
+    records = _current_session_receipts(project_id, session_id, responder)
+    if not records:
+        print(
+            f"[NO TASK] No {target} task in current CCB session; use exact task ID",
+            file=sys.stderr,
+        )
+        return EXIT_NO_REPLY
+    count = args.count if args.count is not None else 1
+    selected = records[:count]
+    return _show_receipts(selected, prefix_task_ids=args.count is not None)
 
 
 if __name__ == "__main__":

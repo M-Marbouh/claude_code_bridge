@@ -12,7 +12,11 @@ script_dir = Path(__file__).resolve().parent
 lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
-from ccb_runtime_status import inside_managed_codex_sandbox, resolve_project_runtime_status
+from ccb_runtime_status import (
+    inside_managed_codex_sandbox,
+    resolve_daemon_work_dir,
+    resolve_project_runtime_status,
+)
 from session_utils import find_project_session_file
 
 
@@ -65,14 +69,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--simple", action="store_true", help="Print a space-separated provider list.")
     parser.add_argument("--json", action="store_true", help="Print JSON output (default).")
     parser.add_argument("--autostart", action="store_true", help="Best-effort daemon autostart before checking.")
-    parser.add_argument("path", nargs="?", default=os.getcwd())
+    parser.add_argument("path", nargs="?", default=None)
     args = parser.parse_args(argv)
 
-    work_dir = Path(args.path).expanduser()
+    explicit_path = args.path is not None
+    work_dir = Path(args.path or os.getcwd()).expanduser()
     try:
         work_dir = work_dir.resolve()
     except Exception:
         work_dir = work_dir.absolute()
+    if not explicit_path:
+        work_dir = resolve_daemon_work_dir(work_dir)
 
     if args.autostart:
         _autostart_daemons(work_dir)

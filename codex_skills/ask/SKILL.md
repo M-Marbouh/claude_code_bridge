@@ -31,6 +31,7 @@ EOF
 - After running the command, say "[Provider] processing..." and immediately end your turn.
 - Do not wait for results or check status in the same turn.
 - The task ID and log file path will be displayed for tracking.
+- If `ask` fails with `CCB_ROUTE_ERROR ... reason=not_mounted`, check your cwd: run from the project root shown by `ccb-list`. Only shells without `CCB_RUN_DIR` (non-CCB-managed) are cwd-sensitive.
 
 ## Examples
 

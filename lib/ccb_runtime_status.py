@@ -195,6 +195,41 @@ def _daemon_project_runtime_status(
         raise RuntimeError(f"askd returned an invalid runtime status: {exc}") from exc
 
 
+def daemon_work_dir_from_state(state: dict[str, Any] | None, *, fallback: str | Path | None = None) -> Path:
+    """Return a valid daemon project root, or the caller's work directory."""
+    fallback_path = Path(fallback or Path.cwd()).expanduser()
+    try:
+        fallback_path = fallback_path.resolve()
+    except Exception:
+        fallback_path = fallback_path.absolute()
+    if not isinstance(state, dict):
+        return fallback_path
+    raw = state.get("work_dir")
+    if not isinstance(raw, str) or not raw.strip():
+        return fallback_path
+    candidate = Path(raw.strip()).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except Exception:
+        candidate = candidate.absolute()
+    return candidate if candidate.is_dir() else fallback_path
+
+
+def resolve_daemon_work_dir(work_dir: str | Path | None = None) -> Path:
+    """Resolve the reachable daemon's project root for an implicit managed target."""
+    fallback = daemon_work_dir_from_state(None, fallback=work_dir)
+    if not (os.environ.get("CCB_RUN_DIR") or "").strip():
+        return fallback
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=fallback,
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
+    return daemon_work_dir_from_state(state, fallback=fallback)
+
+
 def is_project_askd_online(work_dir: Path, project_id: str, *, timeout_s: float = 0.2) -> bool:
     attempt_timeouts = (
         max(0.05, timeout_s),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import askd_rpc
 import askd_runtime
+from ccb_runtime_status import ProviderRuntimeStatus
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,21 @@ def _load_ask_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def _provider_status(*, mounted: bool, daemon_online: bool = True) -> ProviderRuntimeStatus:
+    return ProviderRuntimeStatus(
+        key="codex",
+        provider="codex",
+        capable=True,
+        configured=mounted,
+        registered=mounted,
+        pane_alive=mounted,
+        session_bound=mounted,
+        daemon_online=daemon_online,
+        mounted=mounted,
+        reason="" if mounted else "not_configured",
+    )
 
 
 def _capture_unified_request(monkeypatch, tmp_path: Path, *, show_tier_env: str | None) -> dict:
@@ -105,10 +121,11 @@ def test_unified_daemon_forwards_delivery_only_flags(monkeypatch, tmp_path: Path
 def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None:
     ask = _load_ask_module()
     captured: dict = {}
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
     monkeypatch.setenv("CCB_CALLER", "codex")
     monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
-    monkeypatch.setattr(ask, "_unified_daemon_available", lambda: True)
-    monkeypatch.setattr(ask, "_preflight_target", lambda _provider: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "_preflight_target", lambda _provider, **_kwargs: True)
     monkeypatch.setattr(
         ask,
         "_send_via_unified_daemon",
@@ -125,7 +142,11 @@ def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None
     assert rc == 0
     assert captured["provider"] == "claude"
     assert captured["caller"] == "codex"
-    assert captured["kwargs"] == {"delivery_only": True, "suppress_completion_hook": True}
+    assert captured["kwargs"] == {
+        "delivery_only": True,
+        "suppress_completion_hook": True,
+        "daemon_context": context,
+    }
 
 
 def test_unified_state_discovery_uses_cwd_project_when_run_dir_missing(monkeypatch, tmp_path: Path) -> None:
@@ -164,6 +185,126 @@ def test_preflight_reports_runtime_proxy_failure(monkeypatch, capsys) -> None:
 
     assert ask._preflight_target("claude") is False
     assert "Provider runtime status unavailable: host status unavailable" in capsys.readouterr().err
+
+
+def test_foreground_ask_uses_one_daemon_project_context_from_subdirectory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    subdir = project / "nested"
+    run_dir = tmp_path / "run"
+    subdir.mkdir(parents=True)
+    run_dir.mkdir()
+    state_file = run_dir / "askd.json"
+    state = {"token": "tok", "work_dir": str(project)}
+    find_calls: list[dict] = []
+    preflight_dirs: list[Path] = []
+    statuses: list[ProviderRuntimeStatus] = []
+    sent: dict = {}
+
+    monkeypatch.chdir(subdir)
+    monkeypatch.setenv("CCB_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(
+        ask,
+        "_find_running_unified_state_file",
+        lambda **kwargs: find_calls.append(kwargs) or state_file,
+    )
+    monkeypatch.setattr(askd_rpc, "read_state", lambda _path: state)
+
+    def _status(_provider: str, *, work_dir: Path) -> ProviderRuntimeStatus:
+        preflight_dirs.append(Path(work_dir))
+        status = _provider_status(mounted=True, daemon_online=True)
+        statuses.append(status)
+        return status
+
+    monkeypatch.setattr(ask, "provider_status_for_target", _status)
+    monkeypatch.setattr(
+        askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request) or {"exit_code": 0, "reply": ""},
+    )
+    monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("9", "wezterm"))
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == 0
+    assert find_calls == [{}]
+    assert preflight_dirs == [project]
+    assert statuses[0].daemon_online is True
+    assert sent["work_dir"] == str(project)
+
+
+def test_foreground_ask_rejects_genuinely_unmounted_provider(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    run_dir = tmp_path / "run"
+    project.mkdir()
+    run_dir.mkdir()
+    state_file = run_dir / "askd.json"
+    sent: list[dict] = []
+
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("CCB_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(ask, "_find_running_unified_state_file", lambda **_kwargs: state_file)
+    monkeypatch.setattr(
+        askd_rpc,
+        "read_state",
+        lambda _path: {"token": "tok", "work_dir": str(project)},
+    )
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_args, **_kwargs: _provider_status(mounted=False, daemon_online=True),
+    )
+    monkeypatch.setattr(askd_rpc, "request_daemon", lambda _state, request, **_kwargs: sent.append(request))
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == 1
+    assert sent == []
+    error = capsys.readouterr().err
+    assert "CCB_ROUTE_ERROR target=codex reason=not_mounted" in error
+    assert "daemon_online=true" in error
+
+
+def test_foreground_ask_without_managed_run_dir_falls_back_to_project_cwd(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    state_file = tmp_path / "askd.json"
+    preflight_dirs: list[Path] = []
+    sent: dict = {}
+
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("CCB_RUN_DIR", raising=False)
+    monkeypatch.setenv("CCB_CALLER", "manual")
+    monkeypatch.setattr(ask, "_find_running_unified_state_file", lambda **_kwargs: state_file)
+    monkeypatch.setattr(askd_rpc, "read_state", lambda _path: {"token": "tok"})
+
+    def _status(_provider: str, *, work_dir: Path) -> ProviderRuntimeStatus:
+        preflight_dirs.append(Path(work_dir))
+        return _provider_status(mounted=True, daemon_online=True)
+
+    monkeypatch.setattr(ask, "provider_status_for_target", _status)
+    monkeypatch.setattr(
+        askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request) or {"exit_code": 0, "reply": ""},
+    )
+    monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("", ""))
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == 0
+    assert preflight_dirs == [project]
+    assert sent["work_dir"] == str(project)
 
 
 def test_ask_rejects_provider_instances_before_dispatch(capsys) -> None:

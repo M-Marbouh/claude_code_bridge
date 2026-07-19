@@ -25,6 +25,7 @@
 - Made the launcher reuse its own live `askd` child across provider startup hooks and stop reporting lock-contention duplicates as daemon failures, while requiring a successful RPC before declaring readiness.
 - Retried valid per-project daemon probes before reporting `daemon_offline`, persisted launcher PIDs in registry records, and excluded orphaned provider panes from active peer discovery.
 - Restored TCP daemon response accumulation and added deterministic TCP and mailbox round-trip coverage so runner environment variables cannot silently select the wrong transport.
+- Made implicit managed `ask`, `ccb-ping`, and `ccb-mounted` status checks use the reachable daemon's validated project root, preventing subdirectory cwd hashes from producing false `not_mounted` or `daemon_offline` results.
 
 ## v0.12.0 (2026-07-11)
 

@@ -30,6 +30,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 PROVIDER_DISPLAY = {
     "opencode": "OpenCode",
@@ -49,6 +50,7 @@ setup_windows_encoding()
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import (
     ProviderRuntimeStatus,
+    daemon_work_dir_from_state,
     inside_managed_codex_sandbox,
     provider_status_for_target,
 )
@@ -89,6 +91,12 @@ _REMOVED_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGN
 _PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
+
+
+class _UnifiedDaemonContext(NamedTuple):
+    state_file: Path
+    state: dict
+    work_dir: Path
 
 
 def _caller_pane_info() -> tuple[str, str]:
@@ -247,9 +255,9 @@ def _route_error_line(target: str, status: ProviderRuntimeStatus, *, reason: str
     )
 
 
-def _preflight_target(provider: str) -> bool:
+def _preflight_target(provider: str, *, work_dir: str | Path | None = None) -> bool:
     try:
-        status = provider_status_for_target(provider, work_dir=Path.cwd())
+        status = provider_status_for_target(provider, work_dir=work_dir or Path.cwd())
     except Exception as exc:
         print(f"[ERROR] Provider runtime status unavailable: {exc}", file=sys.stderr)
         return False
@@ -275,8 +283,20 @@ def _find_running_unified_state_file(
     )
 
 
-def _unified_daemon_available() -> bool:
-    return _find_running_unified_state_file() is not None or _maybe_start_unified_daemon()
+def _resolve_unified_daemon_context() -> _UnifiedDaemonContext | None:
+    """Resolve one reachable daemon state for availability, preflight, and dispatch."""
+    import askd_rpc
+
+    state_file = _find_running_unified_state_file()
+    if state_file is None and _maybe_start_unified_daemon():
+        state_file = _find_running_unified_state_file()
+    if state_file is None:
+        return None
+    state = askd_rpc.read_state(state_file)
+    if not isinstance(state, dict):
+        return None
+    work_dir = daemon_work_dir_from_state(state, fallback=Path.cwd())
+    return _UnifiedDaemonContext(state_file=state_file, state=state, work_dir=work_dir)
 
 
 def _maybe_start_unified_daemon() -> bool:
@@ -363,31 +383,18 @@ def _send_via_unified_daemon(
     *,
     delivery_only: bool = False,
     suppress_completion_hook: bool = False,
+    daemon_context: _UnifiedDaemonContext | None = None,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
     import askd_rpc
 
-    state_file = _find_running_unified_state_file()
-    if state_file is None and _maybe_start_unified_daemon():
-        state_file = _find_running_unified_state_file()
-    if state_file is None:
+    context = daemon_context or _resolve_unified_daemon_context()
+    if context is None:
         print("[ERROR] Unified askd daemon not running", file=sys.stderr)
         return EXIT_ERROR
-
-    state = askd_rpc.read_state(state_file)
-    if not state:
-        print("[ERROR] Unified askd daemon state unavailable", file=sys.stderr)
-        return EXIT_ERROR
-
+    state = context.state
     token = state.get("token") or ""
-    # Use daemon's work_dir from state file
-    # This ensures consistency with CCB session (pane id, work_dir, hash)
-    raw_work_dir = state.get("work_dir")
-    daemon_work_dir = raw_work_dir.strip() if isinstance(raw_work_dir, str) and raw_work_dir.strip() else ""
-    if not daemon_work_dir or not Path(daemon_work_dir).is_dir():
-        if daemon_work_dir:
-            print(f"[WARN] daemon work_dir not found: {daemon_work_dir}, falling back to cwd", file=sys.stderr)
-        daemon_work_dir = os.getcwd()
+    daemon_work_dir = str(context.work_dir)
 
     if not token:
         print("[ERROR] Invalid askd state", file=sys.stderr)
@@ -442,13 +449,12 @@ def _send_via_unified_daemon(
             return exit_code
         except askd_rpc.DaemonConnectionError as e:
             if attempt == 0:
-                if _maybe_start_unified_daemon():
-                    # Re-read state for new daemon
-                    state = askd_rpc.read_state(state_file)
-                    if state:
-                        token = state.get("token") or ""
-                        req["token"] = token
-                        continue  # Retry with new connection info
+                replacement = _resolve_unified_daemon_context()
+                if replacement is not None:
+                    state = replacement.state
+                    token = state.get("token") or ""
+                    req["token"] = token
+                    continue  # Retry with new connection info
             print(f"[ERROR] {e}", file=sys.stderr)
             return EXIT_ERROR
         except Exception as e:
@@ -957,22 +963,26 @@ def main(argv: list[str]) -> int:
             peer_target, provider, timeout, message, foreground_mode, peer_intent, peer_reply_to
         )
 
+    daemon_context: _UnifiedDaemonContext | None = None
     if not notify_mode:
         if _use_unified_daemon():
-            if not _unified_daemon_available():
+            daemon_context = _resolve_unified_daemon_context()
+            if daemon_context is None:
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)
                 return EXIT_ERROR
-        if not _preflight_target(provider):
+        preflight_work_dir = daemon_context.work_dir if daemon_context is not None else Path.cwd()
+        if not _preflight_target(provider, work_dir=preflight_work_dir):
             return EXIT_ERROR
 
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:
         caller = _require_caller()
         if _use_unified_daemon() and provider in PEER_PROVIDERS:
-            if not _unified_daemon_available():
+            daemon_context = _resolve_unified_daemon_context()
+            if daemon_context is None:
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)
                 return EXIT_ERROR
-            if not _preflight_target(provider):
+            if not _preflight_target(provider, work_dir=daemon_context.work_dir):
                 return EXIT_ERROR
             return _send_via_unified_daemon(
                 provider,
@@ -982,6 +992,7 @@ def main(argv: list[str]) -> int:
                 caller,
                 delivery_only=True,
                 suppress_completion_hook=True,
+                daemon_context=daemon_context,
             )
         if _use_unified_daemon():
             print("[WARN] Unified notify is unavailable for this provider; using legacy", file=sys.stderr)
@@ -1009,7 +1020,14 @@ def main(argv: list[str]) -> int:
     if foreground_mode:
         if _use_unified_daemon():
             caller = _require_caller()
-            return _send_via_unified_daemon(provider, message, timeout, no_wrap, caller)
+            return _send_via_unified_daemon(
+                provider,
+                message,
+                timeout,
+                no_wrap,
+                caller,
+                daemon_context=daemon_context,
+            )
         else:
             cmd = [daemon_cmd, "--sync", "--timeout", str(timeout)]
             if no_wrap and provider == "claude":
@@ -1024,11 +1042,6 @@ def main(argv: list[str]) -> int:
                 return EXIT_ERROR
 
     # Default async mode: background task
-    if _use_unified_daemon():
-        if not _unified_daemon_available():
-            print("[ERROR] Unified askd daemon not running", file=sys.stderr)
-            return EXIT_ERROR
-
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     log_dir.mkdir(parents=True, exist_ok=True)

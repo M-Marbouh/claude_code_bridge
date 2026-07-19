@@ -62,3 +62,33 @@ def test_ccb_ping_reports_host_runtime_failure_reason(monkeypatch, capsys) -> No
 
     assert rc == 1
     assert "session_unbound" in capsys.readouterr().out
+
+
+def test_ccb_ping_uses_daemon_project_root_for_implicit_managed_target(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    ping = _load_ping_module()
+    project = tmp_path / "project"
+    subdir = project / "nested"
+    subdir.mkdir(parents=True)
+    seen: list[Path] = []
+
+    monkeypatch.chdir(subdir)
+    monkeypatch.setenv("CCB_RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(sys, "argv", ["ccb-ping", "claude"])
+    monkeypatch.setattr(ping, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(ping, "resolve_daemon_work_dir", lambda _work_dir: project)
+
+    def _capture_status(_provider: str, *, work_dir: Path) -> ProviderRuntimeStatus:
+        seen.append(Path(work_dir))
+        return _status(mounted=True)
+
+    monkeypatch.setattr(ping, "provider_status_for_target", _capture_status)
+
+    rc = ping.main()
+
+    assert rc == 0
+    assert seen == [project]
+    assert "host runtime verified" in capsys.readouterr().out

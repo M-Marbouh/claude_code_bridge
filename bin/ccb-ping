@@ -19,7 +19,11 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
-from ccb_runtime_status import inside_managed_codex_sandbox, provider_status_for_target
+from ccb_runtime_status import (
+    inside_managed_codex_sandbox,
+    provider_status_for_target,
+    resolve_daemon_work_dir,
+)
 setup_windows_encoding()
 
 
@@ -83,7 +87,8 @@ def main():
 
     if inside_managed_codex_sandbox():
         try:
-            status = provider_status_for_target(provider, work_dir=work_dir)
+            status_work_dir = work_dir if args.session_file else resolve_daemon_work_dir(work_dir)
+            status = provider_status_for_target(provider, work_dir=status_work_dir)
         except Exception as exc:
             print(f"[ERROR] {provider.capitalize()} connectivity test failed: {exc}", file=sys.stderr)
             return 1

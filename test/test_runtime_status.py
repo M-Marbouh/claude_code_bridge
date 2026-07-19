@@ -230,6 +230,54 @@ def test_project_askd_online_retries_valid_project_state(tmp_path: Path, monkeyp
     assert sleeps == [0.05]
 
 
+def test_resolve_daemon_work_dir_uses_reachable_state_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    subdir = project / "nested"
+    run_dir = tmp_path / "run"
+    subdir.mkdir(parents=True)
+    run_dir.mkdir()
+    state_file = run_dir / "askd.json"
+    seen_work_dirs: list[Path] = []
+
+    def _find(_name, *, protocol_prefix, work_dir, timeout_s):
+        assert protocol_prefix == "ask"
+        assert timeout_s == 0.5
+        seen_work_dirs.append(Path(work_dir))
+        return state_file
+
+    monkeypatch.setenv("CCB_RUN_DIR", str(run_dir))
+    monkeypatch.setattr(ccb_runtime_status, "find_running_state_file", _find)
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc,
+        "read_state",
+        lambda _path: {"token": "tok", "work_dir": str(project)},
+    )
+
+    assert ccb_runtime_status.resolve_daemon_work_dir(subdir) == project
+    assert seen_work_dirs == [subdir]
+
+
+def test_resolve_daemon_work_dir_without_managed_run_dir_keeps_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    subdir = project / "nested"
+    subdir.mkdir(parents=True)
+
+    monkeypatch.delenv("CCB_RUN_DIR", raising=False)
+    monkeypatch.setattr(
+        ccb_runtime_status,
+        "find_running_state_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon discovery used")),
+    )
+
+    assert ccb_runtime_status.resolve_daemon_work_dir(subdir) == subdir
+
+
 def test_runtime_status_excludes_dead_launcher_unless_stale_requested(
     runtime_env,
     monkeypatch: pytest.MonkeyPatch,

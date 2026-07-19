@@ -34,6 +34,7 @@ Bash(CCB_CALLER=claude ask $PROVIDER "$MESSAGE")
 - If submit fails (non-zero exit) or `CCB_ASYNC_SUBMITTED` is absent from output:
   - Reply with exactly one line: `[Provider] submit failed: <short error or 'no async marker in output'>`
   - End your turn immediately.
+- If `ask` fails with `CCB_ROUTE_ERROR ... reason=not_mounted`, check your cwd: run from the project root shown by `ccb-list`. Only shells without `CCB_RUN_DIR` (non-CCB-managed) are cwd-sensitive.
 
 ## Examples
 

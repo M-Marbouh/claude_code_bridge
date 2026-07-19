@@ -859,16 +859,60 @@ class AILauncher:
             managed = bool(state.get("managed"))
             return managed and parent_pid == self.ccb_pid
 
-        state_file = None
-        raw_state_file = (os.environ.get(spec.state_file_env) or "").strip()
+        # Every provider now shares the unified askd daemon.  Do not poll the
+        # retired provider-specific state files (caskd.json, laskd.json, ...)
+        # when starting bin/askd: the child never writes them.
+        if spec.daemon_bin_name == "askd":
+            raw_state_file = (os.environ.get("CCB_ASKD_STATE_FILE") or "").strip()
+            state_file = state_file_path("askd.json")
+        else:
+            raw_state_file = (os.environ.get(spec.state_file_env) or "").strip()
+            state_file = None
         if raw_state_file:
             try:
                 state_file = Path(raw_state_file).expanduser()
             except Exception:
-                state_file = None
+                pass
+
+        def _read_daemon_state() -> dict:
+            if not callable(read_state):
+                return {}
+            try:
+                state = read_state(state_file=state_file) or {}
+            except Exception:
+                return {}
+            return state if isinstance(state, dict) else {}
+
+        def _emit_started(state: dict, *, already_running: bool = False) -> None:
+            host = state.get("host")
+            port = state.get("port")
+            action = "already running" if already_running else "started"
+            if host and port:
+                _emit(f"✅ {spec.daemon_bin_name} {action} at {host}:{port}")
+            else:
+                _emit(f"✅ {spec.daemon_bin_name} {action}")
+
+        def _matching_managed_child(state: dict, proc) -> bool:
+            """Accept state published by our live child even if one RPC probe misses."""
+            try:
+                child_pid = int(getattr(proc, "pid"))
+                state_pid = int(state.get("pid") or 0)
+            except Exception:
+                return False
+            try:
+                poll = getattr(proc, "poll", None)
+                if callable(poll) and poll() is not None:
+                    return False
+            except Exception:
+                return False
+            has_transport = bool(
+                (state.get("host") and state.get("port"))
+                or state.get("mailbox_dir")
+            )
+            return state_pid == child_pid and _owned_by_ccb(state) and has_transport
 
         if ping_daemon(state_file=state_file):
-            st = read_state(state_file=state_file) or {} if callable(read_state) else {}
+            st = _read_daemon_state()
             if spec.daemon_bin_name == "askd" and not self._askd_checked:
                 self._askd_checked = True
                 if not _owned_by_ccb(st):
@@ -904,12 +948,7 @@ class AILauncher:
                         # Foreign parent is still alive, don't force rebind
                         _emit(f"⚠️ askd owned by live parent (PID {foreign_parent_pid}), skipping rebind to avoid disruption")
                         _emit(f"   Set CCB_FORCE_REBIND=1 to override this safety check")
-                        host = st.get("host") if isinstance(st, dict) else None
-                        port = st.get("port") if isinstance(st, dict) else None
-                        if host and port:
-                            _emit(f"✅ {spec.daemon_bin_name} already running at {host}:{port}")
-                        else:
-                            _emit(f"✅ {spec.daemon_bin_name} already running")
+                        _emit_started(st, already_running=True)
                         return
                     deadline = time.time() + 2.0
                     while time.time() < deadline:
@@ -918,28 +957,13 @@ class AILauncher:
                         time.sleep(0.1)
                     if ping_daemon(timeout_s=0.2, state_file=state_file):
                         _emit("⚠️ askd restart skipped: existing daemon still running")
-                        host = st.get("host") if isinstance(st, dict) else None
-                        port = st.get("port") if isinstance(st, dict) else None
-                        if host and port:
-                            _emit(f"✅ {spec.daemon_bin_name} already running at {host}:{port}")
-                        else:
-                            _emit(f"✅ {spec.daemon_bin_name} already running")
+                        _emit_started(st, already_running=True)
                         return
                 else:
-                    host = st.get("host") if isinstance(st, dict) else None
-                    port = st.get("port") if isinstance(st, dict) else None
-                    if host and port:
-                        _emit(f"✅ {spec.daemon_bin_name} already running at {host}:{port}")
-                    else:
-                        _emit(f"✅ {spec.daemon_bin_name} already running")
+                    _emit_started(st, already_running=True)
                     return
             else:
-                host = st.get("host") if isinstance(st, dict) else None
-                port = st.get("port") if isinstance(st, dict) else None
-                if host and port:
-                    _emit(f"✅ {spec.daemon_bin_name} already running at {host}:{port}")
-                else:
-                    _emit(f"✅ {spec.daemon_bin_name} already running")
+                _emit_started(st, already_running=True)
                 return
 
         daemon_script = self.script_dir / "bin" / spec.daemon_bin_name
@@ -958,14 +982,30 @@ class AILauncher:
         else:
             kwargs["start_new_session"] = True
 
+        proc = None
+        reused_process = False
         try:
-            env = os.environ.copy()
-            env["CCB_PARENT_PID"] = str(os.getpid())
-            proc = subprocess.Popen([sys.executable, str(daemon_script)], env=env, **kwargs)
-            # Track daemon process for reaping (thread-safe)
             if spec.daemon_bin_name == "askd":
+                # Provider session hooks can call this method several times while
+                # the first daemon is still publishing readiness.  Reuse the live
+                # child instead of launching lock-contention duplicates.
                 with self._daemon_proc_lock:
-                    self._daemon_proc = proc
+                    tracked = self._daemon_proc
+                    tracked_poll = getattr(tracked, "poll", None)
+                    if tracked is not None and (not callable(tracked_poll) or tracked_poll() is None):
+                        proc = tracked
+                        reused_process = True
+                    else:
+                        env = os.environ.copy()
+                        env["CCB_PARENT_PID"] = str(os.getpid())
+                        proc = subprocess.Popen([sys.executable, str(daemon_script)], env=env, **kwargs)
+                        self._daemon_proc = proc
+            else:
+                env = os.environ.copy()
+                env["CCB_PARENT_PID"] = str(os.getpid())
+                proc = subprocess.Popen([sys.executable, str(daemon_script)], env=env, **kwargs)
+            if proc is None:
+                raise RuntimeError("daemon process was not created")
         except Exception as exc:
             _emit(f"⚠️ Failed to start {spec.daemon_bin_name}: {exc}")
             return
@@ -974,32 +1014,33 @@ class AILauncher:
         deadline = time.time() + start_timeout_s
         while time.time() < deadline:
             if ping_daemon(timeout_s=0.2, state_file=state_file):
-                st = read_state(state_file=state_file) or {} if callable(read_state) else {}
-                host = st.get("host") if isinstance(st, dict) else None
-                port = st.get("port") if isinstance(st, dict) else None
-                if host and port:
-                    _emit(f"✅ {spec.daemon_bin_name} started at {host}:{port}")
-                else:
-                    _emit(f"✅ {spec.daemon_bin_name} started")
+                _emit_started(_read_daemon_state())
+                return
+            st = _read_daemon_state()
+            if spec.daemon_bin_name == "askd" and _matching_managed_child(st, proc):
+                _emit_started(st, already_running=reused_process)
                 return
             poll = getattr(proc, "poll", None)
             exit_code = poll() if callable(poll) else None
             if exit_code is not None:
-                _emit(f"⚠️ {spec.daemon_bin_name} failed to start (exit code {exit_code})")
+                if exit_code == 2 and ping_daemon(timeout_s=0.5, state_file=state_file):
+                    _emit_started(_read_daemon_state(), already_running=True)
+                elif exit_code == 2:
+                    _emit(f"⚠️ {spec.daemon_bin_name} startup skipped: another daemon process owns the lock")
+                else:
+                    _emit(f"⚠️ {spec.daemon_bin_name} failed to start (exit code {exit_code})")
                 return
             time.sleep(0.1)
 
         # Avoid a false warning when the daemon becomes ready on the deadline.
         if ping_daemon(timeout_s=0.5, state_file=state_file):
-            st = read_state(state_file=state_file) or {} if callable(read_state) else {}
-            host = st.get("host") if isinstance(st, dict) else None
-            port = st.get("port") if isinstance(st, dict) else None
-            if host and port:
-                _emit(f"✅ {spec.daemon_bin_name} started at {host}:{port}")
-            else:
-                _emit(f"✅ {spec.daemon_bin_name} started")
+            _emit_started(_read_daemon_state())
             return
-        _emit(f"⚠️ {spec.daemon_bin_name} start requested, but daemon not reachable yet")
+        st = _read_daemon_state()
+        if spec.daemon_bin_name == "askd" and _matching_managed_child(st, proc):
+            _emit_started(st, already_running=reused_process)
+            return
+        _emit(f"⚠️ {spec.daemon_bin_name} process is running, but readiness state is unavailable")
 
     def _start_daemon_watchdog(self) -> None:
         """Start watchdog thread to monitor askd daemon health."""

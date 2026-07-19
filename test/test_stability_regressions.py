@@ -206,6 +206,105 @@ def test_launcher_waits_long_enough_for_slow_askd_start(monkeypatch, tmp_path: P
     assert clock["now"] >= 3.0
 
 
+def test_launcher_accepts_owned_child_state_and_does_not_spawn_duplicates(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    ccb = _load_script_module("ccb_script_owned_askd_state", REPO_ROOT / "ccb")
+    unified_state = tmp_path / "askd.json"
+    legacy_state = tmp_path / "caskd.json"
+    popen_calls: list[object] = []
+    ping_state_files: list[Path] = []
+
+    class _DummyProcess:
+        pid = 2468
+
+        def poll(self):
+            return None
+
+    proc = _DummyProcess()
+    launcher = object.__new__(ccb.AILauncher)
+    launcher.providers = ["codex"]
+    launcher.script_dir = REPO_ROOT
+    launcher._askd_checked = False
+    launcher._daemon_proc_lock = threading.Lock()
+    launcher._daemon_proc = None
+    launcher.ccb_pid = 12345
+
+    def _fake_ping(**kwargs):
+        ping_state_files.append(kwargs["state_file"])
+        return False
+
+    monkeypatch.setenv("CCB_ASKD_STATE_FILE", str(unified_state))
+    monkeypatch.setenv("CCB_CASKD_STATE_FILE", str(legacy_state))
+    monkeypatch.setattr(askd_daemon, "ping_daemon", _fake_ping)
+    monkeypatch.setattr(
+        askd_daemon,
+        "read_state",
+        lambda **_kwargs: {
+            "pid": proc.pid,
+            "parent_pid": launcher.ccb_pid,
+            "managed": True,
+            "host": "127.0.0.1",
+            "port": 31337,
+        },
+    )
+    monkeypatch.setattr(
+        ccb.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: popen_calls.append(object()) or proc,
+    )
+
+    launcher._maybe_start_provider_daemon("codex")
+    launcher._maybe_start_provider_daemon("codex")
+
+    output = capsys.readouterr().out
+    assert len(popen_calls) == 1
+    assert ping_state_files
+    assert set(ping_state_files) == {unified_state}
+    assert str(legacy_state) not in output
+    assert output.count("askd started at 127.0.0.1:31337") == 1
+    assert output.count("askd already running at 127.0.0.1:31337") == 1
+    assert "not reachable" not in output
+    assert "exit code 2" not in output
+
+
+def test_launcher_treats_lock_loser_as_existing_daemon(monkeypatch, tmp_path: Path, capsys) -> None:
+    ccb = _load_script_module("ccb_script_askd_lock_loser", REPO_ROOT / "ccb")
+    ping_results = iter([False, False, True])
+
+    class _LockLoserProcess:
+        pid = 1357
+
+        def poll(self):
+            return 2
+
+    launcher = object.__new__(ccb.AILauncher)
+    launcher.providers = ["codex"]
+    launcher.script_dir = REPO_ROOT
+    launcher._askd_checked = False
+    launcher._daemon_proc_lock = threading.Lock()
+    launcher._daemon_proc = None
+    launcher.ccb_pid = 12345
+
+    monkeypatch.setenv("CCB_ASKD_STATE_FILE", str(tmp_path / "askd.json"))
+    monkeypatch.setattr(askd_daemon, "ping_daemon", lambda **_kwargs: next(ping_results))
+    monkeypatch.setattr(
+        askd_daemon,
+        "read_state",
+        lambda **_kwargs: {"host": "127.0.0.1", "port": 31337},
+    )
+    monkeypatch.setattr(ccb.subprocess, "Popen", lambda *_args, **_kwargs: _LockLoserProcess())
+
+    launcher._maybe_start_provider_daemon("codex")
+
+    output = capsys.readouterr().out
+    assert "askd already running at 127.0.0.1:31337" in output
+    assert "failed to start" not in output
+    assert "exit code 2" not in output
+
+
 def test_codex_log_reader_keeps_bound_session(tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     work_dir = tmp_path / "repo"

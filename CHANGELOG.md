@@ -22,6 +22,7 @@
 - Made `ask`, `ccb-list`, runtime preflight, and peer delivery discover project-scoped `askd` state from the current working directory when `CCB_RUN_DIR` is not inherited.
 - Added automatic TCP-to-mailbox fallback for daemon RPC clients, covering restricted Claude and Codex command subprocesses without provider-specific environment assumptions.
 - Extended `askd` startup readiness to a configurable 10-second window, added a deadline-edge health check, and reported early daemon process exits distinctly.
+- Made the launcher trust state published by its own live `askd` child, reuse that child across provider startup hooks, and stop reporting lock-contention duplicates as daemon failures.
 
 ## v0.12.0 (2026-07-11)
 

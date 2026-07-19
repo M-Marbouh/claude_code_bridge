@@ -970,7 +970,8 @@ class AILauncher:
             _emit(f"⚠️ Failed to start {spec.daemon_bin_name}: {exc}")
             return
 
-        deadline = time.time() + 2.0
+        start_timeout_s = max(2.0, min(_env_float("CCB_ASKD_START_TIMEOUT_S", 10.0), 60.0))
+        deadline = time.time() + start_timeout_s
         while time.time() < deadline:
             if ping_daemon(timeout_s=0.2, state_file=state_file):
                 st = read_state(state_file=state_file) or {} if callable(read_state) else {}
@@ -981,7 +982,23 @@ class AILauncher:
                 else:
                     _emit(f"✅ {spec.daemon_bin_name} started")
                 return
+            poll = getattr(proc, "poll", None)
+            exit_code = poll() if callable(poll) else None
+            if exit_code is not None:
+                _emit(f"⚠️ {spec.daemon_bin_name} failed to start (exit code {exit_code})")
+                return
             time.sleep(0.1)
+
+        # Avoid a false warning when the daemon becomes ready on the deadline.
+        if ping_daemon(timeout_s=0.5, state_file=state_file):
+            st = read_state(state_file=state_file) or {} if callable(read_state) else {}
+            host = st.get("host") if isinstance(st, dict) else None
+            port = st.get("port") if isinstance(st, dict) else None
+            if host and port:
+                _emit(f"✅ {spec.daemon_bin_name} started at {host}:{port}")
+            else:
+                _emit(f"✅ {spec.daemon_bin_name} started")
+            return
         _emit(f"⚠️ {spec.daemon_bin_name} start requested, but daemon not reachable yet")
 
     def _start_daemon_watchdog(self) -> None:

@@ -160,6 +160,7 @@ def test_bridge_request_is_delivery_only(monkeypatch) -> None:
     sent: dict = {}
 
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
+    monkeypatch.setattr(bridge, "find_running_state_file", lambda *_args, **_kwargs: Path("/tmp/askd.json"))
     monkeypatch.setattr(
         bridge.askd_rpc,
         "request_daemon",
@@ -195,6 +196,7 @@ def test_codex_bridge_request_is_delivery_only_with_explicit_reply_context(monke
     sent: dict = {}
 
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
+    monkeypatch.setattr(bridge, "find_running_state_file", lambda *_args, **_kwargs: Path("/tmp/askd.json"))
     monkeypatch.setattr(
         bridge.askd_rpc,
         "request_daemon",
@@ -235,6 +237,7 @@ def test_codex_notify_suppresses_completion_hook(monkeypatch) -> None:
     sent: dict = {}
 
     monkeypatch.setattr(bridge.askd_rpc, "read_state", lambda _path: {"port": 1234, "token": "tok"})
+    monkeypatch.setattr(bridge, "find_running_state_file", lambda *_args, **_kwargs: Path("/tmp/askd.json"))
     monkeypatch.setattr(
         bridge.askd_rpc,
         "request_daemon",

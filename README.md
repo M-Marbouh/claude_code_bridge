@@ -93,12 +93,18 @@ historical or inactive records are needed for diagnostics.
 Managed Codex sessions cannot access the host terminal-multiplexer socket or loopback TCP directly.
 On Linux, CCB therefore records a private filesystem mailbox for each `askd` daemon under `/tmp`.
 Sandboxed `ccb-list`, `ask`, `ccb-ping`, and `ccb-mounted` requests use that authenticated mailbox for
-host-side discovery and runtime checks, while ordinary host clients retain the existing TCP transport.
+host-side discovery and runtime checks. Other clients try TCP first and automatically fall back to the
+mailbox when loopback access is unavailable. Daemon discovery checks the inherited `CCB_RUN_DIR`, the
+project-scoped path derived from the current working directory, and finally the legacy global path, so
+Claude and Codex tool subprocesses remain functional even when they do not inherit CCB runtime variables.
 Claude and Codex `ask --notify` delivery uses the same host path and remains one-way. Mailbox directories
 are mode `0700`, request and response files are written atomically, and every request still requires the
 daemon's random token. After upgrading an active CCB session, restart it once so its daemon state advertises
 the mailbox; otherwise `ccb-list` and provider runtime checks report an explicit transport error instead of
 incorrectly returning an empty list or claiming that a live pane is dead.
+
+CCB waits up to 10 seconds for a newly launched `askd` to become reachable before warning, and reports an
+early child-process failure immediately. Set `CCB_ASKD_START_TIMEOUT_S` to tune that readiness window.
 
 `ccb-mounted` is a human diagnostics command. Delegation does not require a separate mounted skill: `ask` validates the provider session, pane, binding, and daemon before reporting successful async submission.
 

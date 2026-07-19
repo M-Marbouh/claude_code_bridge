@@ -561,7 +561,7 @@ def test_ccb_list_delegates_discovery_from_managed_codex_sandbox(monkeypatch, ca
     monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
     monkeypatch.setenv("CCB_MANAGED", "1")
     monkeypatch.setenv("CCB_CALLER", "codex")
-    monkeypatch.setenv("CCB_RUN_DIR", "/tmp/ccb-run")
+    monkeypatch.delenv("CCB_RUN_DIR", raising=False)
     monkeypatch.setattr(ccb_list, "_daemon_session_entries", lambda include_stale: expected)
     monkeypatch.setattr(
         ccb_list,

@@ -19,6 +19,9 @@
 - Routed one-way Claude and Codex `ask --notify` requests through unified `askd` instead of the sandbox-incompatible legacy terminal path.
 - Scoped implicit `pend <provider>` selection by both project and persisted caller identity, preventing Claude and Codex panes in the same CCB session from reading each other's latest receipts.
 - Isolated test subprocess temporary directories so peer-task tests no longer create receipts in the user's live `/tmp/ccb-tasks` directory.
+- Made `ask`, `ccb-list`, runtime preflight, and peer delivery discover project-scoped `askd` state from the current working directory when `CCB_RUN_DIR` is not inherited.
+- Added automatic TCP-to-mailbox fallback for daemon RPC clients, covering restricted Claude and Codex command subprocesses without provider-specific environment assumptions.
+- Extended `askd` startup readiness to a configurable 10-second window, added a deadline-edge health check, and reported early daemon process exits distinctly.
 
 ## v0.12.0 (2026-07-11)
 

@@ -275,3 +275,12 @@ def test_runtime_status_delegates_from_managed_codex_sandbox(tmp_path: Path, mon
     assert captured["request"]["operation"] == "runtime_status"
     assert captured["request"]["work_dir"] == str(work_dir)
     assert captured["kwargs"]["response_timeout_s"] == 8.0
+
+
+def test_managed_codex_sandbox_detection_does_not_require_run_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.delenv("CCB_RUN_DIR", raising=False)
+
+    assert ccb_runtime_status.inside_managed_codex_sandbox() is True

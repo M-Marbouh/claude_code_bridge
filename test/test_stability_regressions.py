@@ -135,7 +135,7 @@ def test_maybe_start_unified_daemon_honors_autostart_opt_out(monkeypatch, tmp_pa
     popen_calls: list[dict] = []
 
     monkeypatch.setenv("CCB_ASKD_AUTOSTART", "0")
-    monkeypatch.setattr(askd_runtime, "state_file_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(askd_runtime, "state_file_candidates", lambda name, **_kwargs: [tmp_path / name])
     monkeypatch.setattr(askd_daemon, "ping_daemon", lambda **kwargs: False)
     monkeypatch.setattr(ask.subprocess, "Popen", lambda *args, **kwargs: popen_calls.append(kwargs))
 
@@ -146,7 +146,6 @@ def test_maybe_start_unified_daemon_honors_autostart_opt_out(monkeypatch, tmp_pa
 def test_maybe_start_unified_daemon_scrubs_parent_env(monkeypatch, tmp_path: Path) -> None:
     ask = _load_script_module("ask_script_scrub", REPO_ROOT / "bin" / "ask")
     captured: dict[str, object] = {}
-    ping_results = iter([False, True])
 
     class _DummyProcess:
         pass
@@ -159,14 +158,52 @@ def test_maybe_start_unified_daemon_scrubs_parent_env(monkeypatch, tmp_path: Pat
     monkeypatch.delenv("CCB_ASKD_AUTOSTART", raising=False)
     monkeypatch.setenv("CCB_PARENT_PID", "12345")
     monkeypatch.setenv("CCB_MANAGED", "1")
-    monkeypatch.setattr(askd_runtime, "state_file_path", lambda name: tmp_path / name)
-    monkeypatch.setattr(askd_daemon, "ping_daemon", lambda **kwargs: next(ping_results))
+    monkeypatch.setattr(askd_runtime, "state_file_candidates", lambda name, **_kwargs: [tmp_path / name])
+    monkeypatch.setattr(ask, "_find_running_unified_state_file", lambda **_kwargs: None)
+    monkeypatch.setattr(askd_daemon, "ping_daemon", lambda **kwargs: True)
     monkeypatch.setattr(ask.subprocess, "Popen", _fake_popen)
 
     assert ask._maybe_start_unified_daemon() is True
     child_env = captured["kwargs"]["env"]
     assert "CCB_PARENT_PID" not in child_env
     assert "CCB_MANAGED" not in child_env
+    assert child_env["CCB_RUN_DIR"] == str(tmp_path)
+
+
+def test_launcher_waits_long_enough_for_slow_askd_start(monkeypatch, tmp_path: Path, capsys) -> None:
+    ccb = _load_script_module("ccb_script_slow_askd", REPO_ROOT / "ccb")
+    clock = {"now": 0.0}
+
+    class _DummyProcess:
+        def poll(self):
+            return None
+
+    launcher = object.__new__(ccb.AILauncher)
+    launcher.providers = ["codex"]
+    launcher.script_dir = REPO_ROOT
+    launcher._askd_checked = False
+    launcher._daemon_proc_lock = threading.Lock()
+    launcher._daemon_proc = None
+    launcher.ccb_pid = 12345
+
+    monkeypatch.delenv("CCB_ASKD_START_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(askd_runtime, "state_file_path", lambda _name: tmp_path / "askd.json")
+    monkeypatch.setattr(askd_daemon, "ping_daemon", lambda **_kwargs: clock["now"] >= 3.0)
+    monkeypatch.setattr(
+        askd_daemon,
+        "read_state",
+        lambda **_kwargs: {"host": "127.0.0.1", "port": 31337},
+    )
+    monkeypatch.setattr(ccb.subprocess, "Popen", lambda *_args, **_kwargs: _DummyProcess())
+    monkeypatch.setattr(ccb.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(ccb.time, "sleep", lambda seconds: clock.update(now=clock["now"] + seconds))
+
+    launcher._maybe_start_provider_daemon("codex")
+
+    output = capsys.readouterr().out
+    assert "askd started at 127.0.0.1:31337" in output
+    assert "not reachable yet" not in output
+    assert clock["now"] >= 3.0
 
 
 def test_codex_log_reader_keeps_bound_session(tmp_path: Path) -> None:

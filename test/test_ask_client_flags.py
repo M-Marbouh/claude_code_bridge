@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 
 import askd_rpc
+import askd_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,7 @@ def _load_ask_module():
 def _capture_unified_request(monkeypatch, tmp_path: Path, *, show_tier_env: str | None) -> dict:
     ask = _load_ask_module()
     sent: dict = {}
+    state_file = tmp_path / "askd.json"
 
     if show_tier_env is None:
         monkeypatch.delenv("CCB_CODEX_SHOW_TIER", raising=False)
@@ -38,6 +40,7 @@ def _capture_unified_request(monkeypatch, tmp_path: Path, *, show_tier_env: str 
         "request_daemon",
         lambda _state, request, **_kwargs: sent.update(request) or {"exit_code": 0, "reply": ""},
     )
+    monkeypatch.setattr(ask, "_find_running_unified_state_file", lambda **_kwargs: state_file)
     monkeypatch.setattr(ask, "_maybe_start_unified_daemon", lambda: False)
     monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("%1", "tmux"))
 
@@ -70,6 +73,7 @@ def test_unified_daemon_preserves_outer_async_request_id(monkeypatch, tmp_path: 
 def test_unified_daemon_forwards_delivery_only_flags(monkeypatch, tmp_path: Path) -> None:
     ask = _load_ask_module()
     sent: dict = {}
+    state_file = tmp_path / "askd.json"
     monkeypatch.setattr(
         askd_rpc,
         "read_state",
@@ -80,6 +84,7 @@ def test_unified_daemon_forwards_delivery_only_flags(monkeypatch, tmp_path: Path
         "request_daemon",
         lambda _state, request, **_kwargs: sent.update(request) or {"exit_code": 0, "reply": ""},
     )
+    monkeypatch.setattr(ask, "_find_running_unified_state_file", lambda **_kwargs: state_file)
     monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("5", "wezterm"))
 
     rc = ask._send_via_unified_daemon(
@@ -102,8 +107,8 @@ def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None
     captured: dict = {}
     monkeypatch.setenv("CCB_CALLER", "codex")
     monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_unified_daemon_available", lambda: True)
     monkeypatch.setattr(ask, "_preflight_target", lambda _provider: True)
-    monkeypatch.setattr("askd.daemon.ping_daemon", lambda **_kwargs: True)
     monkeypatch.setattr(
         ask,
         "_send_via_unified_daemon",
@@ -121,6 +126,32 @@ def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None
     assert captured["provider"] == "claude"
     assert captured["caller"] == "codex"
     assert captured["kwargs"] == {"delivery_only": True, "suppress_completion_hook": True}
+
+
+def test_unified_state_discovery_uses_cwd_project_when_run_dir_missing(monkeypatch, tmp_path: Path) -> None:
+    ask = _load_ask_module()
+    work_dir = tmp_path / "project"
+    (work_dir / ".ccb").mkdir(parents=True)
+    monkeypatch.chdir(work_dir)
+    monkeypatch.delenv("CCB_RUN_DIR", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    expected = askd_runtime.state_file_candidates("askd.json", work_dir=work_dir)[0]
+    seen: list[Path] = []
+
+    def _ping(*, timeout_s: float, state_file: Path) -> bool:
+        assert timeout_s == 0.5
+        seen.append(state_file)
+        return state_file == expected
+
+    monkeypatch.setattr(askd_rpc, "ping_daemon", lambda _prefix, timeout_s, state_file: _ping(
+        timeout_s=timeout_s,
+        state_file=state_file,
+    ))
+
+    assert ask._find_running_unified_state_file() == expected
+    assert seen == [expected]
+    assert expected.parent.parent.name == "projects"
 
 
 def test_preflight_reports_runtime_proxy_failure(monkeypatch, capsys) -> None:

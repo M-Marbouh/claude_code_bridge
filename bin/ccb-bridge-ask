@@ -16,7 +16,7 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 import askd_rpc
-from askd_runtime import run_dir, state_file_path
+from askd_runtime import find_running_state_file, run_dir
 from ccb_protocol import wrap_codex_delivery_prompt
 from compat import read_stdin_text, setup_windows_encoding
 from laskd_protocol import wrap_claude_delivery_prompt
@@ -258,7 +258,13 @@ def _send_to_daemon(
     caller: str = "claude",
     foreground: bool = False,
 ) -> tuple[int, str, dict[str, Any]]:
-    state = askd_rpc.read_state(state_file_path("askd.json"))
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=sender_work_dir or Path.cwd(),
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
     if not state:
         raise RuntimeError("Unified askd daemon not running")
     try:

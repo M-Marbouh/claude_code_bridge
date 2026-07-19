@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import askd_rpc
-from askd_runtime import state_file_path
+from askd_runtime import find_running_state_file, state_file_candidates
 from ccb_start_config import load_start_config
 from pane_registry import (
     _coerce_updated_at,
@@ -145,7 +145,6 @@ def inside_managed_codex_sandbox() -> bool:
         network_disabled in {"1", "true", "yes", "on"}
         and managed in {"1", "true", "yes", "on"}
         and caller == "codex"
-        and bool((os.environ.get("CCB_RUN_DIR") or "").strip())
     )
 
 
@@ -155,7 +154,13 @@ def _daemon_project_runtime_status(
     include_stale: bool,
     check_daemon: bool,
 ) -> ProjectRuntimeStatus:
-    state = askd_rpc.read_state(state_file_path("askd.json"))
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=work_dir,
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
     if not state:
         raise RuntimeError("Unified askd daemon state is unavailable")
     token = str(state.get("token") or "")
@@ -188,21 +193,8 @@ def _daemon_project_runtime_status(
         raise RuntimeError(f"askd returned an invalid runtime status: {exc}") from exc
 
 
-def _project_run_dir(project_id: str) -> Path:
-    return Path.home() / ".cache" / "ccb" / "projects" / ((project_id or "")[:16] or "unknown")
-
-
-def _state_file_candidates(project_id: str) -> list[Path]:
-    candidates: list[Path] = []
-    override = (os.environ.get("CCB_RUN_DIR") or "").strip()
-    if override:
-        candidates.append(Path(override).expanduser() / "askd.json")
-    candidates.append(_project_run_dir(project_id) / "askd.json")
-    return list(dict.fromkeys(candidates))
-
-
 def is_project_askd_online(work_dir: Path, project_id: str, *, timeout_s: float = 0.2) -> bool:
-    for state_file in _state_file_candidates(project_id):
+    for state_file in state_file_candidates("askd.json", work_dir=work_dir, project_id=project_id):
         state = askd_rpc.read_state(state_file)
         if not isinstance(state, dict):
             continue

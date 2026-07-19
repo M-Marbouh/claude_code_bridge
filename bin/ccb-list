@@ -15,7 +15,7 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 import askd_rpc
-from askd_runtime import state_file_path
+from askd_runtime import find_running_state_file
 from compat import setup_windows_encoding
 from ccb_runtime_status import is_project_askd_online
 from ccb_start_config import load_start_config
@@ -38,12 +38,17 @@ def _inside_codex_network_sandbox() -> bool:
         raw in {"1", "true", "yes", "on"}
         and managed in {"1", "true", "yes", "on"}
         and caller == "codex"
-        and bool((os.environ.get("CCB_RUN_DIR") or "").strip())
     )
 
 
 def _daemon_session_entries(include_stale: bool) -> list[dict[str, Any]]:
-    state = askd_rpc.read_state(state_file_path("askd.json"))
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=Path.cwd(),
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
     if not state:
         raise RuntimeError("Unified askd daemon state is unavailable")
     token = str(state.get("token") or "")

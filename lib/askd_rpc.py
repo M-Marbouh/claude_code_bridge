@@ -104,11 +104,16 @@ def request_daemon(
     connect_timeout_s: float,
     response_timeout_s: float | None,
 ) -> dict:
-    """Send one request through the sandbox mailbox or the TCP fallback."""
+    """Send via TCP, using the filesystem mailbox when TCP is unavailable."""
     mailbox = str(state.get("mailbox_dir") or "").strip()
     if mailbox and _network_disabled():
         return _request_via_mailbox(state, request, response_timeout_s)
-    sock = connect_daemon(state, connect_timeout_s)
+    try:
+        sock = connect_daemon(state, connect_timeout_s)
+    except DaemonConnectionError:
+        if mailbox:
+            return _request_via_mailbox(state, request, response_timeout_s)
+        raise
     with sock:
         sock.settimeout(response_timeout_s)
         sock.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))

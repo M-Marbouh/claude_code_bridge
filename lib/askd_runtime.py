@@ -7,11 +7,7 @@ import time
 from pathlib import Path
 
 
-def run_dir() -> Path:
-    override = (os.environ.get("CCB_RUN_DIR") or "").strip()
-    if override:
-        return Path(override).expanduser()
-
+def _default_run_dir() -> Path:
     if os.name == "nt":
         base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or "").strip()
         if base:
@@ -24,10 +20,75 @@ def run_dir() -> Path:
     return Path.home() / ".cache" / "ccb"
 
 
+def run_dir() -> Path:
+    override = (os.environ.get("CCB_RUN_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _default_run_dir()
+
+
+def _state_file_name(name: str) -> str:
+    return name if name.endswith(".json") else f"{name}.json"
+
+
 def state_file_path(name: str) -> Path:
-    if name.endswith(".json"):
-        return run_dir() / name
-    return run_dir() / f"{name}.json"
+    return run_dir() / _state_file_name(name)
+
+
+def state_file_candidates(
+    name: str,
+    *,
+    work_dir: str | Path | None = None,
+    project_id: str | None = None,
+) -> list[Path]:
+    """Return daemon state paths from most specific to legacy fallback."""
+    filename = _state_file_name(name)
+    candidates: list[Path] = []
+
+    override = (os.environ.get("CCB_RUN_DIR") or "").strip()
+    if override:
+        candidates.append(Path(override).expanduser() / filename)
+
+    try:
+        from project_id import compute_ccb_project_id
+
+        resolved_project_id = (project_id or "").strip()
+        if not resolved_project_id:
+            resolved_work_dir = Path(work_dir or Path.cwd()).expanduser()
+            resolved_project_id = compute_ccb_project_id(resolved_work_dir)
+        project_key = resolved_project_id[:16] or "unknown"
+        candidates.append(_default_run_dir() / "projects" / project_key / filename)
+
+        # CCB launchers historically use ~/.cache/ccb for project state even
+        # when another platform cache directory is configured.
+        candidates.append(Path.home() / ".cache" / "ccb" / "projects" / project_key / filename)
+    except Exception:
+        pass
+
+    # Preserve support for manually started, pre-project-scoped daemons.
+    candidates.append(_default_run_dir() / filename)
+    return list(dict.fromkeys(candidates))
+
+
+def find_running_state_file(
+    name: str,
+    *,
+    protocol_prefix: str,
+    work_dir: str | Path | None = None,
+    project_id: str | None = None,
+    timeout_s: float = 0.5,
+) -> Path | None:
+    """Return the first reachable daemon state file for the current project."""
+    import askd_rpc
+
+    for candidate in state_file_candidates(
+        name,
+        work_dir=work_dir,
+        project_id=project_id,
+    ):
+        if askd_rpc.ping_daemon(protocol_prefix, timeout_s=timeout_s, state_file=candidate):
+            return candidate
+    return None
 
 
 def mailbox_dir(state_file: Path) -> Path | None:

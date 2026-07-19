@@ -259,22 +259,45 @@ def _preflight_target(provider: str) -> bool:
     return False
 
 
+def _find_running_unified_state_file(
+    *,
+    work_dir: str | Path | None = None,
+    timeout_s: float = 0.5,
+) -> Path | None:
+    """Locate a reachable project askd without relying on inherited CCB_RUN_DIR."""
+    from askd_runtime import find_running_state_file
+
+    return find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=work_dir or Path.cwd(),
+        timeout_s=timeout_s,
+    )
+
+
+def _unified_daemon_available() -> bool:
+    return _find_running_unified_state_file() is not None or _maybe_start_unified_daemon()
+
+
 def _maybe_start_unified_daemon() -> bool:
     """Try to start unified askd daemon if not running."""
     import shutil
     import time
     import sys
-    from askd_runtime import state_file_path
+    from askd_runtime import state_file_candidates
     from askd.daemon import ping_daemon
 
     autostart_raw = (os.environ.get("CCB_ASKD_AUTOSTART") or "").strip().lower()
     if autostart_raw in ("0", "false", "no", "off"):
         return False
 
-    # Check if already running
-    state_file = state_file_path("askd.json")
-    if ping_daemon(timeout_s=0.5, state_file=state_file):
+    # Check every project-aware candidate before starting another daemon.
+    running_state = _find_running_unified_state_file()
+    if running_state is not None:
         return True
+
+    candidates = state_file_candidates("askd.json", work_dir=Path.cwd())
+    state_file = candidates[0]
 
     # A managed Codex client cannot launch a useful terminal-aware daemon from
     # inside its sandbox. The CCB-owned host daemon must be restarted instead.
@@ -305,6 +328,7 @@ def _maybe_start_unified_daemon() -> bool:
         child_env = os.environ.copy()
         child_env.pop("CCB_PARENT_PID", None)
         child_env.pop("CCB_MANAGED", None)
+        child_env["CCB_RUN_DIR"] = str(state_file.parent)
         kwargs = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -341,21 +365,19 @@ def _send_via_unified_daemon(
     suppress_completion_hook: bool = False,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
-    from askd_runtime import state_file_path
     import askd_rpc
 
-    # Use CCB_RUN_DIR (set by CCB startup) to locate the state file.
-    # This already contains the correct project-specific path.
-    state_file = state_file_path("askd.json")
+    state_file = _find_running_unified_state_file()
+    if state_file is None and _maybe_start_unified_daemon():
+        state_file = _find_running_unified_state_file()
+    if state_file is None:
+        print("[ERROR] Unified askd daemon not running", file=sys.stderr)
+        return EXIT_ERROR
 
     state = askd_rpc.read_state(state_file)
     if not state:
-        # Try to start daemon and retry once
-        if _maybe_start_unified_daemon():
-            state = askd_rpc.read_state(state_file)
-        if not state:
-            print("[ERROR] Unified askd daemon not running", file=sys.stderr)
-            return EXIT_ERROR
+        print("[ERROR] Unified askd daemon state unavailable", file=sys.stderr)
+        return EXIT_ERROR
 
     token = state.get("token") or ""
     # Use daemon's work_dir from state file
@@ -937,11 +959,7 @@ def main(argv: list[str]) -> int:
 
     if not notify_mode:
         if _use_unified_daemon():
-            from askd_runtime import state_file_path
-            from askd.daemon import ping_daemon
-
-            state_file = state_file_path("askd.json")
-            if not ping_daemon(timeout_s=0.5, state_file=state_file) and not _maybe_start_unified_daemon():
+            if not _unified_daemon_available():
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)
                 return EXIT_ERROR
         if not _preflight_target(provider):
@@ -951,11 +969,7 @@ def main(argv: list[str]) -> int:
     if notify_mode:
         caller = _require_caller()
         if _use_unified_daemon() and provider in PEER_PROVIDERS:
-            from askd_runtime import state_file_path
-            from askd.daemon import ping_daemon
-
-            state_file = state_file_path("askd.json")
-            if not ping_daemon(timeout_s=0.5, state_file=state_file) and not _maybe_start_unified_daemon():
+            if not _unified_daemon_available():
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)
                 return EXIT_ERROR
             if not _preflight_target(provider):
@@ -1011,11 +1025,7 @@ def main(argv: list[str]) -> int:
 
     # Default async mode: background task
     if _use_unified_daemon():
-        from askd_runtime import state_file_path
-        from askd.daemon import ping_daemon
-
-        state_file = state_file_path("askd.json")
-        if not ping_daemon(timeout_s=0.5, state_file=state_file) and not _maybe_start_unified_daemon():
+        if not _unified_daemon_available():
             print("[ERROR] Unified askd daemon not running", file=sys.stderr)
             return EXIT_ERROR
 

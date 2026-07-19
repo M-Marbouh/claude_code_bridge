@@ -79,6 +79,21 @@ def test_upsert_registry_merges_providers(tmp_path: Path, monkeypatch: pytest.Mo
     assert "gemini" in data["providers"]
 
 
+def test_upsert_registry_persists_launcher_pid_from_session_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    assert upsert_registry({"ccb_session_id": "ai-123-4242", "providers": {"codex": {"pane_id": "%1"}}})
+
+    data = json.loads(
+        (tmp_path / ".ccb" / "run" / "ccb-session-ai-123-4242.json").read_text(encoding="utf-8")
+    )
+    assert data["ccb_pid"] == 4242
+
+
 def test_load_registry_by_project_id_filters_dead_panes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))

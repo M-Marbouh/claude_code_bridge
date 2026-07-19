@@ -198,6 +198,74 @@ def test_runtime_status_daemon_offline(runtime_env, monkeypatch: pytest.MonkeyPa
     assert status.reason == "daemon_offline"
 
 
+def test_project_askd_online_retries_valid_project_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    project_id = compute_ccb_project_id(work_dir)
+    state_file = tmp_path / "askd.json"
+    ping_results = iter([False, True])
+    ping_timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(
+        ccb_runtime_status,
+        "state_file_candidates",
+        lambda *_args, **_kwargs: [state_file],
+    )
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc,
+        "read_state",
+        lambda _path: {"token": "token", "work_dir": str(work_dir)},
+    )
+
+    def _ping(_prefix, *, timeout_s, state_file):
+        ping_timeouts.append(timeout_s)
+        return next(ping_results)
+
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "ping_daemon", _ping)
+    monkeypatch.setattr(ccb_runtime_status.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert ccb_runtime_status.is_project_askd_online(work_dir, project_id) is True
+    assert ping_timeouts == [0.2, 0.3]
+    assert sleeps == [0.05]
+
+
+def test_runtime_status_excludes_dead_launcher_unless_stale_requested(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    _write_registry(
+        home,
+        "orphan",
+        {
+            "ccb_session_id": "ai-123-99999999",
+            "ccb_pid": 99999999,
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    active = resolve_project_runtime_status(work_dir).providers["codex"]
+    historical = resolve_project_runtime_status(work_dir, include_stale=True).providers["codex"]
+
+    assert active.registered is False
+    assert active.reason == "not_registered"
+    assert historical.registered is True
+    assert historical.pane_alive is False
+    assert historical.mounted is False
+    assert historical.reason == "launcher_dead"
+
+
 def test_runtime_status_unknown_provider_is_not_exposed(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:
     home, work_dir, project_id = runtime_env
     _write_session(work_dir, ".codex-session", provider="codex", pane_id="%1", project_id=project_id)

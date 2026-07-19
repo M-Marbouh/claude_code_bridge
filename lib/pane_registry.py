@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Iterable
 
 from cli_output import atomic_write_text
+from process_lock import _is_pid_alive
 from project_id import compute_ccb_project_id
 from terminal import get_backend_for_session
 
@@ -64,6 +65,40 @@ def _is_stale(updated_at: int, now: Optional[int] = None) -> bool:
         return True
     now_ts = int(time.time()) if now is None else int(now)
     return (now_ts - updated_at) > REGISTRY_TTL_SECONDS
+
+
+def _record_ccb_pid(data: Dict[str, Any]) -> Optional[int]:
+    """Return an explicit launcher PID or derive it from legacy ai-*-PID IDs."""
+    for key in ("ccb_pid", "parent_pid"):
+        try:
+            pid = int(data.get(key) or 0)
+        except Exception:
+            pid = 0
+        if pid > 0:
+            return pid
+
+    for key in ("ccb_session_id", "session_id"):
+        raw = str(data.get(key) or "")
+        parts = raw.split("-")
+        if len(parts) >= 3 and parts[0] == "ai":
+            try:
+                pid = int(parts[-1])
+            except Exception:
+                pid = 0
+            if pid > 0:
+                return pid
+    return None
+
+
+def _registry_owner_alive(data: Dict[str, Any]) -> Optional[bool]:
+    """Return launcher liveness, or None for records without owner identity."""
+    pid = _record_ccb_pid(data)
+    if pid is None:
+        return None
+    try:
+        return bool(_is_pid_alive(pid))
+    except Exception:
+        return None
 
 
 def _load_registry_file(path: Path) -> Optional[Dict[str, Any]]:
@@ -360,6 +395,12 @@ def upsert_registry(record: Dict[str, Any]) -> bool:
         data[key] = value
 
     data["providers"] = providers
+
+    # Persist launcher ownership explicitly. Existing records remain compatible
+    # because their PID can be derived from ccb_session_id (ai-<time>-<pid>).
+    owner_pid = _record_ccb_pid(data)
+    if owner_pid is not None:
+        data["ccb_pid"] = owner_pid
 
     # Ensure ccb_project_id exists (best-effort from work_dir).
     if not (data.get("ccb_project_id") or "").strip():

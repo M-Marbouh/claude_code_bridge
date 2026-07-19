@@ -103,6 +103,11 @@ daemon's random token. After upgrading an active CCB session, restart it once so
 the mailbox; otherwise `ccb-list` and provider runtime checks report an explicit transport error instead of
 incorrectly returning an empty list or claiming that a live pane is dead.
 
+Project discovery retries a valid project daemon state before declaring it offline, avoiding transient
+`daemon_offline` results during startup. Active registry entries must also belong to a live CCB launcher;
+legacy `ai-<time>-<pid>` records derive that owner automatically, while `ccb-list --stale` retains dead-owner
+history with the `launcher_dead` reason.
+
 CCB waits up to 10 seconds for a newly launched `askd` to become reachable before warning, and reports an
 early child-process failure immediately. Set `CCB_ASKD_START_TIMEOUT_S` to tune that readiness window.
 

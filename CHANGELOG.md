@@ -23,6 +23,7 @@
 - Added automatic TCP-to-mailbox fallback for daemon RPC clients, covering restricted Claude and Codex command subprocesses without provider-specific environment assumptions.
 - Extended `askd` startup readiness to a configurable 10-second window, added a deadline-edge health check, and reported early daemon process exits distinctly.
 - Made the launcher trust state published by its own live `askd` child, reuse that child across provider startup hooks, and stop reporting lock-contention duplicates as daemon failures.
+- Retried valid per-project daemon probes before reporting `daemon_offline`, persisted launcher PIDs in registry records, and excluded orphaned provider panes from active peer discovery.
 
 ## v0.12.0 (2026-07-11)
 

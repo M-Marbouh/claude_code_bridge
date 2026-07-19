@@ -212,6 +212,41 @@ def test_ccb_list_includes_codex_only_project_by_default(tmp_path: Path) -> None
     assert entries[0]["peer_providers"] == []
 
 
+def test_ccb_list_excludes_dead_launcher_and_labels_stale_history(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [{"pane_id": "%2", "title": "CCB-Codex-test", "cwd": str(work_dir), "dead": "0"}],
+    )
+    (run_dir / "ccb-session-orphan.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": "ai-123-99999999",
+                "ccb_pid": 99999999,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {
+                    "codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _run_ccb_list(tmp_path) == []
+    historical = _run_ccb_list(tmp_path, "--stale")
+    assert len(historical) == 1
+    assert historical[0]["sessions"][0]["launcher_alive"] is False
+    assert historical[0]["providers"]["codex"]["reason"] == "launcher_dead"
+    assert historical[0]["peer_providers"] == []
+
+
 def test_ccb_list_reports_mounted_peer_providers(monkeypatch, tmp_path: Path) -> None:
     ccb_list = _load_ccb_list_module()
     work_dir = tmp_path / "project"

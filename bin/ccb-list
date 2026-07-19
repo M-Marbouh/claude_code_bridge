@@ -19,7 +19,7 @@ from askd_runtime import find_running_state_file
 from compat import setup_windows_encoding
 from ccb_runtime_status import is_project_askd_online
 from ccb_start_config import load_start_config
-from pane_registry import _get_providers_map, _is_stale, _iter_registry_files
+from pane_registry import _get_providers_map, _is_stale, _iter_registry_files, _registry_owner_alive
 from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file
 
@@ -366,6 +366,9 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
         record = _load_json_dict(path)
         if not record:
             continue
+        launcher_alive = _registry_owner_alive(record)
+        if launcher_alive is False and not include_stale:
+            continue
         work_dir_raw = str(record.get("work_dir") or "").strip()
         if not work_dir_raw:
             continue
@@ -406,9 +409,13 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                 panes=panes,
             )
 
-        live_groups = {
-            group for status, group in statuses.values() if status.get("_candidate_alive") and group
-        }
+        live_groups = (
+            {
+                group for status, group in statuses.values() if status.get("_candidate_alive") and group
+            }
+            if launcher_alive is not False
+            else set()
+        )
         appended_live = False
         for group_id in live_groups:
             members = [
@@ -447,6 +454,7 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                     "window_id": group_id,
                     "updated_at": updated_at,
                     "timestamp_stale": timestamp_stale,
+                    "launcher_alive": launcher_alive,
                     "alive": True,
                     "providers": providers,
                 }
@@ -459,6 +467,8 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                 status = dict(status)
                 status.pop("_candidate_alive", None)
                 status.pop("_identity_proven", None)
+                if launcher_alive is False:
+                    status["reason"] = "launcher_dead"
                 historical[provider] = status
             sessions.append(
                 {
@@ -469,6 +479,7 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                     "window_id": f"history:{session_id}",
                     "updated_at": updated_at,
                     "timestamp_stale": timestamp_stale,
+                    "launcher_alive": launcher_alive,
                     "alive": False,
                     "providers": historical,
                 }

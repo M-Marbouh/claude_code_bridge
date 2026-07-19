@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from pane_registry import _coerce_updated_at, _get_providers_map, _provider_pane_alive
+from pane_registry import _coerce_updated_at, _get_providers_map, _provider_pane_alive, _record_ccb_pid
 from project_id import compute_ccb_project_id
 
 
@@ -181,28 +181,6 @@ def _liveness_reason(
     if saw_unknown:
         return "liveness_unknown"
     return "dead"
-
-
-def _record_ccb_pid(data: dict[str, Any]) -> int | None:
-    for key in ("ccb_pid", "parent_pid"):
-        try:
-            pid = int(data.get(key) or 0)
-        except Exception:
-            pid = 0
-        if pid > 0:
-            return pid
-
-    for key in ("ccb_session_id", "session_id"):
-        raw = str(data.get(key) or "")
-        parts = raw.split("-")
-        if len(parts) >= 3 and parts[0] == "ai":
-            try:
-                pid = int(parts[-1])
-            except Exception:
-                pid = 0
-            if pid > 0:
-                return pid
-    return None
 
 
 def _default_process_alive(pid: int) -> bool | None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,6 +17,7 @@ from pane_registry import (
     _iter_registry_files,
     _load_registry_file,
     _provider_pane_alive,
+    _registry_owner_alive,
 )
 from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file
@@ -194,6 +196,11 @@ def _daemon_project_runtime_status(
 
 
 def is_project_askd_online(work_dir: Path, project_id: str, *, timeout_s: float = 0.2) -> bool:
+    attempt_timeouts = (
+        max(0.05, timeout_s),
+        max(0.3, timeout_s),
+        max(0.5, timeout_s),
+    )
     for state_file in state_file_candidates("askd.json", work_dir=work_dir, project_id=project_id):
         state = askd_rpc.read_state(state_file)
         if not isinstance(state, dict):
@@ -205,8 +212,13 @@ def is_project_askd_online(work_dir: Path, project_id: str, *, timeout_s: float 
                     continue
             except Exception:
                 continue
-        if askd_rpc.ping_daemon("ask", timeout_s=timeout_s, state_file=state_file):
-            return True
+        if not str(state.get("token") or "").strip():
+            continue
+        for index, attempt_timeout in enumerate(attempt_timeouts):
+            if askd_rpc.ping_daemon("ask", timeout_s=attempt_timeout, state_file=state_file):
+                return True
+            if index < len(attempt_timeouts) - 1:
+                time.sleep(0.05 * (index + 1))
     return False
 
 
@@ -230,6 +242,9 @@ def iter_registry_provider_records(*, project_id: str | None = None, include_sta
         updated_at = _coerce_updated_at(record.get("updated_at"), path)
         timestamp_stale = _is_stale(updated_at)
         if timestamp_stale and not include_stale:
+            continue
+        owner_alive = _registry_owner_alive(record)
+        if owner_alive is False and not include_stale:
             continue
         effective = _effective_project_id(record)
         if not effective or (project_id and effective != project_id):
@@ -294,13 +309,23 @@ def _session_bound(work_dir: Path, project_id: str, provider: str, entry: dict[s
     return True, str(session_file)
 
 
-def _reason(configured: bool, registered: bool, stale: bool, pane_alive: bool, session_bound: bool, daemon_online: bool) -> str:
+def _reason(
+    configured: bool,
+    registered: bool,
+    stale: bool,
+    pane_alive: bool,
+    session_bound: bool,
+    daemon_online: bool,
+    launcher_alive: bool | None = None,
+) -> str:
     if registered and not stale and pane_alive and session_bound and daemon_online:
         return ""
     if not configured and not registered:
         return "not_configured"
     if not registered:
         return "not_registered"
+    if launcher_alive is False:
+        return "launcher_dead"
     if stale:
         return "registry_stale"
     if not pane_alive:
@@ -343,7 +368,8 @@ def resolve_project_runtime_status(
         entry = record.provider_entry if record else {}
         registered = record is not None
         stale = bool(record.timestamp_stale) if record else False
-        pane_alive = bool(_provider_pane_alive(record.registry_record, provider)) if record else False
+        launcher_alive = _registry_owner_alive(record.registry_record) if record else None
+        pane_alive = bool(_provider_pane_alive(record.registry_record, provider)) if record and launcher_alive is not False else False
         bound, session_file = _session_bound(resolved, project_id, provider, entry) if record else (False, "")
         mounted = bool(registered and not stale and pane_alive and bound and daemon_online)
         statuses[provider] = ProviderRuntimeStatus(
@@ -356,7 +382,15 @@ def resolve_project_runtime_status(
             session_bound=bound,
             daemon_online=daemon_online,
             mounted=mounted,
-            reason=_reason(provider in configured, registered, stale, pane_alive, bound, daemon_online),
+            reason=_reason(
+                provider in configured,
+                registered,
+                stale,
+                pane_alive,
+                bound,
+                daemon_online,
+                launcher_alive,
+            ),
             pane_id=str(entry.get("pane_id") or "").strip(),
             pane_title_marker=str(entry.get("pane_title_marker") or "").strip(),
             session_file=session_file,

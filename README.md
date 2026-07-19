@@ -69,7 +69,8 @@ pend codex 3
 `peer` is relative to the current Claude or Codex pane; `local` is the provider in that pane. Provider lookup
 normalizes ordinary and peer receipts, so `pend codex` can retrieve either `codex` or `peer-codex` tasks.
 Both paired panes can retrieve receipts from their shared tab, while another same-project tab cannot win merely
-because it has a newer task. `pend codex 3` prints the newest three matching task replies with task IDs.
+because it has a newer task. `pend codex 3` prints the newest three completed matching replies with task IDs,
+skipping in-flight tasks. Without a count, `pend codex` can still report the newest task as pending.
 
 Models prefer an exact task ID already present in conversation context. Bare `pend` succeeds only when the
 current tab has one unambiguous task. If the current session cannot be established, or a pre-restart receipt
@@ -147,7 +148,7 @@ reply remains recoverable with `pend <original-task-id>` and the reverse command
 
 ## Session safety
 
-CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Implicit `pend` lookup is strict to that session; pre-restart receipts remain available by exact task ID. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.
+CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Implicit `pend` lookup is strict to that session; pre-restart receipts remain available by exact task ID. An unfinished task whose host PID is invisible inside a sandbox remains pending until its recorded timeout plus a short grace period has elapsed, preventing PID-namespace isolation from causing false incomplete results. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.
 
 ## Configuration
 

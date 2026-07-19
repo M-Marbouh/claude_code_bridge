@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
+import time
 from pathlib import Path
 
 from task_receipts import (
@@ -75,6 +77,7 @@ def test_receipt_round_trip(tmp_path: Path, monkeypatch) -> None:
         work_dir=tmp_path,
         status_file=tmp_path / "task.status",
         log_file=tmp_path / "task.log",
+        timeout_seconds=45,
     )
     path = receipt_path("codex", data["task_id"], root=tmp_path)
     write_receipt(path, data)
@@ -85,6 +88,7 @@ def test_receipt_round_trip(tmp_path: Path, monkeypatch) -> None:
     assert found[1]["caller_session_id"] == "ccb-1"
     assert found[1]["caller_pane_id"] == "%7"
     assert found[1]["caller_terminal"] == "tmux"
+    assert found[1]["timeout_seconds"] == 45.0
     assert list(iter_receipts(root=tmp_path))[0][0] == path
 
 
@@ -286,11 +290,46 @@ def test_pend_peer_and_local_resolve_relative_to_model() -> None:
     assert pend._resolve_responder("local", "codex") == ("codex", "")
 
 
-def test_pend_provider_count_is_task_history_not_legacy(monkeypatch, capsys) -> None:
+def test_pend_provider_count_skips_unfinished_and_backfills_completed(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
     pend = _load_pend_module()
+    current_status = tmp_path / "current.status"
+    current_log = tmp_path / "current.log"
+    current_status.write_text("running pid=12345\n", encoding="utf-8")
+    current_log.write_text("", encoding="utf-8")
+
+    peer_status = tmp_path / "peer.status"
+    peer_log = tmp_path / "peer.log"
+    peer_reply = tmp_path / "peer.reply"
+    peer_status.write_text("finished exit_code=0\n", encoding="utf-8")
+    peer_log.write_text("Peer message accepted.\n", encoding="utf-8")
+    peer_reply.write_text("reply-new\n", encoding="utf-8")
+
+    old_status = tmp_path / "old.status"
+    old_log = tmp_path / "old.log"
+    old_status.write_text("finished exit_code=0\n", encoding="utf-8")
+    old_log.write_text("reply-old\n", encoding="utf-8")
+
+    current = _receipt("current", "codex", session="ccb-1", pane="2", project="p", submitted="3")
+    current.update({"status_file": str(current_status), "log_file": str(current_log)})
+    peer = _receipt("new", "peer-codex", session="ccb-1", pane="2", project="p", submitted="2")
+    peer.update(
+        {
+            "status_file": str(peer_status),
+            "log_file": str(peer_log),
+            "peer_reply_file": str(peer_reply),
+            "reply_expected": True,
+        }
+    )
+    old = _receipt("old", "codex", session="ccb-1", pane="2", project="p", submitted="1")
+    old.update({"status_file": str(old_status), "log_file": str(old_log)})
     records = [
-        (Path("old.json"), _receipt("old", "codex", session="ccb-1", pane="2", project="p", submitted="1")),
-        (Path("new.json"), _receipt("new", "peer-codex", session="ccb-1", pane="2", project="p", submitted="2")),
+        (Path("current.json"), current),
+        (Path("new.json"), peer),
+        (Path("old.json"), old),
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "ccb-1", "claude"))
@@ -299,7 +338,6 @@ def test_pend_provider_count_is_task_history_not_legacy(monkeypatch, capsys) -> 
         "_legacy_pend",
         lambda *_args: (_ for _ in ()).throw(AssertionError("legacy pend must be explicit")),
     )
-    monkeypatch.setattr(pend, "_show_receipt", lambda receipt: print(f"reply-{receipt['task_id']}") or pend.EXIT_OK)
 
     rc = pend.main(["pend", "codex", "2"])
 
@@ -311,6 +349,22 @@ def test_pend_provider_count_is_task_history_not_legacy(monkeypatch, capsys) -> 
         "[TASK old]",
         "reply-old",
     ]
+
+
+def test_peer_history_requires_saved_reply_not_finished_transport(tmp_path: Path) -> None:
+    pend = _load_pend_module()
+    status = tmp_path / "peer.status"
+    reply = tmp_path / "peer.reply"
+    status.write_text("finished exit_code=0\n", encoding="utf-8")
+    reply.write_text("", encoding="utf-8")
+    receipt = {
+        "provider": "peer-codex",
+        "status_file": str(status),
+        "peer_reply_file": str(reply),
+        "reply_expected": True,
+    }
+
+    assert pend._receipt_has_completed_reply(receipt) is False
 
 
 def test_pend_legacy_history_requires_explicit_flag(monkeypatch) -> None:
@@ -405,7 +459,11 @@ def test_pend_peer_task_returns_saved_reply_even_when_direct_delivery_failed(
     assert capsys.readouterr().out.strip() == "Recoverable response"
 
 
-def test_pend_reports_dead_waiter_as_incomplete(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_pend_reports_pid_invisible_fresh_waiter_as_pending(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
     pend = _load_pend_module()
     monkeypatch.setattr(pend, "_recover_provider_reply", lambda _receipt: None)
     status = tmp_path / "task.status"
@@ -415,7 +473,44 @@ def test_pend_reports_dead_waiter_as_incomplete(tmp_path: Path, monkeypatch, cap
     monkeypatch.setattr(pend, "_pid_is_alive", lambda _pid: False)
 
     rc = pend._show_receipt(
-        {"task_id": "x", "provider": "codex", "status_file": str(status), "log_file": str(log)}
+        {
+            "task_id": "x",
+            "provider": "codex",
+            "status_file": str(status),
+            "log_file": str(log),
+            "timeout_seconds": 60,
+        }
+    )
+
+    assert rc == pend.EXIT_NO_REPLY
+    output = capsys.readouterr().err
+    assert "[PENDING]" in output
+    assert "[INCOMPLETE]" not in output
+
+
+def test_pend_reports_pid_invisible_stale_waiter_as_incomplete(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    pend = _load_pend_module()
+    monkeypatch.setattr(pend, "_recover_provider_reply", lambda _receipt: None)
+    status = tmp_path / "task.status"
+    log = tmp_path / "task.log"
+    status.write_text("submitted\nrunning pid=12345\n", encoding="utf-8")
+    log.write_text("", encoding="utf-8")
+    stale_time = time.time() - 100
+    os.utime(status, (stale_time, stale_time))
+    monkeypatch.setattr(pend, "_pid_is_alive", lambda _pid: False)
+
+    rc = pend._show_receipt(
+        {
+            "task_id": "x",
+            "provider": "codex",
+            "status_file": str(status),
+            "log_file": str(log),
+            "timeout_seconds": 60,
+        }
     )
 
     assert rc == pend.EXIT_ERROR

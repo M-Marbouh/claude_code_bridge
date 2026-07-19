@@ -672,6 +672,7 @@ def _run_peer_bridge_background(
                 status_file=status_file,
                 log_file=log_file,
                 reply_file=reply_file,
+                timeout_seconds=timeout,
             ),
         )
     except Exception as e:
@@ -1070,6 +1071,7 @@ def main(argv: list[str]) -> int:
                 work_dir=Path.cwd(),
                 status_file=status_file,
                 log_file=log_file,
+                timeout_seconds=timeout,
             ),
         )
     except Exception as exc:

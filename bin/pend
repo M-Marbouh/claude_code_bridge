@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -35,6 +36,8 @@ PEER_PROVIDERS = {
     "claude": "codex",
     "codex": "claude",
 }
+DEFAULT_WAITER_TIMEOUT_SECONDS = 3600.0
+WAITER_STALE_GRACE_SECONDS = 30.0
 
 
 def _legacy_pend(provider: str, extra: list[str]) -> int:
@@ -199,6 +202,22 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _status_is_stale(status_path: Path, receipt: dict, *, now: float | None = None) -> bool:
+    raw_timeout = receipt.get("timeout_seconds")
+    try:
+        timeout = float(raw_timeout) if raw_timeout is not None else DEFAULT_WAITER_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        timeout = DEFAULT_WAITER_TIMEOUT_SECONDS
+    if timeout <= 0:
+        return False
+    try:
+        modified_at = status_path.stat().st_mtime
+    except OSError:
+        return False
+    current = time.time() if now is None else float(now)
+    return current - modified_at > timeout + WAITER_STALE_GRACE_SECONDS
+
+
 def _clean_task_log(text: str) -> str:
     lines = []
     for line in text.splitlines():
@@ -308,7 +327,7 @@ def _show_receipt(receipt: dict) -> int:
             return EXIT_OK
     if not finished:
         pid = _status_pid(status_path)
-        if pid is not None and not _pid_is_alive(pid):
+        if pid is not None and not _pid_is_alive(pid) and _status_is_stale(status_path, receipt):
             print(
                 f"[INCOMPLETE] task={task_id} provider={receipt.get('provider', '')} "
                 f"waiter_pid={pid} is no longer running",
@@ -342,6 +361,15 @@ def _show_receipt(receipt: dict) -> int:
         print(f"[ERROR] Task {task_id} completed without a reply", file=sys.stderr)
         return EXIT_NO_REPLY
     return EXIT_OK if exit_code == 0 else EXIT_ERROR
+
+
+def _receipt_has_completed_reply(receipt: dict) -> bool:
+    provider = str(receipt.get("provider") or "").strip().lower()
+    if provider.startswith("peer-"):
+        return bool(read_peer_reply(receipt))
+    status_path = Path(str(receipt.get("status_file") or ""))
+    finished, _exit_code = _status_finished(status_path)
+    return finished
 
 
 def _show_receipts(records: list[tuple[Path, dict]], *, prefix_task_ids: bool) -> int:
@@ -435,6 +463,15 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return EXIT_NO_REPLY
+    if args.count is not None:
+        records = [record for record in records if _receipt_has_completed_reply(record[1])]
+        if not records:
+            print(
+                f"[NO TASK] No completed {target} replies in current CCB session; "
+                "use exact task ID to inspect a pending task",
+                file=sys.stderr,
+            )
+            return EXIT_NO_REPLY
     count = args.count if args.count is not None else 1
     selected = records[:count]
     return _show_receipts(selected, prefix_task_ids=args.count is not None)

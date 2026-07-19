@@ -7,6 +7,8 @@
 - Made implicit `pend` lookup strict to the current CCB tab, allowed paired panes to retrieve the same tab's tasks, and normalized `peer-<provider>` receipts by their responding provider.
 - Added context-first exact task guidance plus `pend peer`, `pend local`, and newest-first task history with task-ID prefixes. `pend <provider> N` now reads task receipts; legacy provider conversation history requires explicit `--legacy`.
 - Made pre-restart and otherwise unbound receipts exact-task-ID-only, with clear implicit-lookup guidance, while preserving the same-turn Async Guardrail.
+- Made counted `pend` history skip in-flight tasks and backfill from completed replies, while single-task lookup retains pending-state polling.
+- Prevented sandbox PID-namespace isolation from falsely marking fresh waiters incomplete by persisting task timeouts and requiring status staleness beyond the timeout plus grace period.
 - Added provider-aware cross-project peer routing for mounted Codex panes using the same explicit reverse-reply protocol as Claude.
 - Made all peer delivery one-shot so later Codex pane responses cannot be captured and forwarded automatically.
 - Added `peer_providers` discovery, provider-scoped bridge locks, and sender-project completion fallback routing.

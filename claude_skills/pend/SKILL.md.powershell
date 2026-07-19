@@ -35,5 +35,5 @@ pend $ARGUMENTS
 - `/pend peer`
 - `/pend local`
 - `/pend codex`
-- `/pend codex 3` — latest three current-tab Codex task replies
+- `/pend codex 3` — latest three completed current-tab Codex task replies
 - `/pend codex --legacy 3` — explicit provider conversation history

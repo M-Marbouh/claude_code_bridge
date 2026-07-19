@@ -50,13 +50,14 @@ def new_receipt(
     work_dir: Path,
     status_file: Path,
     log_file: Path,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     pane_id, terminal = caller_pane()
     try:
         project_id = compute_ccb_project_id(work_dir)
     except Exception:
         project_id = ""
-    return {
+    receipt = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "task_id": task_id,
         "provider": provider,
@@ -70,6 +71,9 @@ def new_receipt(
         "log_file": str(log_file),
         "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
+    if timeout_seconds is not None:
+        receipt["timeout_seconds"] = float(timeout_seconds)
+    return receipt
 
 
 def new_peer_receipt(
@@ -82,6 +86,7 @@ def new_peer_receipt(
     status_file: Path,
     log_file: Path,
     reply_file: Path,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Create a peer receipt with a validated reverse-route snapshot."""
     receipt = new_receipt(
@@ -91,6 +96,7 @@ def new_peer_receipt(
         work_dir=work_dir,
         status_file=status_file,
         log_file=log_file,
+        timeout_seconds=timeout_seconds,
     )
     receipt.update(
         {

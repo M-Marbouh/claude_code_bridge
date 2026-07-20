@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 
 import askd_rpc
 import askd_runtime
+import ccb_runtime_status
+import pytest
 from ccb_runtime_status import ProviderRuntimeStatus
 
 
@@ -34,6 +37,18 @@ def _provider_status(*, mounted: bool, daemon_online: bool = True) -> ProviderRu
         daemon_online=daemon_online,
         mounted=mounted,
         reason="" if mounted else "not_configured",
+    )
+
+
+def _registry_record(ask, work_dir: Path, provider: str, pane_id: str = "%1"):
+    return ask.RegistryProviderRecord(
+        project_id=ask.compute_ccb_project_id(work_dir),
+        work_dir=str(work_dir),
+        provider=provider,
+        provider_entry={"pane_id": pane_id},
+        registry_record={"work_dir": str(work_dir)},
+        updated_at=1,
+        timestamp_stale=False,
     )
 
 
@@ -434,3 +449,243 @@ def test_peer_routing_rejects_unsupported_provider(capsys) -> None:
 
     assert rc == 1
     assert "does not support cross-project peer routing: gemini" in capsys.readouterr().err
+
+
+def test_sender_work_dir_prefers_validated_environment(monkeypatch, tmp_path: Path) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    record = _registry_record(ask, project, "claude")
+
+    monkeypatch.setenv("CCB_WORK_DIR", str(project))
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [record])
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("%1", "tmux"))
+
+    assert ask._resolve_sender_work_dir("claude") == project.resolve()
+
+
+def test_sender_work_dir_falls_back_from_invalid_environment_to_daemon(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    invalid = tmp_path / "unmounted"
+    daemon_project = tmp_path / "daemon-project"
+    invalid.mkdir()
+    daemon_project.mkdir()
+    record = _registry_record(ask, daemon_project, "codex", pane_id="7")
+
+    monkeypatch.setenv("CCB_WORK_DIR", str(invalid))
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: daemon_project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [record])
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("7", "wezterm"))
+
+    assert ask._resolve_sender_work_dir("codex") == daemon_project.resolve()
+
+
+def test_sender_work_dir_rejects_missing_or_stale_project(monkeypatch, tmp_path: Path) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [])
+
+    resolution = ask._resolve_sender_work_dir("claude")
+
+    assert resolution == ask._SenderWorkDirFailure("unmounted_sender", project.resolve())
+
+
+def test_sender_work_dir_uses_daemon_state_in_managed_codex_sandbox(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    scratch = tmp_path / "scratch"
+    project = tmp_path / "project"
+    run_dir = tmp_path / "run"
+    scratch.mkdir()
+    project.mkdir()
+    run_dir.mkdir()
+    state_file = run_dir / "askd.json"
+    record = _registry_record(ask, project, "codex", pane_id="8")
+
+    monkeypatch.chdir(scratch)
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.setenv("CCB_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ccb_runtime_status, "find_running_state_file", lambda *_args, **_kwargs: state_file)
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc,
+        "read_state",
+        lambda _path: {"token": "tok", "work_dir": str(project)},
+    )
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [record])
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("8", "tmux"))
+
+    assert ask._resolve_sender_work_dir("codex") == project.resolve()
+
+
+def test_sender_work_dir_rejects_environment_daemon_disagreement(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    env_project = tmp_path / "env-project"
+    daemon_project = tmp_path / "daemon-project"
+    env_project.mkdir()
+    daemon_project.mkdir()
+    records = [
+        _registry_record(ask, env_project, "claude"),
+        _registry_record(ask, daemon_project, "claude"),
+    ]
+
+    monkeypatch.setenv("CCB_WORK_DIR", str(env_project))
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: daemon_project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: records)
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("%1", "tmux"))
+
+    resolution = ask._resolve_sender_work_dir("claude")
+
+    assert resolution == ask._SenderWorkDirFailure(
+        "sender_project_mismatch",
+        env_project.resolve(),
+        daemon_project.resolve(),
+    )
+
+
+@pytest.mark.parametrize("foreground", [True, False])
+def test_peer_sender_rejection_precedes_foreground_or_background_dispatch(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+    foreground: bool,
+) -> None:
+    ask = _load_ask_module()
+    rejected = tmp_path / "unmounted"
+    rejected.mkdir()
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(
+        ask,
+        "_resolve_sender_work_dir",
+        lambda _caller: ask._SenderWorkDirFailure("unmounted_sender", rejected),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_foreground",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("foreground bridge dispatched")),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_background",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("background receipt created")),
+    )
+
+    rc = ask._run_peer_bridge("/peer", "claude", 10.0, "hello", foreground, "wait")
+
+    assert rc == ask.EXIT_ERROR
+    error = capsys.readouterr().err
+    assert "CCB_ROUTE_ERROR target=claude reason=unmounted_sender" in error
+    assert f"sender_work_dir={rejected}" in error
+    assert "caller=claude provider=claude" in error
+
+
+@pytest.mark.parametrize("foreground", [True, False])
+def test_peer_foreground_and_background_receive_same_resolved_sender(
+    monkeypatch,
+    tmp_path: Path,
+    foreground: bool,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: list[Path] = []
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(ask, "_resolve_sender_work_dir", lambda _caller: project.resolve())
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_foreground",
+        lambda *_args: captured.append(_args[-1]) or 0,
+    )
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_background",
+        lambda *_args: captured.append(_args[-1]) or 0,
+    )
+
+    assert ask._run_peer_bridge("/peer", "claude", 10.0, "hello", foreground, "wait") == 0
+    assert captured == [project.resolve()]
+
+
+def test_peer_background_uses_resolved_sender_for_receipt_status_and_bridge(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict = {}
+
+    class _Proc:
+        pid = 4242
+
+    def _popen(cmd, **kwargs):
+        captured.update(cmd=cmd, env=kwargs["env"])
+        return _Proc()
+
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(ask, "make_task_id", lambda: "task-fixed")
+    monkeypatch.setattr(ask, "_cleanup_task_logs", lambda _path: None)
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("%1", "tmux"))
+    monkeypatch.setattr(ask.subprocess, "Popen", _popen)
+
+    rc = ask._run_peer_bridge_background(
+        "/peer",
+        "claude",
+        10.0,
+        "hello",
+        "claude",
+        "background",
+        "",
+        project.resolve(),
+    )
+
+    assert rc == ask.EXIT_OK
+    task_dir = tmp_path / "ccb-tasks"
+    receipt = json.loads((task_dir / "ask-peer-claude-task-fixed.json").read_text(encoding="utf-8"))
+    assert receipt["work_dir"] == str(project.resolve())
+    status = (task_dir / "ask-peer-claude-task-fixed.status").read_text(encoding="utf-8")
+    assert f"work_dir={project.resolve()}" in status
+    sender_index = captured["cmd"].index("--sender-work-dir") + 1
+    assert captured["cmd"][sender_index] == str(project.resolve())
+    assert captured["env"]["CCB_WORK_DIR"] == str(project.resolve())
+
+
+def test_peer_notify_does_not_require_mounted_sender(monkeypatch, tmp_path: Path) -> None:
+    ask = _load_ask_module()
+    captured: list[Path] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.setattr(
+        ask,
+        "_resolve_sender_work_dir",
+        lambda _caller: (_ for _ in ()).throw(AssertionError("notify validated sender")),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_foreground",
+        lambda *_args: captured.append(_args[-1]) or 0,
+    )
+
+    rc = ask._run_peer_bridge("/peer", "claude", 10.0, "FYI", True, "notify")
+
+    assert rc == 0
+    assert captured == [tmp_path.resolve()]

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+from project_id import compute_ccb_project_id
 
 
 def _repo_root() -> Path:
@@ -23,6 +27,31 @@ def _run_ask(args: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.C
     )
 
 
+def _peer_env(tmp_path: Path, caller: str = "claude") -> dict[str, str]:
+    home = tmp_path / "home"
+    registry_dir = home / ".ccb" / "run"
+    registry_dir.mkdir(parents=True)
+    pane_id = "%cnt"
+    record = {
+        "ccb_session_id": f"ai-test-{os.getpid()}",
+        "ccb_project_id": compute_ccb_project_id(tmp_path),
+        "ccb_pid": os.getpid(),
+        "work_dir": str(tmp_path),
+        "updated_at": int(time.time()),
+        "providers": {caller: {"pane_id": pane_id}},
+    }
+    (registry_dir / "ccb-session-test.json").write_text(json.dumps(record), encoding="utf-8")
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["CCB_CALLER"] = caller
+    env["CCB_WORK_DIR"] = str(tmp_path)
+    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+    env["CCB_CALLER_PANE_ID"] = pane_id
+    env["CCB_CALLER_TERMINAL"] = "tmux"
+    return env
+
+
 def test_async_mode_fails_fast_when_unified_daemon_unavailable(tmp_path: Path) -> None:
     env = dict(os.environ)
     env["CCB_CALLER"] = "claude"
@@ -38,11 +67,7 @@ def test_async_mode_fails_fast_when_unified_daemon_unavailable(tmp_path: Path) -
 
 
 def test_peer_mode_defaults_async_for_claude_caller(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env["CCB_CALLER"] = "claude"
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
-    env["CCB_CALLER_PANE_ID"] = "%cnt"
-    env["CCB_CALLER_TERMINAL"] = "tmux"
+    env = _peer_env(tmp_path)
 
     proc = _run_ask(["--peer", "abcd", "hello"], cwd=tmp_path, env=env)
 
@@ -55,11 +80,7 @@ def test_peer_mode_defaults_async_for_claude_caller(tmp_path: Path) -> None:
 
 
 def test_peer_background_mode_does_not_emit_wait_guardrail(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env["CCB_CALLER"] = "claude"
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
-    env["CCB_CALLER_PANE_ID"] = "%cnt"
-    env["CCB_CALLER_TERMINAL"] = "tmux"
+    env = _peer_env(tmp_path)
 
     proc = _run_ask(["--peer", "abcd", "--background", "hello"], cwd=tmp_path, env=env)
 
@@ -71,9 +92,7 @@ def test_peer_background_mode_does_not_emit_wait_guardrail(tmp_path: Path) -> No
 
 
 def test_provider_peer_form_honors_background_intent(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env["CCB_CALLER"] = "claude"
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+    env = _peer_env(tmp_path)
 
     proc = _run_ask(["claude", "--peer", "abcd", "--background", "hello"], cwd=tmp_path, env=env)
 
@@ -83,11 +102,7 @@ def test_provider_peer_form_honors_background_intent(tmp_path: Path) -> None:
 
 
 def test_codex_peer_wait_uses_provider_specific_markers(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env["CCB_CALLER"] = "claude"
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
-    env["CCB_CALLER_PANE_ID"] = "%cnt"
-    env["CCB_CALLER_TERMINAL"] = "tmux"
+    env = _peer_env(tmp_path)
 
     proc = _run_ask(["codex", "--peer", "abcd", "--wait", "hello"], cwd=tmp_path, env=env)
 
@@ -97,9 +112,7 @@ def test_codex_peer_wait_uses_provider_specific_markers(tmp_path: Path) -> None:
 
 
 def test_codex_peer_notify_is_non_blocking_without_wait_guardrail(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env["CCB_CALLER"] = "claude"
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
+    env = _peer_env(tmp_path)
 
     proc = _run_ask(["codex", "--peer", "abcd", "--notify", "FYI"], cwd=tmp_path, env=env)
 
@@ -109,11 +122,7 @@ def test_codex_peer_notify_is_non_blocking_without_wait_guardrail(tmp_path: Path
 
 
 def test_peer_mode_foreground_blocks_without_async_markers(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env["CCB_CALLER"] = "claude"
-    env["CCB_RUN_DIR"] = str(tmp_path / "run")
-    env["CCB_CALLER_PANE_ID"] = "%cnt"
-    env["CCB_CALLER_TERMINAL"] = "tmux"
+    env = _peer_env(tmp_path)
 
     proc = _run_ask(["--peer", "abcd", "--foreground", "hello"], cwd=tmp_path, env=env)
 

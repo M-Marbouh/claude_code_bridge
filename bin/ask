@@ -50,10 +50,14 @@ setup_windows_encoding()
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import (
     ProviderRuntimeStatus,
+    RegistryProviderRecord,
     daemon_work_dir_from_state,
     inside_managed_codex_sandbox,
+    iter_registry_provider_records,
     provider_status_for_target,
+    resolve_daemon_work_dir,
 )
+from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file
 from task_receipts import new_peer_receipt, new_receipt, receipt_path, write_receipt
 
@@ -97,6 +101,12 @@ class _UnifiedDaemonContext(NamedTuple):
     state_file: Path
     state: dict
     work_dir: Path
+
+
+class _SenderWorkDirFailure(NamedTuple):
+    reason: str
+    candidate: Path
+    evidence: Path | None = None
 
 
 def _caller_pane_info() -> tuple[str, str]:
@@ -548,6 +558,103 @@ def _peer_caller_pane_info() -> tuple[str, str]:
     return pane_id or detected_pane_id, terminal or detected_terminal
 
 
+def _normalized_work_dir(value: str | Path | None) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    try:
+        return candidate.resolve()
+    except Exception:
+        return candidate.absolute()
+
+
+def _same_work_dir(left: str | Path, right: str | Path) -> bool:
+    left_path = _normalized_work_dir(left)
+    right_path = _normalized_work_dir(right)
+    return left_path is not None and right_path is not None and left_path == right_path
+
+
+def _active_sender_records(candidate: Path, caller: str) -> list[RegistryProviderRecord]:
+    if not candidate.is_dir():
+        return []
+    try:
+        project_id = compute_ccb_project_id(candidate)
+        records = [
+            record
+            for record in iter_registry_provider_records(project_id=project_id)
+            if _same_work_dir(record.work_dir, candidate)
+        ]
+    except Exception:
+        return []
+
+    if caller in PEER_PROVIDERS:
+        records = [record for record in records if record.provider == caller]
+    return records
+
+
+def _sender_pane_conflicts(records: list[RegistryProviderRecord], caller: str) -> bool:
+    if caller not in PEER_PROVIDERS or not records:
+        return False
+    pane_id, _terminal = _peer_caller_pane_info()
+    recorded_panes = {
+        str(record.provider_entry.get("pane_id") or "").strip()
+        for record in records
+        if str(record.provider_entry.get("pane_id") or "").strip()
+    }
+    return bool(pane_id and recorded_panes and pane_id not in recorded_panes)
+
+
+def _resolve_sender_work_dir(caller: str) -> Path | _SenderWorkDirFailure:
+    """Resolve a validated, reply-addressable sender project without daemon autostart."""
+    env_candidate = _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))
+    env_records = _active_sender_records(env_candidate, caller) if env_candidate else []
+    env_valid = bool(env_records)
+
+    try:
+        daemon_candidate = _normalized_work_dir(resolve_daemon_work_dir())
+    except Exception:
+        daemon_candidate = _normalized_work_dir(Path.cwd())
+    daemon_records = _active_sender_records(daemon_candidate, caller) if daemon_candidate else []
+    daemon_valid = bool(daemon_records)
+
+    if env_valid and env_candidate is not None:
+        if _sender_pane_conflicts(env_records, caller):
+            return _SenderWorkDirFailure(
+                "sender_project_mismatch",
+                env_candidate,
+                daemon_candidate if daemon_valid else None,
+            )
+        if daemon_valid and daemon_candidate is not None and daemon_candidate != env_candidate:
+            return _SenderWorkDirFailure("sender_project_mismatch", env_candidate, daemon_candidate)
+        return env_candidate
+    if daemon_valid and daemon_candidate is not None:
+        if _sender_pane_conflicts(daemon_records, caller):
+            return _SenderWorkDirFailure("sender_project_mismatch", daemon_candidate)
+        return daemon_candidate
+
+    rejected = env_candidate or daemon_candidate or _normalized_work_dir(Path.cwd()) or Path.cwd()
+    return _SenderWorkDirFailure("unmounted_sender", rejected)
+
+
+def _sender_route_error_line(
+    peer_provider: str,
+    caller: str,
+    failure: _SenderWorkDirFailure,
+) -> str:
+    evidence = (
+        f" evidence_work_dir={shlex.quote(str(failure.evidence))}"
+        if failure.evidence is not None
+        else ""
+    )
+    return (
+        f"CCB_ROUTE_ERROR target={peer_provider} reason={failure.reason}"
+        f" sender_work_dir={shlex.quote(str(failure.candidate))}"
+        f"{evidence}"
+        f" caller={caller} provider={peer_provider}"
+    )
+
+
 def _notify_requests_reply(message: str) -> bool:
     """Reject the clearest contradictory intent: a notification ending in a question."""
     return (message or "").rstrip().endswith("?")
@@ -608,16 +715,17 @@ def _run_peer_bridge_foreground(
     caller: str,
     intent: str,
     reply_to: str,
+    sender_work_dir: Path,
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
-    sender_work_dir = os.getcwd()
+    sender_work_dir_str = str(sender_work_dir)
     cmd = _peer_bridge_cmd(
         peer_target,
         peer_provider,
         timeout,
         caller_pane_id,
         caller_terminal,
-        sender_work_dir,
+        sender_work_dir_str,
         caller,
         intent,
         reply_to=reply_to,
@@ -625,7 +733,7 @@ def _run_peer_bridge_foreground(
     )
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
-    env["CCB_WORK_DIR"] = sender_work_dir
+    env["CCB_WORK_DIR"] = sender_work_dir_str
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
     if caller_terminal:
@@ -646,6 +754,7 @@ def _run_peer_bridge_background(
     caller: str,
     intent: str,
     reply_to: str,
+    sender_work_dir: Path,
 ) -> int:
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
@@ -668,7 +777,7 @@ def _run_peer_bridge_background(
                 peer_provider=peer_provider,
                 caller=caller,
                 intent=intent,
-                work_dir=Path.cwd(),
+                work_dir=sender_work_dir,
                 status_file=status_file,
                 log_file=log_file,
                 reply_file=reply_file,
@@ -681,14 +790,14 @@ def _run_peer_bridge_background(
     _cleanup_task_logs(log_dir)
 
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
-    sender_work_dir = os.getcwd()
+    sender_work_dir_str = str(sender_work_dir)
     bridge_cmd = _peer_bridge_cmd(
         peer_target,
         peer_provider,
         timeout,
         caller_pane_id,
         caller_terminal,
-        sender_work_dir,
+        sender_work_dir_str,
         caller,
         intent,
         task_id,
@@ -697,7 +806,7 @@ def _run_peer_bridge_background(
     env = os.environ.copy()
     env["CCB_REQ_ID"] = task_id
     env["CCB_CALLER"] = caller
-    env["CCB_WORK_DIR"] = sender_work_dir
+    env["CCB_WORK_DIR"] = sender_work_dir_str
     env["CCB_PEER_STATUS_FILE"] = str(status_file)
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
@@ -728,7 +837,7 @@ def _run_peer_bridge_background(
     _append_task_status_line(
         status_file,
         f"submitted task={task_id} provider=peer-{peer_provider} caller={caller} "
-        f"target={peer_target} work_dir={os.getcwd()}",
+        f"target={peer_target} work_dir={sender_work_dir_str}",
     )
     _append_task_status_line(status_file, f"spawned pid={proc.pid}")
 
@@ -768,12 +877,38 @@ def _run_peer_bridge(
         )
         return EXIT_ERROR
     caller = _require_caller()
+    if intent == "notify":
+        sender_work_dir = (
+            _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))
+            or _normalized_work_dir(Path.cwd())
+            or Path.cwd()
+        )
+    else:
+        resolution = _resolve_sender_work_dir(caller)
+        if isinstance(resolution, _SenderWorkDirFailure):
+            print(_sender_route_error_line(peer_provider, caller, resolution), file=sys.stderr)
+            return EXIT_ERROR
+        sender_work_dir = resolution
     if foreground_mode:
         return _run_peer_bridge_foreground(
-            peer_target, peer_provider, timeout, message, caller, intent, reply_to
+            peer_target,
+            peer_provider,
+            timeout,
+            message,
+            caller,
+            intent,
+            reply_to,
+            sender_work_dir,
         )
     return _run_peer_bridge_background(
-        peer_target, peer_provider, timeout, message, caller, intent, reply_to
+        peer_target,
+        peer_provider,
+        timeout,
+        message,
+        caller,
+        intent,
+        reply_to,
+        sender_work_dir,
     )
 
 

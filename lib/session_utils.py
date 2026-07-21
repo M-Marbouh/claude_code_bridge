@@ -3,13 +3,21 @@ session_utils.py - Session file permission check utility
 """
 from __future__ import annotations
 import os
+import secrets
 import stat
+import tempfile
 from pathlib import Path
 from typing import Tuple, Optional
 
 
 CCB_PROJECT_CONFIG_DIRNAME = ".ccb"
 CCB_PROJECT_CONFIG_LEGACY_DIRNAME = ".ccb_config"
+CCB_SESSION_FILENAMES = (
+    ".claude-session",
+    ".codex-session",
+    ".gemini-session",
+    ".opencode-session",
+)
 
 
 def project_config_dir(work_dir: Path) -> Path:
@@ -110,26 +118,168 @@ def safe_write_session(session_file: Path, content: str) -> Tuple[bool, Optional
     if not writable:
         return False, f"❌ Cannot write {session_file.name}: {reason}\n💡 Fix: {fix}"
 
-    # Attempt atomic write
-    tmp_file = session_file.with_suffix(".tmp")
+    # Attempt an owner-only atomic write. The mode is attached to the temporary
+    # inode before rename, so the live target is never briefly group-readable.
     try:
-        tmp_file.write_text(content, encoding="utf-8")
-        os.replace(tmp_file, session_file)
+        if os.name == "nt":
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{session_file.name}.",
+                suffix=".tmp",
+                dir=str(session_file.parent),
+            )
+            tmp_file = Path(tmp_name)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                    fd = -1
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_file, session_file)
+                tmp_file = None
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                if tmp_file is not None:
+                    try:
+                        tmp_file.unlink()
+                    except FileNotFoundError:
+                        pass
+        else:
+            parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            parent_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+            parent_fd = os.open(session_file.parent, parent_flags)
+            tmp_name = f".{session_file.name}.{secrets.token_hex(8)}.tmp"
+            tmp_fd = -1
+            try:
+                parent_info = os.fstat(parent_fd)
+                if not stat.S_ISDIR(parent_info.st_mode):
+                    raise PermissionError("session parent is not a directory")
+                if hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid():
+                    raise PermissionError("session parent is not owned by the current user")
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+                tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=parent_fd)
+                tmp_info = os.fstat(tmp_fd)
+                if not stat.S_ISREG(tmp_info.st_mode):
+                    raise PermissionError("session temporary is not a regular file")
+                if hasattr(os, "geteuid") and tmp_info.st_uid != os.geteuid():
+                    raise PermissionError("session temporary is not owned by the current user")
+                os.fchmod(tmp_fd, 0o600)
+                with os.fdopen(tmp_fd, "w", encoding="utf-8", newline="") as handle:
+                    tmp_fd = -1
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(
+                    tmp_name,
+                    session_file.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            finally:
+                if tmp_fd >= 0:
+                    os.close(tmp_fd)
+                try:
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+                os.close(parent_fd)
         return True, None
     except PermissionError as e:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except Exception:
-                pass
         return False, f"❌ Cannot write {session_file.name}: {e}\n💡 Try: rm -f {session_file} then retry"
     except Exception as e:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except Exception:
-                pass
         return False, f"❌ Write failed: {e}"
+
+
+def _secure_existing_path(path: Path, *, expect_dir: bool, mode: int) -> Tuple[bool, Optional[str]]:
+    """Validate and chmod one existing path through the same file descriptor."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True, None
+    except OSError as exc:
+        return False, f"{path}: {exc}"
+
+    if os.name == "nt":
+        if path.is_symlink():
+            return False, f"{path}: symbolic links are not allowed"
+        try:
+            info = path.stat()
+            valid_type = stat.S_ISDIR(info.st_mode) if expect_dir else stat.S_ISREG(info.st_mode)
+            if not valid_type:
+                return False, f"{path}: unexpected path type"
+            os.chmod(path, mode)
+            return True, None
+        except OSError as exc:
+            return False, f"{path}: {exc}"
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+    if expect_dir:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return False, f"{path}: {exc}"
+    try:
+        info = os.fstat(fd)
+        valid_type = stat.S_ISDIR(info.st_mode) if expect_dir else stat.S_ISREG(info.st_mode)
+        if not valid_type:
+            return False, f"{path}: unexpected path type"
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            return False, f"{path}: not owned by the current user"
+        os.fchmod(fd, mode)
+        return True, None
+    except OSError as exc:
+        return False, f"{path}: {exc}"
+    finally:
+        os.close(fd)
+
+
+def remediate_ccb_permissions(
+    work_dir: Path,
+    *,
+    home_dir: Optional[Path] = None,
+) -> Tuple[bool, list[str]]:
+    """Repair CCB-owned config/session modes without following symbolic links."""
+    root = Path(work_dir).expanduser()
+    home = Path(home_dir).expanduser() if home_dir is not None else Path.home()
+    primary = root / CCB_PROJECT_CONFIG_DIRNAME
+    legacy = root / CCB_PROJECT_CONFIG_LEGACY_DIRNAME
+    global_ccb = home / ".ccb"
+
+    directory_targets = [primary, legacy, global_ccb, global_ccb / "local", global_ccb / "run"]
+    file_targets = [root / name for name in CCB_SESSION_FILENAMES]
+    for directory in (primary, legacy):
+        file_targets.append(directory / "ccb.config")
+        file_targets.append(directory / ".mcpv-launch-status.json")
+        file_targets.extend(directory / name for name in CCB_SESSION_FILENAMES)
+    file_targets.append(global_ccb / "ccb.config")
+
+    errors: list[str] = []
+    secured_directories: list[Path] = []
+    for path in directory_targets:
+        ok, error = _secure_existing_path(path, expect_dir=True, mode=0o700)
+        if not ok and error:
+            errors.append(error)
+        elif path.is_dir() and not path.is_symlink():
+            secured_directories.append(path)
+    for directory in secured_directories:
+        if directory not in (primary, legacy):
+            continue
+        try:
+            for entry in os.scandir(directory):
+                if entry.name.startswith(".") and entry.name.endswith("-session"):
+                    file_targets.append(Path(entry.path))
+        except OSError as exc:
+            errors.append(f"{directory}: {exc}")
+    file_targets = list(dict.fromkeys(file_targets))
+    for path in file_targets:
+        ok, error = _secure_existing_path(path, expect_dir=False, mode=0o600)
+        if not ok and error:
+            errors.append(error)
+    return not errors, errors
 
 
 def print_session_error(msg: str, to_stderr: bool = True) -> None:

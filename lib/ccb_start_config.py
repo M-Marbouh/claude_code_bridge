@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from typing import Optional, Tuple
 
-from session_utils import legacy_project_config_dir, project_config_dir
+from session_utils import legacy_project_config_dir, project_config_dir, safe_write_session
 
 
 CONFIG_FILENAME = "ccb.config"
@@ -160,9 +160,11 @@ def ensure_default_start_config(work_dir: Path) -> Tuple[Optional[Path], bool]:
     if not primary.parent.exists() and legacy.parent.is_dir():
         target = legacy
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         payload = ",".join(DEFAULT_PROVIDERS) + "\n"
-        target.write_text(payload, encoding="utf-8")
+        ok, _error = safe_write_session(target, payload)
+        if not ok:
+            return None, False
         return target, True
     except Exception:
         return None, False

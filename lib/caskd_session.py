@@ -7,10 +7,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+from ccb_mcpv_bridge import (
+    Decision,
+    DecisionKind,
+    decide as decide_mcpv,
+    record_decision_status,
+    render_shell_prefix,
+)
 from ccb_config import apply_backend_env
 from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file as _find_project_session_file, safe_write_session
-from terminal import get_backend_for_session
+from terminal import get_backend_for_session, get_shell_type
 
 apply_backend_env()
 
@@ -63,6 +70,17 @@ class CodexProjectSession:
     @property
     def work_dir(self) -> str:
         return str(self.data.get("work_dir") or self.session_file.parent)
+
+    @property
+    def policy_project_root(self) -> Path:
+        for key in ("project_root", "work_dir"):
+            raw = self.data.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return Path(raw).expanduser()
+        parent = self.session_file.parent
+        if parent.name in (".ccb", ".ccb_config"):
+            return parent.parent
+        return parent
 
     @property
     def runtime_dir(self) -> Path:
@@ -126,6 +144,9 @@ class CodexProjectSession:
 
         # tmux self-heal: if pane exists but is dead (remain-on-exit), respawn in-place.
         if self.terminal == "tmux":
+            policy_error = str(self.data.get("mcpv_policy_error") or "").strip()
+            if policy_error:
+                return False, f"launch_policy_error:{policy_error}"
             start_cmd = self.start_cmd
             respawn = getattr(backend, "respawn_pane", None)
             if start_cmd and callable(respawn):
@@ -163,15 +184,36 @@ class CodexProjectSession:
         old_id = str(self.data.get("codex_session_id") or "").strip()
 
         updated = False
+        binding_changed = False
         log_path_str = ""
         if log_path:
             log_path_str = str(log_path).strip()
         if log_path_str and self.data.get("codex_session_path") != log_path_str:
             self.data["codex_session_path"] = log_path_str
             updated = True
-        if session_id and self.data.get("codex_session_id") != session_id:
-            self.data["codex_session_id"] = session_id
-            self.data["codex_start_cmd"] = f"codex resume {session_id}"
+            binding_changed = True
+        refresh_policy = bool(session_id and self.data.get("mcpv_policy_error"))
+        if session_id and (self.data.get("codex_session_id") != session_id or refresh_policy):
+            if self.data.get("codex_session_id") != session_id:
+                self.data["codex_session_id"] = session_id
+                binding_changed = True
+            managed = bool(self.data.get("ccb_managed_launch"))
+            caller = str(self.data.get("ccb_launch_caller") or "").strip().lower()
+            required = bool(self.data.get("mcpv_policy_required"))
+            if required and (not managed or caller != "codex"):
+                decision = Decision.error("policy_decision_failed")
+            else:
+                decision = decide_mcpv("codex", self.policy_project_root, managed, caller)
+                if required and not decision.policy_present:
+                    decision = Decision.error("policy_import_failed")
+            if decision.kind is DecisionKind.ERROR:
+                self.data["mcpv_policy_error"] = decision.reason_code
+                record_decision_status(self.policy_project_root, "codex", decision)
+            else:
+                prefix = render_shell_prefix(decision, shell_type=get_shell_type())
+                self.data["codex_start_cmd"] = f"{prefix}codex resume {session_id}"
+                self.data.pop("mcpv_policy_error", None)
+                record_decision_status(self.policy_project_root, "codex", decision)
             updated = True
 
         if updated:
@@ -185,7 +227,7 @@ class CodexProjectSession:
                 self.data["old_codex_session_id"] = old_id
             if old_path and (old_path != log_path_str or (old_id and old_id != new_id)):
                 self.data["old_codex_session_path"] = old_path
-            if old_path or old_id:
+            if binding_changed and (old_path or old_id):
                 self.data["old_updated_at"] = _now_str()
                 try:
                     from ctx_transfer_utils import maybe_auto_transfer

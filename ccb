@@ -31,12 +31,21 @@ from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_s
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
 from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config
+from ccb_mcpv_bridge import (
+    Decision,
+    DecisionKind,
+    PolicyDecisionError,
+    decide as decide_mcpv,
+    record_decision_status,
+    render_shell_prefix,
+)
 from ccb_cleanup import DEFAULT_KEEP_NEWEST, DEFAULT_TTL_SECONDS, plan_prune, run_prune
 from session_utils import (
     check_session_writable,
     find_project_session_file,
     legacy_project_config_dir,
     project_config_dir,
+    remediate_ccb_permissions,
     resolve_project_config_dir,
     safe_write_session,
 )
@@ -632,6 +641,7 @@ class AILauncher:
         self.wezterm_panes = {}
         self.extra_panes = {}
         self.processes = {}
+        self._agent_policy_decisions: dict[str, Decision] = {}
         self.anchor_provider = None
         self.anchor_pane_id = None
         self._migrate_legacy_project_files()
@@ -786,8 +796,31 @@ class AILauncher:
 
     def _agent_command_prefix(self, provider: str) -> AgentCommandPrefix:
         """Return the shared shell/argv prefix for a managed agent launch."""
-        _ = provider
-        return AgentCommandPrefix(shell="", argv=())
+        prov = str(provider or "").strip().lower()
+        if prov not in {"claude", "codex"}:
+            return AgentCommandPrefix(shell="", argv=())
+        decision = self._agent_policy_decisions.get(prov)
+        if decision is None:
+            decision = decide_mcpv(
+                prov,
+                self.project_root,
+                managed=True,
+                caller=prov,
+            )
+            self._agent_policy_decisions[prov] = decision
+            record_decision_status(self.project_root, prov, decision)
+        if decision.kind is DecisionKind.ERROR:
+            raise PolicyDecisionError(decision)
+        return AgentCommandPrefix(
+            shell=render_shell_prefix(decision, shell_type=get_shell_type()),
+            argv=decision.argv_prefix,
+        )
+
+    def _preflight_agent_policies(self) -> None:
+        """Resolve all wrapping decisions before creating or relabeling any pane."""
+        for provider in self.providers:
+            if str(provider or "").strip().lower() in {"claude", "codex"}:
+                self._agent_command_prefix(provider)
 
     def _compose_agent_shell(self, provider: str, command: ShellAgentCommand) -> str:
         """Render an agent command for a shell without changing its outer shell envelope."""
@@ -1425,7 +1458,7 @@ class AILauncher:
         try:
             if not path.parent.is_dir():
                 raise FileNotFoundError(str(path.parent))
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            safe_write_session(path, json.dumps(data, ensure_ascii=False, indent=2))
         except Exception:
             pass
 
@@ -2712,6 +2745,12 @@ class AILauncher:
         if codex_start_cmd:
             data["codex_start_cmd"] = str(codex_start_cmd)
             data["start_cmd"] = str(codex_start_cmd)
+        decision = self._agent_policy_decisions.get("codex", Decision.plain())
+        data["project_root"] = str(self.project_root)
+        data["ccb_managed_launch"] = True
+        data["ccb_launch_caller"] = "codex"
+        data["ccb_launch_provider"] = "codex"
+        data["mcpv_policy_required"] = decision.kind is DecisionKind.WRAP
 
         ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
         if not ok:
@@ -3280,6 +3319,8 @@ class AILauncher:
             print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
             return 2
 
+        self._preflight_agent_policies()
+
         self.anchor_provider = self.providers[-1]
         self.anchor_pane_id = self._current_pane_id()
         if not self.anchor_pane_id:
@@ -3541,11 +3582,18 @@ def cmd_start(args):
             print("💡 If you really intend to do this, set CCB_INIT_PROJECT_DANGEROUS=1 and retry.", file=sys.stderr)
             return 2
         try:
-            cfg.mkdir(parents=False, exist_ok=True)
+            cfg.mkdir(parents=False, exist_ok=True, mode=0o700)
             print(f"✅ Created: {cfg}", file=sys.stderr)
         except Exception as exc:
             print(f"❌ Failed to create {cfg}: {exc}", file=sys.stderr)
             return 2
+
+    permissions_ok, permission_errors = remediate_ccb_permissions(work_dir)
+    if not permissions_ok:
+        print("❌ Refusing to start: unsafe CCB config/session path permissions.", file=sys.stderr)
+        for error in permission_errors:
+            print(f"   {error}", file=sys.stderr)
+        return 2
 
     # Parse explicit provider args early so lock-collision path can reuse an existing pane.
     requested_providers, _requested_cmd_enabled, providers_valid = _parse_providers_with_cmd(args.providers or [])
@@ -3658,7 +3706,11 @@ def cmd_start(args):
         launch_args=launch_args,
         launch_env=launch_env,
     )
-    return launcher.run_up()
+    try:
+        return launcher.run_up()
+    except PolicyDecisionError as exc:
+        print(f"❌ Agent launch policy error: {exc}", file=sys.stderr)
+        return 2
 
 
 def _find_all_zombie_sessions() -> list[dict]:

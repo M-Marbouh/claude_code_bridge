@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import askd_rpc
+from ccb_mcpv_bridge import read_degraded_states
 from askd_runtime import find_running_state_file, state_file_candidates
 from ccb_start_config import load_start_config
 from pane_registry import (
@@ -392,21 +393,31 @@ def resolve_project_runtime_status(
     records = iter_registry_provider_records(project_id=project_id, include_stale=include_stale)
     configured = _configured_providers(resolved)
     selected = _select_records(records)
+    degraded = read_degraded_states(resolved)
     daemon_online = (
         _daemon_online_override
         if _daemon_online_override is not None
         else (is_project_askd_online(resolved, project_id) if check_daemon else False)
     )
     statuses: dict[str, ProviderRuntimeStatus] = {}
-    for provider in sorted(configured | set(selected)):
+    for provider in sorted(configured | set(selected) | set(degraded)):
         record = selected.get(provider)
+        policy_error = degraded.get(provider) or {}
         entry = record.provider_entry if record else {}
         registered = record is not None
         stale = bool(record.timestamp_stale) if record else False
         launcher_alive = _registry_owner_alive(record.registry_record) if record else None
         pane_alive = bool(_provider_pane_alive(record.registry_record, provider)) if record and launcher_alive is not False else False
         bound, session_file = _session_bound(resolved, project_id, provider, entry) if record else (False, "")
-        mounted = bool(registered and not stale and pane_alive and bound and daemon_online)
+        mounted = bool(
+            registered
+            and not stale
+            and pane_alive
+            and bound
+            and daemon_online
+            and not policy_error
+        )
+        policy_reason = str(policy_error.get("reason_code") or "").strip()
         statuses[provider] = ProviderRuntimeStatus(
             key=provider,
             provider=provider,
@@ -417,20 +428,27 @@ def resolve_project_runtime_status(
             session_bound=bound,
             daemon_online=daemon_online,
             mounted=mounted,
-            reason=_reason(
-                provider in configured,
-                registered,
-                stale,
-                pane_alive,
-                bound,
-                daemon_online,
-                launcher_alive,
+            reason=(
+                f"launch_policy_error:{policy_reason}"
+                if policy_reason
+                else _reason(
+                    provider in configured,
+                    registered,
+                    stale,
+                    pane_alive,
+                    bound,
+                    daemon_online,
+                    launcher_alive,
+                )
             ),
             pane_id=str(entry.get("pane_id") or "").strip(),
             pane_title_marker=str(entry.get("pane_title_marker") or "").strip(),
             session_file=session_file,
             timestamp_stale=stale,
-            updated_at=record.updated_at if record else 0,
+            updated_at=max(
+                record.updated_at if record else 0,
+                _coerce_int(policy_error.get("timestamp")),
+            ),
         )
     newest = max(records, key=lambda record: record.updated_at) if records else None
     return ProjectRuntimeStatus(

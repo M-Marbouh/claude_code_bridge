@@ -171,6 +171,7 @@ ccb version
 
 ## Fork changes
 
+- `0.13.0` — replaced relay-style review roles with symmetric mutual ratification and moved managed Codex guidance to the real global `${CODEX_HOME:-~/.codex}/AGENTS.md` target.
 - `0.12.0` — returned to a single-instance architecture; retained Claude, Codex, Gemini, and OpenCode; added request-scoped task receipts and deterministic `pend`; removed worker/tag/role/sub-agent behavior; hardened same-folder Codex isolation.
 - `0.11.x` — introduced runtime status, cleanup, and experimental multi-instance work. Multi-instance behavior was retired in `0.12.0`.
 - `0.9.0` — added local project listing and cross-project Claude messaging.

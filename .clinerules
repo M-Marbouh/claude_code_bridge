@@ -1,15 +1,7 @@
-<!-- CCB_ROLES_START -->
-## Role Assignment
+<!-- MUTUAL_RATIFICATION_START -->
+## Mutual Ratification
 
-Abstract roles map to concrete AI providers. Skills reference roles, not providers directly.
+Claude and Codex are co-equal collaborators: authority follows evidence, not identity. Either may propose, ratify, amend, or contest substantive work. There are no fixed designer, reviewer, or executor roles, and neither agent holds default correctness authority.
 
-| Role | Provider | Description |
-|------|----------|-------------|
-| `designer` | `claude` | Primary planner and architect — owns plans and designs |
-| `inspiration` | `gemini` | Creative brainstorming — provides ideas as reference only (unreliable, never blindly follow) |
-| `reviewer` | `codex` | Scored quality gate — evaluates plans/code using Rubrics |
-| `executor` | `claude` | Code implementation — writes and modifies code |
-
-To change a role assignment, edit the Provider column above.
-When a skill references a role (e.g. `reviewer`), resolve it to the provider listed here.
-<!-- CCB_ROLES_END -->
+Scale effort to stakes. Both agents work substantive or high-risk problems to convergence; routine work takes the fast path. Material disagreement is escalated to the user after one clarification round, and material evidence drift reopens ratification.
+<!-- MUTUAL_RATIFICATION_END -->

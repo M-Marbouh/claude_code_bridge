@@ -67,6 +67,7 @@ function Show-Usage {
   Write-Host ""
   Write-Host "Options:"
   Write-Host "  -InstallPrefix <path>    # Custom install location (default: $env:LOCALAPPDATA\codex-dual)"
+  Write-Host "  CODEX_HOME=<path>        # Codex configuration directory (default: %USERPROFILE%\.codex)"
   Write-Host ""
   Write-Host "Requirements:"
   Write-Host "  - Python 3.10+"
@@ -163,6 +164,26 @@ function Confirm-BackendEnv {
   }
 }
 
+function Copy-ProjectItems {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceRoot,
+    [Parameter(Mandatory = $true)][string]$DestinationRoot
+  )
+
+  if (-not (Test-Path $DestinationRoot)) {
+    New-Item -ItemType Directory -Path $DestinationRoot -Force | Out-Null
+  }
+
+  foreach ($item in @("ccb", "lib", "bin", "config")) {
+    $src = Join-Path $SourceRoot $item
+    $dst = Join-Path $DestinationRoot $item
+    if (Test-Path $src) {
+      if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+      Copy-Item -Recurse -Force $src $dst
+    }
+  }
+}
+
 function Install-Native {
   Confirm-BackendEnv
 
@@ -202,15 +223,7 @@ function Install-Native {
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
   }
 
-  $items = @("ccb", "lib", "bin")
-  foreach ($item in $items) {
-    $src = Join-Path $repoRoot $item
-    $dst = Join-Path $InstallPrefix $item
-    if (Test-Path $src) {
-      if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
-      Copy-Item -Recurse -Force $src $dst
-    }
-  }
+  Copy-ProjectItems -SourceRoot $repoRoot -DestinationRoot $InstallPrefix
 
   # Exclude web UI code from installation (CLI-only mail setup)
   $webDir = Join-Path $InstallPrefix "lib\\web"
@@ -461,6 +474,95 @@ function Install-CodexSkills {
 
 
 
+function Install-AgentsMdConfig {
+  param([Parameter(Mandatory = $true)][string]$InstallPrefix)
+
+  $agentsMdTemplate = Join-Path $InstallPrefix "config\agents-md-ccb.md"
+  if (-not (Test-Path $agentsMdTemplate)) {
+    Write-Warning "Template not found: $agentsMdTemplate; skipping AGENTS.md injection"
+    return $false
+  }
+
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+  $agentsMd = Join-Path $codexHome "AGENTS.md"
+  $legacyAgentsMd = Join-Path $InstallPrefix "AGENTS.md"
+  New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+
+  $templateContent = [System.IO.File]::ReadAllText($agentsMdTemplate, [System.Text.Encoding]::UTF8)
+  $agentsContent = if (Test-Path $agentsMd) {
+    [System.IO.File]::ReadAllText($agentsMd, [System.Text.Encoding]::UTF8)
+  } else {
+    ""
+  }
+  $markerPairs = @(
+    @{ Start = '<!-- CCB_ROLES_START -->'; End = '<!-- CCB_ROLES_END -->' },
+    @{ Start = '<!-- REVIEW_RUBRICS_START -->'; End = '<!-- REVIEW_RUBRICS_END -->' },
+    @{ Start = '<!-- MUTUAL_RATIFICATION_START -->'; End = '<!-- MUTUAL_RATIFICATION_END -->' }
+  )
+
+  $malformed = @()
+  foreach ($pair in $markerPairs) {
+    $startPattern = [regex]::Escape($pair.Start)
+    $endPattern = [regex]::Escape($pair.End)
+    $startCount = [regex]::Matches($agentsContent, $startPattern).Count
+    $endCount = [regex]::Matches($agentsContent, $endPattern).Count
+    $completeCount = [regex]::Matches($agentsContent, "(?s)$startPattern.*?$endPattern").Count
+    if ($startCount -ne $endCount -or $completeCount -ne $startCount) {
+      $malformed += "$($pair.Start) / $($pair.End)"
+    }
+  }
+  if ($malformed.Count -gt 0) {
+    Write-Warning "Malformed CCB marker structure in global Codex AGENTS.md; leaving the file unchanged: $($malformed -join ', ')"
+    return $false
+  }
+
+  foreach ($pair in $markerPairs) {
+    $pattern = "(?s)$([regex]::Escape($pair.Start)).*?$([regex]::Escape($pair.End))"
+    $agentsContent = [regex]::Replace($agentsContent, $pattern, '')
+  }
+  $remainingContent = $agentsContent.TrimEnd()
+  $updatedContent = if ($remainingContent) {
+    $remainingContent + "`n`n" + $templateContent.Trim() + "`n"
+  } else {
+    $templateContent.Trim() + "`n"
+  }
+  [System.IO.File]::WriteAllText($agentsMd, $updatedContent, $script:utf8NoBom)
+  Write-Host "Updated global Codex AGENTS.md: $agentsMd"
+
+  $overrideAgentsMd = Join-Path $codexHome "AGENTS.override.md"
+  if (Test-Path $overrideAgentsMd) {
+    $overrideContent = [System.IO.File]::ReadAllText($overrideAgentsMd, [System.Text.Encoding]::UTF8)
+    if (-not [string]::IsNullOrWhiteSpace($overrideContent)) {
+      Write-Warning "$overrideAgentsMd is non-empty and takes precedence over $agentsMd"
+    }
+  }
+
+  # This cleanup matters for in-place/out-of-tree callers. A clean Unix install
+  # replaces INSTALL_PREFIX before this point, so no legacy file survives there.
+  $sameAgentsFile = $false
+  if ((Test-Path $legacyAgentsMd) -and (Test-Path $agentsMd)) {
+    try {
+      $resolvedLegacy = (Resolve-Path -LiteralPath $legacyAgentsMd).ProviderPath
+      $resolvedAgents = (Resolve-Path -LiteralPath $agentsMd).ProviderPath
+      $sameAgentsFile = [System.StringComparer]::OrdinalIgnoreCase.Equals($resolvedLegacy, $resolvedAgents)
+    } catch {}
+  }
+  if (-not $sameAgentsFile -and (Test-Path $legacyAgentsMd)) {
+    $legacyContent = [System.IO.File]::ReadAllText($legacyAgentsMd, [System.Text.Encoding]::UTF8)
+    foreach ($pair in $markerPairs) {
+      $pattern = "(?s)$([regex]::Escape($pair.Start)).*?$([regex]::Escape($pair.End))"
+      $legacyContent = [regex]::Replace($legacyContent, $pattern, '')
+    }
+    if ([string]::IsNullOrWhiteSpace($legacyContent)) {
+      Remove-Item -Force $legacyAgentsMd
+    } else {
+      [System.IO.File]::WriteAllText($legacyAgentsMd, $legacyContent.Trim() + "`n", $script:utf8NoBom)
+    }
+  }
+
+  return $true
+}
+
 function Install-ClaudeConfig {
   $claudeDir = Join-Path $env:USERPROFILE ".claude"
   $commandsDir = Join-Path $claudeDir "commands"
@@ -611,26 +713,7 @@ function Install-ClaudeConfig {
   }
 
   # --- AGENTS.md injection ---
-  $agentsMdTemplate = Join-Path $installPrefix "config\agents-md-ccb.md"
-  $agentsMd = Join-Path $installPrefix "AGENTS.md"
-  if (Test-Path $agentsMdTemplate) {
-    $templateContent = Get-Content -Raw $agentsMdTemplate
-    if (Test-Path $agentsMd) {
-      $agentsContent = Get-Content -Raw $agentsMd
-      if ($agentsContent -match '<!-- CCB_ROLES_START -->' -or $agentsContent -match '<!-- REVIEW_RUBRICS_START -->' -or $agentsContent -match '<!-- MUTUAL_RATIFICATION_START -->') {
-        $agentsContent = [regex]::Replace($agentsContent, '(?s)<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->', '')
-        $agentsContent = [regex]::Replace($agentsContent, '(?s)<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->', '')
-        $agentsContent = [regex]::Replace($agentsContent, '(?s)<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->', '')
-        $agentsContent = $agentsContent.TrimEnd() + "`n`n" + $templateContent.Trim() + "`n"
-        $agentsContent | Out-File -Encoding UTF8 -FilePath $agentsMd
-      } else {
-        Add-Content -Path $agentsMd -Value ("`n" + $templateContent)
-      }
-    } else {
-      $templateContent | Out-File -Encoding UTF8 -FilePath $agentsMd
-    }
-    Write-Host "Updated AGENTS.md with review rubrics"
-  }
+  $null = Install-AgentsMdConfig -InstallPrefix $InstallPrefix
 
 }
 
@@ -783,7 +866,23 @@ function Uninstall-Native {
     }
   }
 
-  # 5. Remove settings.json permissions
+  # 5. Remove CCB collaboration rules from global Codex AGENTS.md
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+  $agentsMd = Join-Path $codexHome "AGENTS.md"
+  if (Test-Path $agentsMd) {
+    $agentsContent = Get-Content $agentsMd -Raw -Encoding UTF8
+    $updatedAgentsContent = [regex]::Replace($agentsContent, '(?s)\r?\n?<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->\r?\n?', "`n")
+    $updatedAgentsContent = [regex]::Replace($updatedAgentsContent, '(?s)\r?\n?<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->\r?\n?', "`n")
+    $updatedAgentsContent = [regex]::Replace($updatedAgentsContent, '(?s)\r?\n?<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->\r?\n?', "`n")
+    if ($updatedAgentsContent -ne $agentsContent) {
+      $remainingContent = $updatedAgentsContent.Trim()
+      if ($remainingContent) { $remainingContent += "`n" }
+      [System.IO.File]::WriteAllText($agentsMd, $remainingContent, $script:utf8NoBom)
+      Write-Host "Removed CCB collaboration block from $agentsMd"
+    }
+  }
+
+  # 6. Remove settings.json permissions
   $settingsFile = Join-Path $env:USERPROFILE ".claude\settings.json"
   if (Test-Path $settingsFile) {
     $permsToRemove = @("Bash(ask:*)", "Bash(ping:*)", "Bash(ccb-ping:*)", "Bash(pend:*)")
@@ -802,8 +901,7 @@ function Uninstall-Native {
     }
   }
 
-  # 6. Remove Codex skills
-  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+  # 7. Remove Codex skills
   $codexSkillsDir = Join-Path $codexHome "skills"
   if (Test-Path $codexSkillsDir) {
     Write-Host "Removing CCB Codex skills..."
@@ -816,7 +914,7 @@ function Uninstall-Native {
     }
   }
 
-  # 7. Remove Droid skills
+  # 8. Remove Droid skills
   $factoryHome = if ($env:FACTORY_HOME) { $env:FACTORY_HOME } else { Join-Path $env:USERPROFILE ".factory" }
   $droidSkillsDir = Join-Path $factoryHome "skills"
   if (Test-Path $droidSkillsDir) {
@@ -830,7 +928,7 @@ function Uninstall-Native {
     }
   }
 
-  # 8. Remove WezTerm config block
+  # 9. Remove WezTerm config block
   $weztermConfig = Join-Path $env:USERPROFILE ".wezterm.lua"
   if (Test-Path $weztermConfig) {
     $content = Get-Content $weztermConfig -Raw -Encoding UTF8
@@ -847,17 +945,19 @@ function Uninstall-Native {
   Write-Host "Uninstall complete."
 }
 
-if ($Command -eq "help") {
-  Show-Usage
-  exit 0
-}
+if ($MyInvocation.InvocationName -ne '.') {
+  if ($Command -eq "help") {
+    Show-Usage
+    exit 0
+  }
 
-if ($Command -eq "install") {
-  Install-Native
-  exit 0
-}
+  if ($Command -eq "install") {
+    Install-Native
+    exit 0
+  }
 
-if ($Command -eq "uninstall") {
-  Uninstall-Native
-  exit 0
+  if ($Command -eq "uninstall") {
+    Uninstall-Native
+    exit 0
+  }
 }

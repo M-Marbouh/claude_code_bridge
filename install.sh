@@ -168,6 +168,7 @@ Usage:
 Optional environment variables:
   CODEX_INSTALL_PREFIX     Install directory (default: ~/.local/share/codex-dual)
   CODEX_BIN_DIR            Executable directory (default: ~/.local/bin)
+  CODEX_HOME               Codex configuration directory (default: ~/.codex)
   CODEX_CLAUDE_COMMAND_DIR Custom Claude commands directory (default: auto-detect)
   CCB_CLAUDE_MD_MODE       CLAUDE.md injection mode: "inline" (default) or "route"
                            inline = full config in CLAUDE.md (~57 lines)
@@ -559,6 +560,7 @@ copy_project() {
       --exclude '.pytest_cache/' \
       --exclude '.mypy_cache/' \
       --exclude '.venv/' \
+      --exclude '/AGENTS.md' \
       --exclude 'lib/web/' \
       --exclude 'bin/ccb-web' \
       "$REPO_ROOT"/ "$staging"/
@@ -569,6 +571,7 @@ copy_project() {
       --exclude '.pytest_cache' \
       --exclude '.mypy_cache' \
       --exclude '.venv' \
+      --exclude './AGENTS.md' \
       --exclude 'lib/web' \
       --exclude 'bin/ccb-web' \
       -cf - . | tar -C "$staging" -xf -
@@ -986,7 +989,9 @@ CCB_RATIFICATION_START_MARKER="<!-- MUTUAL_RATIFICATION_START -->"
 CCB_RATIFICATION_END_MARKER="<!-- MUTUAL_RATIFICATION_END -->"
 
 install_agents_md_config() {
-  local agents_md="$INSTALL_PREFIX/AGENTS.md"
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local agents_md="$codex_home/AGENTS.md"
+  local legacy_agents_md="$INSTALL_PREFIX/AGENTS.md"
   local template="$INSTALL_PREFIX/config/agents-md-ccb.md"
 
   if ! pick_python_bin; then
@@ -998,47 +1003,94 @@ install_agents_md_config() {
     return 1
   fi
 
-  if [[ -f "$agents_md" ]]; then
-    # Replace existing CCB blocks if present
-    local updated=false
-    if grep -q "$CCB_ROLES_START_MARKER" "$agents_md" 2>/dev/null || \
-       grep -q "$CCB_RUBRICS_START_MARKER" "$agents_md" 2>/dev/null || \
-       grep -q "$CCB_RATIFICATION_START_MARKER" "$agents_md" 2>/dev/null; then
-      echo "Updating existing CCB blocks in AGENTS.md..."
-      "$PYTHON_BIN" -c "
+  mkdir -p "$codex_home"
+
+  local update_status=0
+  "$PYTHON_BIN" -c "
 import re, sys
 
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    content = f.read()
-with open(sys.argv[2], 'r', encoding='utf-8') as f:
+path, template_path = sys.argv[1:3]
+with open(template_path, 'r', encoding='utf-8') as f:
     new_block = f.read().strip()
 
-# Remove old roles block
-content = re.sub(
-    r'<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->',
-    '', content, flags=re.DOTALL)
-# Remove old rubrics block
-content = re.sub(
-    r'<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->',
-    '', content, flags=re.DOTALL)
-content = re.sub(
-    r'<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->',
-    '', content, flags=re.DOTALL)
-content = content.rstrip() + '\n\n' + new_block + '\n'
-with open(sys.argv[1], 'w', encoding='utf-8') as f:
-    f.write(content)
-" "$agents_md" "$template"
-      updated=true
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+except FileNotFoundError:
+    content = ''
+
+marker_pairs = (
+    ('<!-- CCB_ROLES_START -->', '<!-- CCB_ROLES_END -->'),
+    ('<!-- REVIEW_RUBRICS_START -->', '<!-- REVIEW_RUBRICS_END -->'),
+    ('<!-- MUTUAL_RATIFICATION_START -->', '<!-- MUTUAL_RATIFICATION_END -->'),
+)
+malformed = []
+for start, end in marker_pairs:
+    starts = content.count(start)
+    ends = content.count(end)
+    complete = len(re.findall(re.escape(start) + r'.*?' + re.escape(end), content, re.DOTALL))
+    if starts != ends or complete != starts:
+        malformed.append(f'{start} / {end}')
+
+if malformed:
+    print(
+        'WARN: malformed CCB marker structure in global Codex AGENTS.md; '
+        'leaving the file unchanged: ' + ', '.join(malformed),
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+for start, end in marker_pairs:
+    content = re.sub(
+        re.escape(start) + r'.*?' + re.escape(end),
+        '', content, flags=re.DOTALL)
+
+remaining = content.rstrip()
+updated = (remaining + '\n\n' if remaining else '') + new_block + '\n'
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(updated)
+" "$agents_md" "$template" || update_status=$?
+  if [[ $update_status -ne 0 ]]; then
+    if [[ $update_status -eq 3 ]]; then
+      return 0
     fi
-    if ! $updated; then
-      echo "" >> "$agents_md"
-      cat "$template" >> "$agents_md"
-    fi
-  else
-    cat "$template" > "$agents_md"
+    return "$update_status"
   fi
 
-  echo "Updated AGENTS.md: $agents_md"
+  echo "Updated global Codex AGENTS.md: $agents_md"
+
+  local override_agents_md="$codex_home/AGENTS.override.md"
+  if [[ -f "$override_agents_md" ]] && grep -q '[^[:space:]]' "$override_agents_md" 2>/dev/null; then
+    echo "WARN: $override_agents_md is non-empty and takes precedence over $agents_md"
+  fi
+
+  # Older installers wrote this managed block into the installation directory,
+  # where Codex never loads it. This cleanup matters for in-place/out-of-tree
+  # callers; the normal Unix copy_project flow replaces INSTALL_PREFIX first.
+  local same_agents_file=false
+  if [[ -e "$legacy_agents_md" && -e "$agents_md" && "$legacy_agents_md" -ef "$agents_md" ]]; then
+    same_agents_file=true
+  fi
+  if [[ "$same_agents_file" == false && -f "$legacy_agents_md" ]]; then
+    "$PYTHON_BIN" -c "
+import os, re, sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    content = f.read()
+for pattern in (
+    r'<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->',
+    r'<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->',
+    r'<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->',
+):
+    content = re.sub(pattern, '', content, flags=re.DOTALL)
+if content.strip():
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content.strip() + '\n')
+else:
+    os.remove(path)
+" "$legacy_agents_md"
+  fi
 }
 
 install_settings_permissions() {
@@ -1440,7 +1492,7 @@ install_all() {
   else
     echo "   Global CLAUDE.md configured with CCB collaboration rules (inline)"
   fi
-  echo "   AGENTS.md configured with Mutual Ratification protocol"
+  echo "   Global Codex AGENTS.md configured with Mutual Ratification protocol"
   echo "   Global settings.json permissions added"
 }
 
@@ -1502,6 +1554,41 @@ with open('$claude_md', 'w', encoding='utf-8') as f:
   if [[ -f "$external_config" ]]; then
     rm -f "$external_config"
     echo "Removed external CCB config: $external_config"
+  fi
+}
+
+uninstall_agents_md_config() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local agents_md="$codex_home/AGENTS.md"
+
+  if [[ ! -f "$agents_md" ]]; then
+    return
+  fi
+
+  if grep -q "$CCB_ROLES_START_MARKER" "$agents_md" 2>/dev/null || \
+     grep -q "$CCB_RUBRICS_START_MARKER" "$agents_md" 2>/dev/null || \
+     grep -q "$CCB_RATIFICATION_START_MARKER" "$agents_md" 2>/dev/null; then
+    echo "Removing CCB collaboration block from global Codex AGENTS.md..."
+    if pick_any_python_bin; then
+      "$PYTHON_BIN" -c "
+import re, sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    content = f.read()
+for pattern in (
+    r'\n?<!-- CCB_ROLES_START -->.*?<!-- CCB_ROLES_END -->\n?',
+    r'\n?<!-- REVIEW_RUBRICS_START -->.*?<!-- REVIEW_RUBRICS_END -->\n?',
+    r'\n?<!-- MUTUAL_RATIFICATION_START -->.*?<!-- MUTUAL_RATIFICATION_END -->\n?',
+):
+    content = re.sub(pattern, '\n', content, flags=re.DOTALL)
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content.strip() + ('\n' if content.strip() else ''))
+" "$agents_md"
+      echo "Removed CCB collaboration block from $agents_md"
+    else
+      echo "WARN: python required to clean $agents_md; remove the CCB block manually"
+    fi
   fi
 }
 
@@ -1660,23 +1747,26 @@ uninstall_all() {
   # 4. Remove collaboration rules from CLAUDE.md
   uninstall_claude_md_config
 
-  # 5. Remove permission configuration from settings.json
+  # 5. Remove collaboration rules from global Codex AGENTS.md
+  uninstall_agents_md_config
+
+  # 6. Remove permission configuration from settings.json
   uninstall_settings_permissions
 
-  # 6. Remove tmux configuration
+  # 7. Remove tmux configuration
   uninstall_tmux_config
 
-  # 7. Remove Claude skills
+  # 8. Remove Claude skills
   uninstall_claude_skills
 
-  # 8. Remove Codex skills
+  # 9. Remove Codex skills
   uninstall_codex_skills
 
-  # 9. Remove Droid skills
+  # 10. Remove Droid skills
 
-  # 10. Remove Droid MCP delegation
+  # 11. Remove Droid MCP delegation
 
-  # 11. Remove Droid commands
+  # 12. Remove Droid commands
 
   echo "OK: Uninstall complete"
   echo "   NOTE: Dependencies (python, tmux, wezterm) were not removed"
@@ -1702,4 +1792,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

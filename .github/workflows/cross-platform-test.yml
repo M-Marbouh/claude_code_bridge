@@ -99,3 +99,9 @@ jobs:
             exit 1
           }
           Write-Host "install.ps1 syntax check passed"
+
+      - name: Test Windows managed AGENTS.md installation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pytest test/test_installer_managed_markdown.py -k windows_installer_functionally -v

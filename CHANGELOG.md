@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 - 2026-07-21
 
 ### Changed
 
+- Replaced the relay-style Claude-to-Codex review doctrine with symmetric mutual ratification: either collaborator may propose, verify, amend, contest, or implement work according to evidence rather than provider identity.
+- Fixed global Codex guidance installation and migration so the managed collaboration block is written to `${CODEX_HOME:-~/.codex}/AGENTS.md` instead of the unused installation-directory `AGENTS.md`, with surgical uninstall support and shadowing warnings for `AGENTS.override.md`.
 - Made implicit `pend` lookup strict to the current CCB tab, allowed paired panes to retrieve the same tab's tasks, and normalized `peer-<provider>` receipts by their responding provider.
 - Added context-first exact task guidance plus `pend peer`, `pend local`, and newest-first task history with task-ID prefixes. `pend <provider> N` now reads task receipts; legacy provider conversation history requires explicit `--legacy`.
 - Made pre-restart and otherwise unbound receipts exact-task-ID-only, with clear implicit-lookup guidance, while preserving the same-turn Async Guardrail.

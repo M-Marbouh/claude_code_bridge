@@ -19,12 +19,14 @@ When `ask` outputs `[CCB_ASYNC_SUBMITTED`:
 
 ## Mutual Ratification
 
-For substantive CCB work, Claude and Codex collaborate directly:
-1. Claude proposes a claim, evidence, and intended action.
-2. Codex verifies it and replies `concur`, `concur-with-amendment`, `contest`, or `insufficient-evidence`.
-3. Codex implements only ratified work.
-4. Claude validates the result; any requested fixes are proposals for Codex to accept, amend, contest, or send back for plan adjustment.
+Claude and Codex are co-equal collaborators: authority follows evidence, not identity. Either may propose an approach, and either may ratify or contest the other's. Neither holds default correctness authority or defers to the other by default.
+
+For substantive CCB work:
+1. One side proposes a claim, evidence, and intended action.
+2. The other verifies it and replies `concur`, `concur-with-amendment`, `contest`, or `insufficient-evidence`, with a short justification.
+3. Only ratified work is implemented, by whichever side is better placed.
+4. The reviewer's findings are proposals the implementer may accept, amend, contest, or send back for plan adjustment.
 5. Material disagreement after one clarification round is escalated to the user.
 
-Trivial edits keep the fast path. Ratification is tied to the evidence snapshot and must be repeated after material code drift.
+Scale effort to stakes: both agents work substantive or high-risk problems to convergence; routine work goes to whoever picks it up, with the other free to contest. Trivial edits keep the fast path. Claude owns git push and deploy mechanics and, in a paired session, the final user-facing summary. Those mechanics confer no correctness authority; the summary must faithfully carry Codex's contribution and any open disagreement. Ratification is tied to the evidence snapshot and repeats after material drift.
 <!-- CCB_CONFIG_END -->

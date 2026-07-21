@@ -23,6 +23,7 @@ import posixpath
 import shlex
 import threading
 from pathlib import Path
+from typing import NamedTuple
 
 script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(script_dir / "lib"))
@@ -60,6 +61,43 @@ GIT_DATE = "2026-02-25"
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:([/\\\\]|$)")
 _MNT_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])/(.*)$")
 _MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])/(.*)$")
+
+
+class AgentCommandPrefix(NamedTuple):
+    """Typed shell/argv prefixes for the shared agent composition seam."""
+
+    shell: str
+    argv: tuple[str, ...]
+
+
+class ShellAgentCommand(str):
+    """A string-compatible shell command with an explicit pre-agent boundary."""
+
+    def __new__(cls, prelude: str, agent_command: str):
+        instance = super().__new__(cls, prelude + agent_command)
+        instance._prelude = prelude
+        instance._agent_command = agent_command
+        instance._frozen = True
+        return instance
+
+    def __init__(self, prelude: str, agent_command: str):
+        _ = prelude, agent_command
+
+    def __setattr__(self, name: str, value: str) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(f"{type(self).__name__} is immutable")
+        super().__setattr__(name, value)
+
+    @property
+    def prelude(self) -> str:
+        return self._prelude
+
+    @property
+    def agent_command(self) -> str:
+        return self._agent_command
+
+    def render_unwrapped(self) -> str:
+        return str(self)
 
 
 def _looks_like_windows_path(value: str) -> bool:
@@ -746,6 +784,21 @@ class AILauncher:
             parts.append(f"export {key}={shlex.quote(str(val))}; ")
         return "".join(parts)
 
+    def _agent_command_prefix(self, provider: str) -> AgentCommandPrefix:
+        """Return the shared shell/argv prefix for a managed agent launch."""
+        _ = provider
+        return AgentCommandPrefix(shell="", argv=())
+
+    def _compose_agent_shell(self, provider: str, command: ShellAgentCommand) -> str:
+        """Render an agent command for a shell without changing its outer shell envelope."""
+        prefix = self._agent_command_prefix(provider)
+        return command.prelude + prefix.shell + command.agent_command
+
+    def _compose_agent_argv(self, provider: str, argv: list[str]) -> list[str]:
+        """Render an agent argv launch while preserving its argument boundaries."""
+        prefix = self._agent_command_prefix(provider)
+        return [*prefix.argv, *argv]
+
     def _provider_pane_id(self, provider: str) -> str:
         prov = (provider or "").strip().lower()
         anchor = (self.anchor_provider or "").strip().lower()
@@ -1293,7 +1346,7 @@ class AILauncher:
         runtime = self.runtime_dir / provider
         runtime.mkdir(parents=True, exist_ok=True)
 
-        start_cmd = self._get_start_cmd(provider)
+        start_cmd = self._compose_agent_shell(provider, self._get_start_cmd(provider))
         keep_open = os.environ.get("CODEX_WEZTERM_KEEP_OPEN", "1").lower() not in {"0", "false", "no", "off"}
         if keep_open:
             start_cmd = _build_keep_open_cmd(provider, start_cmd)
@@ -1891,19 +1944,21 @@ class AILauncher:
 
         return None, False, None
 
-    def _build_gemini_start_cmd(self) -> str:
+    def _build_gemini_start_cmd(self) -> ShellAgentCommand:
+        prelude = ""
         cmd = "gemini --yolo" if self.auto else "gemini"
         if self.resume:
             _, has_history, resume_dir = self._get_latest_gemini_project_hash()
             if has_history:
                 if resume_dir:
-                    cmd = f"{_build_cd_cmd(resume_dir)}{cmd} --resume latest"
+                    prelude = _build_cd_cmd(resume_dir)
+                    cmd = f"{cmd} --resume latest"
                 else:
                     cmd = f"{cmd} --resume latest"
                 print(f"🔁 {t('resuming_session', provider='Gemini', session_id='')}")
             else:
                 print(f"ℹ️ {t('no_history_fresh', provider='Gemini')}")
-        return cmd
+        return ShellAgentCommand(prelude=prelude, agent_command=cmd)
 
     def _warmup_provider(self, provider: str, timeout: float = 8.0) -> bool:
         if provider == "gemini":
@@ -1948,22 +2003,27 @@ class AILauncher:
         print(f"⚠️ Warmup failed: {provider}")
         return False
 
-    def _get_start_cmd(self, provider: str) -> str:
+    def _get_start_cmd(self, provider: str) -> ShellAgentCommand:
         if provider == "codex":
             # NOTE: Codex TUI has paste-burst detection; terminal injection (wezterm send-text/tmux paste-buffer)
             # is often detected as "paste", causing Enter to only line-break not submit. Disable detection by default.
-            cmd = self._build_codex_start_cmd()
+            command = ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd())
         elif provider == "gemini":
-            cmd = self._build_gemini_start_cmd()
+            command = self._build_gemini_start_cmd()
         elif provider == "opencode":
-            cmd = self._build_opencode_start_cmd()
+            command = ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd())
         else:
-            cmd = ""
+            command = ShellAgentCommand(prelude="", agent_command="")
         # Append per-provider launch_args from config.
         extra = self.launch_args.get(provider)
         if isinstance(extra, str) and extra.strip():
-            cmd = f"{cmd} {extra.strip()}" if cmd else extra.strip()
-        return cmd
+            agent_command = (
+                f"{command.agent_command} {extra.strip()}"
+                if command.agent_command
+                else extra.strip()
+            )
+            command = ShellAgentCommand(prelude=command.prelude, agent_command=agent_command)
+        return command
 
     def _opencode_resume_allowed(self) -> bool:
         target_dir = _normalize_path_for_match(str(self.project_root))
@@ -2148,7 +2208,11 @@ class AILauncher:
             os.mkfifo(output_fifo, 0o644)
 
         env_overrides = self._provider_env_overrides("codex")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
+        agent_cmd = self._compose_agent_shell(
+            "codex",
+            ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd()),
+        )
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
         pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
 
         backend = TmuxBackend()
@@ -2239,7 +2303,8 @@ class AILauncher:
         runtime.mkdir(parents=True, exist_ok=True)
 
         env_overrides = self._provider_env_overrides("gemini")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_gemini_start_cmd()
+        agent_cmd = self._compose_agent_shell("gemini", self._build_gemini_start_cmd())
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
         pane_title_marker = f"CCB-Gemini-{self.project_id[:8]}"
 
         backend = TmuxBackend()
@@ -2290,7 +2355,11 @@ class AILauncher:
         runtime.mkdir(parents=True, exist_ok=True)
 
         env_overrides = self._provider_env_overrides("opencode")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_opencode_start_cmd()
+        agent_cmd = self._compose_agent_shell(
+            "opencode",
+            ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd()),
+        )
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
         pane_title_marker = f"CCB-OpenCode-{self.project_id[:8]}"
 
         backend = TmuxBackend()
@@ -2399,11 +2468,15 @@ class AILauncher:
                 os.mkfifo(output_fifo, 0o644)
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
+        recorded_agent_cmd = self._compose_agent_shell(
+            "codex",
+            ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd()),
+        )
         start_cmd = (
             title_cmd
             + self._build_env_prefix(self._provider_env_overrides("codex"))
             + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_codex_start_cmd()
+            + recorded_agent_cmd
         )
 
         self._write_codex_session(
@@ -2458,9 +2531,13 @@ class AILauncher:
                 env["CODEX_WEZTERM_PANE"] = pane_id
             else:
                 env["CODEX_TMUX_SESSION"] = pane_id
-            return self._run_shell_command(self._build_codex_start_cmd(), env=env, cwd=str(Path.cwd()))
+            executed_agent_cmd = self._compose_agent_shell(
+                "codex",
+                ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd()),
+            )
+            return self._run_shell_command(executed_agent_cmd, env=env, cwd=str(Path.cwd()))
 
-        cmd_parts = shlex.split(self._build_codex_start_cmd())
+        cmd_parts = self._compose_agent_argv("codex", shlex.split(self._build_codex_start_cmd()))
         env = self._with_bin_path_env()
         env.update(self._provider_env_overrides("codex"))
         env["CODEX_SESSION_ID"] = self.session_id
@@ -2506,11 +2583,12 @@ class AILauncher:
                 pass
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
+        agent_cmd = self._compose_agent_shell("gemini", self._build_gemini_start_cmd())
         start_cmd = (
             title_cmd
             + self._build_env_prefix(self._provider_env_overrides("gemini"))
             + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_gemini_start_cmd()
+            + agent_cmd
         )
         self._write_gemini_session(
             runtime,
@@ -2541,7 +2619,8 @@ class AILauncher:
                 pass
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
-        opencode_cmd = self._build_opencode_start_cmd()
+        opencode_command = ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd())
+        opencode_cmd = self._compose_agent_shell("opencode", opencode_command)
         start_cmd = (
             title_cmd
             + self._build_env_prefix(self._provider_env_overrides("opencode"))
@@ -2566,7 +2645,7 @@ class AILauncher:
             env["OPENCODE_TERMINAL"] = self.terminal_type
             env["OPENCODE_TMUX_SESSION"] = pane_id
             try:
-                cmd_parts = shlex.split(opencode_cmd)
+                cmd_parts = self._compose_agent_argv("opencode", shlex.split(opencode_command.render_unwrapped()))
                 if not cmd_parts:
                     print("❌ Empty OpenCode start command", file=sys.stderr)
                     return 1
@@ -2978,6 +3057,7 @@ class AILauncher:
         except FileNotFoundError as e:
             print(str(e))
             return 1
+        cmd = self._compose_agent_argv("claude", cmd)
 
         if self.resume:
             if has_history:
@@ -3024,7 +3104,10 @@ class AILauncher:
             else:
                 print(f"ℹ️ {t('no_claude_session')}")
 
-        start_cmd = " ".join(cmd_parts)
+        start_cmd = self._compose_agent_shell(
+            "claude",
+            ShellAgentCommand(prelude="", agent_command=" ".join(cmd_parts)),
+        )
         full_cmd = (
             _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
             + self._build_env_prefix(env_overrides)

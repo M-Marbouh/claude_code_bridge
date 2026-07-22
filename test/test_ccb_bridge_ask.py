@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import errno
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +34,19 @@ class _Fcntl:
 
     def flock(self, _fd: int, _op: int) -> None:
         pass
+
+
+def test_bridge_lock_remains_exclusive_in_writable_task_dir(tmp_path: Path, monkeypatch) -> None:
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(bridge.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    first_handle, first_fcntl = bridge._acquire_lock("abcd1234", "claude")
+    try:
+        with pytest.raises(RuntimeError, match="target provider is busy"):
+            bridge._acquire_lock("abcd1234", "claude")
+    finally:
+        first_fcntl.flock(first_handle.fileno(), first_fcntl.LOCK_UN)
+        first_handle.close()
 
 
 def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
@@ -456,6 +472,69 @@ def test_reverse_reply_prefers_live_project_and_saves_correlated_result(
     assert sent == {"target": target, "message": "live result"}
     assert reply_file.read_text(encoding="utf-8").strip() == "live result"
     assert "delivery=live exit_code=0" in status_file.read_text(encoding="utf-8")
+
+
+def test_reverse_reply_continues_when_bridge_lock_filesystem_is_read_only(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    bridge = _load_bridge_module()
+    reply_file = tmp_path / "ask-peer-codex-task-erofs.reply"
+    status_file = tmp_path / "ask-peer-codex-task-erofs.status"
+    reply_file.touch()
+    status_file.touch()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "reply_expected": True,
+        "peer_reply_file": str(reply_file),
+        "status_file": str(status_file),
+    }
+    target = {
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "providers": {"claude": {"alive": True, "mounted": True}},
+    }
+    deliveries: list[str] = []
+    original_open = Path.open
+
+    def _open(path: Path, *args, **kwargs):
+        mode = str(args[0] if args else kwargs.get("mode", "r"))
+        if path.name.startswith("bridge-") and "w" in mode:
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(bridge.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(Path, "open", _open)
+    monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    monkeypatch.setattr(
+        bridge,
+        "_send_to_daemon",
+        lambda _target, message, *_args: deliveries.append(message) or (1, "", {}),
+    )
+
+    rc = bridge.main(
+        [
+            "--target",
+            str(tmp_path),
+            "--provider",
+            "claude",
+            "--reply-to",
+            "task-erofs",
+            "recoverable result",
+        ]
+    )
+
+    assert rc == 1
+    assert deliveries == ["recoverable result"]
+    assert reply_file.read_text(encoding="utf-8").strip() == "recoverable result"
+    captured = capsys.readouterr()
+    assert "continuing unlocked" in captured.err
+    assert "[RECOVERABLE] Reply saved for task task-erofs" in captured.err
 
 
 def test_reverse_reply_rejects_reused_pane_but_preserves_result(

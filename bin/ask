@@ -918,7 +918,7 @@ def _run_peer_bridge(
             print(_sender_route_error_line(peer_provider, caller, resolution), file=sys.stderr)
             return EXIT_ERROR
         sender_work_dir = resolution
-    if foreground_mode:
+    if foreground_mode or inside_managed_codex_sandbox():
         return _run_peer_bridge_foreground(
             peer_target,
             peer_provider,

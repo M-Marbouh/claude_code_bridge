@@ -674,6 +674,7 @@ def test_peer_foreground_and_background_receive_same_resolved_sender(
 
     monkeypatch.setenv("CCB_CALLER", "claude")
     monkeypatch.setattr(ask, "_resolve_sender_work_dir", lambda _caller: project.resolve())
+    monkeypatch.setattr(ask, "inside_managed_codex_sandbox", lambda: False)
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_foreground",
@@ -689,6 +690,33 @@ def test_peer_foreground_and_background_receive_same_resolved_sender(
     assert captured == [project.resolve()]
 
 
+def test_peer_sandbox_forces_foreground_instead_of_detached_worker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: list[tuple[str, Path]] = []
+
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask, "_resolve_sender_work_dir", lambda _caller: project.resolve())
+    monkeypatch.setattr(ask, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_foreground",
+        lambda *_args: captured.append((_args[-3], _args[-1])) or 0,
+    )
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge_background",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("sandbox spawned detached worker")),
+    )
+
+    assert ask._run_peer_bridge("/peer", "claude", 10.0, "hello", False, "background") == 0
+    assert captured == [("background", project.resolve())]
+
+
 def test_peer_background_uses_resolved_sender_for_receipt_status_and_bridge(
     monkeypatch,
     tmp_path: Path,
@@ -702,7 +730,7 @@ def test_peer_background_uses_resolved_sender_for_receipt_status_and_bridge(
         pid = 4242
 
     def _popen(cmd, **kwargs):
-        captured.update(cmd=cmd, env=kwargs["env"])
+        captured.update(cmd=cmd, env=kwargs["env"], popen_kwargs=kwargs)
         return _Proc()
 
     monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
@@ -731,6 +759,10 @@ def test_peer_background_uses_resolved_sender_for_receipt_status_and_bridge(
     sender_index = captured["cmd"].index("--sender-work-dir") + 1
     assert captured["cmd"][sender_index] == str(project.resolve())
     assert captured["env"]["CCB_WORK_DIR"] == str(project.resolve())
+    if ask.os.name == "nt":
+        assert captured["popen_kwargs"]["creationflags"]
+    else:
+        assert captured["popen_kwargs"]["start_new_session"] is True
 
 
 def test_peer_notify_does_not_require_mounted_sender(monkeypatch, tmp_path: Path) -> None:

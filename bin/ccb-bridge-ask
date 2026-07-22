@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 import askd_rpc
-from askd_runtime import find_running_state_file, run_dir
+from askd_runtime import find_running_state_file
 from ccb_protocol import wrap_codex_delivery_prompt
 from compat import read_stdin_text, setup_windows_encoding
 from laskd_protocol import wrap_claude_delivery_prompt
@@ -232,10 +234,19 @@ def _acquire_lock(target_hash: str, provider: str):
     except Exception as exc:
         raise RuntimeError("bridge locking requires fcntl on this platform") from exc
 
-    lock_dir = run_dir()
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     lock_path = lock_dir / f"bridge-{target_hash[:8]}-{provider}.lock"
-    lock_handle = lock_path.open("w", encoding="utf-8")
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_handle = lock_path.open("w", encoding="utf-8")
+    except OSError as exc:
+        if exc.errno != errno.EROFS:
+            raise
+        print(
+            f"[WARN] Bridge lock unavailable on read-only filesystem: {lock_path}; continuing unlocked",
+            file=sys.stderr,
+        )
+        return None, fcntl
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
@@ -454,10 +465,11 @@ def main(argv: list[str] | None = None) -> int:
                     bool(args.foreground),
                 )
         finally:
-            try:
-                fcntl_mod.flock(lock_handle.fileno(), fcntl_mod.LOCK_UN)
-            finally:
-                lock_handle.close()
+            if lock_handle is not None:
+                try:
+                    fcntl_mod.flock(lock_handle.fileno(), fcntl_mod.LOCK_UN)
+                finally:
+                    lock_handle.close()
         if reply_receipt is not None:
             delivery = "direct" if direct_backend is not None else "live"
             _write_correlated_status(

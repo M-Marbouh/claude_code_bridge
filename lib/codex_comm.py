@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 from terminal import get_backend_for_session, get_pane_id_from_session
 from ccb_config import apply_backend_env
+from ccb_protocol import REQ_ID_PREFIX, strip_done_text, strip_trailing_markers
 from i18n import t
 from pane_registry import upsert_registry, registry_path_for_session, load_registry_by_session_id
 from session_utils import find_project_session_file
@@ -813,6 +814,88 @@ class CodexLogReader:
         if not pairs:
             self._debug(f"No conversations found in tail (bytes={tail_bytes}, lines={tail_lines}) for log: {log_path}")
         return pairs
+
+    @staticmethod
+    def _exchange_req_id(question: str) -> Optional[str]:
+        for line in (question or "").splitlines():
+            first = line.strip()
+            if not first:
+                continue
+            match = re.match(rf"^{re.escape(REQ_ID_PREFIX)}\s*(\S+)", first)
+            return match.group(1) if match else None
+        return None
+
+    @staticmethod
+    def _clean_exchange_reply(reply: str, req_id: Optional[str]) -> str:
+        cleaned = strip_trailing_markers(reply or "")
+        if req_id:
+            cleaned = strip_done_text(cleaned, req_id)
+        return cleaned.strip()
+
+    def latest_exchanges(self, n: int = 1) -> List[Dict[str, Optional[str]]]:
+        """Return the latest bounded user/final-answer exchanges with timestamps."""
+        log_path = self._latest_log()
+        if not log_path or not log_path.exists() or n <= 0:
+            return []
+
+        tail_bytes = self._env_int("CODEX_LOG_CONV_TAIL_BYTES", 1024 * 1024 * 32)
+        tail_lines = self._env_int("CODEX_LOG_CONV_TAIL_LINES", 20000)
+        lines = self._iter_lines_reverse(log_path, max_bytes=tail_bytes, max_lines=tail_lines)
+        if not lines:
+            return []
+
+        exchanges_rev: List[Dict[str, Optional[str]]] = []
+        final_reply: Optional[Tuple[str, str]] = None
+        fallback_reply: Optional[Tuple[str, str]] = None
+        commentary_replies: set[str] = set()
+
+        for line in lines:
+            if not line.startswith("{"):
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            event = self._extract_event(entry)
+            if event is None:
+                continue
+            role, text, phase = event
+            timestamp = str(entry.get("timestamp") or "").strip()
+            if role == "assistant":
+                if phase == "final_answer" and final_reply is None:
+                    final_reply = (text, timestamp)
+                elif phase == "commentary":
+                    commentary_replies.add(text)
+                    if fallback_reply is not None and fallback_reply[0] == text:
+                        fallback_reply = None
+                elif phase == "event" and fallback_reply is None and text not in commentary_replies:
+                    fallback_reply = (text, timestamp)
+                continue
+            if role != "user":
+                continue
+
+            selected = final_reply or fallback_reply
+            if selected is None:
+                commentary_replies.clear()
+                continue
+            req_id = self._exchange_req_id(text)
+            reply = self._clean_exchange_reply(selected[0], req_id)
+            exchanges_rev.append(
+                {
+                    "ts": selected[1],
+                    "req_id": req_id,
+                    "question": text,
+                    "reply": reply,
+                }
+            )
+            final_reply = None
+            fallback_reply = None
+            commentary_replies.clear()
+            if len(exchanges_rev) >= n:
+                break
+
+        return list(reversed(exchanges_rev))
 
 
 class CodexCommunicator:

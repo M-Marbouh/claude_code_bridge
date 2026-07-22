@@ -3,7 +3,6 @@
 cpend - View latest Codex reply
 """
 
-import json
 import os
 import argparse
 import sys
@@ -19,12 +18,10 @@ from i18n import t
 
 try:
     from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
-    from codex_comm import CodexLogReader, SESSION_ID_PATTERN
     from ccb_protocol import strip_trailing_markers
-    from pane_registry import load_registry_by_session_id, load_registry_by_claude_pane, load_registry_by_project_id
-    from session_utils import find_project_session_file
     from askd_client import resolve_work_dir_with_registry
     from providers import CASK_CLIENT_SPEC
+    from provider_log_reader import provider_log_reader
     from project_id import compute_ccb_project_id
 except ImportError as exc:
     print(f"Import failed: {exc}")
@@ -39,86 +36,6 @@ def _debug(message: str) -> None:
         return
     print(f"[DEBUG] {message}", file=sys.stderr)
 
-
-def _load_session_log_path(work_dir: Path, explicit_session_file: Path | None) -> tuple[Path | None, str | None]:
-    """Load codex_session_path from .codex-session (or .ccb/.codex-session) if exists"""
-    session_file = explicit_session_file or find_project_session_file(work_dir, ".codex-session")
-    if not session_file:
-        return None, None
-    try:
-        with session_file.open("r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-        path_str = data.get("codex_session_path")
-        session_id = data.get("codex_session_id")
-        if path_str:
-            return Path(path_str).expanduser(), session_id
-    except Exception as exc:
-        _debug(f"Failed to read .codex-session ({session_file}): {exc}")
-    return None, None
-
-
-def _record_project_id(record: dict) -> str:
-    pid = str(record.get("ccb_project_id") or "").strip()
-    if pid:
-        return pid
-    wd = record.get("work_dir")
-    if isinstance(wd, str) and wd.strip():
-        try:
-            return compute_ccb_project_id(Path(wd.strip()))
-        except Exception:
-            return ""
-    return ""
-
-
-def _load_registry_log_path(current_pid: str | None) -> tuple[Path | None, dict | None]:
-    session_id = (os.environ.get("CODEX_SESSION_ID") or "").strip()
-    if session_id:
-        record = load_registry_by_session_id(session_id)
-        if record and current_pid:
-            record_pid = _record_project_id(record)
-            if record_pid != current_pid:
-                record = None
-        if record:
-            providers = record.get("providers") if isinstance(record.get("providers"), dict) else {}
-            codex = providers.get("codex") if isinstance(providers, dict) else None
-            path_str = (codex or {}).get("codex_session_path") if isinstance(codex, dict) else record.get("codex_session_path")
-            if path_str:
-                path = Path(path_str).expanduser()
-                _debug(f"Using registry by CODEX_SESSION_ID: {path}")
-                return path, record
-
-    pane_id = (os.environ.get("WEZTERM_PANE") or os.environ.get("TMUX_PANE") or "").strip()
-    if pane_id:
-        record = load_registry_by_claude_pane(pane_id)
-        if record and current_pid:
-            record_pid = _record_project_id(record)
-            if record_pid != current_pid:
-                record = None
-        if record:
-            providers = record.get("providers") if isinstance(record.get("providers"), dict) else {}
-            codex = providers.get("codex") if isinstance(providers, dict) else None
-            path_str = (codex or {}).get("codex_session_path") if isinstance(codex, dict) else record.get("codex_session_path")
-            if path_str:
-                path = Path(path_str).expanduser()
-                _debug(f"Using registry by caller pane: {path}")
-                return path, record
-    return None, None
-
-
-def _derive_session_filter(log_path: Path | None, registry_record: dict | None, session_id: str | None) -> str | None:
-    if registry_record:
-        reg_id = registry_record.get("codex_session_id")
-        if isinstance(reg_id, str) and reg_id:
-            return reg_id
-    if session_id:
-        return session_id
-    if log_path:
-        for source in (log_path.stem, log_path.name):
-            match = SESSION_ID_PATTERN.search(source)
-            if match:
-                return match.group(0)
-        return log_path.name
-    return None
 
 def _parse_n(argv: list[str]) -> int:
     if len(argv) <= 1:
@@ -153,26 +70,16 @@ def main(argv: list[str]) -> int:
         except Exception:
             current_pid = ""
 
-        registry_log_path, registry_record = _load_registry_log_path(current_pid)
-        if not registry_log_path:
-            if current_pid:
-                rec = load_registry_by_project_id(current_pid, "codex")
-                if rec:
-                    providers = rec.get("providers") if isinstance(rec.get("providers"), dict) else {}
-                    codex = providers.get("codex") if isinstance(providers, dict) else None
-                    path_str = (codex or {}).get("codex_session_path") if isinstance(codex, dict) else None
-                    if isinstance(path_str, str) and path_str.strip():
-                        registry_log_path = Path(path_str.strip()).expanduser()
-                        registry_record = rec
-                        _debug(f"Using registry by ccb_project_id: {registry_log_path}")
-        session_log_path, session_id = _load_session_log_path(work_dir, explicit_session_file)
-
-        log_path = registry_log_path or session_log_path
-        if not registry_log_path and log_path:
-            _debug(f"Using codex_session_path from .codex-session: {log_path}")
-
-        session_filter = _derive_session_filter(log_path, registry_record, session_id)
-        reader = CodexLogReader(log_path=log_path, session_id_filter=session_filter, work_dir=work_dir)
+        reader = provider_log_reader(
+            "codex",
+            work_dir,
+            current_pid,
+            explicit_session_file=explicit_session_file,
+            debug=_debug,
+        )
+        if reader is None:
+            print(t("no_reply_available", provider="Codex"), file=sys.stderr)
+            return EXIT_NO_REPLY
 
         if n > 1:
             conversations = reader.latest_conversations(n)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from ccb_config import apply_backend_env
-from ccb_protocol import is_done_text, make_req_id, strip_done_text
+from ccb_protocol import REQ_ID_PREFIX, is_done_text, make_req_id, strip_done_text, strip_trailing_markers
 from laskd_protocol import wrap_claude_prompt
 from claude_session_resolver import resolve_claude_session
 from pane_registry import upsert_registry
@@ -189,11 +189,13 @@ class ClaudeLogReader:
         work_dir: Optional[Path] = None,
         *,
         use_sessions_index: bool = True,
+        allow_session_switch: bool = True,
     ):
         self.root = Path(root).expanduser()
         self.work_dir = work_dir or Path.cwd()
         self._preferred_session: Optional[Path] = None
         self._use_sessions_index = bool(use_sessions_index)
+        self._allow_session_switch = bool(allow_session_switch)
         try:
             poll = float(os.environ.get("CLAUDE_POLL_INTERVAL", "0.05"))
         except Exception:
@@ -328,6 +330,10 @@ class ClaudeLogReader:
 
     def _latest_session(self) -> Optional[Path]:
         preferred = self._preferred_session
+        if preferred and preferred.exists() and not self._allow_session_switch:
+            return preferred
+        if not self._allow_session_switch:
+            return None
         index_session = self._parse_sessions_index()
         scanned = self._scan_latest_session() if index_session is None else None
         if preferred and preferred.exists():
@@ -445,6 +451,110 @@ class ClaudeLogReader:
         except OSError:
             return []
         return pairs[-max(1, int(n)) :]
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _iter_lines_reverse(session: Path, *, max_bytes: int, max_lines: int) -> list[str]:
+        if max_bytes <= 0 or max_lines <= 0:
+            return []
+        try:
+            with session.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                position = handle.tell()
+                bytes_read = 0
+                lines: list[str] = []
+                buffer = b""
+                while position > 0 and bytes_read < max_bytes and len(lines) < max_lines:
+                    remaining = max_bytes - bytes_read
+                    read_size = min(8192, position, remaining)
+                    position -= read_size
+                    handle.seek(position, os.SEEK_SET)
+                    chunk = handle.read(read_size)
+                    bytes_read += len(chunk)
+                    buffer = chunk + buffer
+                    parts = buffer.split(b"\n")
+                    buffer = parts[0]
+                    for part in reversed(parts[1:]):
+                        if len(lines) >= max_lines:
+                            break
+                        text = part.decode("utf-8", errors="ignore").strip()
+                        if text:
+                            lines.append(text)
+                if position == 0 and buffer and len(lines) < max_lines:
+                    text = buffer.decode("utf-8", errors="ignore").strip()
+                    if text:
+                        lines.append(text)
+                return lines
+        except OSError:
+            return []
+
+    @staticmethod
+    def _exchange_req_id(question: str) -> Optional[str]:
+        for line in (question or "").splitlines():
+            first = line.strip()
+            if not first:
+                continue
+            match = re.match(rf"^{re.escape(REQ_ID_PREFIX)}\s*(\S+)", first)
+            return match.group(1) if match else None
+        return None
+
+    @staticmethod
+    def _clean_exchange_reply(reply: str, req_id: Optional[str]) -> str:
+        cleaned = strip_trailing_markers(reply or "")
+        if req_id:
+            cleaned = strip_done_text(cleaned, req_id)
+        return cleaned.strip()
+
+    def latest_exchanges(self, n: int = 1) -> list[dict[str, Optional[str]]]:
+        """Return the latest bounded user/final-assistant exchanges with timestamps."""
+        session = self._latest_session()
+        if not session or not session.exists() or n <= 0:
+            return []
+        tail_bytes = self._env_int("CLAUDE_LOG_CONV_TAIL_BYTES", 1024 * 1024 * 32)
+        tail_lines = self._env_int("CLAUDE_LOG_CONV_TAIL_LINES", 20000)
+        lines = self._iter_lines_reverse(session, max_bytes=tail_bytes, max_lines=tail_lines)
+        exchanges_rev: list[dict[str, Optional[str]]] = []
+        pending_reply: Optional[tuple[str, str]] = None
+
+        for line in lines:
+            if not line.startswith("{"):
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if pending_reply is None:
+                assistant = _extract_message(entry, "assistant")
+                if assistant:
+                    pending_reply = (assistant, str(entry.get("timestamp") or "").strip())
+                continue
+            user = _extract_message(entry, "user")
+            if not user:
+                continue
+            req_id = self._exchange_req_id(user)
+            reply = self._clean_exchange_reply(pending_reply[0], req_id)
+            exchanges_rev.append(
+                {
+                    "ts": pending_reply[1],
+                    "req_id": req_id,
+                    "question": user,
+                    "reply": reply,
+                }
+            )
+            pending_reply = None
+            if len(exchanges_rev) >= n:
+                break
+
+        return list(reversed(exchanges_rev))
 
     def _read_since(self, state: Dict[str, Any], timeout: float, block: bool) -> Tuple[Optional[str], Dict[str, Any]]:
         deadline = time.time() + max(0.0, float(timeout)) if block else time.time()

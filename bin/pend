@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -20,8 +21,9 @@ sys.path.insert(0, str(lib_dir))
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text
 from codex_comm import CodexLogReader
-from pane_registry import load_registry_by_pane
+from pane_registry import load_registry_by_pane, load_registry_by_session_id
 from project_id import compute_ccb_project_id
+from provider_log_reader import provider_log_reader
 from task_receipts import caller_session_id, find_receipt, iter_receipts, read_peer_reply
 
 
@@ -38,6 +40,31 @@ PEER_PROVIDERS = {
 }
 DEFAULT_WAITER_TIMEOUT_SECONDS = 3600.0
 WAITER_STALE_GRACE_SECONDS = 30.0
+RECEIPT_COMPLETED = "completed"
+RECEIPT_PENDING = "pending"
+RECEIPT_PEER_AWAITING = "peer-awaiting"
+RECEIPT_INCOMPLETE = "incomplete"
+
+
+class OverlayItem:
+    __slots__ = ("timestamp", "sequence", "source", "state", "reply", "receipt")
+
+    def __init__(
+        self,
+        *,
+        timestamp: float,
+        sequence: int,
+        source: str,
+        state: str,
+        reply: str = "",
+        receipt: dict | None = None,
+    ) -> None:
+        self.timestamp = timestamp
+        self.sequence = sequence
+        self.source = source
+        self.state = state
+        self.reply = reply
+        self.receipt = receipt
 
 
 def _legacy_pend(provider: str, extra: list[str]) -> int:
@@ -111,6 +138,26 @@ def _current_session_context() -> tuple[str, str, str]:
     return project_id, session_id, current_provider
 
 
+def _current_tab_registry(project_id: str, session_id: str) -> dict | None:
+    if not project_id or not session_id:
+        return None
+    record = load_registry_by_session_id(session_id)
+    if not isinstance(record, dict):
+        return None
+    record_project = str(record.get("ccb_project_id") or "").strip()
+    if not record_project:
+        work_dir = str(record.get("work_dir") or "").strip()
+        if work_dir:
+            try:
+                record_project = compute_ccb_project_id(Path(work_dir))
+            except Exception:
+                record_project = ""
+    record_session = str(record.get("ccb_session_id") or record.get("session_id") or "").strip()
+    if record_project != project_id or record_session != session_id:
+        return None
+    return record
+
+
 def _receipt_session_id(receipt: dict) -> str:
     return str(
         receipt.get("caller_session_id")
@@ -164,17 +211,45 @@ def _resolve_responder(target: str, current_provider: str) -> tuple[str, str]:
     return "", f"Unknown provider, relation, or task ID: {target}"
 
 
-def _status_finished(status_path: Path) -> tuple[bool, int | None]:
+def _parse_timestamp(value: object) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _line_timestamp(line: str) -> tuple[str | None, float | None]:
+    prefix = (line or "").split(maxsplit=1)[0] if (line or "").strip() else ""
+    parsed = _parse_timestamp(prefix)
+    return (prefix, parsed) if parsed is not None else (None, None)
+
+
+def _status_finished(status_path: Path) -> tuple[bool, int | None, str | None]:
     try:
         lines = status_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
     except Exception:
-        return False, None
+        return False, None, None
     exit_code: int | None = None
+    finished_at: str | None = None
     for line in lines:
         match = re.search(r"finished exit_code=(-?\d+)", line)
         if match:
             exit_code = int(match.group(1))
-    return exit_code is not None, exit_code
+            timestamp, _parsed = _line_timestamp(line)
+            if timestamp:
+                finished_at = timestamp
+    return exit_code is not None, exit_code, finished_at
 
 
 def _status_pid(status_path: Path) -> int | None:
@@ -319,7 +394,7 @@ def _show_receipt(receipt: dict) -> int:
     if peer_reply:
         print(peer_reply)
         return EXIT_OK
-    finished, exit_code = _status_finished(status_path)
+    finished, exit_code, _finished_at = _status_finished(status_path)
     if not finished or exit_code != 0:
         recovered = _recover_provider_reply(receipt)
         if recovered:
@@ -368,8 +443,170 @@ def _receipt_has_completed_reply(receipt: dict) -> bool:
     if provider.startswith("peer-"):
         return bool(read_peer_reply(receipt))
     status_path = Path(str(receipt.get("status_file") or ""))
-    finished, _exit_code = _status_finished(status_path)
+    finished, _exit_code, _finished_at = _status_finished(status_path)
     return finished
+
+
+def classify_receipt_state(receipt: dict) -> str:
+    """Classify receipt state without printing or attempting reply recovery."""
+    if read_peer_reply(receipt):
+        return RECEIPT_COMPLETED
+    status_path = Path(str(receipt.get("status_file") or ""))
+    finished, exit_code, _finished_at = _status_finished(status_path)
+    if not finished:
+        pid = _status_pid(status_path)
+        if pid is not None and not _pid_is_alive(pid) and _status_is_stale(status_path, receipt):
+            return RECEIPT_INCOMPLETE
+        return RECEIPT_PENDING
+    if (
+        exit_code == 0
+        and str(receipt.get("provider") or "").startswith("peer-")
+        and bool(receipt.get("reply_expected"))
+    ):
+        return RECEIPT_PEER_AWAITING
+    return RECEIPT_COMPLETED
+
+
+def _path_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _peer_reply_time(receipt: dict) -> float | None:
+    status_path = Path(str(receipt.get("status_file") or ""))
+    latest: float | None = None
+    try:
+        lines = status_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except Exception:
+        lines = []
+    for line in lines:
+        if "peer_reply_saved" not in line:
+            continue
+        _raw, parsed = _line_timestamp(line)
+        if parsed is not None and (latest is None or parsed > latest):
+            latest = parsed
+    if latest is not None:
+        return latest
+    reply_path = Path(str(receipt.get("peer_reply_file") or ""))
+    if read_peer_reply(receipt):
+        return _path_mtime(reply_path)
+    return None
+
+
+def _receipt_timestamp(receipt: dict, state: str) -> float:
+    submitted = _parse_timestamp(receipt.get("submitted_at"))
+    if state != RECEIPT_COMPLETED:
+        return submitted if submitted is not None else 0.0
+
+    provider = str(receipt.get("provider") or "").strip().lower()
+    if provider.startswith("peer-"):
+        peer_time = _peer_reply_time(receipt)
+        if peer_time is not None:
+            return peer_time
+    else:
+        status_path = Path(str(receipt.get("status_file") or ""))
+        _finished, _exit_code, finished_at = _status_finished(status_path)
+        finished_time = _parse_timestamp(finished_at)
+        if finished_time is not None:
+            return finished_time
+    if submitted is not None:
+        return submitted
+    status_path = Path(str(receipt.get("status_file") or ""))
+    return _path_mtime(status_path) or 0.0
+
+
+def _overlay_items(
+    project_id: str,
+    session_id: str,
+    responder: str,
+    records: list[tuple[Path, dict]],
+    *,
+    requested: int,
+    explicit_count: bool,
+) -> list[OverlayItem]:
+    receipt_ids = {
+        str(receipt.get("task_id") or "").strip()
+        for _path, receipt in records
+        if str(receipt.get("task_id") or "").strip()
+    }
+    items: list[OverlayItem] = []
+    sequence = 0
+    for _path, receipt in records:
+        state = classify_receipt_state(receipt)
+        if explicit_count and not _receipt_has_completed_reply(receipt):
+            continue
+        sequence -= 1
+        items.append(
+            OverlayItem(
+                timestamp=_receipt_timestamp(receipt, state),
+                sequence=sequence,
+                source="receipt",
+                state=state,
+                receipt=receipt,
+            )
+        )
+
+    record = _current_tab_registry(project_id, session_id)
+    work_dir_raw = str((record or {}).get("work_dir") or Path.cwd()).strip()
+    try:
+        work_dir = Path(work_dir_raw).expanduser()
+    except Exception:
+        work_dir = Path.cwd()
+    reader = provider_log_reader(
+        responder,
+        work_dir,
+        project_id,
+        strict_tab=True,
+        ccb_session_id=session_id,
+        registry_record=record,
+        update_registry=False,
+    )
+    exchanges = reader.latest_exchanges(requested + len(records)) if reader is not None else []
+    for exchange in reversed(exchanges):
+        req_id = str(exchange.get("req_id") or "").strip()
+        if req_id in receipt_ids:
+            # Matching current-tab tasks are represented by their richer receipt.
+            continue
+        if req_id:
+            # Unmatched IDs are old/foreign CCB deliveries, never manual history.
+            continue
+        reply = str(exchange.get("reply") or "").strip()
+        if not reply:
+            continue
+        sequence -= 1
+        items.append(
+            OverlayItem(
+                timestamp=_parse_timestamp(exchange.get("ts")) or 0.0,
+                sequence=sequence,
+                source="transcript",
+                state=RECEIPT_COMPLETED,
+                reply=reply,
+            )
+        )
+
+    items.sort(key=lambda item: (item.timestamp, item.sequence), reverse=True)
+    return items[:requested]
+
+
+def _show_overlay_items(items: list[OverlayItem], *, prefix_task_ids: bool) -> int:
+    result = EXIT_OK
+    for index, item in enumerate(items):
+        if item.source == "receipt" and item.receipt is not None:
+            if prefix_task_ids:
+                print(f"[TASK {item.receipt.get('task_id', '')}]")
+            current = _show_receipt(item.receipt)
+        else:
+            print(item.reply)
+            current = EXIT_OK
+        if current == EXIT_ERROR:
+            result = EXIT_ERROR
+        elif current == EXIT_NO_REPLY and result == EXIT_OK:
+            result = EXIT_NO_REPLY
+        if index < len(items) - 1:
+            print("---")
+    return result
 
 
 def _show_receipts(records: list[tuple[Path, dict]], *, prefix_task_ids: bool) -> int:
@@ -457,6 +694,31 @@ def main(argv: list[str]) -> int:
         return _show_receipt(records[0][1])
 
     records = _current_session_receipts(project_id, session_id, responder)
+    if responder in {"codex", "claude"}:
+        count = args.count if args.count is not None else 1
+        items = _overlay_items(
+            project_id,
+            session_id,
+            responder,
+            records,
+            requested=count,
+            explicit_count=args.count is not None,
+        )
+        if not items:
+            if args.count is not None:
+                print(
+                    f"[NO TASK] No completed {target} replies in current CCB session; "
+                    "use exact task ID to inspect a pending task",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[NO TASK] No {target} task in current CCB session; use exact task ID",
+                    file=sys.stderr,
+                )
+            return EXIT_NO_REPLY
+        return _show_overlay_items(items, prefix_task_ids=args.count is not None)
+
     if not records:
         print(
             f"[NO TASK] No {target} task in current CCB session; use exact task ID",

@@ -549,3 +549,228 @@ def test_pend_recovers_exact_codex_done_after_waiter_failed(tmp_path: Path, monk
 
     assert rc == pend.EXIT_OK
     assert capsys.readouterr().out.strip() == "Recovered reply."
+
+
+class _ExchangeReader:
+    def __init__(self, exchanges: list[dict]) -> None:
+        self.exchanges = exchanges
+        self.requests: list[int] = []
+
+    def latest_exchanges(self, n: int) -> list[dict]:
+        self.requests.append(n)
+        return self.exchanges[-n:]
+
+
+def _bind_overlay(pend, monkeypatch, reader: _ExchangeReader) -> None:
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "ccb-1", "claude"))
+    monkeypatch.setattr(
+        pend,
+        "_current_tab_registry",
+        lambda project, session: {
+            "ccb_project_id": project,
+            "ccb_session_id": session,
+            "work_dir": str(ROOT),
+        },
+    )
+    monkeypatch.setattr(pend, "provider_log_reader", lambda *_args, **_kwargs: reader)
+
+
+def _completed_overlay_receipt(
+    tmp_path: Path,
+    task_id: str,
+    *,
+    submitted: str,
+    finished: str,
+    reply: str,
+) -> dict:
+    status = tmp_path / f"{task_id}.status"
+    log = tmp_path / f"{task_id}.log"
+    status.write_text(f"{finished} finished exit_code=0\n", encoding="utf-8")
+    log.write_text(f"{reply}\n", encoding="utf-8")
+    receipt = _receipt(task_id, "codex", session="ccb-1", pane="2", project="p", submitted=submitted)
+    receipt.update({"status_file": str(status), "log_file": str(log)})
+    return receipt
+
+
+def test_pend_peer_surfaces_manual_exchange_without_receipt(monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    reader = _ExchangeReader(
+        [{"ts": "2026-07-22T10:00:00Z", "req_id": None, "question": "Manual question", "reply": "Manual reply"}]
+    )
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: [])
+
+    rc = pend.main(["pend", "peer"])
+
+    assert rc == pend.EXIT_OK
+    assert capsys.readouterr().out.strip() == "Manual reply"
+
+
+def test_pend_overlay_orders_manual_and_completed_without_duplicate(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    pend = _load_pend_module()
+    task_id = "20260722-100000-001-1"
+    receipt = _completed_overlay_receipt(
+        tmp_path,
+        task_id,
+        submitted="2026-07-22T09:00:00Z",
+        finished="2026-07-22T10:02:00+00:00",
+        reply="Receipt reply",
+    )
+    reader = _ExchangeReader(
+        [
+            {
+                "ts": "2026-07-22T10:02:00Z",
+                "req_id": task_id,
+                "question": f"CCB_REQ_ID: {task_id}\nQuestion",
+                "reply": "Transcript duplicate",
+            },
+            {"ts": "2026-07-22T10:01:00Z", "req_id": None, "question": "Manual", "reply": "Manual reply"},
+        ]
+    )
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: [(Path("receipt.json"), receipt)])
+
+    rc = pend.main(["pend", "peer", "2"])
+
+    assert rc == pend.EXIT_OK
+    output = capsys.readouterr().out
+    assert output.splitlines() == ["[TASK " + task_id + "]", "Receipt reply", "---", "Manual reply"]
+    assert "Transcript duplicate" not in output
+
+
+def test_pend_overlay_keeps_pending_and_hides_partial_twin(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    pend = _load_pend_module()
+    task_id = "20260722-100100-001-1"
+    status = tmp_path / "pending.status"
+    log = tmp_path / "pending.log"
+    status.write_text("2026-07-22T10:01:00+00:00 running pid=12345\n", encoding="utf-8")
+    log.write_text("", encoding="utf-8")
+    receipt = _receipt(
+        task_id,
+        "codex",
+        session="ccb-1",
+        pane="2",
+        project="p",
+        submitted="2026-07-22T10:01:00Z",
+    )
+    receipt.update({"status_file": str(status), "log_file": str(log)})
+    reader = _ExchangeReader(
+        [{"ts": "2026-07-22T10:02:00Z", "req_id": task_id, "question": f"CCB_REQ_ID: {task_id}", "reply": "Partial leak"}]
+    )
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: [(Path("pending.json"), receipt)])
+    monkeypatch.setattr(pend, "_pid_is_alive", lambda _pid: True)
+
+    rc = pend.main(["pend", "peer"])
+
+    captured = capsys.readouterr()
+    assert rc == pend.EXIT_NO_REPLY
+    assert "[PENDING]" in captured.err
+    assert "Partial leak" not in captured.out + captured.err
+
+
+def test_pend_peer_count_returns_three_newest_eligible_merged_items(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    pend = _load_pend_module()
+    receipt = _completed_overlay_receipt(
+        tmp_path,
+        "20260722-095900-001-1",
+        submitted="2026-07-22T09:59:00Z",
+        finished="2026-07-22T10:03:00Z",
+        reply="Newest receipt",
+    )
+    reader = _ExchangeReader(
+        [
+            {"ts": "2026-07-22T10:00:00Z", "req_id": None, "question": "m1", "reply": "Manual one"},
+            {"ts": "2026-07-22T10:01:00Z", "req_id": None, "question": "m2", "reply": "Manual two"},
+            {"ts": "2026-07-22T10:02:00Z", "req_id": None, "question": "m3", "reply": "Manual three"},
+        ]
+    )
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: [(Path("receipt.json"), receipt)])
+
+    rc = pend.main(["pend", "peer", "3"])
+
+    assert rc == pend.EXIT_OK
+    output = capsys.readouterr().out
+    assert "Newest receipt" in output
+    assert "Manual three" in output
+    assert "Manual two" in output
+    assert "Manual one" not in output
+
+
+def test_pend_overlay_uses_result_time_for_long_task_ordering(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    pend = _load_pend_module()
+    receipt = _completed_overlay_receipt(
+        tmp_path,
+        "20260722-090000-001-1",
+        submitted="2026-07-22T09:00:00Z",
+        finished="2026-07-22T11:00:00+01:00",
+        reply="Long task result",
+    )
+    reader = _ExchangeReader(
+        [{"ts": "2026-07-22T09:30:00Z", "req_id": None, "question": "Manual", "reply": "Later question reply"}]
+    )
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: [(Path("receipt.json"), receipt)])
+
+    rc = pend.main(["pend", "peer"])
+
+    assert rc == pend.EXIT_OK
+    assert capsys.readouterr().out.strip() == "Long task result"
+
+
+def test_pend_overlay_fetch_depth_survives_more_than_five_deduped_exchanges(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    pend = _load_pend_module()
+    records = []
+    exchanges = [{"ts": "2026-07-22T09:00:00Z", "req_id": None, "question": "Manual", "reply": "Deep manual"}]
+    for index in range(6):
+        task_id = f"20260722-10000{index}-001-1"
+        receipt = _completed_overlay_receipt(
+            tmp_path,
+            task_id,
+            submitted=f"2026-07-22T10:00:0{index}Z",
+            finished=f"2026-07-22T10:00:0{index}Z",
+            reply=f"Receipt {index}",
+        )
+        records.append((Path(f"{index}.json"), receipt))
+        exchanges.append(
+            {"ts": f"2026-07-22T10:00:0{index}Z", "req_id": task_id, "question": f"CCB_REQ_ID: {task_id}", "reply": "Duplicate"}
+        )
+    reader = _ExchangeReader(exchanges)
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: records)
+
+    rc = pend.main(["pend", "peer", "7"])
+
+    assert rc == pend.EXIT_OK
+    output = capsys.readouterr().out
+    assert reader.requests == [13]
+    assert "Deep manual" in output
+    assert "Duplicate" not in output
+
+
+def test_pend_overlay_excludes_unmatched_non_null_req_id(monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    reader = _ExchangeReader(
+        [
+            {"ts": "2026-07-22T10:00:00Z", "req_id": "foreign-task", "question": "CCB_REQ_ID: foreign-task", "reply": "Foreign"},
+            {"ts": "2026-07-22T09:00:00Z", "req_id": None, "question": "Manual", "reply": "Manual"},
+        ]
+    )
+    _bind_overlay(pend, monkeypatch, reader)
+    monkeypatch.setattr(pend, "iter_receipts", lambda: [])
+
+    rc = pend.main(["pend", "peer"])
+
+    assert rc == pend.EXIT_OK
+    assert capsys.readouterr().out.strip() == "Manual"

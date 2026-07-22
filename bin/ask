@@ -109,6 +109,11 @@ class _SenderWorkDirFailure(NamedTuple):
     evidence: Path | None = None
 
 
+class _SenderCandidateEvidence(NamedTuple):
+    valid: bool
+    pane_ids: frozenset[str]
+
+
 def _caller_pane_info() -> tuple[str, str]:
     """Return (pane_id, terminal_type) from the current environment."""
     wez = (os.environ.get("WEZTERM_PANE") or "").strip()
@@ -593,43 +598,67 @@ def _active_sender_records(candidate: Path, caller: str) -> list[RegistryProvide
     return records
 
 
-def _sender_pane_conflicts(records: list[RegistryProviderRecord], caller: str) -> bool:
-    if caller not in PEER_PROVIDERS or not records:
-        return False
-    pane_id, _terminal = _peer_caller_pane_info()
-    recorded_panes = {
+def _sender_candidate_evidence(candidate: Path, caller: str) -> _SenderCandidateEvidence:
+    if not candidate.is_dir():
+        return _SenderCandidateEvidence(False, frozenset())
+    if inside_managed_codex_sandbox():
+        try:
+            status = provider_status_for_target(caller, work_dir=candidate)
+        except Exception:
+            return _SenderCandidateEvidence(False, frozenset())
+        pane_id = str(status.pane_id or "").strip()
+        return _SenderCandidateEvidence(
+            bool(status.mounted),
+            frozenset({pane_id}) if pane_id else frozenset(),
+        )
+
+    records = _active_sender_records(candidate, caller)
+    pane_ids = frozenset(
         str(record.provider_entry.get("pane_id") or "").strip()
         for record in records
         if str(record.provider_entry.get("pane_id") or "").strip()
-    }
-    return bool(pane_id and recorded_panes and pane_id not in recorded_panes)
+    )
+    return _SenderCandidateEvidence(bool(records), pane_ids)
+
+
+def _sender_pane_conflicts(evidence: _SenderCandidateEvidence, caller: str) -> bool:
+    if caller not in PEER_PROVIDERS or not evidence.valid:
+        return False
+    pane_id, _terminal = _peer_caller_pane_info()
+    return bool(pane_id and evidence.pane_ids and pane_id not in evidence.pane_ids)
 
 
 def _resolve_sender_work_dir(caller: str) -> Path | _SenderWorkDirFailure:
     """Resolve a validated, reply-addressable sender project without daemon autostart."""
     env_candidate = _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))
-    env_records = _active_sender_records(env_candidate, caller) if env_candidate else []
-    env_valid = bool(env_records)
+    env_evidence = (
+        _sender_candidate_evidence(env_candidate, caller)
+        if env_candidate
+        else _SenderCandidateEvidence(False, frozenset())
+    )
 
     try:
         daemon_candidate = _normalized_work_dir(resolve_daemon_work_dir())
     except Exception:
         daemon_candidate = _normalized_work_dir(Path.cwd())
-    daemon_records = _active_sender_records(daemon_candidate, caller) if daemon_candidate else []
-    daemon_valid = bool(daemon_records)
+    daemon_evidence = (
+        _sender_candidate_evidence(daemon_candidate, caller)
+        if daemon_candidate
+        else _SenderCandidateEvidence(False, frozenset())
+    )
 
-    if env_valid and env_candidate is not None:
-        if _sender_pane_conflicts(env_records, caller):
+    if env_evidence.valid and env_candidate is not None:
+        if _sender_pane_conflicts(env_evidence, caller):
             return _SenderWorkDirFailure(
                 "sender_project_mismatch",
                 env_candidate,
-                daemon_candidate if daemon_valid else None,
+                daemon_candidate if daemon_evidence.valid else None,
             )
-        if daemon_valid and daemon_candidate is not None and daemon_candidate != env_candidate:
+        if daemon_evidence.valid and daemon_candidate is not None and daemon_candidate != env_candidate:
             return _SenderWorkDirFailure("sender_project_mismatch", env_candidate, daemon_candidate)
         return env_candidate
-    if daemon_valid and daemon_candidate is not None:
-        if _sender_pane_conflicts(daemon_records, caller):
+    if daemon_evidence.valid and daemon_candidate is not None:
+        if _sender_pane_conflicts(daemon_evidence, caller):
             return _SenderWorkDirFailure("sender_project_mismatch", daemon_candidate)
         return daemon_candidate
 

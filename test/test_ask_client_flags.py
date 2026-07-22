@@ -25,7 +25,12 @@ def _load_ask_module():
     return module
 
 
-def _provider_status(*, mounted: bool, daemon_online: bool = True) -> ProviderRuntimeStatus:
+def _provider_status(
+    *,
+    mounted: bool,
+    daemon_online: bool = True,
+    pane_id: str = "",
+) -> ProviderRuntimeStatus:
     return ProviderRuntimeStatus(
         key="codex",
         provider="codex",
@@ -37,6 +42,7 @@ def _provider_status(*, mounted: bool, daemon_online: bool = True) -> ProviderRu
         daemon_online=daemon_online,
         mounted=mounted,
         reason="" if mounted else "not_configured",
+        pane_id=pane_id,
     )
 
 
@@ -460,6 +466,13 @@ def test_sender_work_dir_prefers_validated_environment(monkeypatch, tmp_path: Pa
     monkeypatch.setenv("CCB_WORK_DIR", str(project))
     monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
     monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [record])
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("host sender validation must stay on the direct registry path")
+        ),
+    )
     monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("%1", "tmux"))
 
     assert ask._resolve_sender_work_dir("claude") == project.resolve()
@@ -499,36 +512,88 @@ def test_sender_work_dir_rejects_missing_or_stale_project(monkeypatch, tmp_path:
     assert resolution == ask._SenderWorkDirFailure("unmounted_sender", project.resolve())
 
 
-def test_sender_work_dir_uses_daemon_state_in_managed_codex_sandbox(
+def test_sender_work_dir_uses_daemon_proxy_when_sandbox_cannot_see_host_pid(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     ask = _load_ask_module()
     scratch = tmp_path / "scratch"
     project = tmp_path / "project"
-    run_dir = tmp_path / "run"
     scratch.mkdir()
     project.mkdir()
-    run_dir.mkdir()
-    state_file = run_dir / "askd.json"
-    record = _registry_record(ask, project, "codex", pane_id="8")
 
     monkeypatch.chdir(scratch)
     monkeypatch.delenv("CCB_WORK_DIR", raising=False)
-    monkeypatch.setenv("CCB_RUN_DIR", str(run_dir))
     monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
     monkeypatch.setenv("CCB_MANAGED", "1")
     monkeypatch.setenv("CCB_CALLER", "codex")
-    monkeypatch.setattr(ccb_runtime_status, "find_running_state_file", lambda *_args, **_kwargs: state_file)
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [])
     monkeypatch.setattr(
-        ccb_runtime_status.askd_rpc,
-        "read_state",
-        lambda _path: {"token": "tok", "work_dir": str(project)},
+        ask,
+        "provider_status_for_target",
+        lambda provider, **kwargs: (
+            _provider_status(mounted=True, pane_id="8")
+            if provider == "codex" and kwargs.get("work_dir") == project.resolve()
+            else _provider_status(mounted=False)
+        ),
     )
-    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [record])
     monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("8", "tmux"))
 
     assert ask._resolve_sender_work_dir("codex") == project.resolve()
+
+
+def test_sender_work_dir_rejects_sandbox_sender_when_daemon_proxy_reports_unmounted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_args, **_kwargs: _provider_status(mounted=False),
+    )
+
+    assert ask._resolve_sender_work_dir("codex") == ask._SenderWorkDirFailure(
+        "unmounted_sender",
+        project.resolve(),
+    )
+
+
+def test_sender_work_dir_rejects_sandbox_daemon_pane_mismatch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_args, **_kwargs: _provider_status(mounted=True, pane_id="9"),
+    )
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("8", "wezterm"))
+
+    assert ask._resolve_sender_work_dir("codex") == ask._SenderWorkDirFailure(
+        "sender_project_mismatch",
+        project.resolve(),
+    )
 
 
 def test_sender_work_dir_rejects_environment_daemon_disagreement(

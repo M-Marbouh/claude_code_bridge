@@ -689,6 +689,7 @@ class ClaudeAdapter(BaseProviderAdapter):
             reply = "Peer message accepted."
             confirmation = "sent"
 
+        log_path_value = state.get("session_path") if isinstance(state, dict) else None
         return ProviderResult(
             exit_code=exit_code,
             reply=reply,
@@ -698,6 +699,7 @@ class ClaudeAdapter(BaseProviderAdapter):
             anchor_seen=anchor_seen,
             anchor_ms=anchor_ms,
             fallback_scan=fallback_scan,
+            log_path=str(log_path_value) if log_path_value else None,
             status=status,
             extra={"confirmation": confirmation},
         )

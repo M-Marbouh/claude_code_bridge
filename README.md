@@ -146,6 +146,11 @@ only after validating the expected provider, project path, live pane, exact pane
 marker. CCB never routes through an unvalidated stale session. If the pane is genuinely unavailable, the
 reply remains recoverable with `pend <original-task-id>` and the reverse command reports that delivery failed.
 
+Peer receipts distinguish transcript-observed delivery from successful terminal submission whose transcript
+anchor has not appeared yet. `pend <task-id>` rechecks late anchors and reports `delivery=sent-unconfirmed`
+when delivery cannot yet be observed. CCB does not automatically resend unconfirmed messages because doing
+so without receiver-side idempotency could create real duplicates.
+
 ## Session safety
 
 CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Implicit `pend` lookup is strict to that session; pre-restart receipts remain available by exact task ID. An unfinished task whose host PID is invisible inside a sandbox remains pending until its recorded timeout plus a short grace period has elapsed, preventing PID-namespace isolation from causing false incomplete results. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.
@@ -169,8 +174,12 @@ ccb kill
 ccb version
 ```
 
+`ccb clean` also removes oversized-reply artifacts older than `--older-than`; `--dry-run`,
+`--project`, and `--all-projects` apply to both stale session records and reply artifacts.
+
 ## Fork changes
 
+- `0.13.1` — hardened peer routing and failure reporting, restored exact `pend` overlays, bounded agent-visible replies, persisted delivery evidence, and added explicit reply-artifact cleanup.
 - `0.13.0` — replaced relay-style review roles with symmetric mutual ratification and moved managed Codex guidance to the real global `${CODEX_HOME:-~/.codex}/AGENTS.md` target.
 - `0.12.0` — returned to a single-instance architecture; retained Claude, Codex, Gemini, and OpenCode; added request-scoped task receipts and deterministic `pend`; removed worker/tag/role/sub-agent behavior; hardened same-folder Codex isolation.
 - `0.11.x` — introduced runtime status, cleanup, and experimental multi-instance work. Multi-instance behavior was retired in `0.12.0`.

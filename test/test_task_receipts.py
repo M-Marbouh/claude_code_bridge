@@ -14,6 +14,7 @@ from task_receipts import (
     new_receipt,
     read_peer_reply,
     receipt_path,
+    update_peer_delivery,
     write_peer_reply,
     write_receipt,
 )
@@ -96,6 +97,93 @@ def test_pend_codex_recovery_returns_only_marker_bearing_final(
     )
 
     assert recovered == "Actual final"
+
+
+def test_peer_delivery_update_persists_target_and_confirmation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("task_receipts.tempfile.gettempdir", lambda: str(tmp_path))
+    status = tmp_path / "task.status"
+    log = tmp_path / "task.log"
+    reply = tmp_path / "task.reply"
+    receipt = new_peer_receipt(
+        task_id="task-1",
+        peer_provider="claude",
+        caller="codex",
+        intent="background",
+        work_dir=tmp_path,
+        status_file=status,
+        log_file=log,
+        reply_file=reply,
+    )
+    write_receipt(receipt_path("peer-claude", "task-1"), receipt)
+
+    updated = update_peer_delivery(
+        "task-1",
+        confirmation="sent",
+        target_work_dir="/tmp/target",
+        target_project_id="project-target",
+        target_log_path="/tmp/target.jsonl",
+    )
+
+    assert updated is not None
+    assert updated["delivery_confirmation"] == "sent"
+    assert updated["peer_target_work_dir"] == "/tmp/target"
+    assert updated["peer_target_project_id"] == "project-target"
+    assert updated["peer_target_log_path"] == "/tmp/target.jsonl"
+    persisted = find_receipt("task-1")
+    assert persisted is not None
+    assert persisted[1]["delivery_confirmation"] == "sent"
+
+
+def test_pend_reconciles_sent_peer_delivery_to_observed(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    pend = _load_pend_module()
+    status = tmp_path / "task.status"
+    log = tmp_path / "task.log"
+    status.write_text(
+        "2026-07-29T21:00:00+00:00 finished exit_code=0\n",
+        encoding="utf-8",
+    )
+    log.write_text("", encoding="utf-8")
+    receipt = {
+        "task_id": "task-1",
+        "provider": "peer-claude",
+        "peer_provider": "claude",
+        "reply_expected": True,
+        "status_file": str(status),
+        "log_file": str(log),
+        "delivery_confirmation": "sent",
+        "peer_target_work_dir": "/tmp/target",
+        "peer_target_project_id": "project-target",
+        "peer_target_log_path": "/tmp/target.jsonl",
+    }
+    updates: list[dict] = []
+    monkeypatch.setattr(
+        pend,
+        "provider_request_anchor_seen",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        pend,
+        "update_peer_delivery",
+        lambda *_args, **kwargs: updates.append(kwargs)
+        or {**receipt, "delivery_confirmation": "observed"},
+    )
+
+    rc = pend._show_receipt(receipt)
+
+    assert rc == pend.EXIT_NO_REPLY
+    assert updates == [
+        {
+            "confirmation": "observed",
+            "target_work_dir": "/tmp/target",
+            "target_project_id": "project-target",
+            "target_log_path": "/tmp/target.jsonl",
+        }
+    ]
+    assert "delivery=observed" in capsys.readouterr().err
 
 
 def test_pend_skills_preserve_same_turn_async_guardrail() -> None:

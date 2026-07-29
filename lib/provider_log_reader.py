@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from claude_comm import ClaudeLogReader
+from claude_comm import ClaudeLogReader, _extract_message as _extract_claude_message
+from ccb_protocol import REQ_ID_PREFIX
 from codex_comm import CodexLogReader, SESSION_ID_PATTERN
 from pane_registry import (
     load_registry_by_claude_pane,
@@ -283,3 +284,62 @@ def provider_log_reader(
     if log_path:
         reader.set_preferred_session(log_path)
     return reader
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def provider_request_anchor_seen(
+    provider: str,
+    work_dir: Path,
+    project_id: str,
+    req_id: str,
+    *,
+    log_path: str | Path | None = None,
+) -> bool:
+    """Return whether the provider transcript contains this request's user anchor."""
+    provider = (provider or "").strip().lower()
+    marker = f"{REQ_ID_PREFIX} {(req_id or '').strip()}"
+    if provider not in {"claude", "codex"} or not req_id:
+        return False
+
+    path = Path(log_path).expanduser() if log_path else None
+    if path is None or not path.is_file():
+        reader = provider_log_reader(provider, work_dir, project_id)
+        if reader is None:
+            return False
+        if provider == "codex":
+            path = reader.current_log_path()
+        else:
+            path = reader.current_session_path()
+    if path is None or not path.is_file():
+        return False
+
+    tail_bytes = 8 * 1024 * 1024
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - tail_bytes), os.SEEK_SET)
+            lines = handle.read(tail_bytes).splitlines()
+    except OSError:
+        return False
+
+    for raw_line in reversed(lines):
+        try:
+            entry = json.loads(raw_line.decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+        if provider == "codex":
+            event = CodexLogReader._extract_event(entry)
+            text = event[1] if event is not None and event[0] == "user" else ""
+        else:
+            text = _extract_claude_message(entry, "user") or ""
+        if _first_nonempty_line(text) == marker:
+            return True
+    return False

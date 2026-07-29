@@ -83,6 +83,108 @@ def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
     assert "[BRIDGE] done_seen=False anchor_seen=True fallback_scan=True status=incomplete req_id=req-1" in captured.err
 
 
+def test_bridge_persists_observed_delivery_confirmation(monkeypatch) -> None:
+    bridge = _load_bridge_module()
+    target = {
+        "index": 1,
+        "work_dir": "/tmp/target",
+        "ccb_project_id": "project-target",
+        "providers": {"claude": {"alive": True, "mounted": True}},
+    }
+    updates: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    monkeypatch.setattr(
+        bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl())
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_send_to_daemon",
+        lambda *_args: (
+            0,
+            "Peer message delivered.",
+            {
+                "confirmation": "observed",
+                "log_path": "/tmp/target.jsonl",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "update_peer_delivery",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    assert (
+        bridge.main(
+            [
+                "--target",
+                "1",
+                "--peer-task-id",
+                "task-1",
+                "--intent",
+                "background",
+                "hello",
+            ]
+        )
+        == 0
+    )
+    assert updates == [
+        (
+            ("task-1",),
+            {
+                "confirmation": "observed",
+                "target_work_dir": "/tmp/target",
+                "target_project_id": "project-target",
+                "target_log_path": "/tmp/target.jsonl",
+            },
+        )
+    ]
+
+
+def test_bridge_persists_failed_confirmation_when_target_resolution_fails(
+    monkeypatch, capsys
+) -> None:
+    bridge = _load_bridge_module()
+    updates: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        bridge,
+        "_load_targets",
+        lambda: (_ for _ in ()).throw(RuntimeError("discovery failed")),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "update_peer_delivery",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    assert (
+        bridge.main(
+            [
+                "--target",
+                "1",
+                "--peer-task-id",
+                "task-1",
+                "--intent",
+                "background",
+                "hello",
+            ]
+        )
+        == 1
+    )
+    assert "discovery failed" in capsys.readouterr().err
+    assert updates == [
+        (
+            ("task-1",),
+            {
+                "confirmation": "failed",
+                "target_work_dir": "",
+                "target_project_id": "",
+                "target_log_path": "",
+            },
+        )
+    ]
+
+
 def test_background_bridge_failure_notifies_original_caller(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -387,6 +489,7 @@ def test_direct_reply_fallback_wraps_claude_and_codex_delivery_prompts() -> None
         assert exit_code == 0
         assert reply == "Peer reply delivered directly."
         assert meta["direct_reply_fallback"] is True
+        assert meta["confirmation"] == "sent"
         assert backend.sent[0][0] == "%7"
         assert "terminal result" in backend.sent[0][1]
         assert "CCB_REPLY_EXPECTED: no" in backend.sent[0][1]

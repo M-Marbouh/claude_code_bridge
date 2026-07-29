@@ -77,3 +77,66 @@ def test_spill_failure_withholds_full_oversized_result(
     assert "[CCB_RESULT_WITHHELD]" in prepared
     assert "The full result could not be persisted" in prepared
     assert len(prepared.encode("utf-8")) < len(reply.encode("utf-8"))
+
+
+def test_explicit_artifact_cleanup_supports_dry_run(
+    monkeypatch, tmp_path: Path
+) -> None:
+    completion_dir = tmp_path / "completions"
+    completion_dir.mkdir()
+    expired = completion_dir / "expired.md"
+    fresh = completion_dir / "fresh.md"
+    unrelated = completion_dir / "keep.txt"
+    expired.write_text("old", encoding="utf-8")
+    fresh.write_text("new", encoding="utf-8")
+    unrelated.write_text("keep", encoding="utf-8")
+    now = time.time()
+    os.utime(expired, (now - 60, now - 60))
+    monkeypatch.setenv("CCB_RUN_DIR", str(tmp_path))
+
+    assert (
+        reply_artifacts.cleanup_reply_artifacts(
+            older_than_seconds=30, dry_run=True, now=now
+        )
+        == 1
+    )
+    assert expired.exists()
+    assert (
+        reply_artifacts.cleanup_reply_artifacts(
+            older_than_seconds=30, now=now
+        )
+        == 1
+    )
+    assert not expired.exists()
+    assert fresh.exists()
+    assert unrelated.exists()
+
+
+def test_explicit_project_cleanup_does_not_use_current_project_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    projects_dir = tmp_path / "projects"
+    current_dir = projects_dir / "current"
+    other_project = tmp_path / "other-project"
+    other_project.mkdir()
+    other_id = reply_artifacts.compute_ccb_project_id(other_project)[:16]
+    other_completion_dir = projects_dir / other_id / "completions"
+    current_completion_dir = current_dir / "completions"
+    other_completion_dir.mkdir(parents=True)
+    current_completion_dir.mkdir(parents=True)
+    other_artifact = other_completion_dir / "other.md"
+    current_artifact = current_completion_dir / "current.md"
+    other_artifact.write_text("other", encoding="utf-8")
+    current_artifact.write_text("current", encoding="utf-8")
+    monkeypatch.setenv("CCB_RUN_DIR", str(current_dir))
+
+    assert (
+        reply_artifacts.cleanup_reply_artifacts(
+            project=other_project,
+            older_than_seconds=0,
+            now=time.time() + 1,
+        )
+        == 1
+    )
+    assert not other_artifact.exists()
+    assert current_artifact.exists()

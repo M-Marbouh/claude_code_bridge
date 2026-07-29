@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from askd_runtime import run_dir
+from project_id import compute_ccb_project_id
 
 
 HARD_INLINE_MAX_BYTES = 64 * 1024
@@ -74,6 +75,67 @@ def _cleanup_artifacts(completion_dir: Path, keep: Path) -> None:
             path.unlink()
         except OSError:
             pass
+
+
+def _completion_dirs(
+    project: str | Path | None,
+    *,
+    all_projects: bool,
+) -> list[Path]:
+    current = run_dir()
+    if all_projects:
+        if current.parent.name == "projects":
+            base = current.parent.parent
+        else:
+            base = current
+        candidates = [
+            current / "completions",
+            base / "completions",
+            *(base / "projects").glob("*/completions"),
+        ]
+    elif project is not None and current.parent.name == "projects":
+        project_id = compute_ccb_project_id(Path(project).expanduser())
+        candidates = [
+            current.parent / project_id[:16] / "completions",
+        ]
+    elif project is not None and not (os.environ.get("CCB_RUN_DIR") or "").strip():
+        project_id = compute_ccb_project_id(Path(project).expanduser())
+        candidates = [
+            current / "projects" / project_id[:16] / "completions",
+        ]
+    else:
+        candidates = [current / "completions"]
+    return list(dict.fromkeys(candidates))
+
+
+def cleanup_reply_artifacts(
+    *,
+    project: str | Path | None = None,
+    all_projects: bool = False,
+    older_than_seconds: int = DEFAULT_RETENTION_SECONDS,
+    dry_run: bool = False,
+    now: float | None = None,
+) -> int:
+    """Delete expired reply artifacts and return the matching/deleted count."""
+    cutoff = (time.time() if now is None else float(now)) - max(
+        0, int(older_than_seconds)
+    )
+    affected = 0
+    for completion_dir in _completion_dirs(project, all_projects=all_projects):
+        try:
+            paths = list(completion_dir.glob("*.md"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                if path.is_symlink() or not path.is_file() or path.stat().st_mtime >= cutoff:
+                    continue
+                if not dry_run:
+                    path.unlink()
+                affected += 1
+            except OSError:
+                continue
+    return affected
 
 
 def prepare_agent_visible_reply(

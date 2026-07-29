@@ -154,3 +154,88 @@ def test_legacy_claude_resolution_keeps_freshness_and_registry_upsert(
     assert reader._allow_session_switch is True
     assert record["providers"]["claude"]["claude_session_path"] == str(session_log)
     assert len(updates) == 1
+
+
+def test_request_anchor_reconciliation_requires_a_user_anchor(tmp_path: Path) -> None:
+    req_id = "20260729-210000-000-1"
+    codex_log = tmp_path / "codex.jsonl"
+    codex_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": f"Quoted CCB_REQ_ID: {req_id}",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": f"CCB_REQ_ID: {req_id}\nDelivered",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert resolver.provider_request_anchor_seen(
+        "codex",
+        tmp_path,
+        "project-a",
+        req_id,
+        log_path=codex_log,
+    )
+    assert not resolver.provider_request_anchor_seen(
+        "codex",
+        tmp_path,
+        "project-a",
+        "different-task",
+        log_path=codex_log,
+    )
+
+
+def test_claude_request_anchor_reconciliation_reads_explicit_log(
+    tmp_path: Path,
+) -> None:
+    req_id = "20260729-210000-000-2"
+    claude_log = tmp_path / "claude.jsonl"
+    claude_log.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"CCB_REQ_ID: {req_id}\nDelivered",
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert resolver.provider_request_anchor_seen(
+        "claude",
+        tmp_path,
+        "project-a",
+        req_id,
+        log_path=claude_log,
+    )

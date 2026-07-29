@@ -23,7 +23,7 @@ from ccb_protocol import wrap_codex_delivery_prompt
 from compat import read_stdin_text, setup_windows_encoding
 from completion_hook import COMPLETION_STATUS_FAILED, notify_completion
 from laskd_protocol import wrap_claude_delivery_prompt
-from task_receipts import find_receipt, write_peer_reply
+from task_receipts import find_receipt, update_peer_delivery, write_peer_reply
 from terminal import get_backend_for_session
 
 setup_windows_encoding()
@@ -241,7 +241,12 @@ def _send_to_direct_reply_target(
     return (
         0,
         "Peer reply delivered directly.",
-        {"status": "completed", "req_id": req_id, "direct_reply_fallback": True},
+        {
+            "status": "completed",
+            "req_id": req_id,
+            "direct_reply_fallback": True,
+            "confirmation": "sent",
+        },
     )
 
 
@@ -403,6 +408,34 @@ def _print_bridge_diagnostics(meta: dict[str, Any]) -> None:
     )
 
 
+def _persist_peer_delivery(
+    task_id: str,
+    target: dict[str, Any] | None,
+    exit_code: int,
+    meta: dict[str, Any] | None,
+) -> None:
+    if not task_id:
+        return
+    details = meta if isinstance(meta, dict) else {}
+    confirmation = str(details.get("confirmation") or "").strip().lower()
+    if exit_code != 0:
+        confirmation = "failed"
+    elif confirmation not in {"observed", "sent"}:
+        confirmation = "sent"
+    target_data = target if isinstance(target, dict) else {}
+    _write_background_status(f"delivery confirmation={confirmation}")
+    try:
+        update_peer_delivery(
+            task_id,
+            confirmation=confirmation,
+            target_work_dir=str(target_data.get("work_dir") or ""),
+            target_project_id=str(target_data.get("ccb_project_id") or ""),
+            target_log_path=str(details.get("log_path") or ""),
+        )
+    except Exception as exc:
+        _write_background_status(f"delivery receipt_update_failed error={exc}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Send a message to a provider in another CCB project.")
     parser.add_argument("--target", required=True, help="Target project path, hash prefix, or list index.")
@@ -433,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     reply_receipt: dict[str, Any] | None = None
+    target: dict[str, Any] | None = None
     try:
         reply_receipt = _correlated_reply_receipt(
             str(args.reply_to or ""), str(args.target or ""), str(args.provider or "")
@@ -499,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
                     fcntl_mod.flock(lock_handle.fileno(), fcntl_mod.LOCK_UN)
                 finally:
                     lock_handle.close()
+        _persist_peer_delivery(str(args.peer_task_id or ""), target, exit_code, meta)
         if reply_receipt is not None:
             delivery = "direct" if direct_backend is not None else "live"
             _write_correlated_status(
@@ -516,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
             print(reply)
         return exit_code
     except Exception as exc:
+        _persist_peer_delivery(
+            str(args.peer_task_id or ""), target, 1, {"confirmation": "failed"}
+        )
         if reply_receipt is not None:
             _write_correlated_status(reply_receipt, "peer_reply_saved delivery=failed exit_code=1")
         print(f"[ERROR] {exc}", file=sys.stderr)

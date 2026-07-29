@@ -23,9 +23,15 @@ from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
 from codex_comm import CodexLogReader
 from pane_registry import load_registry_by_pane, load_registry_by_session_id
 from project_id import compute_ccb_project_id
-from provider_log_reader import provider_log_reader
+from provider_log_reader import provider_log_reader, provider_request_anchor_seen
 from reply_artifacts import prepare_agent_visible_reply
-from task_receipts import caller_session_id, find_receipt, iter_receipts, read_peer_reply
+from task_receipts import (
+    caller_session_id,
+    find_receipt,
+    iter_receipts,
+    read_peer_reply,
+    update_peer_delivery,
+)
 
 
 PROVIDER_PENDS = {
@@ -391,7 +397,43 @@ def _recover_provider_reply(receipt: dict) -> str | None:
     return None
 
 
+def _reconcile_peer_delivery(receipt: dict) -> dict:
+    if str(receipt.get("delivery_confirmation") or "") != "sent":
+        return receipt
+    task_id = str(receipt.get("task_id") or "").strip()
+    provider = str(receipt.get("peer_provider") or "").strip().lower()
+    work_dir = str(receipt.get("peer_target_work_dir") or "").strip()
+    project_id = str(receipt.get("peer_target_project_id") or "").strip()
+    log_path = str(receipt.get("peer_target_log_path") or "").strip()
+    if not task_id or provider not in {"claude", "codex"} or not work_dir or not project_id:
+        return receipt
+    if not provider_request_anchor_seen(
+        provider,
+        Path(work_dir),
+        project_id,
+        task_id,
+        log_path=log_path or None,
+    ):
+        return receipt
+    updated = update_peer_delivery(
+        task_id,
+        confirmation="observed",
+        target_work_dir=work_dir,
+        target_project_id=project_id,
+        target_log_path=log_path,
+    )
+    return updated or receipt
+
+
+def _peer_delivery_label(receipt: dict) -> str:
+    confirmation = str(receipt.get("delivery_confirmation") or "").strip().lower()
+    if confirmation == "sent":
+        return "sent-unconfirmed"
+    return confirmation
+
+
 def _show_receipt(receipt: dict) -> int:
+    receipt = _reconcile_peer_delivery(receipt)
     task_id = str(receipt.get("task_id") or "")
     status_path = Path(str(receipt.get("status_file") or ""))
     log_path = Path(str(receipt.get("log_file") or ""))
@@ -421,8 +463,11 @@ def _show_receipt(receipt: dict) -> int:
         and str(receipt.get("provider") or "").startswith("peer-")
         and bool(receipt.get("reply_expected"))
     ):
+        delivery = _peer_delivery_label(receipt)
+        suffix = f" delivery={delivery}" if delivery else ""
         print(
-            f"[PENDING] task={task_id} provider={receipt.get('provider', '')} awaiting peer reply",
+            f"[PENDING] task={task_id} provider={receipt.get('provider', '')} "
+            f"awaiting peer reply{suffix}",
             file=sys.stderr,
         )
         return EXIT_NO_REPLY

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.1 - 2026-07-29
+
+### Changed
+
+- Restored transcript-plus-receipt `pend` history without leaking partial or foreign request turns.
+- Validated peer sender routing through the host daemon so managed Codex cwd and sandbox boundaries cannot stamp an unusable reverse-reply target.
+- Made Codex reply assembly and recovery select one marker-bearing final response instead of joining interim or historical finals.
+- Bounded agent-visible replies at 64 KiB across foreground asks, background logs, completion callbacks, and `pend`, preserving oversized results as checksummed artifacts.
+- Made exhausted WezTerm submission retries fail explicitly and notify the originating pane when detached peer delivery fails.
+- Persisted peer delivery evidence as `observed`, `sent`, or `failed`; `pend` now reconciles late transcript anchors and labels unconfirmed sends without automatically retrying.
+- Extended `ccb clean` to prune expired oversized-reply artifacts, including dry-run and all-project modes.
+
 ## 0.13.0 - 2026-07-21
 
 ### Changed

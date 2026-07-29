@@ -12,6 +12,12 @@ from project_id import compute_ccb_project_id
 
 
 RECEIPT_SCHEMA_VERSION = 1
+PEER_DELIVERY_CONFIRMATIONS = {
+    "cancelled",
+    "failed",
+    "observed",
+    "sent",
+}
 
 
 def task_dir() -> Path:
@@ -217,3 +223,36 @@ def find_receipt(task_id: str, *, root: Path | None = None) -> tuple[Path, dict[
         return None
     matches = [(path, data) for path, data in iter_receipts(root=root) if data.get("task_id") == wanted]
     return matches[0] if len(matches) == 1 else None
+
+
+def update_peer_delivery(
+    task_id: str,
+    *,
+    confirmation: str,
+    target_work_dir: str = "",
+    target_project_id: str = "",
+    target_log_path: str = "",
+    root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Persist the latest delivery evidence for a peer task receipt."""
+    normalized = (confirmation or "").strip().lower()
+    if normalized not in PEER_DELIVERY_CONFIRMATIONS:
+        raise ValueError(f"invalid peer delivery confirmation: {confirmation}")
+    found = find_receipt(task_id, root=root)
+    if found is None:
+        return None
+    path, receipt = found
+    if not str(receipt.get("provider") or "").startswith("peer-"):
+        return None
+
+    updated = dict(receipt)
+    updated["delivery_confirmation"] = normalized
+    updated["delivery_updated_at"] = datetime.now(timezone.utc).isoformat()
+    if target_work_dir:
+        updated["peer_target_work_dir"] = str(target_work_dir)
+    if target_project_id:
+        updated["peer_target_project_id"] = str(target_project_id)
+    if target_log_path:
+        updated["peer_target_log_path"] = str(target_log_path)
+    write_receipt(path, updated)
+    return updated

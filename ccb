@@ -40,6 +40,7 @@ from ccb_mcpv_bridge import (
     render_shell_prefix,
 )
 from ccb_cleanup import DEFAULT_KEEP_NEWEST, DEFAULT_TTL_SECONDS, plan_prune, run_prune
+from reply_artifacts import cleanup_reply_artifacts
 from session_utils import (
     check_session_writable,
     find_project_session_file,
@@ -63,7 +64,7 @@ backend_env = get_backend_env()
 if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
 GIT_COMMIT = "c539e79"
 GIT_DATE = "2026-02-25"
 
@@ -4135,11 +4136,23 @@ def cmd_clean(args) -> int:
         plan_prune(keep=args.keep, older_than_seconds=older_than, project=project),
         dry_run=args.dry_run,
     )
+    artifact_count = cleanup_reply_artifacts(
+        project=project,
+        all_projects=args.all_projects,
+        older_than_seconds=older_than,
+        dry_run=args.dry_run,
+    )
     if args.json:
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        payload = result.to_dict()
+        payload["reply_artifacts"] = {
+            "planned": artifact_count if args.dry_run else 0,
+            "deleted": 0 if args.dry_run else artifact_count,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         action = "would delete" if args.dry_run else "deleted"
         print(f"CCB clean: scanned={result.scanned} kept={result.kept} {action}={result.planned if args.dry_run else result.deleted}")
+        print(f"Reply artifacts {action}={artifact_count}")
         for record in result.plan.prunable:
             print(f"  {record.path}")
     return 1 if result.failed else 0

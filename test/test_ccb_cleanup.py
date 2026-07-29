@@ -259,12 +259,27 @@ def test_cmd_clean_forwards_flags_to_prune_engine(monkeypatch, tmp_path: Path, c
 
     monkeypatch.setattr(ccb, "plan_prune", fake_plan_prune)
     monkeypatch.setattr(ccb, "run_prune", fake_run_prune)
+    artifact_calls: list[dict] = []
+    monkeypatch.setattr(
+        ccb,
+        "cleanup_reply_artifacts",
+        lambda **kwargs: artifact_calls.append(kwargs) or 2,
+    )
     monkeypatch.setattr(sys, "argv", ["ccb", "clean", "--all-projects", "--dry-run", "--keep", "2", "--older-than", "12h", "--json"])
 
     assert ccb.main() == 0
     out = json.loads(capsys.readouterr().out)
     assert calls == [{"keep": 2, "older_than_seconds": 43_200, "project": None}]
+    assert artifact_calls == [
+        {
+            "project": None,
+            "all_projects": True,
+            "older_than_seconds": 43_200,
+            "dry_run": True,
+        }
+    ]
     assert out["dry_run"] is True
+    assert out["reply_artifacts"]["planned"] == 2
 
 
 def test_auto_prune_disabled_by_env(monkeypatch, tmp_path: Path) -> None:

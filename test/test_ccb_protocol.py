@@ -7,6 +7,7 @@ from ccb_protocol import (
     REQ_ID_PREFIX,
     is_done_text,
     make_req_id,
+    select_codex_reply,
     strip_done_text,
     strip_trailing_markers,
     wrap_codex_delivery_prompt,
@@ -32,6 +33,7 @@ def test_wrap_codex_prompt_structure() -> None:
     assert f"{REQ_ID_PREFIX} {req_id}" in prompt
     assert "IMPORTANT:" in prompt
     assert "- Reply normally." in prompt
+    assert "sole delivered result" in prompt
     assert f"{DONE_PREFIX} {req_id}" in prompt
     assert prompt.endswith(f"{DONE_PREFIX} {req_id}\n")
 
@@ -92,3 +94,17 @@ def test_claude_delivery_prompt_respects_peer_reply_intent() -> None:
     assert "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message" in prompt
     assert "preserve CCB_PEER_TASK_ID as --reply-to" in prompt
     assert "otherwise use --background" in prompt
+
+
+def test_select_codex_reply_handles_marker_only_terminal_event() -> None:
+    req_id = "20260729-120000-000-1"
+
+    assert (
+        select_codex_reply(
+            f"CCB_DONE: {req_id}",
+            "Actual final",
+            f"Actual final\nCCB_DONE: {req_id}",
+            req_id,
+        )
+        == "Actual final"
+    )

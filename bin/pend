@@ -19,11 +19,12 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
-from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text
+from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
 from codex_comm import CodexLogReader
 from pane_registry import load_registry_by_pane, load_registry_by_session_id
 from project_id import compute_ccb_project_id
 from provider_log_reader import provider_log_reader
+from reply_artifacts import prepare_agent_visible_reply
 from task_receipts import caller_session_id, find_receipt, iter_receipts, read_peer_reply
 
 
@@ -347,7 +348,8 @@ def _recover_codex_reply(receipt: dict) -> str | None:
             continue
         anchor_seen = False
         chunks: list[str] = []
-        final_chunks: list[str] = []
+        latest_final: str | None = None
+        terminal_reply: str | None = None
         try:
             with candidate.open("r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
@@ -363,18 +365,21 @@ def _recover_codex_reply(receipt: dict) -> str | None:
                         if marker in text:
                             anchor_seen = True
                             chunks = []
-                            final_chunks = []
+                            latest_final = None
+                            terminal_reply = None
                         continue
                     if role != "assistant" or not anchor_seen:
                         continue
                     chunks.append(text)
                     combined = "\n".join(chunks)
-                    done_now = is_done_text(combined, task_id)
-                    if (phase == "final_answer" or done_now) and (not final_chunks or final_chunks[-1] != text):
-                        final_chunks.append(text)
+                    done_now = is_done_text(text, task_id)
+                    if phase == "final_answer":
+                        latest_final = text
                     if done_now:
-                        reply = "\n".join(final_chunks) if final_chunks else combined
-                        return strip_done_text(reply, task_id).strip()
+                        terminal_reply = text
+                        return select_codex_reply(
+                            terminal_reply, latest_final, combined, task_id
+                        ).strip()
         except OSError:
             continue
     return None
@@ -392,13 +397,13 @@ def _show_receipt(receipt: dict) -> int:
     log_path = Path(str(receipt.get("log_file") or ""))
     peer_reply = read_peer_reply(receipt)
     if peer_reply:
-        print(peer_reply)
+        print(prepare_agent_visible_reply(peer_reply, task_id))
         return EXIT_OK
     finished, exit_code, _finished_at = _status_finished(status_path)
     if not finished or exit_code != 0:
         recovered = _recover_provider_reply(receipt)
         if recovered:
-            print(recovered)
+            print(prepare_agent_visible_reply(recovered, task_id))
             return EXIT_OK
     if not finished:
         pid = _status_pid(status_path)
@@ -427,11 +432,11 @@ def _show_receipt(receipt: dict) -> int:
         print(f"[ERROR] Failed to read task log for {task_id}: {exc}", file=sys.stderr)
         return EXIT_ERROR
     if output:
-        print(output)
+        print(prepare_agent_visible_reply(output, task_id))
     elif exit_code == 0:
         recovered = _recover_provider_reply(receipt)
         if recovered:
-            print(recovered)
+            print(prepare_agent_visible_reply(recovered, task_id))
             return EXIT_OK
         print(f"[ERROR] Task {task_id} completed without a reply", file=sys.stderr)
         return EXIT_NO_REPLY
@@ -598,7 +603,7 @@ def _show_overlay_items(items: list[OverlayItem], *, prefix_task_ids: bool) -> i
                 print(f"[TASK {item.receipt.get('task_id', '')}]")
             current = _show_receipt(item.receipt)
         else:
-            print(item.reply)
+            print(prepare_agent_visible_reply(item.reply, ""))
             current = EXIT_OK
         if current == EXIT_ERROR:
             result = EXIT_ERROR

@@ -83,6 +83,34 @@ def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
     assert "[BRIDGE] done_seen=False anchor_seen=True fallback_scan=True status=incomplete req_id=req-1" in captured.err
 
 
+def test_background_bridge_failure_notifies_original_caller(
+    monkeypatch, tmp_path: Path
+) -> None:
+    bridge = _load_bridge_module()
+    captured: dict = {}
+    monkeypatch.setenv("CCB_PEER_STATUS_FILE", str(tmp_path / "task.status"))
+    monkeypatch.setenv("CCB_PEER_LOG_FILE", str(tmp_path / "task.log"))
+    monkeypatch.setenv("CCB_PEER_PROVIDER", "claude")
+    monkeypatch.setenv("CCB_REQ_ID", "task-1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setenv("CCB_WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("CCB_CALLER_PANE_ID", "7")
+    monkeypatch.setenv("CCB_CALLER_TERMINAL", "wezterm")
+    monkeypatch.setattr(
+        bridge,
+        "notify_completion",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    bridge._notify_background_failure(1)
+
+    assert captured["provider"] == "peer-claude"
+    assert captured["req_id"] == "task-1"
+    assert captured["status"] == bridge.COMPLETION_STATUS_FAILED
+    assert captured["caller_pane_id"] == "7"
+    assert "delivery failed" in captured["reply"]
+
+
 def test_bridge_appends_wait_context() -> None:
     bridge = _load_bridge_module()
 

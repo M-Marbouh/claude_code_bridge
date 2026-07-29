@@ -15,8 +15,8 @@ from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderRes
 from askd_runtime import log_path, write_log
 from ccb_protocol import (
     REQ_ID_PREFIX,
-    extract_reply_for_req,
     is_done_text,
+    select_codex_reply,
     strip_done_text,
     wrap_codex_delivery_prompt,
     wrap_codex_prompt,
@@ -55,20 +55,22 @@ def _tail_state_for_log(log_path_val: Optional[Path], *, tail_bytes: int) -> dic
     return {"log_path": log_path_val, "offset": offset}
 
 
-def _assemble_reply(final_chunks: list[str], combined: str, req_id: str) -> str:
+def _assemble_reply(
+    terminal_reply: Optional[str],
+    latest_final: Optional[str],
+    combined: str,
+    req_id: str,
+) -> str:
     """
     Assemble the reply Codex returns to the caller.
 
     Modern Codex logs tag the final report with phase=="final_answer"; interim
     progress is phase=="commentary" and the duplicate event_msg twin is
-    phase=="event". When we captured any final_answer content, return only that
-    (stripped of the trailing CCB_DONE marker). Otherwise fall back to the legacy
-    behavior of extracting the full anchor->DONE span -- this preserves replies
-    from older Codex builds that emit no phase metadata.
+    phase=="event". Prefer the event carrying this request's terminating
+    CCB_DONE marker, then the latest final_answer for degraded idle completion.
+    Otherwise fall back to the legacy full-span extraction for older Codex logs.
     """
-    if final_chunks:
-        return strip_done_text("\n".join(final_chunks), req_id)
-    return extract_reply_for_req(combined, req_id)
+    return select_codex_reply(terminal_reply, latest_final, combined, req_id)
 
 
 def _show_tier_footer() -> bool:
@@ -363,7 +365,8 @@ class CodexAdapter(BaseProviderAdapter):
             return result
 
         chunks: list[str] = []
-        final_chunks: list[str] = []
+        latest_final: Optional[str] = None
+        terminal_reply: Optional[str] = None
         anchor_seen = False
         done_seen = False
         anchor_ms: Optional[int] = None
@@ -487,19 +490,14 @@ class CodexAdapter(BaseProviderAdapter):
 
             chunks.append(text)
             combined = "\n".join(chunks)
-            done_now = is_done_text(combined, task.req_id)
-            # A message belongs to the final report if Codex tagged it
-            # phase=="final_answer" OR it carries the terminating CCB_DONE line.
-            # The event_msg/agent_message twin of the final answer is logged
-            # *before* the canonical phase=="final_answer" record and already
-            # carries CCB_DONE, so the loop breaks on the twin first. We must
-            # therefore treat the DONE-bearing message as final too; otherwise
-            # final_chunks stays empty and we fall back to the noisy full span.
-            # Interim commentary and its event twin (no DONE, not final_answer)
-            # still feed `chunks` for completion/idle detection + legacy fallback.
-            if (phase == "final_answer" or done_now) and (not final_chunks or final_chunks[-1] != text):
-                final_chunks.append(text)
+            done_now = is_done_text(text, task.req_id)
+            # Keep only the latest canonical final for degraded idle completion.
+            # The event_msg twin carrying CCB_DONE arrives before its canonical
+            # final_answer record, so the DONE-bearing event is authoritative.
+            if phase == "final_answer":
+                latest_final = text
             if done_now:
+                terminal_reply = text
                 done_seen = True
                 done_ms = _now_ms() - started_ms
                 break
@@ -518,7 +516,7 @@ class CodexAdapter(BaseProviderAdapter):
                 break
 
         combined = "\n".join(chunks)
-        reply = _assemble_reply(final_chunks, combined, task.req_id)
+        reply = _assemble_reply(terminal_reply, latest_final, combined, task.req_id)
         status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
         if task.cancelled:
             status = COMPLETION_STATUS_CANCELLED

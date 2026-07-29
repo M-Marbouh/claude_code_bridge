@@ -21,6 +21,7 @@ import askd_rpc
 from askd_runtime import find_running_state_file
 from ccb_protocol import wrap_codex_delivery_prompt
 from compat import read_stdin_text, setup_windows_encoding
+from completion_hook import COMPLETION_STATUS_FAILED, notify_completion
 from laskd_protocol import wrap_claude_delivery_prompt
 from task_receipts import find_receipt, write_peer_reply
 from terminal import get_backend_for_session
@@ -41,6 +42,34 @@ def _write_background_status(line: str) -> None:
             handle.write(f"{timestamp} {line}\n")
     except Exception:
         pass
+
+
+def _notify_background_failure(exit_code: int) -> None:
+    if not (os.environ.get("CCB_PEER_STATUS_FILE") or "").strip():
+        return
+    task_id = (os.environ.get("CCB_REQ_ID") or "").strip() or "unknown"
+    provider = (os.environ.get("CCB_PEER_PROVIDER") or "claude").strip().lower()
+    log_file = (os.environ.get("CCB_PEER_LOG_FILE") or "").strip()
+    reply_to = (os.environ.get("CCB_PEER_REPLY_TO") or "").strip()
+    if reply_to:
+        recovery = f" The reply remains saved; run `pend {reply_to}` to recover it."
+    else:
+        recovery = f" Inspect the task log or run `pend {task_id}` for details."
+    notify_completion(
+        provider=f"peer-{provider}",
+        output_file=log_file or None,
+        reply=(
+            f"Peer {provider.capitalize()} delivery failed "
+            f"(exit code {exit_code}).{recovery}"
+        ),
+        req_id=task_id,
+        done_seen=False,
+        caller=(os.environ.get("CCB_CALLER") or "claude").strip().lower(),
+        work_dir=(os.environ.get("CCB_WORK_DIR") or "").strip(),
+        status=COMPLETION_STATUS_FAILED,
+        caller_pane_id=(os.environ.get("CCB_CALLER_PANE_ID") or "").strip(),
+        caller_terminal=(os.environ.get("CCB_CALLER_TERMINAL") or "").strip(),
+    )
 
 
 def _task_id() -> str:
@@ -504,4 +533,5 @@ if __name__ == "__main__":
     _write_background_status(f"finished exit_code={exit_code}")
     if exit_code != 0:
         _write_background_status(f"failed exit_code={exit_code}")
+        _notify_background_failure(exit_code)
     sys.exit(exit_code)

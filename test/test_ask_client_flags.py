@@ -759,10 +759,55 @@ def test_peer_background_uses_resolved_sender_for_receipt_status_and_bridge(
     sender_index = captured["cmd"].index("--sender-work-dir") + 1
     assert captured["cmd"][sender_index] == str(project.resolve())
     assert captured["env"]["CCB_WORK_DIR"] == str(project.resolve())
+    assert captured["env"]["CCB_PEER_PROVIDER"] == "claude"
+    assert captured["env"]["CCB_PEER_LOG_FILE"].endswith(
+        "ask-peer-claude-task-fixed.log"
+    )
     if ask.os.name == "nt":
         assert captured["popen_kwargs"]["creationflags"]
     else:
         assert captured["popen_kwargs"]["start_new_session"] is True
+
+
+def test_unified_daemon_spills_oversized_foreground_reply(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ask = _load_ask_module()
+    state_file = tmp_path / "askd.json"
+    monkeypatch.setenv("CCB_RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(
+        askd_rpc,
+        "read_state",
+        lambda _path: {
+            "host": "127.0.0.1",
+            "port": 31337,
+            "token": "tok",
+            "work_dir": str(tmp_path),
+        },
+    )
+    monkeypatch.setattr(
+        askd_rpc,
+        "request_daemon",
+        lambda _state, _request, **_kwargs: {
+            "exit_code": 0,
+            "req_id": "req-large",
+            "reply": "x" * (64 * 1024 + 1),
+        },
+    )
+    monkeypatch.setattr(ask, "_find_running_unified_state_file", lambda **_kwargs: state_file)
+    monkeypatch.setattr(ask, "_maybe_start_unified_daemon", lambda: False)
+    monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("%1", "tmux"))
+
+    rc = ask._send_via_unified_daemon(
+        "codex", "hello", 1.0, False, "claude"
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "[CCB_RESULT_SPILLED]" in output
+    assert (
+        tmp_path / "run" / "completions" / "req-large.md"
+    ).stat().st_size == 64 * 1024 + 1
 
 
 def test_peer_notify_does_not_require_mounted_sender(monkeypatch, tmp_path: Path) -> None:

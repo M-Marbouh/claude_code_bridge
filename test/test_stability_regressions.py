@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import threading
@@ -42,6 +43,29 @@ def test_completion_hook_uses_status_marker_and_directional_workdir_matching() -
     assert completion_status_marker("cancelled") in message
     assert hook._work_dirs_compatible("/repo", "/repo/subdir") is True
     assert hook._work_dirs_compatible("/repo/subdir", "/repo") is False
+
+
+def test_completion_hook_keeps_bounded_reply_inline(monkeypatch) -> None:
+    hook = _load_script_module("ccb_completion_hook_inline", REPO_ROOT / "bin" / "ccb-completion-hook")
+    monkeypatch.setenv("CCB_COMPLETION_INLINE_MAX_BYTES", "16")
+
+    assert hook._prepare_terminal_reply("1234567890abcdef", "req-1") == "1234567890abcdef"
+
+
+def test_completion_hook_spills_oversized_reply_losslessly(monkeypatch, tmp_path: Path) -> None:
+    hook = _load_script_module("ccb_completion_hook_spill", REPO_ROOT / "bin" / "ccb-completion-hook")
+    monkeypatch.setenv("CCB_COMPLETION_INLINE_MAX_BYTES", "64")
+    monkeypatch.setenv("CCB_RUN_DIR", str(tmp_path))
+    reply = "Summary\n" + ("evidence\n" * 20) + "UNIQUE_TAIL"
+
+    prepared = hook._prepare_terminal_reply(reply, "req-1")
+
+    result_path = tmp_path / "completions" / "req-1.md"
+    assert result_path.read_text(encoding="utf-8") == reply
+    assert "[CCB_RESULT_SPILLED]" in prepared
+    assert f"Full result: {result_path}" in prepared
+    assert f"SHA-256: {hashlib.sha256(reply.encode('utf-8')).hexdigest()}" in prepared
+    assert "UNIQUE_TAIL" not in prepared
 
 
 def test_completion_hook_manual_caller_is_noop(monkeypatch) -> None:

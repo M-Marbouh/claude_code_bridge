@@ -64,6 +64,7 @@ def wrap_codex_prompt(message: str, req_id: str) -> str:
         "IMPORTANT:\n"
         "- Reply normally.\n"
         "- Reply normally, in English.\n"
+        "- The marker-bearing reply is the sole delivered result; make it self-contained and do not repeat interim reports.\n"
         "- End your reply with this exact final line (verbatim, on its own line):\n"
         f"{DONE_PREFIX} {req_id}\n"
     )
@@ -161,6 +162,22 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
         segment = segment[:-1]
 
     return "\n".join(segment).rstrip()
+
+
+def select_codex_reply(
+    terminal_reply: str | None,
+    latest_final: str | None,
+    combined: str,
+    req_id: str,
+) -> str:
+    """Select the single Codex reply that belongs to a completed request."""
+    if terminal_reply:
+        selected = strip_done_text(terminal_reply, req_id)
+        if selected:
+            return selected
+    if latest_final:
+        return strip_done_text(latest_final, req_id)
+    return extract_reply_for_req(combined, req_id)
 
 
 @dataclass(frozen=True)

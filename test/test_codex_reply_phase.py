@@ -75,23 +75,31 @@ def test_extract_event_user_has_empty_phase() -> None:
 
 def test_assemble_reply_returns_final_only() -> None:
     req_id = "20260603-101010-000-1-1"
-    final_chunks = [f"Implemented the fix.\nFiles: a.ts\nCCB_DONE: {req_id}"]
+    terminal_reply = f"Implemented the fix.\nFiles: a.ts\nCCB_DONE: {req_id}"
     combined = "\n".join([
         "I'm checking blast radius first.",
         "tsc passed, running tests.",
-        f"Implemented the fix.\nFiles: a.ts\nCCB_DONE: {req_id}",
+        terminal_reply,
     ])
-    reply = codex_adapter._assemble_reply(final_chunks, combined, req_id)
+    reply = codex_adapter._assemble_reply(terminal_reply, "Earlier final.", combined, req_id)
     assert reply == "Implemented the fix.\nFiles: a.ts"
     assert "checking blast radius" not in reply
+    assert "Earlier final" not in reply
     assert "CCB_DONE" not in reply
+
+
+def test_assemble_reply_uses_latest_final_for_degraded_completion() -> None:
+    req_id = "20260603-101010-000-1-2"
+    combined = "Earlier final.\nLatest final."
+    reply = codex_adapter._assemble_reply(None, "Latest final.", combined, req_id)
+    assert reply == "Latest final."
 
 
 def test_assemble_reply_legacy_fallback_when_no_phase() -> None:
     # Old Codex: no final_answer captured -> fall back to full anchor->DONE span.
-    req_id = "20260603-101010-000-1-2"
+    req_id = "20260603-101010-000-1-3"
     combined = f"Legacy single message reply.\nCCB_DONE: {req_id}"
-    reply = codex_adapter._assemble_reply([], combined, req_id)
+    reply = codex_adapter._assemble_reply(None, None, combined, req_id)
     assert reply == "Legacy single message reply."
 
 
@@ -224,6 +232,21 @@ def test_handle_task_final_answer_carries_done(monkeypatch, tmp_path: Path) -> N
     assert result.done_seen is True
     assert result.reply == "Implemented the fix.\nFiles: a.ts"
     assert "Working on it" not in result.reply
+
+
+def test_handle_task_replayed_finals_return_only_done_bearing_final(
+    monkeypatch, tmp_path: Path
+) -> None:
+    req_id = make_req_id()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [
+        ("assistant", "Historical report that must not be delivered.", "final_answer"),
+        ("assistant", "Historical report that must not be delivered.", "final_answer"),
+        ("assistant", "Final complete report.\nCCB_DONE: " + req_id, "event"),
+    ])
+
+    assert result.done_seen is True
+    assert result.reply == "Final complete report."
+    assert "Historical report" not in result.reply
 
 
 def test_handle_task_can_suppress_completion_hook(monkeypatch, tmp_path: Path) -> None:

@@ -32,6 +32,72 @@ def _load_pend_module():
     return module
 
 
+def test_pend_codex_recovery_returns_only_marker_bearing_final(
+    monkeypatch, tmp_path: Path
+) -> None:
+    pend = _load_pend_module()
+    task_id = "20260729-120000-000-1"
+    session_root = tmp_path / "sessions"
+    log = session_root / "rollout.jsonl"
+    log.parent.mkdir(parents=True)
+    entries = [
+        {
+            "type": "session_meta",
+            "payload": {"cwd": str(tmp_path)},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": f"CCB_REQ_ID: {task_id}\nQuestion",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Historical A"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Historical B"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": f"Actual final\nCCB_DONE: {task_id}",
+                    }
+                ],
+            },
+        },
+    ]
+    log.write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(session_root))
+
+    recovered = pend._recover_codex_reply(
+        {"task_id": task_id, "work_dir": str(tmp_path)}
+    )
+
+    assert recovered == "Actual final"
+
+
 def test_pend_skills_preserve_same_turn_async_guardrail() -> None:
     for relative in (
         "claude_skills/pend/SKILL.md",

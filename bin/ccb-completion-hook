@@ -25,7 +25,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -42,6 +41,7 @@ from completion_hook import (
     normalize_completion_status,
 )
 from session_utils import find_project_session_file
+from reply_artifacts import prepare_agent_visible_reply
 
 setup_windows_encoding()
 
@@ -384,6 +384,12 @@ Result: {reply_content}
 """
 
 
+def _prepare_terminal_reply(reply_content: str, req_id: str) -> str:
+    return prepare_agent_visible_reply(
+        reply_content, req_id, debug_log=_debug_log
+    )
+
+
 def send_email_reply(provider: str, reply_content: str, *, status: str) -> bool:
     """Send reply via email when CCB_CALLER=email."""
     try:
@@ -527,9 +533,12 @@ def main() -> int:
         "codex": "Codex",
         "gemini": "Gemini",
         "opencode": "OpenCode",
+        "peer-claude": "Peer Claude",
+        "peer-codex": "Peer Codex",
     }
     provider_display = provider_names.get(provider, provider.capitalize())
     req_id = args.req_id or "unknown"
+    reply_content = _prepare_terminal_reply(reply_content, req_id)
 
     message = _render_terminal_message(
         provider_display,

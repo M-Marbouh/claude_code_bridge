@@ -949,7 +949,7 @@ class WeztermBackend(TerminalBackend):
 
         return False
 
-    def _send_enter(self, pane_id: str) -> None:
+    def _send_enter(self, pane_id: str) -> bool:
         """
         Send Enter to submit the current input in a TUI.
 
@@ -975,7 +975,7 @@ class WeztermBackend(TerminalBackend):
             # Try key injection first (works better with raw-mode TUIs)
             if method in {"key", "auto"}:
                 if self._send_key_cli(pane_id, "Enter"):
-                    return
+                    return True
 
             # Fallback: send CR byte; works for shells/readline, but not for all raw-mode TUIs.
             if method in {"auto", "text"}:
@@ -985,10 +985,11 @@ class WeztermBackend(TerminalBackend):
                     capture_output=True,
                 )
                 if result.returncode == 0:
-                    return
+                    return True
 
             if attempt < max_retries - 1:
                 time.sleep(0.05)
+        return False
 
     def send_text(self, pane_id: str, text: str) -> None:
         sanitized = text.replace("\r", "").strip()
@@ -1011,7 +1012,8 @@ class WeztermBackend(TerminalBackend):
                     input=sanitized.encode("utf-8"),
                     check=True,
                 )
-            self._send_enter(pane_id)
+            if not self._send_enter(pane_id):
+                raise RuntimeError(f"failed to submit text to WezTerm pane {pane_id}")
             return
 
         # Slow path: multiline or long text -> use paste mode (bracketed paste)
@@ -1026,7 +1028,8 @@ class WeztermBackend(TerminalBackend):
         if paste_delay:
             time.sleep(paste_delay)
 
-        self._send_enter(pane_id)
+        if not self._send_enter(pane_id):
+            raise RuntimeError(f"failed to submit text to WezTerm pane {pane_id}")
 
     def pane_log_path(self, pane_id: str) -> Optional[Path]:
         pid = (pane_id or "").strip()

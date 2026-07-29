@@ -58,6 +58,7 @@ from ccb_runtime_status import (
     resolve_daemon_work_dir,
 )
 from project_id import compute_ccb_project_id
+from reply_artifacts import prepare_agent_visible_reply
 from session_utils import find_project_session_file
 from task_receipts import new_peer_receipt, new_receipt, receipt_path, write_receipt
 
@@ -460,7 +461,10 @@ def _send_via_unified_daemon(
             exit_code = int(resp.get("exit_code") or 0)
             reply = resp.get("reply") or ""
             if reply:
-                print(reply)
+                reply_req_id = str(
+                    resp.get("req_id") or req.get("req_id") or req["id"]
+                )
+                print(prepare_agent_visible_reply(reply, reply_req_id))
             return exit_code
         except askd_rpc.DaemonConnectionError as e:
             if attempt == 0:
@@ -837,6 +841,10 @@ def _run_peer_bridge_background(
     env["CCB_CALLER"] = caller
     env["CCB_WORK_DIR"] = sender_work_dir_str
     env["CCB_PEER_STATUS_FILE"] = str(status_file)
+    env["CCB_PEER_LOG_FILE"] = str(log_file)
+    env["CCB_PEER_PROVIDER"] = peer_provider
+    if reply_to:
+        env["CCB_PEER_REPLY_TO"] = reply_to
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
     if caller_terminal:

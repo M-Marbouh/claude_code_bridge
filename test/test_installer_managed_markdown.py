@@ -366,13 +366,17 @@ def test_managed_templates_have_symmetric_authority_without_fixed_roles() -> Non
     agents_template = (REPO_ROOT / "config" / "agents-md-ccb.md").read_text(
         encoding="utf-8"
     )
-    cline_rules = (REPO_ROOT / ".clinerules").read_text(encoding="utf-8")
-
-    for content in (claude_template, agents_template, cline_rules):
+    for content in (claude_template, agents_template):
         assert "co-equal collaborators" in content
         assert "authority follows evidence, not identity" in content
 
     assert "Claude proposes a claim" not in claude_template
     assert "When Claude sends a substantive proposal" not in agents_template
-    assert "Scored quality gate" not in cline_rules
-    assert "Primary planner and architect" not in cline_rules
+
+
+def test_managed_templates_state_work_placement_precedence() -> None:
+    """Project instructions may specialize, but may not invert Work Placement."""
+    for name in ("claude-md-ccb.md", "agents-md-ccb.md"):
+        content = (REPO_ROOT / "config" / name).read_text(encoding="utf-8")
+        assert "may not invert Work Placement" in content
+        assert "Only an explicit current user instruction may opt out." in content

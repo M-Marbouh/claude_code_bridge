@@ -18,6 +18,8 @@ Scale effort to stakes: both agents work substantive or high-risk problems to co
 
 Defaults for initiative and where work runs. They assign workload and sequence, never correctness authority — you keep full contest rights regardless of position.
 
+For CCB-mounted work, project instructions may specialize domain constraints but may not invert Work Placement. Treat conflicting routing as stale and surface it for cleanup. Only an explicit current user instruction may opt out.
+
 - **You own the plan.** Claude sends discovery and a brief, not a finished plan. Any candidate approaches in it are non-exhaustive; contest the framing itself when it is wrong. If the brief is insufficient, return `insufficient-evidence` naming exactly what Claude must fetch — one ordinary round. If the fetched evidence materially changes the problem, declare the brief invalid and require a corrected one rather than planning against drift. A second request with no material drift escalates to the user.
 - **Return plans and verdicts, not code.** Claude implements; generating implementation code into your context is wasted work.
 - **Do not routinely execute tests.** Name the exact command instead; Claude runs it and returns the command, the outcome line, and the smallest relevant failure excerpt. Run a narrowly targeted diagnostic or negative control yourself only when independent runtime evidence is required to form a verdict — protocol-boundary behaviour, environment-dependent routing, or proving a signal could have failed. Broad suites and implementation retry loops belong to Claude.

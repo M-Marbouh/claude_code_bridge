@@ -23,6 +23,8 @@ def isolate_process_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "CCB_SESSION_ID",
         "CCB_CALLER_PANE_ID",
         "CCB_CALLER_TERMINAL",
+        "CCB_ROUTE_LAUNCH_ID",
+        "CCB_CALLER_LIVE_ID",
         "WEZTERM_PANE",
         "TMUX_PANE",
     ):

@@ -25,6 +25,7 @@ from gaskd_protocol import extract_reply_for_req, is_done_text, wrap_gemini_prom
 from gaskd_session import compute_session_key, load_project_session
 from gemini_comm import GeminiLogReader
 from providers import GASKD_SPEC
+from task_receipts import PersistOutcome, persist_proven_result
 from terminal import get_backend_for_session
 
 
@@ -286,6 +287,29 @@ class GeminiAdapter(BaseProviderAdapter):
         reply_for_hook = final_reply
         if not reply_for_hook.strip():
             reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
+        result = ProviderResult(
+            exit_code=0 if done_seen else 2,
+            reply=final_reply,
+            req_id=task.req_id,
+            session_key=session_key,
+            done_seen=done_seen,
+            done_ms=done_ms,
+            status=status,
+        )
+        _write_log(f"[INFO] done provider=gemini req_id={task.req_id} exit={result.exit_code}")
+
+        # Task 2/Item 5: persist the proven result BEFORE any notification.
+        # A receipt that exists but could not be saved suppresses
+        # notification entirely.
+        persist_outcome = PersistOutcome.NO_RECEIPT
+        try:
+            persist_outcome = persist_proven_result(task.req_id, reply=reply_for_hook, status=status)
+        except Exception:
+            persist_outcome = PersistOutcome.FAILED
+        if persist_outcome == PersistOutcome.FAILED:
+            _write_log(f"[WARN] proven result could not be saved; suppressing notification req_id={task.req_id}")
+            return result
+
         notify_completion(
             provider="gemini",
             output_file=req.output_path,
@@ -300,16 +324,8 @@ class GeminiAdapter(BaseProviderAdapter):
             work_dir=req.work_dir,
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
+            caller_live_id=req.route.caller_live_id if req.route.present else "",
+            route_launch_id=req.route.launch_id if req.route.present else "",
         )
 
-        result = ProviderResult(
-            exit_code=0 if done_seen else 2,
-            reply=final_reply,
-            req_id=task.req_id,
-            session_key=session_key,
-            done_seen=done_seen,
-            done_ms=done_ms,
-            status=status,
-        )
-        _write_log(f"[INFO] done provider=gemini req_id={task.req_id} exit={result.exit_code}")
         return result

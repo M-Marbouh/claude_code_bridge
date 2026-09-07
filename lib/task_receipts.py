@@ -5,10 +5,12 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from cli_output import atomic_write_text
 from project_id import compute_ccb_project_id
+from askd.adapters.base import ResolvedRoute
+from completion_hook import COMPLETION_STATUS_COMPLETED as _COMPLETION_STATUS_COMPLETED
 
 
 RECEIPT_SCHEMA_VERSION = 1
@@ -48,6 +50,30 @@ def caller_session_id() -> str:
     return (os.environ.get("CCB_SESSION_ID") or "").strip()
 
 
+def _identity_fields_from_route(route: Optional[ResolvedRoute]) -> dict[str, Any]:
+    """The exact-identity block Task 1 adds to a receipt, additively.
+
+    Deliberately EMPTY (no keys at all) unless `route` is a `ResolvedRoute`
+    that was actually resolved (`route.present`): a receipt created for a
+    request that never had a route (no inventory, legacy path, email/manual
+    caller, notify-only) must come out byte-identical to a receipt created
+    before this function existed. Nothing here ever infers identity from
+    anything else on the receipt -- it only ever copies what the route
+    already proved.
+    """
+    if route is None or not route.present:
+        return {}
+    return {
+        "route_launch_id": route.launch_id,
+        "destination_live_id": route.live_id,
+        "destination_pane_id": route.pane_id,
+        "destination_terminal": route.terminal,
+        "destination_session_file": route.session_file,
+        "destination_ccb_project_id": route.ccb_project_id,
+        "caller_live_id": route.caller_live_id,
+    }
+
+
 def new_receipt(
     *,
     task_id: str,
@@ -57,6 +83,7 @@ def new_receipt(
     status_file: Path,
     log_file: Path,
     timeout_seconds: float | None = None,
+    route: Optional[ResolvedRoute] = None,
 ) -> dict[str, Any]:
     pane_id, terminal = caller_pane()
     try:
@@ -79,6 +106,7 @@ def new_receipt(
     }
     if timeout_seconds is not None:
         receipt["timeout_seconds"] = float(timeout_seconds)
+    receipt.update(_identity_fields_from_route(route))
     return receipt
 
 
@@ -223,6 +251,173 @@ def find_receipt(task_id: str, *, root: Path | None = None) -> tuple[Path, dict[
         return None
     matches = [(path, data) for path, data in iter_receipts(root=root) if data.get("task_id") == wanted]
     return matches[0] if len(matches) == 1 else None
+
+
+def server_result_path(receipt: dict[str, Any]) -> Path | None:
+    """Where the server-side (adapter/daemon) persisted result lives for a
+    receipt -- derived from `log_file`, never a new field a receipt must
+    already carry, so this resolves correctly even for a receipt written
+    before this existed.
+
+    Deliberately a DIFFERENT file from `log_file` itself: that file is, and
+    remains, exclusively populated by the client-side stdout capture that
+    has always owned it. Writing here from a second process (the daemon's
+    worker thread, ahead of that capture) would otherwise race it instead
+    of reliably beating it to disk.
+    """
+    raw = str(receipt.get("log_file") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).with_suffix(".result")
+
+
+def _read_server_result_payload(receipt: dict[str, Any]) -> dict[str, Any] | None:
+    path = server_result_path(receipt)
+    if path is None:
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    except Exception:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def read_server_result(receipt: dict[str, Any]) -> str:
+    """Item 1: the provider adapter's own pre-notification save, but ONLY
+    when it represents a genuinely FINISHED answer (persisted `status` ==
+    the completed status -- see `persist_proven_result`).
+
+    A saved INCOMPLETE/CANCELLED/FAILED placeholder must never read as a
+    finished answer: this returns `""` for one, exactly as it does for a
+    receipt with nothing persisted at all, so every existing caller that
+    treats a truthy result as "done" keeps working, and none of them start
+    treating a placeholder as done. Callers needing the raw persisted
+    status regardless of finality use `read_server_result_status`.
+    """
+    payload = _read_server_result_payload(receipt)
+    if payload is None:
+        return ""
+    if str(payload.get("status") or "") != _COMPLETION_STATUS_COMPLETED:
+        return ""
+    return str(payload.get("reply") or "").strip()
+
+
+def read_server_result_status(receipt: dict[str, Any]) -> str:
+    """The raw persisted status, whatever it is -- empty when nothing has
+    been persisted yet. Unlike `read_server_result`, this does NOT gate on
+    finality; it is what lets a caller tell "nothing saved yet" apart from
+    "a placeholder was saved" apart from "the real answer was saved"."""
+    payload = _read_server_result_payload(receipt)
+    if payload is None:
+        return ""
+    return str(payload.get("status") or "")
+
+
+class PersistOutcome:
+    """Item 5: what happened when a provider adapter tried to persist its
+    proven result, for the adapter's OWN use in deciding whether to notify.
+
+    - NO_RECEIPT: this request has no async receipt at all (a foreground or
+      notify-only call never created one). Not a failure -- there was
+      nothing to save to, so notification proceeds exactly as before this
+      mechanism existed.
+    - SAVED: the reply text was durably written to the receipt's result
+      sidecar. Notification may proceed.
+    - FAILED: a receipt WAS expected (one exists for this task id) but the
+      reply text could not be written. The adapter must suppress automatic
+      notification -- delivering "your task is done" when the durable
+      answer failed to save is exactly the failure this ordering exists to
+      prevent.
+    """
+
+    NO_RECEIPT = "no_receipt"
+    SAVED = "saved"
+    FAILED = "failed"
+
+
+def persist_proven_result(
+    req_id: str,
+    *,
+    reply: str = "",
+    status: str = "",
+    transcript_path: str = "",
+    conversation_id: str = "",
+    root: Path | None = None,
+) -> str:
+    """Called by a provider adapter, inside the daemon, BEFORE any
+    completion notification is even attempted -- so a delivery that then
+    fails or is suppressed always leaves the answer, and the exact
+    conversation it was proven to come from, already durable and findable
+    by `req_id` alone. Returns one of `PersistOutcome.{NO_RECEIPT,SAVED,
+    FAILED}`; see that class for what the adapter must do with each.
+
+    `status` (a `completion_hook.COMPLETION_STATUS_*` value) is persisted
+    alongside the reply so a later reader can tell a genuinely finished
+    answer apart from an incomplete/cancelled/failed placeholder --
+    `read_server_result` only ever returns text for the former. This is
+    also why a placeholder never blocks a later, real reply from
+    superseding it: a placeholder is never treated as authoritative, so
+    retrieval keeps falling through to recovery (`destination_transcript_
+    path`, below) until a genuinely completed result is persisted.
+
+    `transcript_path`/`conversation_id` are the adapter's OWN proof,
+    captured at the moment it confirmed the request anchor -- the exact
+    native transcript file this reply came from, and that transcript's own
+    session identity -- never the mutable `destination_session_file`
+    binding captured at ask-time, which a LATER, unrelated ask can silently
+    repoint at a different conversation. A metadata-only update (this pair
+    changed but the reply body did not, or could not, get written) is
+    NEVER reported as SAVED on its own -- only a durably-written reply body
+    counts as having saved the answer.
+    """
+    found = find_receipt(req_id, root=root)
+    if found is None:
+        return PersistOutcome.NO_RECEIPT
+    path, receipt = found
+
+    # Correction 2: once a receipt IS found, the default outcome is
+    # FAILED, not NO_RECEIPT -- NO_RECEIPT means "nothing was ever
+    # expected to be saved here," which is no longer true the moment a
+    # receipt exists. An empty reply body (which should not happen in
+    # practice; every adapter always computes a non-empty `reply_for_hook`)
+    # must not silently read as "nothing to save" and let the caller
+    # notify normally -- that defeats save-before-notify for exactly the
+    # case where nothing was saved. Only a durably written reply body ever
+    # moves this to SAVED.
+    outcome = PersistOutcome.FAILED
+    body = (reply or "").strip()
+    if body:
+        result_path = server_result_path(receipt)
+        if result_path is None:
+            outcome = PersistOutcome.FAILED
+        else:
+            try:
+                payload = json.dumps({"reply": body, "status": status or ""}, ensure_ascii=False)
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(result_path, payload + "\n")
+                outcome = PersistOutcome.SAVED
+            except Exception:
+                outcome = PersistOutcome.FAILED
+
+    updated = dict(receipt)
+    changed = False
+    if transcript_path and str(receipt.get("destination_transcript_path") or "") != transcript_path:
+        updated["destination_transcript_path"] = transcript_path
+        changed = True
+    if conversation_id and str(receipt.get("destination_conversation_id") or "") != conversation_id:
+        updated["destination_conversation_id"] = conversation_id
+        changed = True
+    if changed:
+        try:
+            write_receipt(path, updated)
+        except Exception:
+            pass
+
+    return outcome
 
 
 def update_peer_delivery(

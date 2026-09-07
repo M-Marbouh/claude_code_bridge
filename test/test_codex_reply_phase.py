@@ -198,6 +198,39 @@ def _drive_handle_task(
     return adapter.handle_task(task)
 
 
+def test_handle_task_persists_proven_result_before_any_notification(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Task 2 (round-1 claim rejected on review): Codex calls
+    `notify_completion` before returning its result, so "a notification
+    failure cannot prevent a later save" is NOT sufficient -- the adapter
+    must persist the proven result to disk FIRST, server-side, before
+    notification is even attempted. Verified here against the REAL
+    `handle_task`, not a reimplementation: `persist_proven_result` is
+    tracked to prove no notification has happened yet at the moment it
+    runs, and exactly one notification follows it."""
+    req_id = make_req_id()
+    final = f"Implemented the fix.\nCCB_DONE: {req_id}"
+    notifications: list[dict] = []
+    persisted_before_notify: list[bool] = []
+
+    def _tracking_persist(*_args, **_kwargs):
+        persisted_before_notify.append(len(notifications) == 0)
+
+    monkeypatch.setattr(codex_adapter, "persist_proven_result", _tracking_persist)
+
+    _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", final, "final_answer")],
+        notifications=notifications,
+    )
+
+    assert persisted_before_notify == [True]
+    assert len(notifications) == 1
+
+
 def test_handle_task_real_ordering_event_twin_done_first(monkeypatch, tmp_path: Path) -> None:
     # Models the ACTUAL Codex rollout ordering: each message is logged as an
     # event twin then the canonical response_item. The final answer's event
@@ -266,6 +299,62 @@ def test_handle_task_can_suppress_completion_hook(monkeypatch, tmp_path: Path) -
 
     assert result.done_seen is True
     assert notifications == []
+
+
+def test_handle_task_suppresses_notification_when_result_could_not_be_saved(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 5: `persist_proven_result` swallowing write failures and the
+    adapter notifying anyway is exactly the failure save-before-notify
+    exists to prevent. Force the save to report FAILED (a receipt WAS
+    expected) and prove notification is suppressed -- NO TERMINAL SEND
+    (via `notify_completion`) occurs, even though the task itself still
+    completed successfully and its result is still returned to the
+    caller."""
+    req_id = make_req_id()
+    final = f"Implemented the fix.\nCCB_DONE: {req_id}"
+    notifications: list[dict] = []
+    monkeypatch.setattr(
+        codex_adapter, "persist_proven_result", lambda *a, **k: "failed"
+    )
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", final, "final_answer")],
+        notifications=notifications,
+    )
+
+    assert result.done_seen is True
+    assert result.reply == "Implemented the fix."
+    # NO TERMINAL SEND OCCURRED: notify_completion was never reached.
+    assert notifications == []
+
+
+def test_handle_task_notifies_normally_when_no_receipt_was_expected(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The other half of Item 5: NO_RECEIPT (a foreground/notify-only call
+    with nothing to save to) must NOT be treated as a failure -- it must
+    not suppress notification."""
+    req_id = make_req_id()
+    final = f"Implemented the fix.\nCCB_DONE: {req_id}"
+    notifications: list[dict] = []
+    monkeypatch.setattr(
+        codex_adapter, "persist_proven_result", lambda *a, **k: "no_receipt"
+    )
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", final, "final_answer")],
+        notifications=notifications,
+    )
+
+    assert result.done_seen is True
+    assert len(notifications) == 1
 
 
 def test_handle_task_delivery_only_stops_at_anchor_without_capturing_reply(
@@ -360,6 +449,77 @@ def test_handle_task_unbound_requires_anchor(monkeypatch, tmp_path: Path) -> Non
     assert result.done_seen is False
     assert result.anchor_seen is False
     assert result.reply == ""
+
+
+def test_handle_task_records_transcript_proof_at_anchor_even_on_timeout(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 2: transcript identity must be recorded at the moment the
+    request ANCHOR is confirmed, not from finalization state. A request
+    that times out AFTER its anchor was seen (no CCB_DONE ever arrives)
+    must still have proof recorded -- that proof is what lets a LATER,
+    genuinely completed reply be found by recovery, even though this
+    request itself ended incomplete."""
+    req_id = make_req_id()
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    log_path = tmp_path / f"{sid}.jsonl"
+    log_path.write_text("", encoding="utf-8")
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        codex_adapter,
+        "persist_proven_result",
+        lambda req_id, **kwargs: persisted.append(kwargs) or "saved",
+    )
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [],  # anchor only (prepended by _drive_handle_task) -- no reply ever arrives
+        timeout_s=0.05,
+        log_path=log_path,
+    )
+
+    assert result.anchor_seen is True
+    assert result.done_seen is False
+    assert len(persisted) == 1
+    assert persisted[0]["transcript_path"] == str(log_path)
+
+
+def test_handle_task_never_records_transcript_proof_when_unanchored(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 2's other half: a request that times out WITHOUT its anchor
+    ever being confirmed must NOT have any transcript proof recorded --
+    the adapter never established that this transcript belongs to this
+    request at all, so recording one anyway would be proof it never
+    earned."""
+    req_id = make_req_id()
+    sid = "11111111-2222-3333-4444-555555555555"
+    log_path = tmp_path / f"{sid}.jsonl"
+    log_path.write_text("", encoding="utf-8")
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        codex_adapter,
+        "persist_proven_result",
+        lambda req_id, **kwargs: persisted.append(kwargs) or "saved",
+    )
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", f"Wrong pane output.\nCCB_DONE: {req_id}", "event")],
+        include_anchor=False,
+        timeout_s=0.05,
+        log_path=log_path,
+    )
+
+    assert result.anchor_seen is False
+    assert result.done_seen is False
+    assert len(persisted) == 1
+    assert persisted[0]["transcript_path"] == ""
+    assert persisted[0]["conversation_id"] == ""
 
 
 def test_handle_task_anchor_confirmed_completion_repairs_binding(monkeypatch, tmp_path: Path) -> None:

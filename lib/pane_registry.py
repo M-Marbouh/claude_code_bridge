@@ -305,6 +305,70 @@ def resolve_live_session_by_id(launch_id: str, live_id: str) -> Optional[LiveSes
     return matches[0]
 
 
+def confirm_caller_pane(
+    *,
+    launch_id: str,
+    caller_live_id: str = "",
+    pane_id: str,
+    terminal: str = "",
+) -> Optional[LiveSession]:
+    """Re-confirm, from a FRESH registry read, that `pane_id` still names the
+    SAME live session that originally issued a request -- used by completion
+    delivery (Task 3) to decide whether it is safe to push the finished
+    answer into that pane, never to pick a destination.
+
+    Returns the live session `pane_id`/`terminal` currently resolve to
+    within `launch_id`'s inventory, or `None` when that cannot be
+    established: the launch record is gone or stale, its inventory is
+    broken, the pane no longer identifies exactly one session there, that
+    session is no longer active, or (when `caller_live_id` was supplied) the
+    pane's current identity contradicts it. A caller getting `None` back
+    must suppress delivery rather than send anyway or search for somewhere
+    else to put the answer -- this function never selects among candidates.
+
+    A record with no `live_sessions` key at all -- today's universal case
+    -- is NOT the same as a broken one: `read_inventory` still projects it
+    to one live session per provider (`INVENTORY_ABSENT`), and this
+    function accepts that projection exactly the way every other consumer
+    of `read_inventory_for_record` does. Only a `live_sessions` key that is
+    actually present and malformed (`INVENTORY_INVALID`) refuses here --
+    gating on `.valid` instead would suppress delivery for every launch
+    that exists today, which is precisely the "record with no inventory
+    behaves byte-identically to today" requirement this function must not
+    violate.
+
+    `caller_live_id` is corroborating evidence, not a shortcut: identity is
+    always re-established from `pane_id`/`terminal` against a fresh read
+    (via `live_sessions.find_caller`), and a supplied `caller_live_id` is
+    only ever used to REFUSE on disagreement, never trusted on its own.
+    """
+    launch_id = (launch_id or "").strip()
+    pane_id = (pane_id or "").strip()
+    if not launch_id or not pane_id:
+        return None
+
+    record = load_registry_by_session_id(launch_id)
+    if record is None:
+        return None
+
+    inventory = read_inventory_for_record(record)
+    if inventory.status == INVENTORY_INVALID:
+        return None
+
+    session = find_caller(inventory.sessions, pane_id=pane_id, terminal=terminal)
+    if session is None:
+        return None
+
+    wanted_live_id = (caller_live_id or "").strip()
+    if wanted_live_id and session.live_id != wanted_live_id:
+        return None
+
+    if not session.active:
+        return None
+
+    return session
+
+
 def _evidence_agrees(expected: str, actual: str) -> bool:
     """True unless both sides are non-empty and disagree.
 

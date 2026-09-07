@@ -1462,6 +1462,7 @@ def main(argv: list[str]) -> int:
                 status_file=status_file,
                 log_file=log_file,
                 timeout_seconds=timeout,
+                route=local_route,
             ),
         )
     except Exception as exc:

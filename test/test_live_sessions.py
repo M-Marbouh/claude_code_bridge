@@ -492,3 +492,113 @@ def test_live_sessions_from_record_is_a_thin_wrapper_over_read_inventory() -> No
         "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
     }
     assert live_sessions_from_record(record) == list(read_inventory(record).sessions)
+
+
+# --- Task 3: `pane_registry.confirm_caller_pane` -- completion delivery must
+# re-confirm the caller's identity from a fresh registry read before pushing
+# the finished answer into a terminal pane, never trust the pane id alone. ---
+
+
+def test_confirm_caller_pane_confirms_todays_universal_legacy_record(
+    tmp_path, monkeypatch
+) -> None:
+    """The record shape every launch has TODAY: no `live_sessions` key at
+    all, just `providers`. `read_inventory` projects this to one legacy
+    session per provider (`INVENTORY_ABSENT`, not `INVENTORY_VALID`).
+    `confirm_caller_pane` must still confirm against that projection --
+    gating on strict validity here would suppress completion delivery for
+    every launch that exists today, which is exactly what "a record with no
+    inventory behaves byte-identically to today" forbids."""
+    from pane_registry import confirm_caller_pane, upsert_registry
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path),
+            "providers": {"claude": {"pane_id": "7", "terminal": "tmux"}},
+        }
+    )
+
+    confirmed = confirm_caller_pane(launch_id="ai-1", pane_id="7", terminal="tmux")
+
+    assert confirmed is not None
+    assert confirmed.provider == "claude"
+
+
+def test_confirm_caller_pane_matches_by_pane_without_a_saved_live_id(
+    tmp_path, monkeypatch
+) -> None:
+    from pane_registry import confirm_caller_pane, upsert_registry
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path),
+            "live_sessions": [
+                {"live_id": "claude-1", "provider": "claude", "pane_id": "7", "terminal": "tmux"},
+                {"live_id": "codex-1", "provider": "codex", "pane_id": "8", "terminal": "tmux"},
+            ],
+        }
+    )
+
+    confirmed = confirm_caller_pane(launch_id="ai-1", pane_id="7", terminal="tmux")
+
+    assert confirmed is not None
+    assert confirmed.live_id == "claude-1"
+
+
+def test_confirm_caller_pane_refuses_when_pane_was_reused_by_a_different_session(
+    tmp_path, monkeypatch
+) -> None:
+    """The exact scenario Task 3 exists for: the pane a request's caller was
+    captured from now belongs to a DIFFERENT live session (the original
+    asker closed and something else opened in the same pane slot). The
+    saved `caller_live_id` no longer matches what a fresh read proves that
+    pane to be -- delivery must refuse, never send to whoever is there now."""
+    from pane_registry import confirm_caller_pane, upsert_registry
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path),
+            "live_sessions": [
+                {"live_id": "new-owner", "provider": "codex", "pane_id": "7", "terminal": "tmux"},
+            ],
+        }
+    )
+
+    confirmed = confirm_caller_pane(
+        launch_id="ai-1", caller_live_id="original-claude", pane_id="7", terminal="tmux"
+    )
+
+    assert confirmed is None
+
+
+def test_confirm_caller_pane_refuses_when_launch_record_is_gone() -> None:
+    from pane_registry import confirm_caller_pane
+
+    assert confirm_caller_pane(launch_id="ai-does-not-exist", pane_id="7", terminal="tmux") is None
+
+
+def test_confirm_caller_pane_refuses_when_session_is_inactive(tmp_path) -> None:
+    from pane_registry import confirm_caller_pane, upsert_registry
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path),
+            "live_sessions": [
+                {
+                    "live_id": "claude-1",
+                    "provider": "claude",
+                    "pane_id": "7",
+                    "terminal": "tmux",
+                    "active": False,
+                },
+            ],
+        }
+    )
+
+    confirmed = confirm_caller_pane(launch_id="ai-1", pane_id="7", terminal="tmux")
+
+    assert confirmed is None

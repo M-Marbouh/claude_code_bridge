@@ -555,6 +555,54 @@ def main() -> int:
     direct_pane_id = os.environ.get("CCB_CALLER_PANE_ID", "").strip()
     direct_terminal = os.environ.get("CCB_CALLER_TERMINAL", "").strip()
 
+    # Task 3 / Gap 5: when the request that produced this completion
+    # resolved a route, `CCB_ROUTE_LAUNCH_ID` names the launch registry
+    # scope that route's caller identity belongs to. Re-confirm, from a
+    # FRESH read of that registry, that `direct_pane_id` still names the
+    # exact live session that asked -- never trust the captured pane id on
+    # its own.
+    #
+    # Gate on ROUTED identity FIRST, independent of whether a caller pane
+    # even happens to be present: a routed request with no confirmable
+    # caller pane at all is not "no evidence to check" -- it is a routed
+    # request that cannot be confirmed, and must be suppressed exactly the
+    # same way as one whose pane was reused. It must NEVER fall through to
+    # the legacy session-file lookup below, which is itself a form of
+    # "search for somewhere else to deliver" that a routed request must
+    # never re-enter.
+    #
+    # Absent (`route_launch_id` empty -- no route was ever resolved: legacy
+    # path, email/manual caller, no inventory), this whole block is a
+    # complete no-op and delivery behaves exactly as it did before this
+    # check existed.
+    route_launch_id = os.environ.get("CCB_ROUTE_LAUNCH_ID", "").strip()
+    route_caller_live_id = os.environ.get("CCB_CALLER_LIVE_ID", "").strip()
+    if route_launch_id:
+        confirmed_caller = None
+        if direct_pane_id:
+            try:
+                from pane_registry import confirm_caller_pane
+
+                confirmed_caller = confirm_caller_pane(
+                    launch_id=route_launch_id,
+                    caller_live_id=route_caller_live_id,
+                    pane_id=direct_pane_id,
+                    terminal=direct_terminal,
+                )
+            except Exception:
+                confirmed_caller = None
+        if confirmed_caller is None:
+            _debug_log(
+                "routed request's caller identity could not be confirmed; suppressing "
+                f"terminal delivery launch={route_launch_id!r} pane={direct_pane_id!r} "
+                f"terminal={direct_terminal!r}"
+            )
+            return 0
+        # Deliver to what the fresh read says this session's pane/terminal
+        # actually are now, not to the possibly-stale captured values.
+        direct_pane_id = confirmed_caller.pane_id or direct_pane_id
+        direct_terminal = confirmed_caller.terminal or direct_terminal
+
     pane_id = None
     terminal = "tmux"  # default
     session_data = {}

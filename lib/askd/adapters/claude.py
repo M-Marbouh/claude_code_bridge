@@ -36,6 +36,7 @@ from pane_registry import session_data_from_live, upsert_registry, validate_rout
 from project_id import compute_ccb_project_id
 from providers import LASKD_SPEC
 from session_file_watcher import HAS_WATCHDOG
+from task_receipts import PersistOutcome, persist_proven_result
 from terminal import get_backend_for_session
 
 
@@ -629,10 +630,6 @@ class ClaudeAdapter(BaseProviderAdapter):
     def _finalize_result(self, result: ProviderResult, req: ProviderRequest, task: QueuedTask) -> None:
         _write_log(f"[INFO] done provider=claude req_id={result.req_id} exit={result.exit_code}")
 
-        if req.suppress_completion_hook:
-            _write_log(f"[INFO] completion hook suppressed req_id={result.req_id}")
-            return
-
         reply_for_hook = result.reply
         status = result.status or (COMPLETION_STATUS_COMPLETED if result.done_seen else COMPLETION_STATUS_INCOMPLETE)
         if task.cancelled:
@@ -640,6 +637,36 @@ class ClaudeAdapter(BaseProviderAdapter):
             status = COMPLETION_STATUS_CANCELLED
         if not (reply_for_hook or "").strip():
             reply_for_hook = default_reply_for_status(status, done_seen=result.done_seen)
+
+        # Task 2/Item 5: persist the proven result BEFORE any notification
+        # is even considered -- including when the hook ends up suppressed
+        # below. A receipt that exists but could not be saved suppresses
+        # notification entirely. `result.log_path`/`result.extra[
+        # "conversation_id"]` are the Item-2 anchor-time transcript proof
+        # (see `_wait_for_response`), not finalization-time state.
+        conversation_id = str((result.extra or {}).get("conversation_id") or "")
+        persist_outcome = PersistOutcome.NO_RECEIPT
+        try:
+            persist_outcome = persist_proven_result(
+                result.req_id,
+                reply=reply_for_hook,
+                status=status,
+                transcript_path=result.log_path or "",
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            _write_log(f"[WARN] persist_proven_result raised req_id={result.req_id}")
+            persist_outcome = PersistOutcome.FAILED
+
+        if req.suppress_completion_hook:
+            _write_log(f"[INFO] completion hook suppressed req_id={result.req_id}")
+            return
+
+        if persist_outcome == PersistOutcome.FAILED:
+            _write_log(
+                f"[WARN] proven result could not be saved; suppressing notification req_id={result.req_id}"
+            )
+            return
 
         _write_log(
             f"[INFO] notify_completion caller={req.caller} status={status} "
@@ -659,6 +686,8 @@ class ClaudeAdapter(BaseProviderAdapter):
             work_dir=req.work_dir,
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
+            caller_live_id=req.route.caller_live_id if req.route.present else "",
+            route_launch_id=req.route.launch_id if req.route.present else "",
         )
 
     def _wait_for_delivery(
@@ -794,6 +823,12 @@ class ClaudeAdapter(BaseProviderAdapter):
         anchor_ms: Optional[int] = None
         done_seen = False
         done_ms: Optional[int] = None
+        # Item 2: the receipt's recovery proof must be captured at the
+        # moment the request anchor itself is confirmed, in that same
+        # transcript -- never only when the completion marker was also
+        # seen (a timeout must not silently lose proof it already had).
+        session_path_at_anchor: Optional[Path] = None
+        session_id_at_anchor: Optional[str] = None
 
         anchor_grace_deadline = min(deadline, time.time() + 1.5) if deadline else (time.time() + 1.5)
         rebounded = False
@@ -850,6 +885,11 @@ class ClaudeAdapter(BaseProviderAdapter):
                         anchor_seen = True
                         if anchor_ms is None:
                             anchor_ms = _now_ms() - started_ms
+                        if session_path_at_anchor is None:
+                            anchor_session = state.get("session_path") if isinstance(state, dict) else None
+                            if isinstance(anchor_session, Path):
+                                session_path_at_anchor = anchor_session
+                                session_id_at_anchor = anchor_session.stem
                     continue
                 if role != "assistant":
                     continue
@@ -868,6 +908,8 @@ class ClaudeAdapter(BaseProviderAdapter):
         combined = "\n".join(chunks)
         final_reply = extract_reply_for_req(combined, task.req_id)
 
+        session_path = None
+        session_id = None
         if done_seen:
             session_path = state.get("session_path") if isinstance(state, dict) else None
             session_id = session_path.stem if isinstance(session_path, Path) else None
@@ -941,6 +983,11 @@ class ClaudeAdapter(BaseProviderAdapter):
             anchor_seen=anchor_seen,
             anchor_ms=anchor_ms,
             fallback_scan=fallback_scan,
+            # Item 2: proof for recovery is the transcript the request
+            # ANCHOR was confirmed in, not the finalization-time reader
+            # state -- a timeout must not lose proof it already had.
+            log_path=str(session_path_at_anchor) if isinstance(session_path_at_anchor, Path) else None,
+            extra={"conversation_id": session_id_at_anchor or ""},
             status=COMPLETION_STATUS_COMPLETED if done_seen else (
                 COMPLETION_STATUS_CANCELLED if task.cancelled else COMPLETION_STATUS_INCOMPLETE
             ),

@@ -40,6 +40,7 @@ from completion_hook import (
 from pane_registry import session_data_from_live, validate_route
 from project_id import compute_ccb_project_id, normalize_work_dir
 from providers import CASKD_SPEC
+from task_receipts import PersistOutcome, persist_proven_result
 from terminal import get_backend_for_session, is_windows
 
 
@@ -472,6 +473,13 @@ class CodexAdapter(BaseProviderAdapter):
         anchor_ms: Optional[int] = None
         done_ms: Optional[int] = None
         fallback_scan = False
+        # Item 2: the receipt's recovery proof must be captured at the
+        # moment the request anchor itself is confirmed, in that same
+        # transcript -- never from whatever the reader happens to be
+        # pointed at afterward (which can differ after a stale-log switch,
+        # and is set unconditionally on every exit path, anchored or not).
+        codex_log_path_at_anchor: Optional[str] = None
+        codex_session_id_at_anchor: Optional[str] = None
 
         # Idle timeout detection for degraded completion
         idle_timeout = float(os.environ.get("CCB_CASKD_IDLE_TIMEOUT", "8.0"))
@@ -579,6 +587,14 @@ class CodexAdapter(BaseProviderAdapter):
                     anchor_seen = True
                     if anchor_ms is None:
                         anchor_ms = _now_ms() - started_ms
+                    if codex_log_path_at_anchor is None:
+                        anchor_log = state.get("log_path") if isinstance(state, dict) else None
+                        if anchor_log:
+                            codex_log_path_at_anchor = str(anchor_log)
+                            try:
+                                codex_session_id_at_anchor = _codex_log_session_id(Path(codex_log_path_at_anchor))
+                            except Exception:
+                                codex_session_id_at_anchor = None
                 continue
 
             if role != "assistant":
@@ -667,13 +683,43 @@ class CodexAdapter(BaseProviderAdapter):
             f"anchor={result.anchor_seen} done={result.done_seen}"
         )
 
+        reply_for_hook = reply
+        if not reply_for_hook.strip():
+            reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
+
+        # Task 2/Item 5: persist the proven result BEFORE any notification
+        # is even considered -- including when the hook ends up suppressed
+        # below. A receipt that exists but could not be saved suppresses
+        # notification entirely: delivering "your task is done" when the
+        # durable answer failed to save is exactly the failure this
+        # ordering exists to prevent. A task with no async receipt at all
+        # (NO_RECEIPT) is not a failure -- notification proceeds normally.
+        # `codex_log_path_at_anchor`/`codex_session_id_at_anchor` (Item 2)
+        # are the transcript proof captured when the anchor was confirmed,
+        # not the finalization-time reader state.
+        persist_outcome = PersistOutcome.NO_RECEIPT
+        try:
+            persist_outcome = persist_proven_result(
+                task.req_id,
+                reply=reply_for_hook,
+                status=status,
+                transcript_path=codex_log_path_at_anchor or "",
+                conversation_id=codex_session_id_at_anchor or "",
+            )
+        except Exception:
+            _write_log(f"[WARN] persist_proven_result raised req_id={task.req_id}")
+            persist_outcome = PersistOutcome.FAILED
+
         if req.suppress_completion_hook:
             _write_log(f"[INFO] completion hook suppressed req_id={task.req_id}")
             return result
 
-        reply_for_hook = reply
-        if not reply_for_hook.strip():
-            reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
+        if persist_outcome == PersistOutcome.FAILED:
+            _write_log(
+                f"[WARN] proven result could not be saved; suppressing notification req_id={task.req_id}"
+            )
+            return result
+
         _write_log(f"[INFO] notify_completion caller={req.caller} status={status} done_seen={done_seen}")
         notify_completion(
             provider="codex",
@@ -689,6 +735,8 @@ class CodexAdapter(BaseProviderAdapter):
             work_dir=req.caller_work_dir or req.work_dir,
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
+            caller_live_id=req.route.caller_live_id if req.route.present else "",
+            route_launch_id=req.route.launch_id if req.route.present else "",
         )
 
         return result

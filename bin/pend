@@ -20,8 +20,14 @@ sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
+from claude_comm import ClaudeLogReader
 from codex_comm import CodexLogReader
-from pane_registry import load_registry_by_pane, load_registry_by_session_id
+from live_sessions import INVENTORY_INVALID, find_caller
+from pane_registry import (
+    load_registry_by_pane,
+    load_registry_by_session_id,
+    read_inventory_for_record,
+)
 from project_id import compute_ccb_project_id
 from provider_log_reader import provider_log_reader, provider_request_anchor_seen
 from reply_artifacts import prepare_agent_visible_reply
@@ -30,6 +36,7 @@ from task_receipts import (
     find_receipt,
     iter_receipts,
     read_peer_reply,
+    read_server_result,
     update_peer_delivery,
 )
 
@@ -184,7 +191,23 @@ def _current_session_receipts(
     project_id: str,
     session_id: str,
     responder: str = "",
+    *,
+    caller_live_id: str = "",
+    destination_live_id: str = "",
 ) -> list[tuple[Path, dict]]:
+    """Receipts visible to the current CCB session.
+
+    `caller_live_id`/`destination_live_id` are Task 5's pair-disambiguation
+    filters: empty by default, in which case this behaves exactly as it did
+    before they existed. When one is supplied (because the launch's own
+    live-session inventory showed genuine same-provider ambiguity -- see
+    `_pair_scope`/`_resolve_retrieval_target`), a receipt is only included
+    when its OWN recorded identity matches. An old receipt that predates
+    Task 1's identity fields, or one whose route was never resolved, has no
+    value there at all -- it is excluded rather than guessed about, which
+    is exactly what keeps two crossed exchanges (A asking B and B asking A)
+    from ever merging into one history.
+    """
     records = [
         (path, data)
         for path, data in iter_receipts()
@@ -193,6 +216,11 @@ def _current_session_receipts(
         and str(data.get("ccb_project_id") or "").strip() == project_id
         and _receipt_session_id(data) == session_id
         and (not responder or _receipt_responder(data) == responder)
+        and (not caller_live_id or str(data.get("caller_live_id") or "").strip() == caller_live_id)
+        and (
+            not destination_live_id
+            or str(data.get("destination_live_id") or "").strip() == destination_live_id
+        )
     ]
     records.sort(
         key=lambda item: str(item[1].get("submitted_at") or item[0].name),
@@ -216,6 +244,140 @@ def _resolve_responder(target: str, current_provider: str) -> tuple[str, str]:
     if target in PROVIDER_PENDS:
         return target, ""
     return "", f"Unknown provider, relation, or task ID: {target}"
+
+
+def _pair_scope(project_id: str, session_id: str) -> tuple[list, str, bool, bool]:
+    """Task 5 / Gap 3(a) / Item 3: the current launch's live-session
+    inventory, this process's own identity within it, whether implicit
+    retrieval must REFUSE outright, and whether the inventory is PRESENT
+    at all -- returned as `(sessions, current_live_id, invalid, present)`.
+
+    Four distinct cases, never collapsed into fewer:
+      - ABSENT (no `live_sessions` key at all -- the common case today,
+        "NOTHING WRITES AN INVENTORY YET"): `([], "", False, False)`, a
+        pure no-op every caller below treats as "nothing to disambiguate,"
+        so retrieval for such a record behaves byte-identically to before
+        this function existed.
+      - VALID with entries: `(sessions, current_live_id, False, True)`.
+      - VALID but genuinely EMPTY (a real `live_sessions: []`): `([], "",
+        False, True)`. Item 3: this is NOT the same as absent. `present`
+        is what lets a caller keep that distinction -- an authoritative
+        "there is nothing here" must never be treated as "we have no
+        information, fall back to a heuristic guess," even though the
+        `sessions` list itself is `[]` either way.
+      - INVALID (a `live_sessions` key IS present but malformed): `([], "",
+        True, True)`. A record that claims to carry an inventory and fails
+        to parse it is a broken record, not a legacy one, and implicit
+        retrieval must refuse rather than quietly behave as if there were
+        nothing to disambiguate.
+    """
+    record = _current_tab_registry(project_id, session_id)
+    if record is None:
+        return [], "", False, False
+    inventory = read_inventory_for_record(record)
+    if inventory.status == INVENTORY_INVALID:
+        return [], "", True, True
+    if not inventory.valid:
+        return [], "", False, False
+    pane_id, terminal = _executing_pane()
+    caller = find_caller(inventory.sessions, pane_id=pane_id, terminal=terminal)
+    return list(inventory.sessions), (caller.live_id if caller else ""), False, True
+
+
+def _resolve_retrieval_target(
+    target: str,
+    current_provider: str,
+    sessions: list,
+    current_live_id: str,
+    inventory_present: bool,
+) -> tuple[str, str, str, str]:
+    """Resolve `target` for RETRIEVAL to `(responder, required_caller_live_id,
+    required_destination_live_id, error)`.
+
+    Item 3: gated on `inventory_present` (from `_pair_scope`), NOT on
+    whether `sessions` happens to be empty -- those are different facts. A
+    record with NO inventory at all (`inventory_present` False) falls back
+    to `_resolve_responder`'s legacy, name-only heuristic (today's
+    behaviour, unchanged): with no other information, that heuristic is
+    the best available answer. A record WITH a real, valid inventory that
+    simply lists nothing (`inventory_present` True, `sessions` empty) is
+    authoritative -- it must never be overridden by that same heuristic,
+    which has no basis in this launch's actual (empty) topology.
+
+    Once `inventory_present` is True, every identity constraint below only
+    ever narrows a result down to exactly one candidate -- anything less
+    exact refuses ("Any relation larger or more ambiguous than that FAILS
+    rather than picking"), it is never guessed.
+    """
+    if not inventory_present:
+        base, error = _resolve_responder(target, current_provider)
+        return base, "", "", error
+
+    if target == "local":
+        if not current_provider:
+            return "", "", "", "'local' requires a bound model pane; use a provider name or exact task ID"
+        pool = [s for s in sessions if s.provider == current_provider]
+        # Correction 1: a ZERO-member pool is not "unique, proceed" -- once
+        # the inventory is authoritative, "local" claiming to be a provider
+        # this inventory says is not live at all must refuse, not fall
+        # through as if uniqueness had been established.
+        if not pool:
+            return "", "", "", (
+                f"'local' claims {current_provider}, but this launch's live-session inventory "
+                f"has no {current_provider} session; use an exact task ID"
+            )
+        if len(pool) > 1:
+            if not current_live_id:
+                return "", "", "", (
+                    f"multiple {current_provider} sessions in this launch and this pane's "
+                    "identity could not be confirmed; use an exact task ID"
+                )
+            return current_provider, "", current_live_id, ""
+        return current_provider, "", "", ""
+
+    if target == "peer":
+        if not current_provider:
+            return "", "", "", "'peer' requires a bound model pane; use a provider name or exact task ID"
+        if len(sessions) == 2 and current_live_id:
+            others = [s for s in sessions if s.live_id != current_live_id]
+            if len(others) == 1:
+                other = others[0]
+                return other.provider, "", other.live_id, ""
+        # Item 3: once the inventory is authoritative, "peer" is resolved
+        # ONLY from what it actually says -- never from the legacy static
+        # provider mapping, which could name a peer this inventory says is
+        # not even there (e.g. a genuinely empty launch).
+        return "", "", "", (
+            "'peer' could not be resolved from this launch's live-session inventory "
+            "(not reducible to exactly one other session); use a provider name or exact task ID"
+        )
+
+    if target in PROVIDER_PENDS:
+        pool = [s for s in sessions if s.provider == target]
+        # Correction 1: a provider ABSENT from a present, authoritative
+        # inventory must refuse -- it must never fall back to a "unique,
+        # proceed" default just because the pool size isn't >1.
+        if not pool:
+            return "", "", "", (
+                f"this launch's live-session inventory has no {target} session; "
+                "use an exact task ID"
+            )
+        if len(pool) > 1:
+            if not current_live_id:
+                return "", "", "", (
+                    f"multiple {target} sessions in this launch and this pane's identity "
+                    "could not be confirmed; use an exact task ID"
+                )
+            siblings = [s for s in pool if s.live_id != current_live_id]
+            if len(siblings) != 1:
+                return "", "", "", (
+                    f"'{target}' is ambiguous: {len(siblings)} eligible {target} sessions "
+                    "in this launch; use an exact task ID"
+                )
+            return target, "", siblings[0].live_id, ""
+        return target, "", "", ""
+
+    return "", "", "", f"Unknown provider, relation, or task ID: {target}"
 
 
 def _parse_timestamp(value: object) -> float | None:
@@ -391,8 +553,95 @@ def _recover_codex_reply(receipt: dict) -> str | None:
     return None
 
 
+def _is_routed_receipt(receipt: dict) -> bool:
+    """Whether this task went through an actually-resolved route (Task 1).
+
+    Absent for a receipt predating that field, or for one whose route was
+    never resolved (no inventory, legacy path, email/manual caller) -- in
+    either case, no identity was ever proven for this receipt, and none is
+    inferred for it here.
+    """
+    return bool(str(receipt.get("route_launch_id") or "").strip())
+
+
+def _recover_from_recorded_conversation(receipt: dict, provider: str) -> str | None:
+    """Task 4/Gap 1: read the reply out of the EXACT transcript this task's
+    own adapter PROVED it came from -- `destination_transcript_path` and
+    `destination_conversation_id`, both written by the adapter itself, once
+    it confirmed the request anchor, moments before it saved the result
+    (see `task_receipts.persist_proven_result`).
+
+    This is deliberately NOT `destination_session_file`: that field is the
+    per-provider BINDING file (`.codex-session`/`.claude-session`) captured
+    at ask-time, which is mutable and gets repointed by whatever the SAME
+    pane asks next -- reading it later for recovery would silently read the
+    replacement conversation, not the one this task actually ran in. Only
+    the adapter's own post-hoc proof is trustworthy here.
+
+    Returns `None` (never raises) whenever there is nothing proven to read:
+    an old receipt predating this mechanism, a task whose adapter never
+    reached the point of confirming its transcript (crashed first, or is
+    still running), or a recorded file that no longer exists. Callers must
+    NOT treat `None` here as "try a project-wide scan" for a routed
+    receipt -- see `_recover_provider_reply`.
+    """
+    task_id = str(receipt.get("task_id") or "").strip()
+    transcript_path = str(receipt.get("destination_transcript_path") or "").strip()
+    if not task_id or not transcript_path:
+        return None
+    path = Path(transcript_path).expanduser()
+    if not path.is_file():
+        return None
+
+    work_dir_raw = str(receipt.get("work_dir") or "").strip()
+    try:
+        work_dir = Path(work_dir_raw).expanduser() if work_dir_raw else path.parent
+    except Exception:
+        work_dir = path.parent
+
+    conversation_id = str(receipt.get("destination_conversation_id") or "").strip()
+
+    if provider == "codex":
+        reader = CodexLogReader(
+            log_path=path,
+            session_id_filter=conversation_id or path.stem or path.name,
+            work_dir=work_dir,
+            allow_stale_switch=False,
+        )
+    elif provider == "claude":
+        reader = ClaudeLogReader(work_dir=work_dir, allow_session_switch=False)
+        reader.set_preferred_session(path)
+    else:
+        return None
+
+    try:
+        exchanges = reader.latest_exchanges(2000)
+    except Exception:
+        return None
+    for exchange in reversed(exchanges):
+        if str(exchange.get("req_id") or "").strip() == task_id:
+            reply = str(exchange.get("reply") or "").strip()
+            return reply or None
+    return None
+
+
 def _recover_provider_reply(receipt: dict) -> str | None:
-    if str(receipt.get("provider") or "").strip().lower() == "codex":
+    """Gap 2: a ROUTED task never falls back to a project-wide scan. It
+    returns its saved result (checked by `_show_receipt` before this is
+    even called), or reads its own proven transcript, or reports
+    unavailable (`None`) -- it never searches other conversations, even
+    when the proven transcript is missing, unreadable, or not yet written.
+
+    Only a receipt that carries NO routed identity at all -- today's
+    legacy path, or one predating Task 1 -- still uses the old work_dir-
+    wide marker scan, exactly as it always has.
+    """
+    provider = str(receipt.get("provider") or "").strip().lower()
+    if provider not in {"codex", "claude"}:
+        return None
+    if _is_routed_receipt(receipt):
+        return _recover_from_recorded_conversation(receipt, provider)
+    if provider == "codex":
         return _recover_codex_reply(receipt)
     return None
 
@@ -440,6 +689,15 @@ def _show_receipt(receipt: dict) -> int:
     peer_reply = read_peer_reply(receipt)
     if peer_reply:
         print(prepare_agent_visible_reply(peer_reply, task_id))
+        return EXIT_OK
+    # Task 2: the adapter's own pre-notification save (`persist_proven_
+    # result`) is checked first -- it is written durably, server-side,
+    # before any delivery/notification is even attempted, so its mere
+    # presence is proof the task is done regardless of what the transport-
+    # side status file currently says.
+    server_result = read_server_result(receipt)
+    if server_result:
+        print(prepare_agent_visible_reply(server_result, task_id))
         return EXIT_OK
     finished, exit_code, _finished_at = _status_finished(status_path)
     if not finished or exit_code != 0:
@@ -492,6 +750,8 @@ def _receipt_has_completed_reply(receipt: dict) -> bool:
     provider = str(receipt.get("provider") or "").strip().lower()
     if provider.startswith("peer-"):
         return bool(read_peer_reply(receipt))
+    if read_server_result(receipt):
+        return True
     status_path = Path(str(receipt.get("status_file") or ""))
     finished, _exit_code, _finished_at = _status_finished(status_path)
     return finished
@@ -500,6 +760,8 @@ def _receipt_has_completed_reply(receipt: dict) -> bool:
 def classify_receipt_state(receipt: dict) -> str:
     """Classify receipt state without printing or attempting reply recovery."""
     if read_peer_reply(receipt):
+        return RECEIPT_COMPLETED
+    if read_server_result(receipt):
         return RECEIPT_COMPLETED
     status_path = Path(str(receipt.get("status_file") or ""))
     finished, exit_code, _finished_at = _status_finished(status_path)
@@ -575,7 +837,21 @@ def _overlay_items(
     *,
     requested: int,
     explicit_count: bool,
+    duplicate_mode: bool = False,
 ) -> list[OverlayItem]:
+    """`duplicate_mode` is Gap 4: True whenever the responder here was
+    disambiguated from a genuine multi-session pool (Task 5) rather than
+    being the launch's single, unique provider session. The manual-
+    exchange half of this overlay (below) has no per-session identity of
+    its own to filter by -- `provider_log_reader`'s strict-tab mode is
+    keyed by the LAUNCH's `ccb_session_id` and its legacy `providers.
+    <provider>` mapping, which cannot represent "the sibling, not me" at
+    all. Reading it under real ambiguity risks appending manual history
+    from the WRONG pane even though `records` (the receipt half) is
+    already filtered correctly. Rather than guess, this mode omits
+    unproven transcript history entirely and shows only what the receipts
+    themselves prove -- exactly `records`, never more.
+    """
     receipt_ids = {
         str(receipt.get("task_id") or "").strip()
         for _path, receipt in records
@@ -597,6 +873,10 @@ def _overlay_items(
                 receipt=receipt,
             )
         )
+
+    if duplicate_mode:
+        items.sort(key=lambda item: (item.timestamp, item.sequence), reverse=True)
+        return items[:requested]
 
     record = _current_tab_registry(project_id, session_id)
     work_dir_raw = str((record or {}).get("work_dir") or Path.cwd()).strip()
@@ -702,17 +982,63 @@ def main(argv: list[str]) -> int:
             return EXIT_ERROR
         return _show_receipt(found[1])
 
+    project_id, session_id, current_provider = _current_session_context()
+    # Task 5: only a REAL, valid `live_sessions` inventory ever populates
+    # `sessions`/`current_live_id` -- a record with none (today's universal
+    # case) leaves both empty, and every branch below that consults them is
+    # written to be a pure no-op in that case. Item 3: `inventory_present`
+    # is tracked SEPARATELY from `sessions` being non-empty -- a real,
+    # valid, but genuinely empty inventory is still authoritative.
+    sessions: list = []
+    current_live_id = ""
+    inventory_invalid = False
+    inventory_present = False
+    if project_id and session_id:
+        sessions, current_live_id, inventory_invalid, inventory_present = _pair_scope(project_id, session_id)
+
+    # Gap 3(a): a PRESENT-but-BROKEN `live_sessions` inventory is not the
+    # same as no inventory at all -- it must refuse every implicit
+    # (non-exact-task-id) retrieval outright, never silently behave as if
+    # there were nothing to disambiguate.
+    if inventory_invalid:
+        print(
+            "[ERROR] This launch's live-session inventory is present but invalid; "
+            "implicit retrieval refuses rather than guessing. Use an exact task ID.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
     if args.legacy:
         if target not in PROVIDER_PENDS:
             print("[ERROR] --legacy requires an explicit provider name", file=sys.stderr)
             return EXIT_ERROR
+        # Correction 1: gate on `inventory_present`, not `sessions` being
+        # non-empty -- a present, authoritative, EMPTY inventory means
+        # `target` has no live session at all, and `--legacy` (which
+        # always reads whatever the default session file currently says,
+        # with no identity check of its own) must refuse rather than fall
+        # through to that disconnected default. Refuses on anything other
+        # than exactly one eligible session, not merely on more than one.
+        if inventory_present:
+            legacy_pool = [s for s in sessions if s.provider == target]
+            if len(legacy_pool) != 1:
+                print(
+                    f"[ERROR] --legacy cannot resolve {target} against this launch's live-session "
+                    f"inventory ({len(legacy_pool)} eligible sessions); it always reads the default "
+                    "session file, which may not match. Use an exact task ID.",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
         legacy_args = [str(args.count)] if args.count is not None else []
         return _legacy_pend(target, legacy_args)
 
-    project_id, session_id, current_provider = _current_session_context()
     responder = ""
+    required_caller_live_id = ""
+    required_destination_live_id = ""
     if target:
-        responder, error = _resolve_responder(target, current_provider)
+        responder, required_caller_live_id, required_destination_live_id, error = _resolve_retrieval_target(
+            target, current_provider, sessions, current_live_id, inventory_present
+        )
         if error:
             print(f"[ERROR] {error}", file=sys.stderr)
             print(f"[ERROR] Available providers: {', '.join(PROVIDER_PENDS)}", file=sys.stderr)
@@ -726,7 +1052,59 @@ def main(argv: list[str]) -> int:
         return EXIT_NO_REPLY
 
     if not target:
-        records = _current_session_receipts(project_id, session_id)
+        # A bare retrieval must be scoped to THIS pane's own identity once
+        # this launch shows more than one session of the caller's own
+        # provider -- otherwise two crossed senders sharing one launch (A
+        # asking B and B asking A) would merge into a single ambiguity
+        # check instead of each resolving on its own.
+        #
+        # Gap 3(b) / Item 3: when that ambiguity exists and this pane's OWN
+        # identity could not be confirmed, there is no safe scope to apply
+        # at all -- refusing here is required, not just narrowing. Falling
+        # through with an empty filter would read every receipt in the
+        # launch, and if only ONE happens to exist (a foreign one, sent by
+        # the sibling) that would look exactly like a correct,
+        # unambiguous match. This also covers not knowing this pane's own
+        # PROVIDER at all: the old guard (`sessions and current_provider`)
+        # skipped verification entirely in that case rather than refusing
+        # -- an unidentified provider is no safer a scope than an
+        # unidentified live_id once real live sessions exist to be
+        # scoped against.
+        bare_caller_live_id = ""
+        # Correction 1: gate on `inventory_present`, not `sessions` being
+        # non-empty -- a present, authoritative, EMPTY inventory must
+        # refuse implicit selection the same way any other implicit branch
+        # does, rather than falling through to an unfiltered, launch-wide
+        # read of whatever receipts happen to be sitting there.
+        if inventory_present:
+            if not sessions:
+                print(
+                    "[ERROR] this launch's live-session inventory is present but empty; "
+                    "implicit retrieval refuses rather than reading launch-wide receipts. "
+                    "Use an exact task ID.",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            if not current_provider:
+                print(
+                    "[ERROR] this launch has live sessions but this pane's own provider "
+                    "could not be determined; use an exact task ID",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            own_pool = [s for s in sessions if s.provider == current_provider]
+            if len(own_pool) > 1:
+                if not current_live_id:
+                    print(
+                        f"[ERROR] multiple {current_provider} sessions in this launch and this "
+                        "pane's identity could not be confirmed; use an exact task ID",
+                        file=sys.stderr,
+                    )
+                    return EXIT_ERROR
+                bare_caller_live_id = current_live_id
+        records = _current_session_receipts(
+            project_id, session_id, caller_live_id=bare_caller_live_id
+        )
         if not records:
             print(
                 "[NO TASK] No task in current CCB session; use exact task ID",
@@ -743,9 +1121,27 @@ def main(argv: list[str]) -> int:
             return EXIT_ERROR
         return _show_receipt(records[0][1])
 
-    records = _current_session_receipts(project_id, session_id, responder)
+    records = _current_session_receipts(
+        project_id,
+        session_id,
+        responder,
+        caller_live_id=required_caller_live_id,
+        destination_live_id=required_destination_live_id,
+    )
     if responder in {"codex", "claude"}:
         count = args.count if args.count is not None else 1
+        # Item 4: overlay suppression is driven by the SELECTED PROVIDER'S
+        # actual multiplicity in the inventory, never by whether a
+        # destination happened to be resolved. "peer" in the ordinary
+        # mixed-provider case (e.g. exactly one codex + one claude) DOES
+        # resolve an exact `required_destination_live_id` even though
+        # there is only ONE session of the responder's own provider --
+        # that is exact selection, not duplicate-provider ambiguity, and
+        # must keep today's overlay behaviour exactly. Only when the
+        # RESPONDER's own provider genuinely has more than one live
+        # session does the overlay's provider-wide manual-history reader
+        # have no way to tell which one it's reading.
+        responder_pool_size = sum(1 for s in sessions if s.provider == responder)
         items = _overlay_items(
             project_id,
             session_id,
@@ -753,6 +1149,7 @@ def main(argv: list[str]) -> int:
             records,
             requested=count,
             explicit_count=args.count is not None,
+            duplicate_mode=responder_pool_size > 1,
         )
         if not items:
             if args.count is not None:

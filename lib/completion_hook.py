@@ -91,6 +91,8 @@ def _run_hook_async(
     status: str = COMPLETION_STATUS_COMPLETED,
     caller_pane_id: str = "",
     caller_terminal: str = "",
+    caller_live_id: str = "",
+    route_launch_id: str = "",
 ) -> None:
     """Run the completion hook in a background thread."""
     if not env_bool("CCB_COMPLETION_HOOK_ENABLED", True):
@@ -133,6 +135,24 @@ def _run_hook_async(
 
             # Set up environment with caller and email-related vars
             env = os.environ.copy()
+            # Gap 5: this daemon process is long-lived and handles many
+            # requests over its lifetime; `os.environ` here is a snapshot
+            # of ITS OWN process environment, which may itself carry
+            # leftover CCB_* identity values from however it was launched.
+            # Explicitly CLEAR every completion-identity variable this
+            # function populates before conditionally re-setting them for
+            # THIS request -- otherwise a value this specific call has no
+            # opinion on (because it is falsy/absent for this request)
+            # would silently fall through to whatever this process
+            # inherited, and be read downstream as if it were proof about
+            # THIS request's caller.
+            for _stale_key in (
+                "CCB_CALLER_PANE_ID",
+                "CCB_CALLER_TERMINAL",
+                "CCB_ROUTE_LAUNCH_ID",
+                "CCB_CALLER_LIVE_ID",
+            ):
+                env.pop(_stale_key, None)
             env["CCB_CALLER"] = caller  # Ensure caller is passed via env var
             env["CCB_DONE_SEEN"] = "1" if done_seen else "0"  # Pass completion status
             env["CCB_COMPLETION_STATUS"] = normalize_completion_status(status, done_seen=done_seen)
@@ -149,6 +169,16 @@ def _run_hook_async(
                 env["CCB_CALLER_PANE_ID"] = caller_pane_id
             if caller_terminal:
                 env["CCB_CALLER_TERMINAL"] = caller_terminal
+            # Task 3: identity the completion hook can re-confirm the
+            # caller's pane against, from a fresh registry read, before
+            # pushing the finished answer into it. Both are additive and
+            # empty by default -- a request that never resolved a route
+            # (no inventory, legacy path, email/manual caller) sets
+            # neither, and the hook's delivery behaves exactly as before.
+            if route_launch_id:
+                env["CCB_ROUTE_LAUNCH_ID"] = route_launch_id
+            if caller_live_id:
+                env["CCB_CALLER_LIVE_ID"] = caller_live_id
 
             # Pass reply via stdin to avoid command line length limits
             # Use longer timeout for SMTP retries (3 retries * 8s max backoff + send time)
@@ -182,6 +212,8 @@ def notify_completion(
     status: str | None = None,
     caller_pane_id: str = "",
     caller_terminal: str = "",
+    caller_live_id: str = "",
+    route_launch_id: str = "",
 ) -> None:
     """
     Notify the caller that a CCB delegation task has completed.
@@ -198,6 +230,12 @@ def notify_completion(
         email_from: Original sender email address (for email caller)
         work_dir: Working directory for session file lookup
         status: Terminal status for notifications (completed/cancelled/failed/incomplete)
+        caller_live_id: The route's recorded caller identity, when a route
+            was resolved (Task 3). Empty when no route is available -- the
+            hook then behaves exactly as it did before this field existed.
+        route_launch_id: The launch registry scope `caller_live_id` (and
+            `caller_pane_id`) should be re-confirmed against. Empty has the
+            same no-op effect as an empty `caller_live_id`.
     """
     normalized_status = normalize_completion_status(status, done_seen=done_seen)
     _run_hook_async(
@@ -214,4 +252,6 @@ def notify_completion(
         normalized_status,
         caller_pane_id,
         caller_terminal,
+        caller_live_id,
+        route_launch_id,
     )

@@ -11,7 +11,13 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
+from askd.adapters.base import (
+    BaseProviderAdapter,
+    ProviderRequest,
+    ProviderResult,
+    QueuedTask,
+    route_session_key,
+)
 from askd_runtime import log_path, write_log
 from ccb_protocol import (
     REQ_ID_PREFIX,
@@ -31,7 +37,8 @@ from completion_hook import (
     default_reply_for_status,
     notify_completion,
 )
-from project_id import normalize_work_dir
+from pane_registry import session_data_from_live, validate_route
+from project_id import compute_ccb_project_id, normalize_work_dir
 from providers import CASKD_SPEC
 from terminal import get_backend_for_session, is_windows
 
@@ -344,8 +351,60 @@ class CodexAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=codex req_id={task.req_id} work_dir={req.work_dir} caller={req.caller}")
 
-        session = load_project_session(work_dir)
-        session_key = self.compute_session_key(session)
+        if req.route.present:
+            # Re-confirm the destination this request was already routed to
+            # -- at ENQUEUE time (daemon.py) this was checked once already;
+            # this is the second checkpoint, immediately before the SEND,
+            # closing the gap between a task sitting queued and this worker
+            # actually acting on it. Never re-select; a destination that
+            # failed this check is refused, not redirected to a sibling.
+            session_key = route_session_key(self.key, req.route)
+            try:
+                request_project_id = compute_ccb_project_id(work_dir)
+            except Exception:
+                request_project_id = ""
+            outcome = validate_route(
+                live_id=req.route.live_id,
+                launch_id=req.route.launch_id,
+                provider=self.key,
+                pane_id=req.route.pane_id,
+                terminal=req.route.terminal,
+                session_file=req.route.session_file,
+                ccb_project_id=req.route.ccb_project_id,
+                request_project_id=request_project_id,
+                caller_pane_id=req.caller_pane_id,
+                caller_terminal=req.caller_terminal,
+                caller_live_id=req.route.caller_live_id,
+            )
+            if not outcome.ok:
+                return ProviderResult(
+                    exit_code=1,
+                    reply=f"Routed destination is no longer available ({outcome.error}).",
+                    req_id=task.req_id,
+                    session_key=session_key,
+                    done_seen=False,
+                    status=COMPLETION_STATUS_FAILED,
+                )
+            live_data = session_data_from_live(outcome.session)
+            if live_data is None:
+                return ProviderResult(
+                    exit_code=1,
+                    reply="Routed destination has no readable session binding.",
+                    req_id=task.req_id,
+                    session_key=session_key,
+                    done_seen=False,
+                    status=COMPLETION_STATUS_FAILED,
+                )
+            # This session's OWN file and binding, never the work_dir-wide
+            # `.codex-session` default `load_project_session` would read --
+            # a sibling live session in the same work_dir may own that file.
+            session = CodexProjectSession(
+                session_file=Path(outcome.session.session_file).expanduser(),
+                data=live_data,
+            )
+        else:
+            session = load_project_session(work_dir)
+            session_key = self.compute_session_key(session)
 
         if not session:
             return ProviderResult(

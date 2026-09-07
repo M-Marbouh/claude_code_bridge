@@ -78,6 +78,21 @@ class OpenCodeAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=opencode req_id={task.req_id} work_dir={req.work_dir}")
 
+        if req.route.present:
+            # This adapter does not yet implement the routed contract
+            # (send-time re-validation, reading from the routed session's
+            # own file). Queueing under a routed identity while sending via
+            # provider-default lookup would silently bypass exact
+            # selection, so a routed request is refused outright instead.
+            return ProviderResult(
+                exit_code=1,
+                reply="OpenCode does not support routed live-session requests yet.",
+                req_id=task.req_id,
+                session_key="opencode:unsupported-route",
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
+
         session = load_project_session(work_dir)
         session_key = self.compute_session_key(session)
 

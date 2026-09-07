@@ -11,13 +11,19 @@ from cli_output import atomic_write_text
 from live_sessions import (
     INVENTORY_INVALID,
     INVENTORY_VALID,
+    AMBIGUOUS,
+    SELF_ONLY,
+    UNAVAILABLE,
+    UNKNOWN_CALLER,
     InventoryResult,
     LiveSession,
+    Resolution,
+    find_caller,
     live_sessions_from_record,
     read_inventory,
 )
 from process_lock import _is_pid_alive
-from project_id import compute_ccb_project_id
+from project_id import compute_ccb_project_id, normalize_work_dir
 from terminal import get_backend_for_session
 
 REGISTRY_PREFIX = "ccb-session-"
@@ -267,6 +273,313 @@ def read_inventory_for_record(record: Dict[str, Any]) -> InventoryResult:
     registry-specific plumbing sits on top of what `live_sessions` decides.
     """
     return read_inventory(record)
+
+
+def resolve_live_session_by_id(launch_id: str, live_id: str) -> Optional[LiveSession]:
+    """Re-read `launch_id`'s registry record and return the exact session
+    named by `live_id`, or `None`.
+
+    This is IDENTITY LOOKUP, not selection: unlike `live_sessions.
+    resolve_local_target`, it never chooses among candidates and never
+    falls back to a provider-wide search. A caller that gets `None` back
+    must refuse -- the record is gone or stale, its inventory is no longer
+    valid, or this id no longer appears in it (which also covers the case
+    where the whole `live_sessions` key vanished: the record then only
+    yields the legacy `legacy:...` projection, which can never match a real
+    inventory id). Establishes identity before availability is even in
+    scope: the caller decides what to do with `.active` on the result.
+    """
+    launch_id = (launch_id or "").strip()
+    live_id = (live_id or "").strip()
+    if not launch_id or not live_id:
+        return None
+    record = load_registry_by_session_id(launch_id)
+    if not record:
+        return None
+    inventory = read_inventory_for_record(record)
+    if not inventory.valid:
+        return None
+    matches = [session for session in inventory.sessions if session.live_id == live_id]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _evidence_agrees(expected: str, actual: str) -> bool:
+    """True unless both sides are non-empty and disagree.
+
+    Used for endpoint-evidence comparisons: an EMPTY expectation means the
+    route was resolved without an opinion on that field (nothing to
+    contradict), but two non-empty values that differ are a real
+    replacement and must refuse.
+    """
+    expected = (expected or "").strip()
+    actual = (actual or "").strip()
+    if not expected or not actual:
+        return True
+    return expected == actual
+
+
+def validate_route(
+    *,
+    live_id: str,
+    launch_id: str,
+    provider: str,
+    pane_id: str = "",
+    terminal: str = "",
+    session_file: str = "",
+    ccb_project_id: str = "",
+    request_project_id: str = "",
+    caller_pane_id: str = "",
+    caller_terminal: str = "",
+    caller_live_id: str = "",
+) -> Resolution:
+    """Re-confirm that a previously resolved route still names the SAME
+    live session, without re-running selection.
+
+    Used at both checkpoints Task 3 requires -- daemon-side enqueue and the
+    provider adapter's own send -- so both share one definition of "still
+    valid" instead of two that could drift.
+
+    ONE registry read per call. The launch record is loaded exactly once,
+    right here, and every check below -- the destination's identity and
+    evidence, the caller, and launcher ownership -- is derived from that
+    SAME snapshot. Reading it more than once would let this function see
+    the record in two different states across two reads (one write landing
+    in between) and blend them into a false "still matches"; it would also
+    let a record that vanished entirely between two reads be read as
+    "gone" by one check and silently skipped by another. A single read
+    that comes back missing or unusable is one clean refusal for
+    everything that depends on it.
+
+    TRUST MODEL for `caller_pane_id` / `caller_terminal` / `caller_live_id`
+    (all three: the request's own terminal-environment evidence, read from
+    `ProviderRequest.caller_pane_id` / `.caller_terminal`, and the route's
+    OWN saved `caller_live_id` from when it was first resolved): this
+    phase runs under an explicitly TRUSTED-SAME-USER-CLIENT model. There is
+    no socket peer-credential check and none is being added here --
+    cross-checking this evidence against the launch record CCB itself
+    wrote establishes CONSISTENCY with that record, not cryptographic
+    proof of which real terminal pane sent the message. That trust does
+    NOT extend to accepting evidence that is missing, unmatched, or
+    self-contradictory: those cases refuse below, every time, precisely
+    because "trusted" here means "internally consistent," not "exempt from
+    checking."
+
+    This self-route re-check applies to a LOCAL PAIR route only: one
+    resolved and re-validated inside a single project's own launch
+    registry. Every call site that reaches here today gates on `request.
+    route.present`, which no cross-project peer request currently sets --
+    a peer caller does not belong to the destination's own launch record
+    at all, and peer routing must define its own authorization contract in
+    a later phase rather than extend this same-launch assumption.
+
+    `pane_id`, `terminal`, `session_file` and `ccb_project_id` are the
+    ENDPOINT EVIDENCE the route was originally resolved against (see
+    `ResolvedRoute`) -- deliberately NOT a cache: they are compared against
+    this one fresh read and used ONLY to refuse on a mismatch, never
+    substituted for what that read says. This is what turns a live_id
+    whose pane or session file was silently swapped underneath it into a
+    refusal rather than a silent follow. `request_project_id`, when given,
+    is the CALLING request's own project scope, checked against the
+    destination's recorded project independently of whatever
+    `ccb_project_id` evidence was carried.
+
+    A destination that fails here must be refused outright -- never
+    redirected to a sibling and never silently resubmitted.
+    """
+    launch_id = (launch_id or "").strip()
+    live_id = (live_id or "").strip()
+    if not launch_id or not live_id:
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination is gone or its launch record is no longer readable",
+        )
+
+    record = load_registry_by_session_id(launch_id)
+    if record is None:
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination is gone or its launch record is no longer readable",
+        )
+
+    inventory = read_inventory_for_record(record)
+    if not inventory.valid:
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination is gone or its launch record is no longer readable",
+        )
+
+    matches = [entry for entry in inventory.sessions if entry.live_id == live_id]
+    if len(matches) != 1:
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination is gone or its launch record is no longer readable",
+        )
+    session = matches[0]
+
+    if session.provider != (provider or "").strip().lower():
+        return Resolution(
+            error=AMBIGUOUS,
+            detail="routed destination no longer matches this provider",
+            candidates=(session.live_id,),
+        )
+
+    # Whether caller proof is REQUIRED comes from the RECORDED TOPOLOGY and
+    # the route's own saved identity -- never from whether evidence merely
+    # happened to be supplied:
+    #   - a duplicate-provider pool (more than one session of this
+    #     provider in this launch) makes the destination ambiguous without
+    #     a verified caller to exclude, so caller evidence is mandatory;
+    #   - a route that SAVED a caller_live_id needs live evidence to
+    #     corroborate it -- a saved identity with nothing backing it is
+    #     weaker than no identity at all, not stronger, so losing that
+    #     evidence refuses rather than silently trusting the saved value.
+    # Only when NEITHER applies (a genuinely unique destination and no
+    # caller was ever claimed) does an evidence-free route stay allowed.
+    # Evidence supplied on top of that is still validated (Hole 2): once
+    # supplied, it is never ignored.
+    duplicate_provider_pool = sum(1 for entry in inventory.sessions if entry.provider == session.provider) > 1
+    must_verify_caller = duplicate_provider_pool or bool(caller_live_id) or bool(caller_pane_id or caller_terminal)
+
+    if must_verify_caller:
+        if not (caller_pane_id or caller_terminal):
+            return Resolution(
+                error=UNKNOWN_CALLER,
+                detail="caller evidence is required to validate this route but none was supplied",
+                candidates=(session.live_id,),
+            )
+        # Hole 2: this must FAIL OPEN-TO-REFUSAL, never fail open-to-pass.
+        # The caller must resolve UNIQUELY within this same snapshot, must
+        # be CONSISTENT with the caller identity the route itself saved,
+        # and only then is the destination checked against it. Evidence
+        # that is unknown, unmatched, or contradictory refuses -- it never
+        # simply skips the check and lets validation carry on. NEVER is
+        # `caller_live_id` alone -- without this fresh corroboration --
+        # trusted to establish identity.
+        actual_caller = find_caller(
+            inventory.sessions,
+            pane_id=caller_pane_id,
+            terminal=caller_terminal,
+        )
+        if actual_caller is None:
+            return Resolution(
+                error=UNKNOWN_CALLER,
+                detail="the request's own caller pane could not be uniquely identified in this launch",
+                candidates=(session.live_id,),
+            )
+        if caller_live_id and actual_caller.live_id != caller_live_id.strip():
+            return Resolution(
+                error=UNKNOWN_CALLER,
+                detail="the request's own caller identity contradicts the route's saved caller",
+                candidates=(session.live_id,),
+            )
+        if actual_caller.live_id == session.live_id:
+            return Resolution(
+                error=SELF_ONLY,
+                detail="the request's own caller pane matches the routed destination",
+                candidates=(session.live_id,),
+            )
+
+    if not _evidence_agrees(pane_id, session.pane_id):
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination's pane no longer matches what it was resolved against",
+            candidates=(session.live_id,),
+        )
+    if not _evidence_agrees(terminal, session.terminal):
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination's terminal backend no longer matches what it was resolved against",
+            candidates=(session.live_id,),
+        )
+    if not _evidence_agrees(session_file, session.session_file):
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination's session file no longer matches what it was resolved against",
+            candidates=(session.live_id,),
+        )
+    if not _evidence_agrees(ccb_project_id, session.ccb_project_id):
+        return Resolution(
+            error=AMBIGUOUS,
+            detail="routed destination's project no longer matches what it was resolved against",
+            candidates=(session.live_id,),
+        )
+    if not _evidence_agrees(request_project_id, session.ccb_project_id):
+        return Resolution(
+            error=AMBIGUOUS,
+            detail="routed destination's project does not match the request's own project",
+            candidates=(session.live_id,),
+        )
+    if _registry_owner_alive(record) is False:
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="the launch that owns this destination is no longer running",
+            candidates=(session.live_id,),
+        )
+    if not session.active:
+        return Resolution(
+            error=UNAVAILABLE,
+            detail="routed destination is no longer active",
+            candidates=(session.live_id,),
+        )
+    return Resolution(session=session)
+
+
+def session_data_from_live(session: LiveSession) -> Optional[Dict[str, Any]]:
+    """Read a routed `LiveSession`'s OWN session-file JSON.
+
+    Never a fallback to some other (e.g. work_dir-wide default) file: a
+    session that names no file of its own, or whose file can't be read as a
+    JSON object, returns `None` -- a fail-closed refusal, because a
+    fallback here is exactly the "project-wide default" reply readers must
+    not use for a routed request.
+
+    The file's own recorded `pane_id`, `work_dir` and `ccb_project_id` must
+    AGREE with the inventory entry (when both sides state an opinion) --
+    this is validation, not a merge: a session file whose own scope
+    CONTRADICTS the route it is named from returns `None` rather than
+    being silently overwritten with the inventory's version. Only once
+    that agreement is confirmed are the LiveSession's own pane-targeting
+    fields (`pane_id`, `pane_title_marker`, `terminal`) applied, since the
+    inventory entry -- not this file -- is what the route was resolved
+    against and commits to being current.
+    """
+    raw = (session.session_file or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    data = _load_registry_file(path)
+    if not data:
+        return None
+
+    file_pane_id = str(data.get("pane_id") or "").strip()
+    if not _evidence_agrees(session.pane_id, file_pane_id):
+        return None
+    file_project_id = str(data.get("ccb_project_id") or "").strip()
+    if not _evidence_agrees(session.ccb_project_id, file_project_id):
+        return None
+    file_work_dir = str(data.get("work_dir") or "").strip()
+    session_work_dir = (session.work_dir or "").strip()
+    if file_work_dir and session_work_dir:
+        try:
+            agrees = normalize_work_dir(file_work_dir) == normalize_work_dir(session_work_dir)
+        except Exception:
+            agrees = False
+        if not agrees:
+            return None
+
+    data = dict(data)
+    if session.pane_id:
+        data["pane_id"] = session.pane_id
+    if session.pane_title_marker:
+        data["pane_title_marker"] = session.pane_title_marker
+    if session.terminal:
+        data["terminal"] = session.terminal
+    data.setdefault("work_dir", session.work_dir)
+    if session.ccb_project_id:
+        data.setdefault("ccb_project_id", session.ccb_project_id)
+    return data
 
 
 def load_registry_by_session_id(session_id: str) -> Optional[Dict[str, Any]]:

@@ -10,9 +10,10 @@ from pathlib import Path
 
 import askd.daemon as askd_daemon
 import askd_runtime
-from askd.adapters.base import ProviderRequest, QueuedTask
+from askd.adapters.base import ProviderRequest, QueuedTask, ResolvedRoute
 from askd.adapters.claude import ClaudeAdapter
 from askd.adapters.gemini import GeminiAdapter
+from askd.adapters.opencode import OpenCodeAdapter
 from codex_comm import CodexLogReader
 from completion_hook import completion_status_marker
 
@@ -679,9 +680,11 @@ def test_claude_adapter_delivery_only_accepts_successful_send_without_log_anchor
 
 
 def test_provider_request_defaults_route_snapshot_fields_empty() -> None:
-    # Route-snapshot fields must default to empty so every existing
-    # ProviderRequest construction site (none of which pass them) keeps
-    # working unchanged; nothing populates or reads them yet.
+    # Route-snapshot field must default to the empty ResolvedRoute so every
+    # existing ProviderRequest construction site (none of which pass it)
+    # keeps working unchanged.
+    from askd.adapters.base import ResolvedRoute
+
     req = ProviderRequest(
         client_id="c1",
         work_dir="/tmp/proj",
@@ -691,11 +694,22 @@ def test_provider_request_defaults_route_snapshot_fields_empty() -> None:
         caller="claude",
     )
 
-    assert req.resolved_live_id == ""
-    assert req.caller_live_id == ""
+    assert req.route == ResolvedRoute()
+    assert req.route.present is False
 
 
 def test_provider_request_carries_explicit_route_snapshot_fields() -> None:
+    from askd.adapters.base import ResolvedRoute
+
+    route = ResolvedRoute(
+        live_id="s2",
+        launch_id="ai-1",
+        caller_live_id="s1",
+        pane_id="%2",
+        terminal="tmux",
+        session_file="/tmp/s2.json",
+        ccb_project_id="proj-1",
+    )
     req = ProviderRequest(
         client_id="c1",
         work_dir="/tmp/proj",
@@ -703,9 +717,185 @@ def test_provider_request_carries_explicit_route_snapshot_fields() -> None:
         quiet=False,
         message="hello",
         caller="claude",
-        resolved_live_id="s2",
-        caller_live_id="s1",
+        route=route,
     )
 
-    assert req.resolved_live_id == "s2"
-    assert req.caller_live_id == "s1"
+    assert req.route.live_id == "s2"
+    assert req.route.caller_live_id == "s1"
+    assert req.route.present is True
+
+
+def _routed_task(req_id: str = "r1") -> QueuedTask:
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir="/tmp/proj",
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+        req_id=req_id,
+        route=ResolvedRoute(live_id="s2", launch_id="ai-1"),
+    )
+    return QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+
+def test_gemini_adapter_rejects_routed_request_without_touching_a_session(monkeypatch) -> None:
+    # Ruling: an adapter that does not implement the routed contract must
+    # REJECT a routed request outright, never queue under a routed
+    # identity and then send via provider-default lookup.
+    from askd.adapters import gemini as gemini_mod
+
+    monkeypatch.setattr(
+        gemini_mod,
+        "load_project_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("session lookup reached: no terminal send guard")),
+    )
+
+    result = GeminiAdapter().handle_task(_routed_task())
+
+    assert result.exit_code == 1
+    assert result.status == "failed"
+    assert "does not support routed" in result.reply
+
+
+def test_opencode_adapter_rejects_routed_request_without_touching_a_session(monkeypatch) -> None:
+    from askd.adapters import opencode as opencode_mod
+
+    monkeypatch.setattr(
+        opencode_mod,
+        "load_project_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("session lookup reached: no terminal send guard")),
+    )
+
+    result = OpenCodeAdapter().handle_task(_routed_task())
+
+    assert result.exit_code == 1
+    assert result.status == "failed"
+    assert "does not support routed" in result.reply
+
+
+def test_claude_routed_completion_does_not_resurrect_stale_registry_state(monkeypatch, tmp_path: Path) -> None:
+    # Item 2: a routed Claude completion write must not resurrect stale
+    # `active`/endpoint state. The live session's recorded `active` flag
+    # changes to False WHILE the task is running (simulating another
+    # process marking it inactive mid-task); the completion write must
+    # not revert that back to True.
+    import json as _json
+
+    from askd.adapters import claude as claude_mod
+    import laskd_session
+    from project_id import compute_ccb_project_id
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    work_dir = tmp_path / "project"
+    work_dir.mkdir(parents=True)
+    registry_dir = home / ".ccb" / "run"
+    registry_dir.mkdir(parents=True)
+    registry_path = registry_dir / "ccb-session-ai-1.json"
+    project_id = compute_ccb_project_id(work_dir)
+
+    own_session_file = work_dir / ".ccb" / "claude-session-s2.json"
+    own_session_file.parent.mkdir(parents=True, exist_ok=True)
+    own_session_file.write_text(
+        _json.dumps({"active": True, "pane_id": "%3", "ccb_project_id": project_id, "work_dir": str(work_dir)}),
+        encoding="utf-8",
+    )
+
+    def _write_registry(active: bool) -> None:
+        registry_path.write_text(
+            _json.dumps(
+                {
+                    "ccb_session_id": "ai-1",
+                    "ccb_project_id": project_id,
+                    "work_dir": str(work_dir),
+                    "terminal": "tmux",
+                    "updated_at": 9999999999,
+                    "providers": {"claude": {"pane_id": "%2"}},
+                    "live_sessions": [
+                        {
+                            "live_id": "s2",
+                            "provider": "claude",
+                            "pane_id": "%3",
+                            "session_file": str(own_session_file),
+                            "active": active,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    _write_registry(active=True)
+
+    req_id = "req-completion-1"
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def is_alive(self, pane_id: str) -> bool:
+            return True
+
+    class _Reader:
+        def __init__(self, work_dir, use_sessions_index: bool = True):
+            self.work_dir = work_dir
+            self._events = [
+                [("user", f"CCB_REQ_ID: {req_id}")],
+                [("assistant", f"Done.\nCCB_DONE: {req_id}")],
+            ]
+            self._mutated = False
+
+        def set_preferred_session(self, path) -> None:
+            return None
+
+        def capture_state(self) -> dict:
+            return {}
+
+        def wait_for_events(self, state: dict, timeout: float):
+            if not self._mutated:
+                # The live session's recorded state changes WHILE this
+                # task is running -- between when it was resolved/sent and
+                # when this completion write happens.
+                _write_registry(active=False)
+                self._mutated = True
+            if self._events:
+                return self._events.pop(0), state
+            return [], state
+
+    monkeypatch.setattr(claude_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(laskd_session, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(claude_mod, "ClaudeLogReader", _Reader)
+    monkeypatch.setattr(claude_mod, "notify_completion", lambda **kwargs: None)
+    monkeypatch.setattr(claude_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(work_dir),
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+        req_id=req_id,
+        route=ResolvedRoute(
+            live_id="s2",
+            launch_id="ai-1",
+            pane_id="%3",
+            terminal="tmux",
+            session_file=str(own_session_file),
+            ccb_project_id=project_id,
+        ),
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+    result = ClaudeAdapter().handle_task(task)
+
+    assert result.done_seen is True
+
+    final = _json.loads(registry_path.read_text(encoding="utf-8"))
+    final_sessions = {entry["live_id"]: entry for entry in final["live_sessions"]}
+    # The mid-task change (active=False) must survive the completion --
+    # never resurrected back to the stale (active=True) snapshot the task
+    # started with.
+    assert final_sessions["s2"]["active"] is False

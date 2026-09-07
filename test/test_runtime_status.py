@@ -8,7 +8,12 @@ import pytest
 
 import ccb_runtime_status
 import pane_registry
-from ccb_runtime_status import ProjectRuntimeStatus, ProviderRuntimeStatus, resolve_project_runtime_status
+from ccb_runtime_status import (
+    ProjectRuntimeStatus,
+    ProviderRuntimeStatus,
+    resolve_live_route,
+    resolve_project_runtime_status,
+)
 from project_id import compute_ccb_project_id
 
 
@@ -791,3 +796,1072 @@ def test_runtime_status_session_without_file_reference_reports_unbound(
 
     assert status.session_bound is False
     assert status.mounted is False
+
+
+# --- resolve_live_route -----------------------------------------------------
+# These exercise the client-side route-resolution entry point `bin/ask`'s
+# `_preflight_target` calls: it must find the SAME record
+# `resolve_project_runtime_status` would, and only produce a route when that
+# record actually carries a `live_sessions` inventory.
+
+
+def test_resolve_live_route_picks_sibling_for_identified_caller(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding 6: caller-aware resolution supersedes the provider-wide
+    # AMBIGUITY verdict only -- the destination it picks must still pass
+    # the same operational checks (pane liveness, session binding) a
+    # non-routed status check would run, hence the backend/session-file
+    # setup below.
+    home, work_dir, project_id = runtime_env
+    sibling_session_file = work_dir / ".ccb" / "codex-session-s2.json"
+    sibling_session_file.parent.mkdir(parents=True, exist_ok=True)
+    sibling_session_file.write_text(
+        json.dumps({"active": True, "provider": "codex", "ccb_project_id": project_id, "pane_id": "%3"}),
+        encoding="utf-8",
+    )
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "terminal": "tmux"},
+                {
+                    "live_id": "s2",
+                    "provider": "codex",
+                    "pane_id": "%3",
+                    "terminal": "tmux",
+                    "pane_title_marker": "CCB-Codex-s2",
+                    "session_file": str(sibling_session_file),
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2", "%3"}, {"CCB-Codex-s2": "%3"}),
+    )
+
+    outcome = resolve_live_route("codex", work_dir, caller_pane_id="%2", caller_terminal="tmux")
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.live_id == "s2"
+    assert resolution.session.launch_id == "ai-1"
+    assert caller is not None and caller.live_id == "s1"
+
+
+def test_resolve_live_route_refuses_unknown_caller_among_two_sessions(
+    runtime_env,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2"},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3"},
+            ],
+        },
+    )
+
+    outcome = resolve_live_route("codex", work_dir)
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert caller is None
+
+
+def test_resolve_live_route_returns_none_when_record_has_no_inventory(
+    runtime_env,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+        },
+    )
+
+    assert resolve_live_route("codex", work_dir) is None
+
+
+def test_resolve_live_route_refuses_on_invalid_inventory(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": "nope",
+        },
+    )
+
+    outcome = resolve_live_route("codex", work_dir)
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert resolution.error == "invalid_inventory"
+
+
+# --- pane_registry.validate_route / resolve_live_session_by_id -------------
+# The "confirm, never re-select" checkpoint Task 3 requires at both enqueue
+# and send. These must establish identity (does this live_id still exist in
+# this exact launch record?) before ever looking at availability.
+
+
+def test_validate_route_accepts_still_active_destination(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(live_id="s1", launch_id="ai-1", provider="codex")
+
+    assert outcome.ok is True
+    assert outcome.session.live_id == "s1"
+
+
+def test_validate_route_refuses_when_destination_is_gone(runtime_env) -> None:
+    # No registry record at all for this launch_id: the record was cleaned
+    # up, replaced, or never existed under this id.
+    outcome = pane_registry.validate_route(live_id="s1", launch_id="ai-missing", provider="codex")
+
+    assert outcome.ok is False
+    assert outcome.session is None
+
+
+def test_validate_route_refuses_when_destination_now_inactive(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": False},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(live_id="s1", launch_id="ai-1", provider="codex")
+
+    assert outcome.ok is False
+
+
+def test_validate_route_never_redirects_to_sibling_when_id_vanishes(runtime_env) -> None:
+    # The routed id is gone, but a DIFFERENT live session of the same
+    # provider is still present in the record. This must still refuse --
+    # never quietly resolve to the sibling instead.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%3"}},
+            "live_sessions": [
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(live_id="s1", launch_id="ai-1", provider="codex")
+
+    assert outcome.ok is False
+    assert outcome.session is None
+
+
+def test_session_data_from_live_reads_its_own_file_never_a_default(tmp_path: Path) -> None:
+    own_file = tmp_path / "codex-session-s1.json"
+    own_file.write_text(
+        json.dumps({"codex_session_path": "/tmp/own.jsonl", "codex_session_id": "own-id"}),
+        encoding="utf-8",
+    )
+    session = pane_registry.LiveSession(
+        live_id="s1",
+        provider="codex",
+        launch_id="ai-1",
+        pane_id="%2",
+        terminal="tmux",
+        work_dir=str(tmp_path),
+        session_file=str(own_file),
+    )
+
+    data = pane_registry.session_data_from_live(session)
+
+    assert data is not None
+    assert data["codex_session_path"] == "/tmp/own.jsonl"
+    assert data["codex_session_id"] == "own-id"
+    assert data["pane_id"] == "%2"
+
+
+def test_session_data_from_live_refuses_when_no_file_of_its_own(tmp_path: Path) -> None:
+    session = pane_registry.LiveSession(
+        live_id="s1",
+        provider="codex",
+        launch_id="ai-1",
+        pane_id="%2",
+        terminal="tmux",
+        work_dir=str(tmp_path),
+        session_file="",
+    )
+
+    assert pane_registry.session_data_from_live(session) is None
+
+
+def test_session_data_from_live_refuses_when_file_scope_contradicts_route(tmp_path: Path) -> None:
+    # Finding 4: a session file whose OWN recorded pane_id disagrees with
+    # the inventory entry it is named from must be rejected outright, not
+    # merged over -- this is validation, never a silent overwrite.
+    own_file = tmp_path / "codex-session-s1.json"
+    own_file.write_text(
+        json.dumps({"pane_id": "%99", "codex_session_path": "/tmp/own.jsonl"}),
+        encoding="utf-8",
+    )
+    session = pane_registry.LiveSession(
+        live_id="s1",
+        provider="codex",
+        launch_id="ai-1",
+        pane_id="%2",  # disagrees with the file's own "%99"
+        terminal="tmux",
+        work_dir=str(tmp_path),
+        session_file=str(own_file),
+    )
+
+    assert pane_registry.session_data_from_live(session) is None
+
+
+def test_session_data_from_live_refuses_when_file_work_dir_contradicts_route(tmp_path: Path) -> None:
+    own_file = tmp_path / "codex-session-s1.json"
+    other_dir = tmp_path / "other-project"
+    own_file.write_text(json.dumps({"pane_id": "%2", "work_dir": str(other_dir)}), encoding="utf-8")
+    session = pane_registry.LiveSession(
+        live_id="s1",
+        provider="codex",
+        launch_id="ai-1",
+        pane_id="%2",
+        terminal="tmux",
+        work_dir=str(tmp_path),  # disagrees with the file's own recorded work_dir
+        session_file=str(own_file),
+    )
+
+    assert pane_registry.session_data_from_live(session) is None
+
+
+def test_validate_route_refuses_when_pane_was_replaced_under_the_same_id(runtime_env) -> None:
+    # Finding 4: a bare live_id match is not enough to detect replacement.
+    # The route's own endpoint evidence (the pane it was resolved against)
+    # must be compared to a FRESH read, and a mismatch refuses.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%9"}},
+            "live_sessions": [
+                # Same live_id as originally resolved, but now a DIFFERENT
+                # pane -- the session was replaced underneath the id.
+                {"live_id": "s1", "provider": "codex", "pane_id": "%99", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(
+        live_id="s1", launch_id="ai-1", provider="codex", pane_id="%2",
+    )
+
+    assert outcome.ok is False
+    assert outcome.session is None
+
+
+def test_validate_route_refuses_when_session_file_was_replaced_under_the_same_id(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {
+                    "live_id": "s1",
+                    "provider": "codex",
+                    "pane_id": "%2",
+                    "session_file": str(work_dir / ".ccb" / "codex-session-REPLACED.json"),
+                    "active": True,
+                },
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(
+        live_id="s1",
+        launch_id="ai-1",
+        provider="codex",
+        pane_id="%2",
+        session_file=str(work_dir / ".ccb" / "codex-session-ORIGINAL.json"),
+    )
+
+    assert outcome.ok is False
+
+
+def test_validate_route_refuses_forged_self_route(runtime_env) -> None:
+    # Finding 2: a forged caller_live_id inside the route payload must
+    # never be trusted for the self-route check. The ACTUAL caller is
+    # re-derived from caller_pane_id/caller_terminal (the request's own
+    # terminal-environment evidence) against the fresh launch record, and
+    # a route whose destination turns out to BE that caller is refused --
+    # even though identity, evidence and provider all otherwise check out.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+
+    # The route CLAIMS to target s2 (a legitimate-looking sibling), but the
+    # request is actually being submitted FROM pane %2 -- which the
+    # inventory says is s1, not s2. A forged route could try to route
+    # someone to themselves by mis-describing who the destination is
+    # relative to who is actually asking; here we directly prove the
+    # self-route case: the caller's real pane matches the DESTINATION's
+    # own live_id.
+    outcome = pane_registry.validate_route(
+        live_id="s1",
+        launch_id="ai-1",
+        provider="codex",
+        caller_pane_id="%2",
+        caller_terminal="tmux",
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == pane_registry.SELF_ONLY
+
+
+def test_resolve_live_route_rejects_forged_caller_live_id_contradicting_pane(runtime_env) -> None:
+    # A caller_live_id that contradicts the supplied pane/terminal evidence
+    # must never be trusted -- the caller is then unidentified, not
+    # "identified as whatever the forged id claims."
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+
+    # Really at pane %2 (== s1), but forges caller_live_id="s2".
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_pane_id="%2", caller_terminal="tmux", caller_live_id="s2",
+    )
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert caller is None
+
+
+def test_resolve_live_route_refuses_two_competing_launches_without_caller_evidence(runtime_env) -> None:
+    # Finding 3: two unrelated CCB launches in the same project, both
+    # carrying a codex inventory. Without caller evidence to place the
+    # request in ONE of them, this must refuse -- never guess a
+    # project-wide "the" record.
+    home, work_dir, project_id = runtime_env
+    for session_id, pane in (("ai-1", "%2"), ("ai-2", "%20")):
+        _write_registry(
+            home,
+            session_id,
+            {
+                "ccb_session_id": session_id,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {"codex": {"pane_id": pane}},
+                "live_sessions": [
+                    {"live_id": f"{session_id}-s1", "provider": "codex", "pane_id": pane, "active": True},
+                ],
+            },
+        )
+
+    outcome = resolve_live_route("codex", work_dir)
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert caller is None
+
+
+def test_resolve_live_route_uses_correct_launch_when_caller_identifies_it(runtime_env, monkeypatch) -> None:
+    # The SAME two-launch setup as above, but this time the caller's own
+    # pane places them unambiguously in "ai-2" -- resolution must proceed
+    # strictly within that launch and never even consider "ai-1"'s.
+    home, work_dir, project_id = runtime_env
+    session_file_2 = work_dir / ".ccb" / "codex-session-ai2.json"
+    session_file_2.parent.mkdir(parents=True, exist_ok=True)
+    session_file_2.write_text(
+        json.dumps({"active": True, "provider": "codex", "ccb_project_id": project_id, "pane_id": "%21"}),
+        encoding="utf-8",
+    )
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "shared", "provider": "codex", "pane_id": "%2", "active": True},
+            ],
+        },
+    )
+    _write_registry(
+        home,
+        "ai-2",
+        {
+            "ccb_session_id": "ai-2",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%20"}},
+            "live_sessions": [
+                {"live_id": "caller", "provider": "codex", "pane_id": "%20", "active": True},
+                {
+                    "live_id": "shared",
+                    "provider": "codex",
+                    "pane_id": "%21",
+                    "pane_title_marker": "CCB-Codex-ai2",
+                    "session_file": str(session_file_2),
+                    "active": True,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2", "%20", "%21"}, {"CCB-Codex-ai2": "%21"}),
+    )
+
+    outcome = resolve_live_route("codex", work_dir, caller_pane_id="%20", caller_terminal="tmux")
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.launch_id == "ai-2"
+    assert resolution.session.pane_id == "%21"
+    assert caller is not None and caller.live_id == "caller"
+
+
+def test_resolve_live_route_refuses_after_identity_succeeds_but_pane_is_dead(
+    runtime_env, monkeypatch
+) -> None:
+    # Finding 6: caller-aware resolution supersedes the AMBIGUITY verdict
+    # only. Identity here resolves cleanly (single session, no caller
+    # needed) -- but the destination's pane is not actually alive, and
+    # that operational failure must still refuse, exactly as a non-routed
+    # status check would.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+            ],
+        },
+    )
+    # No pane in the fake backend's alive set: pane_dead.
+    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _rec: _FakeBackend(set()))
+
+    outcome = resolve_live_route("codex", work_dir)
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert resolution.error == "pane_dead"
+
+
+def test_resolve_live_route_proxies_through_daemon_rpc_inside_managed_sandbox(monkeypatch) -> None:
+    # Finding 1: a sandboxed caller must get a REAL, host-computed answer
+    # via the authenticated daemon RPC -- never a local bypass. Proven two
+    # ways: (a) direct registry access is never attempted from here (it
+    # would raise if it were), and (b) the RPC round-trip's response is
+    # what determines the outcome.
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(
+        ccb_runtime_status,
+        "_iter_qualifying_registry_records",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("sandbox bypassed to direct registry access")),
+    )
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "secret"})
+
+    captured: dict = {}
+
+    def _fake_request(_state, request, **kwargs):
+        captured.update(request=request, kwargs=kwargs)
+        return {
+            "type": "ask.response",
+            "exit_code": 0,
+            "route_outcome": {
+                "kind": "route",
+                "live_id": "s2",
+                "launch_id": "ai-1",
+                "provider": "codex",
+                "pane_id": "%3",
+                "terminal": "tmux",
+                "work_dir": "/tmp/proj",
+                "ccb_project_id": "proj-1",
+                "session_file": "/tmp/s2.json",
+                "active": True,
+                "caller_live_id": "s1",
+            },
+        }
+
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "request_daemon", _fake_request)
+
+    outcome = resolve_live_route(
+        "codex", "/tmp/proj", caller_pane_id="%2", caller_terminal="tmux",
+    )
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is True
+    assert resolution.session.live_id == "s2"
+    assert resolution.session.launch_id == "ai-1"
+    assert caller is not None and caller.live_id == "s1"
+    assert captured["request"]["operation"] == "resolve_route"
+    assert captured["request"]["provider"] == "codex"
+    assert captured["request"]["caller_pane_id"] == "%2"
+
+
+def test_resolve_live_route_sandbox_proxy_reports_explicit_refusal(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "secret"})
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc,
+        "request_daemon",
+        lambda _state, _request, **_kwargs: {
+            "type": "ask.response",
+            "exit_code": 0,
+            "route_outcome": {"kind": "refused", "reason": "unknown_caller", "detail": "no verified caller", "candidates": []},
+        },
+    )
+
+    outcome = resolve_live_route("codex", "/tmp/proj", caller_pane_id="%2", caller_terminal="tmux")
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert resolution.error == "unknown_caller"
+    assert caller is None
+
+
+def test_resolve_live_route_sandbox_proxy_reports_no_inventory(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "secret"})
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc,
+        "request_daemon",
+        lambda _state, _request, **_kwargs: {
+            "type": "ask.response",
+            "exit_code": 0,
+            "route_outcome": {"kind": "no_inventory"},
+        },
+    )
+
+    assert resolve_live_route("codex", "/tmp/proj", caller_pane_id="%2", caller_terminal="tmux") is None
+
+
+# --- Hole 2: caller re-validation must fail CLOSED, not open ---------------
+
+
+def test_validate_route_refuses_when_caller_evidence_matches_nothing(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+
+    # Pane %999 belongs to no session in this launch at all.
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_pane_id="%999", caller_terminal="tmux",
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == pane_registry.UNKNOWN_CALLER
+
+
+def test_validate_route_refuses_when_caller_contradicts_routes_saved_caller(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+                {"live_id": "s3", "provider": "codex", "pane_id": "%4", "active": True},
+            ],
+        },
+    )
+
+    # The request is genuinely being submitted from pane %2 (== s1), but
+    # the route it is carrying claims its caller was "s3" -- a mismatch
+    # that must refuse rather than either trusting the route's claim or
+    # silently ignoring it.
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_pane_id="%2", caller_terminal="tmux", caller_live_id="s3",
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == pane_registry.UNKNOWN_CALLER
+
+
+def test_validate_route_refuses_when_launch_record_vanishes_between_reads(runtime_env, monkeypatch) -> None:
+    # Simulates the launch record disappearing between an earlier resolve
+    # and this validation checkpoint: load_registry_by_session_id must be
+    # read ONCE and, finding nothing, refuse outright rather than treating
+    # a vanished record as any kind of pass.
+    monkeypatch.setattr(pane_registry, "load_registry_by_session_id", lambda _session_id: None)
+
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_pane_id="%2", caller_terminal="tmux",
+    )
+
+    assert outcome.ok is False
+    assert outcome.session is None
+
+
+def test_validate_route_refuses_when_inventory_becomes_invalid_between_reads(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            # Broken: was valid when the route was first resolved, is not
+            # valid any more by the time this checkpoint reads it.
+            "live_sessions": "nope",
+        },
+    )
+
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_pane_id="%2", caller_terminal="tmux",
+    )
+
+    assert outcome.ok is False
+
+
+def test_validate_route_reads_the_launch_record_exactly_once(runtime_env, monkeypatch) -> None:
+    # Hole 2: one snapshot for the whole checkpoint -- destination,
+    # caller, and owner checks must all come from the SAME read.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+    calls: list[str] = []
+    real_loader = pane_registry.load_registry_by_session_id
+
+    def _counting_loader(session_id):
+        calls.append(session_id)
+        return real_loader(session_id)
+
+    monkeypatch.setattr(pane_registry, "load_registry_by_session_id", _counting_loader)
+
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_pane_id="%2", caller_terminal="tmux",
+    )
+
+    assert outcome.ok is True
+    assert calls == ["ai-1"]
+
+
+# --- Hole 3: a present, valid inventory is authoritative; evidence that ----
+# --- resolves to nothing must fail, not fall back to a callerless pick. ---
+
+
+def test_resolve_live_route_refuses_when_valid_inventory_lacks_the_provider(runtime_env, monkeypatch) -> None:
+    # Hole 3(a): the caller's own launch has a VALID inventory that simply
+    # doesn't mention "codex" (it's Claude-only). A healthy LEGACY codex
+    # registration sits right alongside it in the same registry file. The
+    # present inventory is authoritative: this must refuse, never fall
+    # through to that legacy provider entry.
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            # A healthy legacy codex registration -- would happily mount
+            # if the caller ever fell back to it.
+            "providers": {
+                "codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+                "claude": {"pane_id": "%9"},
+            },
+            "live_sessions": [
+                {"live_id": "c1", "provider": "claude", "pane_id": "%9", "active": True},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    outcome = resolve_live_route("codex", work_dir)
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert resolution.error != ""
+
+    # Proof that "refuses" here really is overriding a healthy fallback,
+    # not coincidentally agreeing with an already-broken one: the legacy
+    # codex pane itself checks out as alive on its own terms.
+    legacy_pane_alive = pane_registry._provider_pane_alive(
+        {"providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}}, "terminal": "tmux", "work_dir": str(work_dir)},
+        "codex",
+    )
+    assert legacy_pane_alive is True
+
+
+def test_resolve_live_route_refuses_when_evidence_matches_nothing_but_one_destination_exists(
+    runtime_env,
+) -> None:
+    # Hole 3(b): caller evidence was SUPPLIED but matches no launch at all,
+    # while exactly one otherwise-eligible destination sits in the
+    # project. Must refuse -- never silently fall back to the callerless
+    # single-destination pick, which would have succeeded.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+            ],
+        },
+    )
+
+    # Pane %999 matches nothing anywhere in the project.
+    outcome = resolve_live_route("codex", work_dir, caller_pane_id="%999", caller_terminal="tmux")
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert resolution.error == "unknown_caller"
+    assert caller is None
+
+
+def test_resolve_live_route_still_falls_back_when_no_evidence_and_no_inventory_anywhere(
+    runtime_env, monkeypatch
+) -> None:
+    # Guardrail against over-correcting Hole 3(b): a caller that supplies
+    # NO evidence at all, in a project with NO inventory anywhere, must
+    # still get today's byte-identical un-routed behaviour -- this is the
+    # Phase 1 hard requirement, and it must survive the Hole 3 fix.
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            # No "live_sessions" key at all anywhere in the project.
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    assert resolve_live_route("codex", work_dir) is None
+
+
+# --- Item 1: caller proof is required by TOPOLOGY, not by whether -----------
+# --- evidence happened to be supplied. ---------------------------------
+
+
+def test_validate_route_refuses_duplicate_pool_no_evidence_saved_caller_is_destination(
+    runtime_env,
+) -> None:
+    # A complete, well-formed route into a two-Codex inventory, saved
+    # caller_live_id naming the DESTINATION itself, with NEITHER
+    # caller_pane_id NOR caller_terminal supplied. Mandatory endpoint
+    # fields alone don't catch this -- they only prove the destination is
+    # what it was, never that it isn't the caller. Must refuse.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex", caller_live_id="s2",
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == pane_registry.UNKNOWN_CALLER
+
+
+def test_validate_route_refuses_duplicate_pool_no_evidence_saved_caller_is_sibling(
+    runtime_env,
+) -> None:
+    # Same duplicate-provider pool, but the saved caller_live_id names the
+    # SIBLING, not the destination -- still refuses, because a saved
+    # identity with nothing corroborating it is weaker than no identity at
+    # all: it must never be trusted on its own.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex", caller_live_id="s1",
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == pane_registry.UNKNOWN_CALLER
+
+
+def test_validate_route_refuses_saved_caller_without_corroborating_evidence_even_in_unique_pool(
+    runtime_env,
+) -> None:
+    # A SINGLE-session provider pool (no ambiguity from topology alone),
+    # but the route still saved a caller_live_id and supplies nothing to
+    # corroborate it. That saved identity must not be trusted on its own
+    # either.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(
+        live_id="s1", launch_id="ai-1", provider="codex", caller_live_id="someone-else",
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == pane_registry.UNKNOWN_CALLER
+
+
+def test_validate_route_still_allows_genuinely_callerless_routing_to_unique_destination(
+    runtime_env,
+) -> None:
+    # Positive control: a single-session provider pool, no saved caller,
+    # no evidence supplied at all -- this must remain allowed. (Mirrors
+    # `test_validate_route_accepts_still_active_destination`, stated
+    # explicitly here as the Item 1 positive case.)
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+            ],
+        },
+    )
+
+    outcome = pane_registry.validate_route(live_id="s1", launch_id="ai-1", provider="codex")
+
+    assert outcome.ok is True

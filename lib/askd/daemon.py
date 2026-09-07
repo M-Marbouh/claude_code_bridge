@@ -14,10 +14,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
+from askd.adapters.base import (
+    BaseProviderAdapter,
+    MalformedRouteError,
+    ProviderRequest,
+    ProviderResult,
+    QueuedTask,
+    ResolvedRoute,
+    parse_route_mapping,
+    route_session_key,
+)
 from askd.registry import ProviderRegistry
 from askd_runtime import log_path, random_token, state_file_path, write_log
 from ccb_protocol import make_req_id
+from completion_hook import COMPLETION_STATUS_FAILED
+from pane_registry import validate_route
+from project_id import compute_ccb_project_id
 from providers import ProviderDaemonSpec
 from worker_pool import BaseSessionWorker, PerSessionWorkerPool
 
@@ -96,8 +108,47 @@ class _UnifiedWorkerPool:
             cancel_event=cancel_event,
         )
 
-        session = adapter.load_session(Path(request.work_dir))
-        session_key = adapter.compute_session_key(session) if session else f"{provider}:unknown"
+        if request.route.present:
+            # This request was already resolved to an exact destination in
+            # client-side preflight. Re-CONFIRM that destination still names
+            # the same live session -- never re-select among candidates,
+            # never fall back to a provider-wide lookup. A destination that
+            # is gone, replaced, or now ambiguous fails the request outright
+            # here, before it is ever enqueued to a worker. The route's own
+            # endpoint evidence (pane, terminal, session file, project) is
+            # compared against a FRESH read, never substituted for one.
+            try:
+                request_project_id = compute_ccb_project_id(Path(request.work_dir))
+            except Exception:
+                request_project_id = ""
+            outcome = validate_route(
+                live_id=request.route.live_id,
+                launch_id=request.route.launch_id,
+                provider=provider,
+                pane_id=request.route.pane_id,
+                terminal=request.route.terminal,
+                session_file=request.route.session_file,
+                ccb_project_id=request.route.ccb_project_id,
+                request_project_id=request_project_id,
+                caller_pane_id=request.caller_pane_id,
+                caller_terminal=request.caller_terminal,
+                caller_live_id=request.route.caller_live_id,
+            )
+            if not outcome.ok:
+                task.result = ProviderResult(
+                    exit_code=1,
+                    reply=f"Routed destination is no longer available ({outcome.error}).",
+                    req_id=req_id,
+                    session_key=route_session_key(provider, request.route),
+                    done_seen=False,
+                    status=COMPLETION_STATUS_FAILED,
+                )
+                task.done_event.set()
+                return task
+            session_key = route_session_key(provider, request.route)
+        else:
+            session = adapter.load_session(Path(request.work_dir))
+            session_key = adapter.compute_session_key(session) if session else f"{provider}:unknown"
 
         pool = self._get_pool(provider)
         worker = pool.get_or_create(
@@ -140,6 +191,8 @@ class UnifiedAskDaemon:
             return self._handle_list_projects(msg)
         if operation == "runtime_status":
             return self._handle_runtime_status(msg)
+        if operation == "resolve_route":
+            return self._handle_resolve_route(msg)
 
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
@@ -180,6 +233,20 @@ class UnifiedAskDaemon:
                 "reply": "Missing 'caller' field (required).",
             }
 
+        # Finding 5: malformed route data must never be quietly downgraded
+        # into "no route supplied" and allowed to fall through to
+        # provider-default lookup -- it is a hard failure of the request.
+        try:
+            route = parse_route_mapping(msg.get("route"))
+        except MalformedRouteError as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Malformed route: {exc}",
+            }
+
         try:
             request = ProviderRequest(
                 client_id=str(msg.get("id") or ""),
@@ -200,6 +267,7 @@ class UnifiedAskDaemon:
                 caller_pane_id=str(msg.get("caller_pane_id") or ""),
                 caller_terminal=str(msg.get("caller_terminal") or ""),
                 caller_work_dir=str(msg.get("caller_work_dir") or ""),
+                route=route,
             )
         except Exception as exc:
             return {
@@ -361,6 +429,61 @@ class UnifiedAskDaemon:
             "exit_code": 0,
             "reply": "",
             "project": project.to_dict(),
+        }
+
+    def _handle_resolve_route(self, msg: dict) -> dict:
+        """Host-side live-session route resolution (Finding 1): run here,
+        unsandboxed, with real filesystem AND terminal/daemon visibility,
+        for a caller (e.g. a managed Codex sandbox) that cannot compute
+        this itself. Returns one of exactly three outcomes -- an exact
+        validated route, an explicit refusal, or a genuinely verified
+        "no inventory" legacy case -- never a bypass.
+        """
+        raw_work_dir = msg.get("work_dir")
+        if not isinstance(raw_work_dir, str) or not raw_work_dir.strip():
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Route resolution requires a work_dir",
+            }
+        provider = str(msg.get("provider") or "").strip().lower()
+        if not provider:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Route resolution requires a provider",
+            }
+        try:
+            from ccb_runtime_status import _live_session_to_route_outcome_dict, _resolve_live_route_host
+
+            outcome = _resolve_live_route_host(
+                provider,
+                raw_work_dir,
+                caller_pane_id=str(msg.get("caller_pane_id") or ""),
+                caller_terminal=str(msg.get("caller_terminal") or ""),
+                caller_live_id=str(msg.get("caller_live_id") or ""),
+                check_daemon=_request_bool(msg.get("check_daemon", True)),
+            )
+            payload = _live_session_to_route_outcome_dict(outcome)
+        except Exception as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Route resolution failed: {exc}",
+            }
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0,
+            "reply": "",
+            "route_outcome": payload,
         }
 
     def serve_forever(self) -> int:

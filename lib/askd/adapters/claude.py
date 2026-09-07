@@ -11,7 +11,13 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
+from askd.adapters.base import (
+    BaseProviderAdapter,
+    ProviderRequest,
+    ProviderResult,
+    QueuedTask,
+    route_session_key,
+)
 from askd_runtime import log_path, write_log
 from ccb_protocol import BEGIN_PREFIX, REQ_ID_PREFIX
 from claude_comm import ClaudeLogReader
@@ -25,8 +31,8 @@ from completion_hook import (
 )
 from laskd_registry import get_session_registry
 from laskd_protocol import extract_reply_for_req, is_done_text, wrap_claude_delivery_prompt, wrap_claude_prompt
-from laskd_session import compute_session_key, load_project_session
-from pane_registry import upsert_registry
+from laskd_session import ClaudeProjectSession, compute_session_key, load_project_session
+from pane_registry import session_data_from_live, upsert_registry, validate_route
 from project_id import compute_ccb_project_id
 from providers import LASKD_SPEC
 from session_file_watcher import HAS_WATCHDOG
@@ -501,8 +507,60 @@ class ClaudeAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=claude req_id={task.req_id} work_dir={req.work_dir}")
 
-        session = load_project_session(work_dir)
-        session_key = self.compute_session_key(session)
+        if req.route.present:
+            # Re-confirm the destination this request was already routed to
+            # -- at ENQUEUE time (daemon.py) this was checked once already;
+            # this is the second checkpoint, immediately before the SEND,
+            # closing the gap between a task sitting queued and this worker
+            # actually acting on it. Never re-select; a destination that
+            # failed this check is refused, not redirected to a sibling.
+            session_key = route_session_key(self.key, req.route)
+            try:
+                request_project_id = compute_ccb_project_id(work_dir)
+            except Exception:
+                request_project_id = ""
+            outcome = validate_route(
+                live_id=req.route.live_id,
+                launch_id=req.route.launch_id,
+                provider=self.key,
+                pane_id=req.route.pane_id,
+                terminal=req.route.terminal,
+                session_file=req.route.session_file,
+                ccb_project_id=req.route.ccb_project_id,
+                request_project_id=request_project_id,
+                caller_pane_id=req.caller_pane_id,
+                caller_terminal=req.caller_terminal,
+                caller_live_id=req.route.caller_live_id,
+            )
+            if not outcome.ok:
+                return ProviderResult(
+                    exit_code=1,
+                    reply=f"Routed destination is no longer available ({outcome.error}).",
+                    req_id=task.req_id,
+                    session_key=session_key,
+                    done_seen=False,
+                    status=COMPLETION_STATUS_FAILED,
+                )
+            live_data = session_data_from_live(outcome.session)
+            if live_data is None:
+                return ProviderResult(
+                    exit_code=1,
+                    reply="Routed destination has no readable session binding.",
+                    req_id=task.req_id,
+                    session_key=session_key,
+                    done_seen=False,
+                    status=COMPLETION_STATUS_FAILED,
+                )
+            # This session's OWN file and binding, never the work_dir-wide
+            # `.claude-session` default `load_project_session` would read --
+            # a sibling live session in the same work_dir may own that file.
+            session = ClaudeProjectSession(
+                session_file=Path(outcome.session.session_file).expanduser(),
+                data=live_data,
+            )
+        else:
+            session = load_project_session(work_dir)
+            session_key = self.compute_session_key(session)
 
         if not session:
             return ProviderResult(
@@ -824,26 +882,52 @@ class ClaudeAdapter(BaseProviderAdapter):
                 ccb_pid = str(session.data.get("ccb_project_id") or "").strip()
                 if not ccb_pid:
                     ccb_pid = compute_ccb_project_id(Path(session.work_dir))
-                ccb_session_id = str(session.data.get("ccb_session_id") or session.data.get("session_id") or "").strip()
-                if ccb_session_id:
-                    upsert_registry(
-                        {
-                            "ccb_session_id": ccb_session_id,
-                            "ccb_project_id": ccb_pid or None,
-                            "work_dir": str(session.work_dir),
-                            "terminal": session.terminal,
-                            "providers": {
-                                "claude": {
-                                    "pane_id": session.pane_id or None,
-                                    "pane_title_marker": session.pane_title_marker or None,
-                                    "session_file": str(session.session_file),
-                                    "claude_session_id": session.data.get("claude_session_id"),
-                                    "claude_session_path": session.data.get("claude_session_path"),
-                                    "active": bool(session.data.get("active", True)),
-                                }
-                            },
-                        }
-                    )
+                if req.route.present:
+                    # Item 2: a completion write must never resurrect or
+                    # replace state that changed WHILE this task was
+                    # running. `session.data` here is a SNAPSHOT captured
+                    # at send time (`session_data_from_live`, at the top of
+                    # `handle_task`) -- by completion time the launch
+                    # record's own copy of this entry may have moved on
+                    # (a different `active` flag, a replaced pane), and
+                    # writing the snapshot back would silently overwrite
+                    # that newer, authoritative state with the old one.
+                    #
+                    # `session.update_claude_binding(...)` just above
+                    # already persisted the one thing that genuinely
+                    # changed as a result of this task -- the session's own
+                    # conversation binding -- directly into that session's
+                    # OWN file, which is exactly what a later resolution
+                    # (`session_data_from_live`) reads from. The registry's
+                    # `live_sessions` entry itself (pane_id, marker,
+                    # terminal, active) is launch topology, not a
+                    # conversation fact this completion has anything new to
+                    # assert about, so it is intentionally left untouched
+                    # here rather than re-written from a stale snapshot.
+                    pass
+                else:
+                    ccb_session_id = str(
+                        session.data.get("ccb_session_id") or session.data.get("session_id") or ""
+                    ).strip()
+                    if ccb_session_id:
+                        upsert_registry(
+                            {
+                                "ccb_session_id": ccb_session_id,
+                                "ccb_project_id": ccb_pid or None,
+                                "work_dir": str(session.work_dir),
+                                "terminal": session.terminal,
+                                "providers": {
+                                    "claude": {
+                                        "pane_id": session.pane_id or None,
+                                        "pane_title_marker": session.pane_title_marker or None,
+                                        "session_file": str(session.session_file),
+                                        "claude_session_id": session.data.get("claude_session_id"),
+                                        "claude_session_path": session.data.get("claude_session_path"),
+                                        "active": bool(session.data.get("active", True)),
+                                    }
+                                },
+                            }
+                        )
             except Exception:
                 pass
 

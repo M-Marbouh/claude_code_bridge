@@ -129,6 +129,91 @@ def test_request_daemon_uses_mailbox_when_network_is_disabled(monkeypatch, tmp_p
     assert list(responses.iterdir()) == []
 
 
+def test_route_field_survives_tcp_transport_unchanged(monkeypatch, tmp_path: Path) -> None:
+    """A resolved route travels inside the request dict like any other
+    field: `askd_rpc` never inspects or rewrites it, so it must arrive at
+    the daemon exactly as the client sent it, over the socket transport.
+    """
+    state_file = tmp_path / "askd.json"
+    sent_route: dict = {}
+
+    class _RecordingSocket(_FakeSocket):
+        def sendall(self, data: bytes) -> None:
+            super().sendall(data)
+            payload = json.loads(data.decode("utf-8").strip())
+            sent_route.update(payload.get("route") or {})
+
+    fake_socket = _RecordingSocket(
+        {"type": "ask.response", "v": 1, "id": "r1", "exit_code": 0, "reply": "ok"}
+    )
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    monkeypatch.setattr(
+        askd_rpc,
+        "connect_daemon",
+        lambda *_args, **_kwargs: fake_socket,
+    )
+
+    route = {"live_id": "s2", "launch_id": "ai-1", "caller_live_id": "s1"}
+    response = askd_rpc.request_daemon(
+        {"host": "127.0.0.1", "port": 31337, "token": "tok"},
+        {"type": "ask.request", "id": "r1", "token": "tok", "message": "hello", "route": route},
+        connect_timeout_s=0.5,
+        response_timeout_s=1.0,
+    )
+
+    assert response["reply"] == "ok"
+    assert sent_route == route
+
+
+def test_route_field_survives_mailbox_transport_unchanged(monkeypatch, tmp_path: Path) -> None:
+    """The same request dict, including its `route`, is what a mailbox
+    responder receives -- the filesystem mailbox is a transport swap, not a
+    payload transform.
+    """
+    root = tmp_path / "mailbox"
+    requests = root / "requests"
+    responses = root / "responses"
+    requests.mkdir(parents=True)
+    responses.mkdir()
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setattr(
+        askd_rpc,
+        "connect_daemon",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("TCP transport used")),
+    )
+
+    seen_route: dict = {}
+
+    def _respond() -> None:
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            pending = list(requests.glob("*.json"))
+            if pending:
+                request_path = pending[0]
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                seen_route.update(request.get("route") or {})
+                askd_rpc._write_json_atomic(
+                    responses / request_path.name,
+                    {"type": "ask.response", "exit_code": 0, "reply": request["message"]},
+                )
+                return
+            time.sleep(0.01)
+
+    responder = Thread(target=_respond, daemon=True)
+    responder.start()
+    route = {"live_id": "s2", "launch_id": "ai-1", "caller_live_id": "s1"}
+    response = askd_rpc.request_daemon(
+        {"mailbox_dir": str(root), "token": "tok"},
+        {"type": "ask.request", "token": "tok", "message": "hello", "route": route},
+        connect_timeout_s=0.5,
+        response_timeout_s=1.0,
+    )
+    responder.join(timeout=1.0)
+
+    assert response["reply"] == "hello"
+    assert seen_route == route
+
+
 def test_request_daemon_falls_back_to_mailbox_when_tcp_is_unreachable(monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "mailbox"
     requests = root / "requests"

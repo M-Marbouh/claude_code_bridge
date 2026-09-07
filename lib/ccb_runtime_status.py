@@ -5,12 +5,21 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional, Tuple
 
 import askd_rpc
 from ccb_mcpv_bridge import read_degraded_states
 from askd_runtime import find_running_state_file, state_file_candidates
 from ccb_start_config import load_start_config
+from live_sessions import (
+    AMBIGUOUS,
+    SELF_ONLY,
+    UNKNOWN_CALLER,
+    LiveSession,
+    Resolution,
+    find_caller,
+    resolve_local_target,
+)
 from pane_registry import (
     _coerce_updated_at,
     _get_providers_map,
@@ -695,4 +704,458 @@ def provider_status_for_target(
         daemon_online=any(item.daemon_online for item in project.providers.values()),
         mounted=False,
         reason="not_configured",
+    )
+
+
+
+# --------------------------------------------------------------------------
+# Live-session route resolution
+# --------------------------------------------------------------------------
+#
+# Resolves the exact live-session destination one `ask <provider>` invocation
+# addresses, when the caller's own launch record carries a `live_sessions`
+# inventory. Three findings from review govern the shape of this section:
+#
+#   - The caller's own LAUNCH is established first (by pane/terminal
+#     evidence, independent of which provider is being asked), and
+#     resolution then proceeds strictly within THAT launch's inventory --
+#     never a project-wide, provider-selected record. Two unrelated CCB
+#     launches in the same project must never be able to supply each
+#     other's destinations or refusals.
+#   - A sandboxed caller (managed Codex client) gets a REAL answer via the
+#     authenticated daemon RPC/mailbox, computed host-side where real
+#     terminal and filesystem state is visible -- never a bypass that
+#     silently reports "no inventory" just because this process can't see
+#     the answer itself.
+#   - Caller-aware resolution supersedes the provider-wide AMBIGUITY
+#     verdict ONLY. It still runs the same operational checks
+#     (`resolve_project_runtime_status`'s inventory branch also runs:
+#     launcher liveness, pane liveness, session binding, daemon
+#     availability, launch policy) against the specific destination it
+#     selects, so a caller-identified sibling that is not actually usable
+#     is still refused, not reported as a successful route.
+
+
+def _record_claims_pane(record: dict[str, Any], pane_id: str, terminal: str) -> bool:
+    """True when this record's raw `providers` map names a pane matching
+    the given evidence -- regardless of whether its `live_sessions`
+    inventory (if any) is even readable.
+
+    Used to recognize "this is the caller's OWN launch" even when that
+    launch's inventory is broken: a caller must never be silently treated
+    as unplaceable, and resolution silently proceed against some OTHER,
+    unrelated launch instead, merely because the caller's own launch
+    record happens to be corrupt. That must be a refusal, not a fallback.
+    """
+    pane_id = (pane_id or "").strip()
+    if not pane_id:
+        return False
+    want_terminal = (terminal or "").strip().lower()
+    record_terminal = str(record.get("terminal") or "").strip().lower()
+    for entry in _get_providers_map(record).values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("pane_id") or "").strip() != pane_id:
+            continue
+        if want_terminal and record_terminal and want_terminal != record_terminal:
+            continue
+        return True
+    return False
+
+
+def _operational_refusal(
+    record: dict[str, Any],
+    session: LiveSession,
+    provider: str,
+    *,
+    project_id: str,
+    check_daemon: bool,
+) -> Optional[str]:
+    """The reason a resolved destination fails an OPERATIONAL check, or
+    `None` when it passes all of them.
+
+    Mirrors `resolve_project_runtime_status`'s own per-session inventory
+    branch (launcher liveness, real pane liveness, session binding, daemon
+    availability, launch policy) so the two never silently drift into
+    different definitions of "usable." Finding 6: caller-aware resolution
+    supersedes the provider-wide AMBIGUITY verdict only -- it must not also
+    let a destination through that fails any of these.
+    """
+    launcher_alive = _registry_owner_alive(record)
+    if launcher_alive is False:
+        return "launcher_dead"
+    session_record = {
+        "providers": {
+            provider: {"pane_id": session.pane_id, "pane_title_marker": session.pane_title_marker}
+        },
+        "terminal": session.terminal or record.get("terminal"),
+        "work_dir": session.work_dir or record.get("work_dir"),
+    }
+    pane_alive = bool(_provider_pane_alive(session_record, provider)) if launcher_alive is not False else False
+    if not pane_alive:
+        return "pane_dead"
+    if not session.session_file:
+        return "session_unbound"
+    work_dir_hint = Path(session.work_dir or record.get("work_dir") or ".")
+    bound, _session_file = _session_bound(
+        work_dir_hint, project_id, provider, {"pane_id": session.pane_id, "session_file": session.session_file}
+    )
+    if not bound:
+        return "session_unbound"
+    if check_daemon and not is_project_askd_online(work_dir_hint, project_id):
+        return "daemon_offline"
+    degraded = read_degraded_states(work_dir_hint)
+    policy_error = degraded.get(provider) or {}
+    policy_reason = str(policy_error.get("reason_code") or "").strip()
+    if policy_reason:
+        return f"launch_policy_error:{policy_reason}"
+    if not session.active:
+        return "session_inactive"
+    return None
+
+
+def _resolve_within_launch(
+    record: dict[str, Any],
+    provider: str,
+    *,
+    caller: Optional[LiveSession],
+    project_id: str,
+    check_daemon: bool,
+) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
+    """Resolve `provider`'s destination strictly within ONE already-
+    identified launch record. Never consults any other record.
+    """
+    inventory = read_inventory_for_record(record)
+    if not inventory.present:
+        return None
+    if not inventory.valid:
+        return Resolution(error="invalid_inventory", detail="live_sessions inventory is invalid"), caller
+
+    resolution = resolve_local_target(inventory.sessions, provider=provider, caller=caller)
+    if not resolution.ok:
+        return resolution, caller
+
+    # Finding 2, repeated explicitly: resolve_local_target already excludes
+    # the caller from candidates -- defeating exactly this property is what
+    # a forged caller identity would be FOR, so it is re-asserted here
+    # rather than trusted to have been enforced once, upstream.
+    if caller is not None and resolution.session.live_id == caller.live_id:
+        return Resolution(error=SELF_ONLY, detail="resolved destination is the caller itself"), caller
+
+    reason = _operational_refusal(
+        record, resolution.session, provider, project_id=project_id, check_daemon=check_daemon
+    )
+    if reason:
+        return Resolution(
+            error=reason,
+            detail=f"routed destination failed an operational check: {reason}",
+            candidates=(resolution.session.live_id,),
+        ), caller
+
+    return resolution, caller
+
+
+def _resolve_live_route_host(
+    provider: str,
+    work_dir: str | Path,
+    *,
+    caller_pane_id: str = "",
+    caller_terminal: str = "",
+    caller_live_id: str = "",
+    check_daemon: bool = True,
+) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
+    """The real, host-side route resolution: filesystem and (via the
+    operational checks) real terminal/daemon state must be visible to run
+    this. Never called directly from inside a managed Codex sandbox --
+    `resolve_live_route` proxies through the daemon RPC for that case.
+    """
+    try:
+        resolved_work_dir = Path(work_dir).expanduser().resolve()
+        project_id = compute_ccb_project_id(resolved_work_dir)
+    except Exception:
+        return None
+
+    qualifying = list(_iter_qualifying_registry_records(project_id=project_id))
+    records = [record for record, _wd, _eff, _ts, _stale in qualifying]
+    have_evidence = bool(caller_pane_id or caller_terminal or caller_live_id)
+
+    # Finding 3: establish the CALLER'S OWN LAUNCH first, by searching
+    # every qualifying record's own inventory for a session matching the
+    # supplied evidence -- never a project-wide, provider-selected record.
+    caller_matches: list[tuple[dict, LiveSession]] = []
+    if have_evidence:
+        for record in records:
+            inventory = read_inventory_for_record(record)
+            if not inventory.valid:
+                continue
+            found = find_caller(
+                inventory.sessions,
+                live_id=caller_live_id,
+                pane_id=caller_pane_id,
+                terminal=caller_terminal,
+            )
+            if found is not None:
+                caller_matches.append((record, found))
+
+    if len(caller_matches) > 1:
+        return Resolution(
+            error=AMBIGUOUS,
+            detail="caller pane matched sessions in more than one launch",
+        ), None
+
+    if caller_matches:
+        caller_launch, caller = caller_matches[0]
+        return _resolve_within_launch(
+            caller_launch, provider, caller=caller, project_id=project_id, check_daemon=check_daemon
+        )
+
+    # Whether there is even a launch anywhere in the project the callerless
+    # fallback below could match. Computed once, up front, because BOTH
+    # branches need it: the evidence-supplied branch needs it to tell
+    # "evidence matched nothing, but nothing was on offer anyway" (still
+    # legacy) apart from "evidence matched nothing, and something WAS on
+    # offer" (must refuse, not silently take that something).
+    present_records = [record for record in records if read_inventory_for_record(record).present]
+
+    # No VALID inventory could place the caller. Before falling back,
+    # check whether the caller's own launch is identifiable by pane
+    # evidence alone, even with a BROKEN inventory -- that must be a
+    # refusal, never routing silently through some other, unrelated
+    # launch just because this one's inventory happens to be corrupt.
+    if have_evidence:
+        for record in records:
+            if not _record_claims_pane(record, caller_pane_id, caller_terminal):
+                continue
+            inventory = read_inventory_for_record(record)
+            if inventory.present and not inventory.valid:
+                return Resolution(
+                    error="invalid_inventory",
+                    detail="the caller's own launch record has a broken live_sessions inventory",
+                ), None
+            if not inventory.present:
+                # The caller's own launch carries no inventory at all: the
+                # legacy case for THIS caller, regardless of what any
+                # other launch in the project carries.
+                return None
+        # Hole 3(b): evidence WAS supplied but matched NOTHING anywhere --
+        # a different case from "no evidence was supplied at all", and one
+        # that must FAIL rather than silently fall through to the
+        # genuinely-no-evidence callerless path, GROUPING the two together
+        # is exactly what let unresolvable-but-supplied evidence slip
+        # through to a callerless single-destination pick. But this only
+        # matters when the callerless path would have had something to
+        # pick from at all: when the project carries NO inventory
+        # anywhere, routing is genuinely inapplicable regardless of this
+        # caller's evidence, and the Phase 1 "no inventory is
+        # byte-identical to today" guarantee still governs -- a caller's
+        # pane happening to be identifiable (or not) must never be able to
+        # turn an ordinary, un-inventoried ask into a refusal.
+        if present_records:
+            return Resolution(
+                error=UNKNOWN_CALLER,
+                detail="caller evidence did not match any launch in this project",
+            ), None
+        return None
+
+    # The ONLY way to reach here is genuinely NO evidence having been
+    # supplied at all (have_evidence is False). Inventory-based routing
+    # cannot apply without knowing which launch is being asked FROM --
+    # fall back only when there is exactly one launch in the project that
+    # carries a `live_sessions` key at all (valid or not), since then
+    # there is no "wrong launch" to have picked between. A launch whose
+    # inventory happens to be broken still counts here (and still refuses
+    # below): silently skipping it would let an unrelated, unbroken launch
+    # in the same project stand in for it undetected.
+    if not present_records:
+        return None
+    if len(present_records) > 1:
+        return Resolution(
+            error=AMBIGUOUS,
+            detail=f"{len(present_records)} launches carry a live_sessions inventory and the caller is unidentified",
+        ), None
+
+    only_record = present_records[0]
+    inventory = read_inventory_for_record(only_record)
+    if not inventory.valid:
+        return Resolution(error="invalid_inventory", detail="live_sessions inventory is invalid"), None
+
+    # Hole 3(a): a present, VALID inventory is AUTHORITATIVE for this
+    # launch. Resolve strictly within it regardless of whether it happens
+    # to name this provider -- `resolve_local_target` itself refuses
+    # cleanly (NOT_MOUNTED) when the provider is absent from it. That
+    # refusal must never be softened into `None`, which would send the
+    # request on to consult a legacy provider file sitting alongside it.
+    return _resolve_within_launch(
+        only_record, provider, caller=None, project_id=project_id, check_daemon=check_daemon
+    )
+
+
+def _live_session_to_route_outcome_dict(
+    outcome: Optional[Tuple[Resolution, Optional[LiveSession]]],
+) -> dict[str, Any]:
+    """Serialize a `resolve_live_route` outcome for the RPC boundary."""
+    if outcome is None:
+        return {"kind": "no_inventory"}
+    resolution, caller = outcome
+    if not resolution.ok:
+        return {
+            "kind": "refused",
+            "reason": resolution.error,
+            "detail": resolution.detail,
+            "candidates": list(resolution.candidates),
+        }
+    session = resolution.session
+    return {
+        "kind": "route",
+        "live_id": session.live_id,
+        "launch_id": session.launch_id,
+        "provider": session.provider,
+        "pane_id": session.pane_id,
+        "terminal": session.terminal,
+        "work_dir": session.work_dir,
+        "ccb_project_id": session.ccb_project_id,
+        "session_file": session.session_file,
+        "active": session.active,
+        "caller_live_id": caller.live_id if caller else "",
+    }
+
+
+def _route_outcome_dict_to_live_session(
+    payload: dict[str, Any], provider: str
+) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
+    """Inverse of `_live_session_to_route_outcome_dict`."""
+    kind = payload.get("kind")
+    if kind == "no_inventory":
+        return None
+    if kind == "refused":
+        candidates = payload.get("candidates")
+        return Resolution(
+            error=str(payload.get("reason") or ""),
+            detail=str(payload.get("detail") or ""),
+            candidates=tuple(candidates) if isinstance(candidates, list) else (),
+        ), None
+    if kind == "route":
+        session = LiveSession(
+            live_id=str(payload.get("live_id") or ""),
+            provider=str(payload.get("provider") or provider),
+            launch_id=str(payload.get("launch_id") or ""),
+            pane_id=str(payload.get("pane_id") or ""),
+            terminal=str(payload.get("terminal") or ""),
+            work_dir=str(payload.get("work_dir") or ""),
+            ccb_project_id=str(payload.get("ccb_project_id") or ""),
+            active=bool(payload.get("active", True)),
+            session_file=str(payload.get("session_file") or ""),
+        )
+        caller_live_id = str(payload.get("caller_live_id") or "")
+        caller = (
+            LiveSession(live_id=caller_live_id, provider=session.provider, launch_id=session.launch_id)
+            if caller_live_id
+            else None
+        )
+        return Resolution(session=session), caller
+    raise RuntimeError(f"askd returned an unknown route outcome: {kind!r}")
+
+
+def _daemon_resolve_live_route(
+    provider: str,
+    work_dir: str | Path,
+    *,
+    caller_pane_id: str,
+    caller_terminal: str,
+    caller_live_id: str,
+    check_daemon: bool,
+) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
+    """Finding 1: a sandboxed caller cannot see real terminal/daemon state
+    itself, so route resolution is proxied to the host daemon over the
+    SAME authenticated RPC/mailbox transport `_daemon_project_runtime_
+    status` already uses -- never a local bypass. The daemon runs
+    `_resolve_live_route_host` directly (unsandboxed) and returns one of
+    exactly three outcomes: an exact validated route, an explicit refusal,
+    or a genuinely verified "no inventory" legacy case.
+    """
+    state_file = find_running_state_file(
+        "askd.json", protocol_prefix="ask", work_dir=work_dir, timeout_s=0.5
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
+    if not state:
+        raise RuntimeError("Unified askd daemon state is unavailable")
+    token = str(state.get("token") or "")
+    if not token:
+        raise RuntimeError("Unified askd daemon state is invalid")
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"resolve-route-{os.getpid()}",
+        "token": token,
+        "operation": "resolve_route",
+        "work_dir": str(work_dir),
+        "provider": provider,
+        "caller_pane_id": caller_pane_id,
+        "caller_terminal": caller_terminal,
+        "caller_live_id": caller_live_id,
+        "check_daemon": check_daemon,
+    }
+    response = askd_rpc.request_daemon(
+        state,
+        request,
+        connect_timeout_s=2.0,
+        response_timeout_s=8.0,
+    )
+    if response.get("type") != "ask.response" or int(response.get("exit_code", 1)) != 0:
+        raise RuntimeError(str(response.get("reply") or "askd rejected route resolution"))
+    payload = response.get("route_outcome")
+    if not isinstance(payload, dict):
+        raise RuntimeError("askd returned an invalid route outcome")
+    return _route_outcome_dict_to_live_session(payload, provider)
+
+
+def resolve_live_route(
+    provider: str,
+    work_dir: str | Path,
+    *,
+    caller_pane_id: str = "",
+    caller_terminal: str = "",
+    caller_live_id: str = "",
+    check_daemon: bool = True,
+    _allow_daemon_proxy: bool = True,
+) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
+    """Resolve the exact live-session destination `provider` names for this
+    caller.
+
+    Returns `None` when NO launch relevant to this caller/provider carries
+    a `live_sessions` inventory at all: there is nothing to resolve, and
+    the caller (`bin/ask`'s `_preflight_target`) must fall through to
+    today's un-routed, per-provider status check untouched -- the "no
+    inventory" case every touched sending path must leave byte-identical.
+
+    A present-but-broken inventory, an unidentifiable caller, a
+    self-route, or a destination that fails an operational check all come
+    back as a `Resolution` refusal instead of `None`, so a caller can tell
+    "not applicable" apart from "applicable and refused" and must never
+    treat the latter as the former.
+
+    Inside a managed Codex sandbox this proxies to the host daemon over
+    RPC (Finding 1) rather than resolving locally or bypassing -- see
+    `_daemon_resolve_live_route`. Resolution is always scoped to the
+    CALLER'S OWN launch record (Finding 3) and, once a destination is
+    picked, still subject to the same operational checks `resolve_project_
+    runtime_status` would run (Finding 6): caller-awareness supersedes the
+    provider-wide ambiguity verdict only.
+    """
+    if _allow_daemon_proxy and inside_managed_codex_sandbox():
+        return _daemon_resolve_live_route(
+            provider,
+            work_dir,
+            caller_pane_id=caller_pane_id,
+            caller_terminal=caller_terminal,
+            caller_live_id=caller_live_id,
+            check_daemon=check_daemon,
+        )
+    return _resolve_live_route_host(
+        provider,
+        work_dir,
+        caller_pane_id=caller_pane_id,
+        caller_terminal=caller_terminal,
+        caller_live_id=caller_live_id,
+        check_daemon=check_daemon,
     )

@@ -13,10 +13,12 @@ import json
 import threading
 from pathlib import Path
 
+import caskd_session
 from askd.adapters import codex as codex_adapter
-from askd.adapters.base import ProviderRequest, QueuedTask
+from askd.adapters.base import ProviderRequest, QueuedTask, ResolvedRoute
 from ccb_protocol import DONE_PREFIX, REQ_ID_PREFIX, make_req_id
 from codex_comm import CodexLogReader, CodexTurnContext, read_latest_turn_context
+from live_sessions import LiveSession, Resolution
 
 
 # --------------------------------------------------------------------------
@@ -565,3 +567,251 @@ def test_scan_latest_candidate_keeps_rollouts_without_lineage_metadata(monkeypat
 
     assert not codex_adapter._codex_log_is_descendant(legacy_log)
     assert codex_adapter._scan_latest_candidate_log(tmp_path, req_id=req_id) == legacy_log
+
+
+# --------------------------------------------------------------------------
+# Routed requests: send-time revalidation, and reading from the routed
+# session's own conversation rather than a work_dir-wide default.
+# --------------------------------------------------------------------------
+
+
+def test_handle_task_refuses_routed_destination_that_became_invalid(monkeypatch, tmp_path: Path) -> None:
+    """Enqueue-time validation (daemon.py) is not the only checkpoint: the
+    adapter must re-confirm immediately before it would send, and refuse
+    outright -- never fall back to the work_dir-wide session, never send
+    anything -- when the routed destination no longer checks out.
+    """
+    req_id = make_req_id()
+    backend = _FakeBackend()
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: backend)
+    monkeypatch.setattr(
+        codex_adapter,
+        "validate_route",
+        lambda **_kw: Resolution(error="unavailable", detail="routed destination is gone"),
+    )
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c", work_dir=str(tmp_path), timeout_s=5.0, quiet=True,
+        message="do it", caller="claude", req_id=req_id,
+        route=ResolvedRoute(live_id="s2", launch_id="ai-1", caller_live_id="s1"),
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert result.exit_code == 1
+    assert result.status == codex_adapter.COMPLETION_STATUS_FAILED
+    assert "no longer available" in result.reply
+    assert backend.sent == []
+
+
+def test_handle_task_reads_reply_from_routed_sessions_own_file(monkeypatch, tmp_path: Path) -> None:
+    """A routed request must bind its reply reader to the ROUTED session's
+    own `codex_session_path`/`codex_session_id`, never the work_dir-wide
+    `.codex-session` default -- even when that default names a real,
+    different session that would otherwise happily satisfy the adapter.
+    """
+    req_id = make_req_id()
+
+    routed_log_path = tmp_path / "routed.jsonl"
+    routed_log_path.write_text("", encoding="utf-8")
+    own_session_file = tmp_path / "codex-session-s2.json"
+    own_session_file.write_text(
+        json.dumps(
+            {
+                "pane_id": "%9",
+                "codex_session_path": str(routed_log_path),
+                "codex_session_id": "routed-sid",
+                "work_dir": str(tmp_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    live = LiveSession(
+        live_id="s2",
+        provider="codex",
+        launch_id="ai-1",
+        pane_id="%9",
+        terminal="tmux",
+        work_dir=str(tmp_path),
+        session_file=str(own_session_file),
+    )
+
+    # The work_dir-wide default: a DIFFERENT, otherwise-healthy session. If
+    # the adapter ever fell back to this, the reader would bind to it
+    # instead of the routed session's own file.
+    wrong_session = _FakeSession(tmp_path)
+    wrong_session.codex_session_path = str(tmp_path / "wrong.jsonl")
+    wrong_session.codex_session_id = "wrong-sid"
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd: wrong_session)
+
+    monkeypatch.setattr(codex_adapter, "validate_route", lambda **_kw: Resolution(session=live))
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: _FakeBackend())
+    monkeypatch.setattr(caskd_session, "get_backend_for_session", lambda data: _FakeBackend())
+    monkeypatch.setattr(codex_adapter, "notify_completion", lambda **kw: None)
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
+
+    captured_reader_kwargs: dict = {}
+
+    def _fake_reader(**kwargs):
+        captured_reader_kwargs.update(kwargs)
+        scripted = [
+            ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+            ("assistant", f"Done.\nCCB_DONE: {req_id}", "final_answer"),
+        ]
+        return _ScriptedReader(scripted, log_path=kwargs.get("log_path"))
+
+    monkeypatch.setattr(codex_adapter, "CodexLogReader", _fake_reader)
+
+    req = ProviderRequest(
+        client_id="c", work_dir=str(tmp_path), timeout_s=5.0, quiet=True,
+        message="do it", caller="claude", req_id=req_id,
+        route=ResolvedRoute(live_id="s2", launch_id="ai-1", caller_live_id="s1"),
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert result.done_seen is True
+    assert result.reply == "Done."
+    assert str(captured_reader_kwargs["log_path"]) == str(routed_log_path)
+    assert captured_reader_kwargs["session_id_filter"] == "routed-sid"
+    assert captured_reader_kwargs["work_dir"] == tmp_path
+
+
+def test_handle_task_refuses_when_send_time_caller_evidence_matches_nothing(monkeypatch, tmp_path: Path) -> None:
+    # Hole 2, exercised through the REAL (unmocked) validate_route against
+    # a real registry record: the send-time caller re-check must fail
+    # CLOSED when the request's own caller_pane_id matches no session in
+    # the launch -- not silently let the send through. NO TERMINAL SEND
+    # OCCURRED is the guard.
+    import json as _json
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    work_dir = tmp_path / "project"
+    work_dir.mkdir(parents=True)
+    registry_dir = home / ".ccb" / "run"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "ccb-session-ai-1.json").write_text(
+        _json.dumps(
+            {
+                "ccb_session_id": "ai-1",
+                "ccb_project_id": "proj-1",
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": 9999999999,
+                "providers": {"codex": {"pane_id": "%2"}},
+                "live_sessions": [
+                    {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                    {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req_id = make_req_id()
+    backend = _FakeBackend()
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: backend)
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c",
+        work_dir=str(work_dir),
+        timeout_s=5.0,
+        quiet=True,
+        message="do it",
+        caller="claude",
+        req_id=req_id,
+        # Claims pane %999, which matches no session in the launch at all.
+        caller_pane_id="%999",
+        caller_terminal="tmux",
+        route=ResolvedRoute(
+            live_id="s2",
+            launch_id="ai-1",
+            pane_id="%3",
+            terminal="tmux",
+            session_file="",
+            ccb_project_id="proj-1",
+        ),
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert result.exit_code == 1
+    assert result.status == codex_adapter.COMPLETION_STATUS_FAILED
+    assert "no longer available" in result.reply
+    # NO TERMINAL SEND OCCURRED.
+    assert backend.sent == []
+
+
+def test_handle_task_refuses_duplicate_pool_route_missing_caller_evidence(monkeypatch, tmp_path: Path) -> None:
+    # Item 1, exercised through the ADAPTER SEND checkpoint with the REAL
+    # (unmocked) validate_route: a duplicate-provider pool, a route whose
+    # saved caller_live_id names the SIBLING (not even the destination),
+    # and no fresh caller evidence on the request at all. Must refuse
+    # before any terminal send.
+    import json as _json
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    work_dir = tmp_path / "project"
+    work_dir.mkdir(parents=True)
+    registry_dir = home / ".ccb" / "run"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "ccb-session-ai-1.json").write_text(
+        _json.dumps(
+            {
+                "ccb_session_id": "ai-1",
+                "ccb_project_id": "proj-1",
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": 9999999999,
+                "providers": {"codex": {"pane_id": "%2"}},
+                "live_sessions": [
+                    {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                    {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req_id = make_req_id()
+    backend = _FakeBackend()
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: backend)
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c",
+        work_dir=str(work_dir),
+        timeout_s=5.0,
+        quiet=True,
+        message="do it",
+        caller="claude",
+        req_id=req_id,
+        # No caller_pane_id/caller_terminal at all on the request.
+        route=ResolvedRoute(
+            live_id="s2",
+            launch_id="ai-1",
+            caller_live_id="s1",  # saved caller == the sibling
+            pane_id="%3",
+            terminal="tmux",
+            session_file="",
+            ccb_project_id="proj-1",
+        ),
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert result.exit_code == 1
+    assert result.status == codex_adapter.COMPLETION_STATUS_FAILED
+    assert "no longer available" in result.reply
+    # NO TERMINAL SEND OCCURRED.
+    assert backend.sent == []

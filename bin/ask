@@ -47,6 +47,7 @@ sys.path.insert(0, str(lib_dir))
 from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
+from askd.adapters.base import MalformedRouteError, ResolvedRoute, parse_route_mapping
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import (
     ProviderRuntimeStatus,
@@ -56,6 +57,7 @@ from ccb_runtime_status import (
     iter_registry_provider_records,
     provider_status_for_target,
     resolve_daemon_work_dir,
+    resolve_live_route,
 )
 from project_id import compute_ccb_project_id
 from reply_artifacts import prepare_agent_visible_reply
@@ -124,6 +126,87 @@ def _caller_pane_info() -> tuple[str, str]:
     if tmux:
         return tmux, "tmux"
     return "", ""
+
+
+# A route resolved by one `ask` invocation's preflight must reach the
+# `--foreground` re-invocation the default async path spawns as a detached
+# child process, WITHOUT that child resolving it again — these are the only
+# channel between the two: plain environment variables, the same mechanism
+# already used to carry caller pane identity across that same boundary.
+_ROUTE_ENV_LIVE_ID = "CCB_ROUTE_LIVE_ID"
+_ROUTE_ENV_LAUNCH_ID = "CCB_ROUTE_LAUNCH_ID"
+_ROUTE_ENV_CALLER_LIVE_ID = "CCB_ROUTE_CALLER_LIVE_ID"
+_ROUTE_ENV_PANE_ID = "CCB_ROUTE_PANE_ID"
+_ROUTE_ENV_TERMINAL = "CCB_ROUTE_TERMINAL"
+_ROUTE_ENV_SESSION_FILE = "CCB_ROUTE_SESSION_FILE"
+_ROUTE_ENV_PROJECT_ID = "CCB_ROUTE_PROJECT_ID"
+# Binds the exported route to the ONE task it was resolved for. Without
+# this, a route env var left over in a reused/inherited shell environment
+# could be mistaken for a fresh preflight result by a later, unrelated
+# invocation that happens to inherit the same environment.
+_ROUTE_ENV_TASK_ID = "CCB_ROUTE_TASK_ID"
+
+_ROUTE_ENV_FIELD_NAMES = {
+    "live_id": _ROUTE_ENV_LIVE_ID,
+    "launch_id": _ROUTE_ENV_LAUNCH_ID,
+    "caller_live_id": _ROUTE_ENV_CALLER_LIVE_ID,
+    "pane_id": _ROUTE_ENV_PANE_ID,
+    "terminal": _ROUTE_ENV_TERMINAL,
+    "session_file": _ROUTE_ENV_SESSION_FILE,
+    "ccb_project_id": _ROUTE_ENV_PROJECT_ID,
+}
+
+
+def _inherited_route_from_env() -> "ResolvedRoute | None":
+    """A route carried in from a parent `ask` process's preflight, if any.
+
+    Returns `None` when there is nothing to inherit for THIS invocation --
+    no route env vars set at all, or a task-id marker mismatch (leftover
+    or stale values from an unrelated invocation sharing this environment)
+    -- the caller must then resolve fresh via `_preflight_target`, exactly
+    once, itself. A route that WAS meant for this invocation (its task id
+    matches `CCB_REQ_ID`) but is malformed raises `MalformedRouteError`:
+    that must never be silently treated as absent.
+    """
+    task_id = (os.environ.get(_ROUTE_ENV_TASK_ID) or "").strip()
+    req_id = (os.environ.get("CCB_REQ_ID") or "").strip()
+    if not task_id or not req_id or task_id != req_id:
+        return None
+    raw = {field: (os.environ.get(env_name) or "") for field, env_name in _ROUTE_ENV_FIELD_NAMES.items()}
+    route = parse_route_mapping(raw)
+    return route if route.present else None
+
+
+def _ps1_literal(value: str) -> str:
+    """A PowerShell single-quoted string literal for `value`.
+
+    Single-quoted PowerShell strings are fully literal -- no variable
+    interpolation, no escape sequences -- so the only encoding a value
+    ever needs is doubling an embedded `'`. This is deliberately NOT naive
+    double-quote interpolation (`"{value}"`), which a value containing a
+    `"`, a backtick, or a `$` could break out of or be interpreted inside.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _route_env_export_lines(route: "ResolvedRoute | None", *, style: str, task_id: str) -> str:
+    """Shell (`style="sh"`) or PowerShell (`style="ps1"`) lines exporting a
+    resolved route -- plus the `task_id` marker `_inherited_route_from_env`
+    requires to match `CCB_REQ_ID` -- for the detached child process to
+    inherit. Empty when there is no route to carry — a no-inventory ask
+    exports nothing, so the child's own `_inherited_route_from_env` sees
+    exactly what it sees today: nothing.
+    """
+    if route is None or not route.present:
+        return ""
+    pairs = [(_ROUTE_ENV_TASK_ID, task_id)]
+    for field, env_name in _ROUTE_ENV_FIELD_NAMES.items():
+        value = getattr(route, field)
+        if value:
+            pairs.append((env_name, value))
+    if style == "ps1":
+        return "".join(f"$env:{name} = {_ps1_literal(value)}\n" for name, value in pairs)
+    return "".join(f"export {name}={shlex.quote(value)}\n" for name, value in pairs)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -271,12 +354,73 @@ def _route_error_line(target: str, status: ProviderRuntimeStatus, *, reason: str
     )
 
 
-def _preflight_target(provider: str, *, work_dir: str | Path | None = None) -> bool:
+def _preflight_target(
+    provider: str,
+    *,
+    work_dir: str | Path | None = None,
+    caller_pane_id: str = "",
+    caller_terminal: str = "",
+    route_out: dict | None = None,
+) -> bool:
+    """Answer whether `provider` can be reached, and -- when the record this
+    answer is based on carries a `live_sessions` inventory -- resolve the
+    exact destination too, writing it into `route_out` (when given) before
+    returning.
+
+    Two independent checks feed the answer:
+      - `provider_status_for_target`, unchanged, is the ONLY check for a
+        record with no inventory: this is the byte-identical path every
+        existing caller of this function already exercises.
+      - `resolve_live_route` is consulted only for records that DO carry an
+        inventory. It supersedes the status check for those records rather
+        than adding to it, because status's ambiguity detection has no
+        caller context and cannot know a caller-specific sibling pick is
+        actually unambiguous -- this is the whole reason a second live pane
+        of one provider can ever be reached at all.
+
+    `route_out`, when given, is populated in place rather than returned, so
+    this function's return type stays a plain bool -- existing callers, and
+    existing tests that assert `is True`/`is False` on it directly, are
+    completely unaffected by a `route_out=None` default they never pass.
+    """
     try:
         status = provider_status_for_target(provider, work_dir=work_dir or Path.cwd())
     except Exception as exc:
         print(f"[ERROR] Provider runtime status unavailable: {exc}", file=sys.stderr)
         return False
+
+    try:
+        outcome = resolve_live_route(
+            provider,
+            work_dir or Path.cwd(),
+            caller_pane_id=caller_pane_id,
+            caller_terminal=caller_terminal,
+        )
+    except Exception as exc:
+        print(f"[ERROR] Live-session route unavailable: {exc}", file=sys.stderr)
+        return False
+
+    if outcome is not None:
+        resolution, caller = outcome
+        if not resolution.ok:
+            print(
+                f"CCB_ROUTE_ERROR target={provider} reason={resolution.error} "
+                f"detail={shlex.quote(resolution.detail)}",
+                file=sys.stderr,
+            )
+            return False
+        if route_out is not None:
+            route_out.update(
+                live_id=resolution.session.live_id,
+                launch_id=resolution.session.launch_id,
+                caller_live_id=caller.live_id if caller else "",
+                pane_id=resolution.session.pane_id,
+                terminal=resolution.session.terminal,
+                session_file=resolution.session.session_file,
+                ccb_project_id=resolution.session.ccb_project_id,
+            )
+        return True
+
     if status.mounted:
         return True
     print(_route_error_line(provider, status), file=sys.stderr)
@@ -400,6 +544,7 @@ def _send_via_unified_daemon(
     delivery_only: bool = False,
     suppress_completion_hook: bool = False,
     daemon_context: _UnifiedDaemonContext | None = None,
+    route: ResolvedRoute | None = None,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
     import askd_rpc
@@ -442,6 +587,22 @@ def _send_via_unified_daemon(
         req["req_id"] = outer_req_id
     if _env_bool("CCB_CODEX_SHOW_TIER", False):
         req["show_tier"] = True
+    if route is not None and route.present:
+        # A route resolved once in client-side preflight, carried unchanged
+        # into the request the daemon will enqueue and validate — never
+        # re-resolved here or anywhere downstream. Includes the endpoint
+        # evidence (pane/terminal/session_file/project) it was resolved
+        # against, so the daemon can detect a replacement rather than
+        # silently following it.
+        req["route"] = {
+            "live_id": route.live_id,
+            "launch_id": route.launch_id,
+            "caller_live_id": route.caller_live_id,
+            "pane_id": route.pane_id,
+            "terminal": route.terminal,
+            "session_file": route.session_file,
+            "ccb_project_id": route.ccb_project_id,
+        }
 
     # Pass email-related env vars for email caller
     if caller == "email":
@@ -1137,6 +1298,7 @@ def main(argv: list[str]) -> int:
         )
 
     daemon_context: _UnifiedDaemonContext | None = None
+    local_route: ResolvedRoute = ResolvedRoute()
     if not notify_mode:
         if _use_unified_daemon():
             daemon_context = _resolve_unified_daemon_context()
@@ -1144,8 +1306,37 @@ def main(argv: list[str]) -> int:
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)
                 return EXIT_ERROR
         preflight_work_dir = daemon_context.work_dir if daemon_context is not None else Path.cwd()
-        if not _preflight_target(provider, work_dir=preflight_work_dir):
+        try:
+            inherited_route = _inherited_route_from_env()
+        except MalformedRouteError as exc:
+            print(f"[ERROR] Malformed inherited route: {exc}", file=sys.stderr)
             return EXIT_ERROR
+        if inherited_route is not None:
+            # This is the detached `--foreground` re-invocation of an
+            # earlier `ask` process's default async submission: that
+            # process already resolved the route once. Carry it through
+            # unchanged; never resolve again.
+            local_route = inherited_route
+        else:
+            caller_pane_id, caller_terminal = _caller_pane_info()
+            route_fields: dict = {}
+            if not _preflight_target(
+                provider,
+                work_dir=preflight_work_dir,
+                caller_pane_id=caller_pane_id,
+                caller_terminal=caller_terminal,
+                route_out=route_fields,
+            ):
+                return EXIT_ERROR
+            try:
+                # Same parser as the ingestion boundaries: a resolution
+                # that produced incomplete endpoint evidence must refuse
+                # here too, never quietly carry a route nothing downstream
+                # can actually use to detect a replacement.
+                local_route = parse_route_mapping(route_fields)
+            except MalformedRouteError as exc:
+                print(f"[ERROR] Resolved route is incomplete: {exc}", file=sys.stderr)
+                return EXIT_ERROR
 
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:
@@ -1155,8 +1346,33 @@ def main(argv: list[str]) -> int:
             if daemon_context is None:
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)
                 return EXIT_ERROR
-            if not _preflight_target(provider, work_dir=daemon_context.work_dir):
+            # An inventory-backed destination must not go out unrouted just
+            # because this is a one-way notification: resolve (or inherit)
+            # the route exactly as the reply-collecting path does.
+            notify_route: ResolvedRoute = ResolvedRoute()
+            try:
+                inherited_notify_route = _inherited_route_from_env()
+            except MalformedRouteError as exc:
+                print(f"[ERROR] Malformed inherited route: {exc}", file=sys.stderr)
                 return EXIT_ERROR
+            if inherited_notify_route is not None:
+                notify_route = inherited_notify_route
+            else:
+                notify_caller_pane_id, notify_caller_terminal = _caller_pane_info()
+                notify_route_fields: dict = {}
+                if not _preflight_target(
+                    provider,
+                    work_dir=daemon_context.work_dir,
+                    caller_pane_id=notify_caller_pane_id,
+                    caller_terminal=notify_caller_terminal,
+                    route_out=notify_route_fields,
+                ):
+                    return EXIT_ERROR
+                try:
+                    notify_route = parse_route_mapping(notify_route_fields)
+                except MalformedRouteError as exc:
+                    print(f"[ERROR] Resolved route is incomplete: {exc}", file=sys.stderr)
+                    return EXIT_ERROR
             return _send_via_unified_daemon(
                 provider,
                 message,
@@ -1166,6 +1382,7 @@ def main(argv: list[str]) -> int:
                 delivery_only=True,
                 suppress_completion_hook=True,
                 daemon_context=daemon_context,
+                route=notify_route,
             )
         if _use_unified_daemon():
             print("[WARN] Unified notify is unavailable for this provider; using legacy", file=sys.stderr)
@@ -1200,6 +1417,7 @@ def main(argv: list[str]) -> int:
                 no_wrap,
                 caller,
                 daemon_context=daemon_context,
+                route=local_route,
             )
         else:
             cmd = [daemon_cmd, "--sync", "--timeout", str(timeout)]
@@ -1293,6 +1511,9 @@ def main(argv: list[str]) -> int:
             win_pane_env_lines += f'$env:CCB_CALLER_PANE_ID = "{win_caller_pane_id}"\n'
         if win_caller_terminal:
             win_pane_env_lines += f'$env:CCB_CALLER_TERMINAL = "{win_caller_terminal}"\n'
+        # Carry the route this process already resolved into the detached
+        # `--foreground` re-invocation, so it never resolves a second time.
+        win_pane_env_lines += _route_env_export_lines(local_route, style="ps1", task_id=task_id)
 
         script_content = f'''$ErrorActionPreference = "SilentlyContinue"
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -1347,6 +1568,9 @@ exit $rc
             pane_env_lines += f'export CCB_CALLER_PANE_ID="{bg_pane_id}"\n'
         if bg_terminal:
             pane_env_lines += f'export CCB_CALLER_TERMINAL="{bg_terminal}"\n'
+        # Carry the route this process already resolved into the detached
+        # `--foreground` re-invocation, so it never resolves a second time.
+        pane_env_lines += _route_env_export_lines(local_route, style="sh", task_id=task_id)
 
         quoted_status = shlex.quote(str(status_file))
         quoted_ask_cmd = shlex.quote(ask_cmd)

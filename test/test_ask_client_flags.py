@@ -163,10 +163,14 @@ def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None
     assert rc == 0
     assert captured["provider"] == "claude"
     assert captured["caller"] == "codex"
+    # Ruling: notify mode must carry the route too. `_preflight_target` is
+    # mocked here (no inventory involved), so the carried route is the
+    # empty ResolvedRoute -- but it must still be present in the call.
     assert captured["kwargs"] == {
         "delivery_only": True,
         "suppress_completion_hook": True,
         "daemon_context": context,
+        "route": ask.ResolvedRoute(),
     }
 
 
@@ -831,3 +835,489 @@ def test_peer_notify_does_not_require_mounted_sender(monkeypatch, tmp_path: Path
 
     assert rc == 0
     assert captured == [tmp_path.resolve()]
+
+
+# --- route resolution: _preflight_target, env carry, and background spawn --
+
+
+def test_preflight_target_route_supersedes_ambiguous_status(monkeypatch) -> None:
+    """An inventory-present record's route resolution, not the generic
+    per-provider status, decides pass/fail: `provider_status_for_target`
+    alone would refuse (its ambiguity check has no caller context), but a
+    caller-identified sibling pick must still succeed and populate the
+    route.
+    """
+    from live_sessions import LiveSession, Resolution
+
+    ask = _load_ask_module()
+    sibling = LiveSession(live_id="s2", provider="codex", launch_id="ai-1", pane_id="%3")
+    caller = LiveSession(live_id="s1", provider="codex", launch_id="ai-1", pane_id="%2")
+
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_a, **_k: _provider_status(mounted=False, daemon_online=True),
+    )
+    monkeypatch.setattr(
+        ask,
+        "resolve_live_route",
+        lambda *_a, **_k: (Resolution(session=sibling), caller),
+    )
+
+    route_out: dict = {}
+    ok = ask._preflight_target(
+        "codex",
+        work_dir="/tmp/proj",
+        caller_pane_id="%2",
+        caller_terminal="tmux",
+        route_out=route_out,
+    )
+
+    assert ok is True
+    assert route_out == {
+        "live_id": "s2",
+        "launch_id": "ai-1",
+        "caller_live_id": "s1",
+        "pane_id": "%3",
+        "terminal": "",
+        "session_file": "",
+        "ccb_project_id": "",
+    }
+
+
+def test_preflight_target_refuses_when_route_present_but_unresolvable(monkeypatch, capsys) -> None:
+    """Even a generically MOUNTED status must not override an inventory
+    that is present but cannot be narrowed to one destination for this
+    caller -- the route check supersedes the status check, not the other
+    way around.
+    """
+    from live_sessions import Resolution
+
+    ask = _load_ask_module()
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_a, **_k: _provider_status(mounted=True, daemon_online=True),
+    )
+    monkeypatch.setattr(
+        ask,
+        "resolve_live_route",
+        lambda *_a, **_k: (Resolution(error="unknown_caller", detail="2 codex sessions and no verified caller"), None),
+    )
+
+    route_out: dict = {}
+    ok = ask._preflight_target("codex", work_dir="/tmp/proj", route_out=route_out)
+
+    assert ok is False
+    assert route_out == {}
+    err = capsys.readouterr().err
+    assert "CCB_ROUTE_ERROR target=codex reason=unknown_caller" in err
+
+
+def test_preflight_target_falls_back_to_status_when_no_inventory(monkeypatch) -> None:
+    """`resolve_live_route` returning `None` (no `live_sessions` key on the
+    record) must leave today's status-only decision completely untouched.
+    """
+    ask = _load_ask_module()
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_a, **_k: _provider_status(mounted=True, daemon_online=True),
+    )
+    monkeypatch.setattr(ask, "resolve_live_route", lambda *_a, **_k: None)
+
+    route_out: dict = {}
+    ok = ask._preflight_target("codex", work_dir="/tmp/proj", route_out=route_out)
+
+    assert ok is True
+    assert route_out == {}
+
+
+def test_inherited_route_from_env_reads_all_fields_when_task_id_matches(monkeypatch) -> None:
+    # Finding 5: a route env var must be bound to the task it was resolved
+    # for -- the child only inherits it when CCB_ROUTE_TASK_ID matches
+    # CCB_REQ_ID, never on field presence alone.
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_REQ_ID", "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_TASK_ID, "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_LIVE_ID, "s2")
+    monkeypatch.setenv(ask._ROUTE_ENV_LAUNCH_ID, "ai-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_CALLER_LIVE_ID, "s1")
+    monkeypatch.setenv(ask._ROUTE_ENV_PANE_ID, "%3")
+    monkeypatch.setenv(ask._ROUTE_ENV_TERMINAL, "tmux")
+    monkeypatch.setenv(ask._ROUTE_ENV_SESSION_FILE, "/tmp/s2.json")
+    monkeypatch.setenv(ask._ROUTE_ENV_PROJECT_ID, "proj-1")
+
+    route = ask._inherited_route_from_env()
+
+    assert route == ask.ResolvedRoute(
+        live_id="s2",
+        launch_id="ai-1",
+        caller_live_id="s1",
+        pane_id="%3",
+        terminal="tmux",
+        session_file="/tmp/s2.json",
+        ccb_project_id="proj-1",
+    )
+
+
+def test_inherited_route_from_env_is_none_when_unset(monkeypatch) -> None:
+    ask = _load_ask_module()
+    monkeypatch.delenv(ask._ROUTE_ENV_LIVE_ID, raising=False)
+    monkeypatch.delenv(ask._ROUTE_ENV_LAUNCH_ID, raising=False)
+    monkeypatch.delenv(ask._ROUTE_ENV_TASK_ID, raising=False)
+    monkeypatch.delenv("CCB_REQ_ID", raising=False)
+
+    assert ask._inherited_route_from_env() is None
+
+
+def test_inherited_route_from_env_ignores_stale_task_id_mismatch(monkeypatch) -> None:
+    # A leftover route env var from a DIFFERENT, unrelated task must never
+    # be mistaken for a fresh preflight result for THIS task.
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_REQ_ID", "task-current")
+    monkeypatch.setenv(ask._ROUTE_ENV_TASK_ID, "task-stale")
+    monkeypatch.setenv(ask._ROUTE_ENV_LIVE_ID, "s2")
+    monkeypatch.setenv(ask._ROUTE_ENV_LAUNCH_ID, "ai-1")
+
+    assert ask._inherited_route_from_env() is None
+
+
+def test_inherited_route_from_env_rejects_malformed_partial_route(monkeypatch) -> None:
+    # Finding 5: a partial route (live_id without launch_id) must not be
+    # silently downgraded to "no route" -- it must raise, so the caller
+    # refuses the ask outright instead of falling back to legacy lookup.
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_REQ_ID", "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_TASK_ID, "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_LIVE_ID, "s2")
+    monkeypatch.delenv(ask._ROUTE_ENV_LAUNCH_ID, raising=False)
+
+    import pytest as _pytest
+
+    with _pytest.raises(ask.MalformedRouteError):
+        ask._inherited_route_from_env()
+
+
+def test_route_env_export_lines_shell_and_powershell_styles() -> None:
+    ask = _load_ask_module()
+    route = ask.ResolvedRoute(live_id="s2", launch_id="ai-1", caller_live_id="s1")
+
+    sh = ask._route_env_export_lines(route, style="sh", task_id="task-1")
+    assert "export CCB_ROUTE_TASK_ID=task-1\n" in sh
+    assert "export CCB_ROUTE_LIVE_ID=s2\n" in sh
+    assert "export CCB_ROUTE_LAUNCH_ID=ai-1\n" in sh
+    assert "export CCB_ROUTE_CALLER_LIVE_ID=s1\n" in sh
+
+    ps1 = ask._route_env_export_lines(route, style="ps1", task_id="task-1")
+    assert "$env:CCB_ROUTE_TASK_ID = 'task-1'\n" in ps1
+    assert "$env:CCB_ROUTE_LIVE_ID = 's2'\n" in ps1
+    assert "$env:CCB_ROUTE_LAUNCH_ID = 'ai-1'\n" in ps1
+
+    assert ask._route_env_export_lines(ask.ResolvedRoute(), style="sh", task_id="task-1") == ""
+    assert ask._route_env_export_lines(None, style="sh", task_id="task-1") == ""
+
+
+def test_route_env_export_lines_powershell_special_characters_survive_intact(monkeypatch) -> None:
+    # Ruling: PowerShell values must be literal-safe, not naive
+    # double-quote interpolation -- prove special characters round-trip.
+    ask = _load_ask_module()
+    tricky = "s2's \"pane\" `backtick` $env:HOME; Remove-Item -Recurse"
+    route = ask.ResolvedRoute(live_id=tricky, launch_id="ai-1")
+
+    ps1 = ask._route_env_export_lines(route, style="ps1", task_id="task-1")
+
+    # The value must appear as a single-quoted literal with only `'`
+    # doubled -- never split, never executed, never losing characters.
+    expected_literal = ask._ps1_literal(tricky)
+    assert f"$env:CCB_ROUTE_LIVE_ID = {expected_literal}\n" in ps1
+    assert "Remove-Item" not in ps1.split("=", 1)[0]  # not outside the literal
+
+    # Round-trip it back through a real PowerShell-style single-quote
+    # parse to prove no information was lost.
+    line = next(ln for ln in ps1.splitlines() if ln.startswith("$env:CCB_ROUTE_LIVE_ID"))
+    literal = line.split("=", 1)[1].strip()
+    assert literal.startswith("'") and literal.endswith("'")
+    recovered = literal[1:-1].replace("''", "'")
+    assert recovered == tricky
+
+
+def test_default_async_background_script_carries_resolved_route_via_env(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The route this process resolves in preflight must reach the detached
+    `--foreground` re-invocation through the environment the spawned script
+    exports -- that child must never resolve it again.
+    """
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+
+    class _Proc:
+        pid = 999
+
+    def _popen(cmd, **kwargs):
+        return _Proc()
+
+    def _fake_preflight(_provider, *, work_dir=None, caller_pane_id="", caller_terminal="", route_out=None):
+        if route_out is not None:
+            route_out.update(
+                live_id="s2",
+                launch_id="ai-1",
+                caller_live_id="s1",
+                pane_id="%3",
+                terminal="tmux",
+                session_file="/tmp/s2.json",
+                ccb_project_id="proj-1",
+            )
+        return True
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(ask, "make_task_id", lambda: "task-fixed")
+    monkeypatch.setattr(ask, "_cleanup_task_logs", lambda _path: None)
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "_preflight_target", _fake_preflight)
+    monkeypatch.setattr(ask.subprocess, "Popen", _popen)
+
+    rc = ask.main(["ask", "codex", "hello"])
+
+    assert rc == ask.EXIT_OK
+    log_dir = tmp_path / "ccb-tasks"
+    if ask.os.name == "nt":
+        content = (log_dir / "ask-codex-task-fixed.ps1").read_text(encoding="utf-8")
+        # Single-quoted PowerShell literals, matching `_ps1_literal`: this
+        # branch never runs on Linux, so it has to be asserted against the
+        # encoder's real output rather than assumed.
+        assert "$env:CCB_ROUTE_LIVE_ID = 's2'" in content
+        assert "$env:CCB_ROUTE_LAUNCH_ID = 'ai-1'" in content
+        assert "$env:CCB_ROUTE_CALLER_LIVE_ID = 's1'" in content
+    else:
+        content = (log_dir / "ask-codex-task-fixed.sh").read_text(encoding="utf-8")
+        assert "export CCB_ROUTE_LIVE_ID=s2" in content
+        assert "export CCB_ROUTE_LAUNCH_ID=ai-1" in content
+        assert "export CCB_ROUTE_CALLER_LIVE_ID=s1" in content
+
+
+def test_foreground_re_invocation_inherits_route_without_resolving_again(monkeypatch) -> None:
+    """The detached `--foreground` re-invocation must use the route it
+    inherited from the environment and must NOT call `_preflight_target`
+    (which would mean resolving a second time).
+    """
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+    captured: dict = {}
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setenv("CCB_REQ_ID", "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_TASK_ID, "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_LIVE_ID, "s2")
+    monkeypatch.setenv(ask._ROUTE_ENV_LAUNCH_ID, "ai-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_CALLER_LIVE_ID, "s1")
+    monkeypatch.setenv(ask._ROUTE_ENV_PANE_ID, "%3")
+    monkeypatch.setenv(ask._ROUTE_ENV_TERMINAL, "tmux")
+    monkeypatch.setenv(ask._ROUTE_ENV_SESSION_FILE, "/tmp/s2.json")
+    monkeypatch.setenv(ask._ROUTE_ENV_PROJECT_ID, "proj-1")
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(
+        ask,
+        "_preflight_target",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("resolved a second time")),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda *_a, **kwargs: captured.update(route=kwargs.get("route")) or 0,
+    )
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == 0
+    assert captured["route"] == ask.ResolvedRoute(
+        live_id="s2",
+        launch_id="ai-1",
+        caller_live_id="s1",
+        pane_id="%3",
+        terminal="tmux",
+        session_file="/tmp/s2.json",
+        ccb_project_id="proj-1",
+    )
+
+
+def test_notify_mode_carries_a_resolved_route_when_inventory_applies(monkeypatch) -> None:
+    # Ruling: notify mode must carry the route too -- an inventory-backed
+    # destination cannot pass a route-aware preflight and then send without
+    # that identity.
+    from live_sessions import LiveSession, Resolution
+
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+    sibling = LiveSession(
+        live_id="s2",
+        provider="claude",
+        launch_id="ai-1",
+        pane_id="%3",
+        terminal="tmux",
+        session_file="/tmp/s2.json",
+        ccb_project_id="proj-1",
+    )
+    caller = LiveSession(live_id="s1", provider="claude", launch_id="ai-1", pane_id="%2")
+    captured: dict = {}
+
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "provider_status_for_target", lambda *_a, **_k: _provider_status(mounted=True))
+    monkeypatch.setattr(ask, "resolve_live_route", lambda *_a, **_k: (Resolution(session=sibling), caller))
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda provider, message, timeout, no_wrap, caller, **kwargs: captured.update(
+            provider=provider, kwargs=kwargs
+        )
+        or 0,
+    )
+
+    rc = ask.main(["ask", "claude", "--notify", "FYI"])
+
+    assert rc == 0
+    route = captured["kwargs"]["route"]
+    assert route.live_id == "s2"
+    assert route.launch_id == "ai-1"
+    assert route.caller_live_id == "s1"
+    assert route.present is True
+
+
+@pytest.mark.parametrize("missing_field", ["pane_id", "terminal", "session_file", "ccb_project_id"])
+def test_inherited_route_from_env_rejects_route_missing_one_mandatory_field(monkeypatch, missing_field) -> None:
+    # Hole 1, env-boundary side: same requirement as the RPC boundary --
+    # once a route is present at all, its endpoint-evidence fields are
+    # mandatory. Removing just one must still raise, not parse as a
+    # (weaker, unenforceable) valid route.
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_REQ_ID", "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_TASK_ID, "task-1")
+    env_values = {
+        ask._ROUTE_ENV_LIVE_ID: "s2",
+        ask._ROUTE_ENV_LAUNCH_ID: "ai-1",
+        ask._ROUTE_ENV_PANE_ID: "%3",
+        ask._ROUTE_ENV_TERMINAL: "tmux",
+        ask._ROUTE_ENV_SESSION_FILE: "/tmp/s2.json",
+        ask._ROUTE_ENV_PROJECT_ID: "proj-1",
+    }
+    field_to_env = {
+        "pane_id": ask._ROUTE_ENV_PANE_ID,
+        "terminal": ask._ROUTE_ENV_TERMINAL,
+        "session_file": ask._ROUTE_ENV_SESSION_FILE,
+        "ccb_project_id": ask._ROUTE_ENV_PROJECT_ID,
+    }
+    del env_values[field_to_env[missing_field]]
+    for name, value in env_values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(field_to_env[missing_field], raising=False)
+
+    with pytest.raises(ask.MalformedRouteError):
+        ask._inherited_route_from_env()
+
+
+@pytest.mark.parametrize("missing_field", ["pane_id", "terminal", "session_file", "ccb_project_id"])
+def test_foreground_ask_refuses_and_never_sends_when_inherited_route_missing_one_field(
+    monkeypatch, missing_field
+) -> None:
+    # Full pipeline, env boundary: an incomplete inherited route must
+    # refuse the whole ask before ever reaching the daemon transport --
+    # NO TERMINAL SEND OCCURRED, proven the same way the unsupported-
+    # adapter tests prove it: the send function must never be called.
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setenv("CCB_REQ_ID", "task-1")
+    monkeypatch.setenv(ask._ROUTE_ENV_TASK_ID, "task-1")
+    env_values = {
+        ask._ROUTE_ENV_LIVE_ID: "s2",
+        ask._ROUTE_ENV_LAUNCH_ID: "ai-1",
+        ask._ROUTE_ENV_PANE_ID: "%3",
+        ask._ROUTE_ENV_TERMINAL: "tmux",
+        ask._ROUTE_ENV_SESSION_FILE: "/tmp/s2.json",
+        ask._ROUTE_ENV_PROJECT_ID: "proj-1",
+    }
+    field_to_env = {
+        "pane_id": ask._ROUTE_ENV_PANE_ID,
+        "terminal": ask._ROUTE_ENV_TERMINAL,
+        "session_file": ask._ROUTE_ENV_SESSION_FILE,
+        "ccb_project_id": ask._ROUTE_ENV_PROJECT_ID,
+    }
+    del env_values[field_to_env[missing_field]]
+    for name, value in env_values.items():
+        monkeypatch.setenv(name, value)
+
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(
+        ask,
+        "_preflight_target",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("resolved a second time")),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("terminal send reached despite malformed route")),
+    )
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == ask.EXIT_ERROR
+
+
+def test_foreground_ask_refuses_and_never_sends_when_valid_inventory_lacks_provider(monkeypatch) -> None:
+    # Hole 3(a): resolve_live_route refuses because the caller's own
+    # launch has a present, valid inventory that doesn't name this
+    # provider. The ask must stop right there -- NO TERMINAL SEND OCCURRED
+    # -- never fall through to a legacy-lookup send.
+    from live_sessions import Resolution
+
+    ask = _load_ask_module()
+    monkeypatch.setattr(ask, "provider_status_for_target", lambda *_a, **_k: _provider_status(mounted=True))
+    monkeypatch.setattr(
+        ask,
+        "resolve_live_route",
+        lambda *_a, **_k: (Resolution(error="not_mounted", detail="no codex session in this launch"), None),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("terminal send reached despite authoritative refusal")),
+    )
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: False)
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == ask.EXIT_ERROR
+
+
+def test_foreground_ask_refuses_and_never_sends_when_caller_evidence_matches_nothing(monkeypatch) -> None:
+    # Hole 3(b): evidence was supplied but matched no launch, even though
+    # exactly one otherwise-eligible destination exists. Must refuse and
+    # never send.
+    from live_sessions import Resolution
+
+    ask = _load_ask_module()
+    monkeypatch.setattr(ask, "provider_status_for_target", lambda *_a, **_k: _provider_status(mounted=True))
+    monkeypatch.setattr(
+        ask,
+        "resolve_live_route",
+        lambda *_a, **_k: (Resolution(error="unknown_caller", detail="caller evidence did not match any launch in this project"), None),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("terminal send reached despite unresolvable caller evidence")),
+    )
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: False)
+
+    rc = ask.main(["ask", "codex", "--foreground", "hello"])
+
+    assert rc == ask.EXIT_ERROR

@@ -35,6 +35,12 @@ class ProviderRequest:
     caller_pane_id: str = ""
     caller_terminal: str = ""
     caller_work_dir: str = ""
+    # Route snapshot: the live-session identities this request was resolved
+    # against, if any. Both default to empty so every existing construction
+    # site is unaffected. Nothing populates these yet, and no adapter reads
+    # them yet — this step only gives a request somewhere to carry them.
+    resolved_live_id: str = ""
+    caller_live_id: str = ""
 
 
 @dataclass

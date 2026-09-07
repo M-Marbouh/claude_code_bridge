@@ -19,6 +19,7 @@ from pane_registry import (
     _load_registry_file,
     _provider_pane_alive,
     _registry_owner_alive,
+    read_inventory_for_record,
 )
 from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file
@@ -56,6 +57,13 @@ class ProviderRuntimeStatus:
     session_file: str = ""
     timestamp_stale: bool = False
     updated_at: int = 0
+    # A record's own live-session inventory can hold more than one session of
+    # this provider (e.g. two Codex panes in one launch). When it does, this
+    # is the explicit "can't pick one" state, and `candidates` names who was
+    # tied rather than leaving a caller to guess. Both default so every
+    # existing single-session outcome is unaffected.
+    ambiguous: bool = False
+    candidates: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,10 +82,13 @@ class ProviderRuntimeStatus:
             "session_file": self.session_file,
             "timestamp_stale": self.timestamp_stale,
             "updated_at": self.updated_at,
+            "ambiguous": self.ambiguous,
+            "candidates": list(self.candidates),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProviderRuntimeStatus":
+        raw_candidates = data.get("candidates")
         return cls(
             key=str(data.get("key") or ""),
             provider=str(data.get("provider") or ""),
@@ -94,6 +105,8 @@ class ProviderRuntimeStatus:
             session_file=str(data.get("session_file") or ""),
             timestamp_stale=bool(data.get("timestamp_stale")),
             updated_at=_coerce_int(data.get("updated_at")),
+            ambiguous=bool(data.get("ambiguous")),
+            candidates=tuple(raw_candidates) if isinstance(raw_candidates, list) else (),
         )
 
 
@@ -269,8 +282,19 @@ def _effective_project_id(record: dict[str, Any]) -> str:
         return ""
 
 
-def iter_registry_provider_records(*, project_id: str | None = None, include_stale: bool = False) -> list[RegistryProviderRecord]:
-    records: list[RegistryProviderRecord] = []
+def _iter_qualifying_registry_records(
+    *, project_id: str | None = None, include_stale: bool = False
+) -> Iterable[tuple[dict[str, Any], str, str, int, bool]]:
+    """Yield `(record, work_dir, effective_project_id, updated_at, timestamp_stale)`
+    for registry files passing the staleness/owner/project checks every
+    consumer of a raw registry file needs. `iter_registry_provider_records`
+    (below) explodes each one into a `RegistryProviderRecord` per legacy
+    provider; provider discovery driven off a record's `live_sessions`
+    inventory instead of `providers` builds on this same filtered set, so a
+    provider named only in the inventory isn't invisible just because
+    `providers` never mentioned it. Pure refactor of what this loop already
+    did — no filtering behaviour changes.
+    """
     for path in _iter_registry_files():
         record = _load_registry_file(path)
         if not record:
@@ -288,11 +312,50 @@ def iter_registry_provider_records(*, project_id: str | None = None, include_sta
         work_dir = str(record.get("work_dir") or "").strip()
         if not work_dir:
             continue
+        yield record, work_dir, effective, updated_at, timestamp_stale
+
+
+def iter_registry_provider_records(*, project_id: str | None = None, include_stale: bool = False) -> list[RegistryProviderRecord]:
+    records: list[RegistryProviderRecord] = []
+    for record, work_dir, effective, updated_at, timestamp_stale in _iter_qualifying_registry_records(
+        project_id=project_id, include_stale=include_stale
+    ):
         for provider, entry in _get_providers_map(record).items():
             if provider not in SUPPORTED_PROVIDERS or not isinstance(entry, dict):
                 continue
             records.append(RegistryProviderRecord(effective, work_dir, provider, dict(entry), record, updated_at, timestamp_stale))
     return records
+
+
+def _inventory_only_provider_records(
+    *, project_id: str | None = None, include_stale: bool = False
+) -> list[RegistryProviderRecord]:
+    """Synthesize a `RegistryProviderRecord` for a provider that a record's
+    (valid) `live_sessions` inventory names but its legacy `providers` map
+    never does. Without this, such a provider is invisible to
+    `resolve_project_runtime_status`, whose provider discovery otherwise runs
+    entirely off `providers`. The synthetic entry's `provider_entry` is empty
+    on purpose: the inventory-driven status path is what actually reads this
+    provider's pane, straight off the matching `LiveSession`, never off this
+    placeholder.
+    """
+    extra: list[RegistryProviderRecord] = []
+    for record, work_dir, effective, updated_at, timestamp_stale in _iter_qualifying_registry_records(
+        project_id=project_id, include_stale=include_stale
+    ):
+        inventory = read_inventory_for_record(record)
+        if not inventory.valid:
+            # An invalid inventory can't be trusted to name real providers;
+            # the invalid-inventory refusal below only applies to a provider
+            # already known through `providers`.
+            continue
+        legacy_providers = set(_get_providers_map(record))
+        inventory_providers = {session.provider for session in inventory.sessions}
+        for provider in sorted(inventory_providers - legacy_providers):
+            if provider not in SUPPORTED_PROVIDERS:
+                continue
+            extra.append(RegistryProviderRecord(effective, work_dir, provider, {}, record, updated_at, timestamp_stale))
+    return extra
 
 
 def _configured_providers(work_dir: Path) -> set[str]:
@@ -391,6 +454,11 @@ def resolve_project_runtime_status(
         )
     project_id = (project_id or compute_ccb_project_id(resolved)).strip()
     records = iter_registry_provider_records(project_id=project_id, include_stale=include_stale)
+    # A provider named only in a record's live_sessions inventory (never in
+    # its legacy `providers` map) still needs to be discoverable, or it
+    # silently vanishes from status entirely — provider discovery below is
+    # driven off this combined list.
+    records = records + _inventory_only_provider_records(project_id=project_id, include_stale=include_stale)
     configured = _configured_providers(resolved)
     selected = _select_records(records)
     degraded = read_degraded_states(resolved)
@@ -403,6 +471,137 @@ def resolve_project_runtime_status(
     for provider in sorted(configured | set(selected) | set(degraded)):
         record = selected.get(provider)
         policy_error = degraded.get(provider) or {}
+
+        # A record whose `live_sessions` key is present at all — valid or
+        # not — must have every provider it can name derived from that
+        # inventory alone, never from the legacy `providers` map: `providers`
+        # may still name a pane the inventory has superseded, or may simply
+        # agree by coincidence, and a broken inventory must never be quietly
+        # bridged over by reading `providers` as though the key were absent.
+        if record is not None:
+            inventory = read_inventory_for_record(record.registry_record)
+            if inventory.present:
+                stale = bool(record.timestamp_stale)
+                launcher_alive = _registry_owner_alive(record.registry_record)
+
+                if not inventory.valid:
+                    # Distinct from the ambiguous state below: this is "the
+                    # inventory itself could not be read," not "it named more
+                    # than one session." Never mounted, never consults
+                    # `providers`.
+                    statuses[provider] = ProviderRuntimeStatus(
+                        key=provider,
+                        provider=provider,
+                        capable=True,
+                        configured=provider in configured,
+                        registered=True,
+                        pane_alive=False,
+                        session_bound=False,
+                        daemon_online=daemon_online,
+                        mounted=False,
+                        reason="invalid_inventory",
+                        timestamp_stale=stale,
+                        updated_at=record.updated_at,
+                    )
+                    continue
+
+                same_provider_sessions = [
+                    session for session in inventory.sessions if session.provider == provider
+                ]
+                if len(same_provider_sessions) > 1:
+                    # More than one session of this provider: there is no
+                    # single pane to report on, so say that explicitly rather
+                    # than picking one (today's newest-record-wins or
+                    # first-match behaviour).
+                    statuses[provider] = ProviderRuntimeStatus(
+                        key=provider,
+                        provider=provider,
+                        capable=True,
+                        configured=provider in configured,
+                        registered=True,
+                        pane_alive=False,
+                        session_bound=False,
+                        daemon_online=daemon_online,
+                        mounted=False,
+                        reason="ambiguous_sessions",
+                        timestamp_stale=stale,
+                        updated_at=record.updated_at,
+                        ambiguous=True,
+                        candidates=tuple(sorted(session.live_id for session in same_provider_sessions)),
+                    )
+                    continue
+
+                # Zero or exactly one session of this provider: inspect that
+                # session's own pane and binding (not the legacy projection,
+                # which may name a different pane entirely).
+                session = same_provider_sessions[0] if same_provider_sessions else None
+                session_pane_id = session.pane_id if session else ""
+                session_marker = session.pane_title_marker if session else ""
+                session_record = {
+                    "providers": {
+                        provider: {"pane_id": session_pane_id, "pane_title_marker": session_marker}
+                    },
+                    "terminal": (session.terminal if session else "") or record.registry_record.get("terminal"),
+                    "work_dir": (session.work_dir if session else "") or record.registry_record.get("work_dir"),
+                }
+                pane_alive = bool(_provider_pane_alive(session_record, provider)) if launcher_alive is not False else False
+                # Bind against THIS session's own file reference only — never
+                # the provider-default file `_session_bound` would otherwise
+                # fall back to when an entry lacks "session_file". A session
+                # (or the absence of one) with no explicit file is reported
+                # unbound rather than borrowing an unrelated file's binding.
+                session_file_ref = session.session_file if session else ""
+                if session_file_ref:
+                    bound, session_file = _session_bound(
+                        resolved, project_id, provider, {"pane_id": session_pane_id, "session_file": session_file_ref}
+                    )
+                else:
+                    bound, session_file = False, ""
+                # A sole session's own recorded `active` flag governs mounted
+                # status directly — ambiguity detection above already counted
+                # inactive members, this is only about the single-session
+                # outcome. An inactive session must never report mounted, and
+                # must say so rather than reusing a reason that would
+                # otherwise read "" (nothing wrong) for an inactive session
+                # whose pane/binding/daemon all happen to look healthy.
+                session_inactive = session is not None and not session.active
+                mounted = bool(not stale and pane_alive and bound and daemon_online and not policy_error and not session_inactive)
+                policy_reason = str(policy_error.get("reason_code") or "").strip()
+                if policy_reason:
+                    reason = f"launch_policy_error:{policy_reason}"
+                elif session_inactive:
+                    reason = "session_inactive"
+                else:
+                    reason = _reason(
+                        provider in configured,
+                        True,
+                        stale,
+                        pane_alive,
+                        bound,
+                        daemon_online,
+                        launcher_alive,
+                    )
+                statuses[provider] = ProviderRuntimeStatus(
+                    key=provider,
+                    provider=provider,
+                    capable=True,
+                    configured=provider in configured,
+                    registered=True,
+                    pane_alive=pane_alive,
+                    session_bound=bound,
+                    daemon_online=daemon_online,
+                    mounted=mounted,
+                    reason=reason,
+                    pane_id=session_pane_id,
+                    pane_title_marker=session_marker,
+                    session_file=session_file,
+                    timestamp_stale=stale,
+                    updated_at=max(record.updated_at, _coerce_int(policy_error.get("timestamp"))),
+                )
+                continue
+
+        # No live_sessions key on this record (or no record at all): today's
+        # behaviour, driven off the legacy `providers` map, unchanged.
         entry = record.provider_entry if record else {}
         registered = record is not None
         stale = bool(record.timestamp_stale) if record else False

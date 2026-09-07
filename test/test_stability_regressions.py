@@ -676,3 +676,36 @@ def test_claude_adapter_delivery_only_accepts_successful_send_without_log_anchor
     assert result.anchor_seen is False
     assert result.status == "completed"
     assert result.extra == {"confirmation": "sent"}
+
+
+def test_provider_request_defaults_route_snapshot_fields_empty() -> None:
+    # Route-snapshot fields must default to empty so every existing
+    # ProviderRequest construction site (none of which pass them) keeps
+    # working unchanged; nothing populates or reads them yet.
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir="/tmp/proj",
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+    )
+
+    assert req.resolved_live_id == ""
+    assert req.caller_live_id == ""
+
+
+def test_provider_request_carries_explicit_route_snapshot_fields() -> None:
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir="/tmp/proj",
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+        resolved_live_id="s2",
+        caller_live_id="s1",
+    )
+
+    assert req.resolved_live_id == "s2"
+    assert req.caller_live_id == "s1"

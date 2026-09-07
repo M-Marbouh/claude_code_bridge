@@ -5,9 +5,17 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Iterable
+from typing import Optional, Dict, Any, Iterable, List
 
 from cli_output import atomic_write_text
+from live_sessions import (
+    INVENTORY_INVALID,
+    INVENTORY_VALID,
+    InventoryResult,
+    LiveSession,
+    live_sessions_from_record,
+    read_inventory,
+)
 from process_lock import _is_pid_alive
 from project_id import compute_ccb_project_id
 from terminal import get_backend_for_session
@@ -234,6 +242,33 @@ def _provider_pane_alive(record: Dict[str, Any], provider: str) -> bool:
     return False
 
 
+def live_sessions_for_record(record: Dict[str, Any]) -> List[LiveSession]:
+    """Read the live-session inventory off a stored registry record.
+
+    Delegates entirely to `live_sessions_from_record` for parsing and never
+    adds a fallback of its own on top: that parser already decides, on its
+    own fail-closed terms, when an empty result means "no live sessions" and
+    when it means "this record's `live_sessions` key is broken." Either way
+    the result here is an empty list, and this function must not reach into
+    `providers` to paper over that — a broken inventory is broken, not
+    legacy, and a caller here must not be able to tell the two empties apart
+    by consulting `providers` itself.
+    """
+    return live_sessions_from_record(record)
+
+
+def read_inventory_for_record(record: Dict[str, Any]) -> InventoryResult:
+    """Read a stored registry record's live-session inventory, with its
+    validity signalled explicitly (absent / valid / invalid).
+
+    Thin wrapper over `live_sessions.read_inventory`, the same way
+    `live_sessions_for_record` wraps `live_sessions_from_record` above: this
+    module adds no validation rules of its own here either, only
+    registry-specific plumbing sits on top of what `live_sessions` decides.
+    """
+    return read_inventory(record)
+
+
 def load_registry_by_session_id(session_id: str) -> Optional[Dict[str, Any]]:
     if not session_id:
         return None
@@ -387,6 +422,29 @@ def upsert_registry(record: Dict[str, Any]) -> bool:
         if isinstance(existing, dict):
             data.update(existing)
 
+    # Captured before any of this write's own merges: the scope
+    # (ccb_session_id, work_dir, ccb_project_id) a retained inventory was
+    # last validated against, so a later step can tell whether THIS write
+    # actually changes it.
+    original_scope = (
+        str(data.get("ccb_session_id") or "").strip(),
+        str(data.get("work_dir") or "").strip(),
+        str(data.get("ccb_project_id") or "").strip(),
+    )
+
+    # A write that itself carries a `live_sessions` key is "inventory-carrying".
+    # Such a write must not silently merge over — i.e. implicitly repair — an
+    # inventory that is already broken on disk; that would launder a broken
+    # inventory into a valid one nobody asked to fix. Checked here, against
+    # the on-disk record as loaded, before any of this write's own field
+    # merges below can change the very scope fields (work_dir,
+    # ccb_project_id, terminal) that validity depends on. A write that omits
+    # `live_sessions` entirely is unaffected by this check and always leaves
+    # the stored inventory exactly as it is.
+    if "live_sessions" in record and read_inventory(data).status == INVENTORY_INVALID:
+        _debug(f"Registry update rejected: stored live_sessions inventory is already broken: {path}")
+        return False
+
     # Normalize to the new schema.
     providers = _get_providers_map(data)
 
@@ -423,14 +481,110 @@ def upsert_registry(record: Dict[str, Any]) -> bool:
             providers.setdefault(p, {})
             providers[p].update({k: v for k, v in legacy_entry.items() if v is not None})
 
+    # Merge the live-session inventory the same way `providers` is merged
+    # above: by identity (here `live_id` rather than provider key), so an
+    # incoming write updates or adds an entry without discarding sibling
+    # entries it didn't mention. Unlike `providers`, though, an incoming
+    # entry is a COMPLETE session record, not a field-level patch: it
+    # wholesale replaces whatever is stored under the same `live_id` rather
+    # than being merged key-by-key into it. A write that omits
+    # `live_sessions` entirely leaves the stored inventory exactly as it is
+    # — `pending_live_sessions` stays `None`, and `data["live_sessions"]`
+    # (already loaded from the existing file, if any) is never touched.
+    #
+    # Validation happens in two passes. The first, here, is purely
+    # structural and doesn't depend on anything the rest of this write still
+    # has to decide: every incoming entry must be a dict carrying a usable
+    # `live_id`, and no two incoming entries may claim the same one. A
+    # failure here fails the whole write and leaves the stored file
+    # untouched — nothing has been persisted yet.
+    pending_live_sessions: Optional[List[Dict[str, Any]]] = None
+    if "live_sessions" in record:
+        incoming_live_sessions = record.get("live_sessions")
+        if not isinstance(incoming_live_sessions, list):
+            _debug(f"Registry update rejected: live_sessions is not a list: {path}")
+            return False
+
+        incoming_ids: set[str] = set()
+        for entry in incoming_live_sessions:
+            if not isinstance(entry, dict):
+                _debug(f"Registry update rejected: live_sessions entry is not an object: {path}")
+                return False
+            lid = entry.get("live_id")
+            if not isinstance(lid, str) or not lid.strip():
+                _debug(f"Registry update rejected: live_sessions entry has no usable live_id: {path}")
+                return False
+            lid = lid.strip()
+            if lid in incoming_ids:
+                _debug(f"Registry update rejected: duplicate incoming live_id {lid!r}: {path}")
+                return False
+            incoming_ids.add(lid)
+
+        by_live_id: Dict[str, Dict[str, Any]] = {}
+        existing_live_sessions = data.get("live_sessions")
+        if isinstance(existing_live_sessions, list):
+            # The on-disk-invalid guard above already proved this is not a
+            # broken inventory (or there was none to begin with), so every
+            # entry here is a well-formed dict with a usable live_id.
+            for entry in existing_live_sessions:
+                if isinstance(entry, dict):
+                    existing_lid = str(entry.get("live_id") or "").strip()
+                    if existing_lid:
+                        by_live_id[existing_lid] = dict(entry)
+        for entry in incoming_live_sessions:
+            lid = str(entry.get("live_id")).strip()
+            # A whole-record replace, not a patch: keys are copied verbatim,
+            # including an explicit `None`. The legacy `providers`/top-level
+            # merges elsewhere in this function drop `None` values to mean
+            # "leave the old value alone" — that reading is deliberately NOT
+            # applied here, because a null must survive to be judged by the
+            # scope/structure validation below rather than being quietly
+            # absorbed into "unspecified."
+            by_live_id[lid] = dict(entry)
+        pending_live_sessions = list(by_live_id.values())
+
     # Top-level fields.
     for key, value in record.items():
         if value is None:
             continue
-        if key in {"providers", "provider"}:
+        if key in {"providers", "provider", "live_sessions"}:
             continue
         # Legacy provider-scoped keys stay duplicated for compatibility but won't be used for routing.
         data[key] = value
+
+    if pending_live_sessions is not None:
+        # Second validation pass: now that this write's top-level fields
+        # (ccb_session_id, work_dir, ccb_project_id, terminal) have settled
+        # into their final values, validate the merged inventory against
+        # THAT scope, using the exact same rules the reader applies —
+        # `read_inventory` itself, not a second set of rules kept in sync by
+        # hand. A merged result that fails is rejected outright: this
+        # function repairs nothing, it only accepts or refuses.
+        scoped_record = dict(data)
+        scoped_record["live_sessions"] = pending_live_sessions
+        if read_inventory(scoped_record).status != INVENTORY_VALID:
+            _debug(f"Registry update rejected: merged live_sessions inventory is invalid for its scope: {path}")
+            return False
+        data["live_sessions"] = pending_live_sessions
+    elif "live_sessions" in data:
+        # This write left live_sessions untouched — the stored inventory is
+        # simply being retained. But it may still have changed the scope
+        # (ccb_session_id, work_dir, ccb_project_id) those unchanged bytes
+        # are implicitly read against, and the same bytes can silently mean
+        # something different under a new scope. Only worth re-checking when
+        # that scope actually moved: a write that changes nothing about it
+        # must behave exactly as it does today, pre-existing brokenness
+        # included, since nothing here asked to confront that.
+        final_scope = (
+            str(data.get("ccb_session_id") or "").strip(),
+            str(data.get("work_dir") or "").strip(),
+            str(data.get("ccb_project_id") or "").strip(),
+        )
+        if final_scope != original_scope and read_inventory(data).status != INVENTORY_VALID:
+            _debug(
+                f"Registry update rejected: retained live_sessions inventory no longer valid under this write's new scope: {path}"
+            )
+            return False
 
     data["providers"] = providers
 

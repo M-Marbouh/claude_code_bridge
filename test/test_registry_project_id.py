@@ -8,7 +8,12 @@ from typing import Optional
 import pytest
 
 import pane_registry
-from pane_registry import load_registry_by_pane, load_registry_by_project_id, upsert_registry
+from pane_registry import (
+    live_sessions_for_record,
+    load_registry_by_pane,
+    load_registry_by_project_id,
+    upsert_registry,
+)
 from project_id import compute_ccb_project_id
 
 
@@ -273,3 +278,473 @@ def test_load_registry_by_project_id_rejects_reused_wezterm_pane_id_with_wrong_c
     )
 
     assert load_registry_by_project_id(pid, "codex") is None
+
+
+# --------------------------------------------------------------------------
+# live_sessions inventory carried by the registry
+# --------------------------------------------------------------------------
+
+def test_live_sessions_round_trips_through_upsert_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "7"},
+                {"live_id": "s2", "provider": "codex", "pane_id": "8"},
+            ],
+        }
+    )
+
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert {entry["live_id"] for entry in data["live_sessions"]} == {"s1", "s2"}
+
+    sessions = live_sessions_for_record(data)
+    assert sorted(s.live_id for s in sessions) == ["s1", "s2"]
+    assert all(s.provider == "codex" for s in sessions)
+
+
+def test_upsert_registry_incoming_write_without_the_key_preserves_stored_live_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+
+    # A later write that never mentions live_sessions (e.g. just touching
+    # providers) must not erase the stored inventory.
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "providers": {"codex": {"pane_id": "7"}},
+        }
+    )
+
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert [entry["live_id"] for entry in data["live_sessions"]] == ["s1"]
+
+
+def test_upsert_registry_merges_live_sessions_by_live_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+    # A second write naming a different live_id must add to the inventory,
+    # not replace it wholesale.
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s2", "provider": "codex", "pane_id": "8"}],
+        }
+    )
+
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert {entry["live_id"] for entry in data["live_sessions"]} == {"s1", "s2"}
+
+
+def test_legacy_record_without_live_sessions_key_resolves_exactly_as_before(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "providers": {"codex": {"pane_id": "7"}},
+        }
+    )
+
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert "live_sessions" not in data
+
+    sessions = live_sessions_for_record(data)
+    assert len(sessions) == 1
+    assert sessions[0].provider == "codex"
+    assert sessions[0].live_id == "legacy:ai-1:codex"
+
+
+def test_broken_live_sessions_key_reads_as_empty_not_a_providers_fallback() -> None:
+    # A `live_sessions` key that fails to parse is a broken record, not a
+    # legacy one: it must never be treated as if the key were absent, which
+    # would resurrect a `providers`-derived session as a false "one true
+    # destination."
+    record = {
+        "ccb_session_id": "ai-1",
+        "work_dir": "/w",
+        "live_sessions": "not-a-list",
+        "providers": {"codex": {"pane_id": "%3"}},
+    }
+    assert live_sessions_for_record(record) == []
+
+
+# --------------------------------------------------------------------------
+# live_sessions write-path validation (fail-closed, never repair)
+# --------------------------------------------------------------------------
+
+def test_upsert_registry_rejects_malformed_incoming_entry_and_leaves_file_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    before = reg_path.read_bytes()
+
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {"live_id": "s2", "provider": "codex", "pane_id": "8"},
+                "not-a-dict",
+            ],
+        }
+    )
+
+    assert ok is False
+    assert reg_path.read_bytes() == before
+
+
+def test_upsert_registry_rejects_duplicate_incoming_live_id_and_leaves_file_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    before = reg_path.read_bytes()
+
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {"live_id": "s2", "provider": "codex", "pane_id": "8"},
+                {"live_id": "s2", "provider": "codex", "pane_id": "9"},
+            ],
+        }
+    )
+
+    assert ok is False
+    assert reg_path.read_bytes() == before
+
+
+def test_upsert_registry_rejects_non_list_live_sessions_and_leaves_file_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    before = reg_path.read_bytes()
+
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": "nope",
+        }
+    )
+
+    assert ok is False
+    assert reg_path.read_bytes() == before
+
+
+def test_upsert_registry_rejects_write_when_stored_inventory_already_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # Simulate a pre-existing broken record directly (upsert_registry itself
+    # refuses to ever create one).
+    _write_registry_file(
+        tmp_path,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": "nope",
+        },
+    )
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    before = reg_path.read_bytes()
+
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+
+    assert ok is False
+    assert reg_path.read_bytes() == before
+
+
+def test_upsert_registry_rejects_merged_result_whose_scope_disagrees_with_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    before = reg_path.read_bytes()
+
+    # This entry's own launch_id disagrees with the record's ccb_session_id,
+    # which makes the merged inventory invalid for its containing scope.
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {"live_id": "s2", "provider": "codex", "pane_id": "8", "launch_id": "ai-2"},
+            ],
+        }
+    )
+
+    assert ok is False
+    assert reg_path.read_bytes() == before
+
+
+def test_upsert_registry_valid_write_preserves_siblings_it_did_not_mention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "7"},
+                {"live_id": "s2", "provider": "codex", "pane_id": "8"},
+            ],
+        }
+    )
+
+    # A write naming only s2 must not drop the sibling s1 it never mentioned.
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [{"live_id": "s2", "provider": "codex", "pane_id": "9"}],
+        }
+    )
+    assert ok is True
+
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    by_id = {entry["live_id"]: entry for entry in data["live_sessions"]}
+    assert by_id["s1"]["pane_id"] == "7"
+    assert by_id["s2"]["pane_id"] == "9"
+
+
+def test_upsert_registry_explicit_null_is_not_treated_as_keep_old_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {
+                    "live_id": "s1",
+                    "provider": "codex",
+                    "pane_id": "7",
+                    "pane_title_marker": "CCB-Codex-1",
+                }
+            ],
+        }
+    )
+
+    # A whole-record replace: an explicit null for pane_title_marker must
+    # survive into the stored entry, not be silently read as "leave the old
+    # marker alone" the way the legacy providers merge treats a None value.
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "9", "pane_title_marker": None}
+            ],
+        }
+    )
+    assert ok is True
+
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    entry = data["live_sessions"][0]
+    assert entry["pane_id"] == "9"
+    assert entry.get("pane_title_marker") is None
+
+
+# --------------------------------------------------------------------------
+# Retained inventory must be revalidated against a changed scope
+# --------------------------------------------------------------------------
+
+def test_upsert_registry_rejects_scope_change_that_invalidates_retained_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    proj = tmp_path / "proj"
+    other = tmp_path / "other"
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(proj),
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "7", "work_dir": str(proj)},
+            ],
+        }
+    )
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    before = reg_path.read_bytes()
+
+    # Omits live_sessions entirely, but changes work_dir to something the
+    # stored entry's own explicit work_dir now disagrees with.
+    ok = upsert_registry({"ccb_session_id": "ai-1", "work_dir": str(other)})
+
+    assert ok is False
+    assert reg_path.read_bytes() == before
+
+
+def test_upsert_registry_scope_compatible_write_without_live_sessions_key_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    proj = tmp_path / "proj"
+    other = tmp_path / "other"
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(proj),
+            # No explicit work_dir on the entry itself, so it inherits — a
+            # later change to the record's work_dir doesn't create a conflict.
+            "live_sessions": [{"live_id": "s1", "provider": "codex", "pane_id": "7"}],
+        }
+    )
+
+    ok = upsert_registry({"ccb_session_id": "ai-1", "work_dir": str(other)})
+
+    assert ok is True
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert data["work_dir"] == str(other)
+    assert [entry["live_id"] for entry in data["live_sessions"]] == ["s1"]
+
+
+def test_upsert_registry_scope_change_without_any_stored_inventory_is_unaffected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    proj = tmp_path / "proj"
+    other = tmp_path / "other"
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(proj),
+            "providers": {"codex": {"pane_id": "7"}},
+        }
+    )
+
+    ok = upsert_registry({"ccb_session_id": "ai-1", "work_dir": str(other)})
+
+    assert ok is True
+    reg_path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1.json"
+    data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert data["work_dir"] == str(other)
+    assert "live_sessions" not in data
+
+
+def test_upsert_registry_no_scope_change_leaves_already_broken_inventory_write_unaffected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A write that changes nothing about scope must behave exactly as it
+    # does today, pre-existing brokenness included — today an absent-key
+    # write never revalidates a retained inventory at all.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _write_registry_file(
+        tmp_path,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "live_sessions": "nope",
+        },
+    )
+
+    ok = upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path / "proj"),
+            "providers": {"codex": {"pane_id": "7"}},
+        }
+    )
+
+    assert ok is True

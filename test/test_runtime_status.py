@@ -400,3 +400,394 @@ def test_managed_codex_sandbox_detection_does_not_require_run_dir(monkeypatch: p
     monkeypatch.delenv("CCB_RUN_DIR", raising=False)
 
     assert ccb_runtime_status.inside_managed_codex_sandbox() is True
+
+
+def test_runtime_status_reports_ambiguous_for_two_sessions_of_one_provider(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2"},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2", "%3"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.ambiguous is True
+    assert sorted(status.candidates) == ["s1", "s2"]
+    assert status.mounted is False
+    assert status.reason == "ambiguous_sessions"
+    assert status.registered is True
+
+
+def test_runtime_status_single_session_output_unchanged_by_ambiguity_check(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    _write_registry(
+        home,
+        "live",
+        {
+            "ccb_session_id": "live",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.configured is True
+    assert status.registered is True
+    assert status.pane_alive is True
+    assert status.session_bound is True
+    assert status.daemon_online is True
+    assert status.mounted is True
+    assert status.reason == ""
+    assert status.ambiguous is False
+    assert status.candidates == ()
+
+
+def test_runtime_status_invalid_inventory_never_reports_mounted(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            # A healthy legacy entry that a fallback would happily mount.
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": "nope",
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.mounted is False
+    assert status.reason == "invalid_inventory"
+    assert status.ambiguous is False
+    assert status.registered is True
+
+
+def test_runtime_status_valid_single_session_uses_inventory_pane_not_legacy_pane(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            # Legacy pane %2 is alive in the fake backend below; the
+            # inventory names a different pane, %9, which is not.
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-legacy"}},
+            "live_sessions": [
+                {
+                    "live_id": "s1",
+                    "provider": "codex",
+                    "pane_id": "%9",
+                    "pane_title_marker": "CCB-Codex-inventory",
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-legacy": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    # If the legacy pane were still consulted, pane_alive would be True
+    # (it's the one the fake backend reports alive). It isn't: the
+    # inventory's own (dead, per this backend) pane governs instead.
+    assert status.pane_id == "%9"
+    assert status.pane_alive is False
+    assert status.mounted is False
+
+
+def test_runtime_status_provider_present_only_in_inventory_still_appears(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+                # opencode never appears in `providers` at all.
+                {"live_id": "s2", "provider": "opencode", "pane_id": "%5", "pane_title_marker": "CCB-Opencode-test"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2", "%5"}, {"CCB-Codex-test": "%2", "CCB-Opencode-test": "%5"}),
+    )
+
+    project = resolve_project_runtime_status(work_dir)
+
+    assert "opencode" in project.providers
+    status = project.providers["opencode"]
+    assert status.registered is True
+    assert status.pane_id == "%5"
+    assert status.pane_alive is True
+
+
+def test_iter_registry_provider_records_returns_legacy_records(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Isolated coverage of iter_registry_provider_records itself (bin/ask
+    # consumes it directly), independent of resolve_project_runtime_status —
+    # locks in that last round's refactor onto a shared generator didn't
+    # change what it returns for a plain legacy record.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+        },
+    )
+
+    records = ccb_runtime_status.iter_registry_provider_records(project_id=project_id)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.provider == "codex"
+    assert record.project_id == project_id
+    assert record.work_dir == str(work_dir)
+    assert record.provider_entry.get("pane_id") == "%2"
+
+
+def test_runtime_status_inactive_sole_session_never_reports_mounted(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    session_file = str(work_dir / ".ccb" / ".codex-session")
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": [
+                {
+                    "live_id": "s1",
+                    "provider": "codex",
+                    "pane_id": "%2",
+                    "pane_title_marker": "CCB-Codex-test",
+                    "session_file": session_file,
+                    "active": False,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    # Pane, binding and daemon are all otherwise healthy — only the
+    # session's own recorded inactivity should stop it from mounting.
+    assert status.pane_alive is True
+    assert status.session_bound is True
+    assert status.daemon_online is True
+    assert status.mounted is False
+    assert status.reason == "session_inactive"
+
+
+def test_runtime_status_ambiguity_still_counts_inactive_members(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Item 1 only changes the single-session outcome; an inactive member
+    # must still count toward ambiguity detection exactly as before.
+    home, work_dir, project_id = runtime_env
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "active": True},
+                {"live_id": "s2", "provider": "codex", "pane_id": "%3", "active": False},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.ambiguous is True
+    assert sorted(status.candidates) == ["s1", "s2"]
+
+
+def test_runtime_status_uses_sessions_own_file_over_provider_default(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    # No provider-default `.codex-session` file exists at all: if binding
+    # ever fell back to it for this inventory session, it would fail.
+    own_file = work_dir / ".ccb" / "codex-session-s1.json"
+    own_file.parent.mkdir(parents=True, exist_ok=True)
+    own_file.write_text(
+        json.dumps(
+            {
+                "active": True,
+                "provider": "codex",
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "pane_id": "%2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": [
+                {
+                    "live_id": "s1",
+                    "provider": "codex",
+                    "pane_id": "%2",
+                    "pane_title_marker": "CCB-Codex-test",
+                    "session_file": str(own_file),
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.session_bound is True
+    assert status.session_file == str(own_file)
+    assert status.mounted is True
+
+
+def test_runtime_status_session_without_file_reference_reports_unbound(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, work_dir, project_id = runtime_env
+    # A HEALTHY provider-default file exists — if binding ever fell back to
+    # it for an inventory session with no file of its own, this would
+    # incorrectly report bound.
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%2", project_id=project_id)
+    _write_registry(
+        home,
+        "ai-1",
+        {
+            "ccb_session_id": "ai-1",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%2", "pane_title_marker": "CCB-Codex-test"}},
+            "live_sessions": [
+                {"live_id": "s1", "provider": "codex", "pane_id": "%2", "pane_title_marker": "CCB-Codex-test"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%2"}, {"CCB-Codex-test": "%2"}),
+    )
+
+    status = resolve_project_runtime_status(work_dir).providers["codex"]
+
+    assert status.session_bound is False
+    assert status.mounted is False

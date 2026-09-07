@@ -505,3 +505,63 @@ def test_handle_task_footer_uses_single_provider_key(monkeypatch, tmp_path: Path
     ])
 
     assert result.reply == "Codex reply.\n[codex model=gpt-5.4-mini effort=medium sandbox=workspace-write]"
+
+
+def _write_rollout(path: Path, *, sid: str, cwd: Path, req_id: str, meta_extra: dict | None = None) -> None:
+    payload = {"id": sid, "cwd": str(cwd)}
+    payload.update(meta_extra or {})
+    path.write_text(
+        "\n".join([
+            json.dumps({"type": "session_meta", "payload": payload}),
+            json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": f"{REQ_ID_PREFIX} {req_id}"}}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_scan_latest_candidate_skips_descendant_transcript_even_when_newer(monkeypatch, tmp_path: Path) -> None:
+    """A native subagent rollout quotes the parent's anchor and shares its cwd.
+
+    Selection is mtime-ordered, so the descendant can outrank the conversation
+    that actually received the request. It must lose in both orderings.
+    """
+    root = tmp_path / "codex-root"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(root))
+    req_id = make_req_id()
+    top_id = "cccccccc-3333-3333-3333-cccccccccccc"
+    child_id = "dddddddd-4444-4444-4444-dddddddddddd"
+    top_log = root / f"{top_id}.jsonl"
+    child_log = root / f"{child_id}.jsonl"
+
+    _write_rollout(top_log, sid=top_id, cwd=tmp_path, req_id=req_id,
+                   meta_extra={"session_id": top_id, "parent_thread_id": None, "source": "cli"})
+    _write_rollout(child_log, sid=child_id, cwd=tmp_path, req_id=req_id,
+                   meta_extra={"session_id": top_id, "parent_thread_id": top_id,
+                               "source": {"subagent": {"other": "guardian"}}})
+
+    for newer, older in ((child_log, top_log), (top_log, child_log)):
+        import os as _os
+        now = _os.stat(newer).st_mtime
+        _os.utime(older, (now - 60, now - 60))
+        _os.utime(newer, (now, now))
+        assert codex_adapter._scan_latest_candidate_log(tmp_path, req_id=req_id) == top_log
+
+    # Sanity: the descendant is a genuine candidate apart from its lineage.
+    assert codex_adapter._codex_log_work_dir_matches(child_log, tmp_path)
+    assert codex_adapter._codex_log_is_descendant(child_log)
+    assert not codex_adapter._codex_log_is_descendant(top_log)
+
+
+def test_scan_latest_candidate_keeps_rollouts_without_lineage_metadata(monkeypatch, tmp_path: Path) -> None:
+    """Older Codex builds write neither field; those rollouts stay eligible."""
+    root = tmp_path / "codex-root"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(root))
+    req_id = make_req_id()
+    legacy_id = "eeeeeeee-5555-5555-5555-eeeeeeeeeeee"
+    legacy_log = root / f"{legacy_id}.jsonl"
+    _write_rollout(legacy_log, sid=legacy_id, cwd=tmp_path, req_id=req_id)
+
+    assert not codex_adapter._codex_log_is_descendant(legacy_log)
+    assert codex_adapter._scan_latest_candidate_log(tmp_path, req_id=req_id) == legacy_log

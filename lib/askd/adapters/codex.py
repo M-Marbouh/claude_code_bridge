@@ -161,6 +161,43 @@ def _codex_log_work_dir_matches(log_path: Path, work_dir: Path) -> bool:
     return False
 
 
+def _codex_log_is_descendant(log_path: Path) -> bool:
+    """True when the rollout is a descendant transcript rather than a top-level
+    conversation.
+
+    Codex writes native subagent runs to their own rollout files that share the
+    parent's cwd and can quote the parent's prompt, request anchor included. A
+    descendant is never the conversation CCB addressed, so it must not win
+    candidate selection just by being the most recently written file.
+
+    Only positive evidence rejects a candidate: rollouts from CLI versions that
+    predate these fields carry neither marker and stay eligible.
+    """
+    try:
+        with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(50):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+                    continue
+                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                parent = payload.get("parent_thread_id")
+                if isinstance(parent, str) and parent.strip():
+                    return True
+                source = payload.get("source")
+                if isinstance(source, dict) and "subagent" in source:
+                    return True
+                return False
+    except Exception:
+        return False
+    return False
+
+
 def _scan_latest_candidate_log(
     work_dir: Path,
     *,
@@ -184,6 +221,10 @@ def _scan_latest_candidate_log(
         if sid and sid in excluded:
             continue
         if not _codex_log_work_dir_matches(candidate, work_dir):
+            continue
+        # A native subagent transcript shares the parent's cwd and can quote the
+        # request anchor, so it can outrank the real conversation on mtime.
+        if _codex_log_is_descendant(candidate):
             continue
         # Never switch logs based only on cwd: the exact request anchor proves
         # that this Codex session received the task.

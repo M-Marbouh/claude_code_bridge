@@ -33,4 +33,5 @@ openspec
 *.log
 .hippocampus
 .serena/
-plans/
+plans/*
+!plans/live-provider-pairing-plan.md

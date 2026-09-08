@@ -565,6 +565,7 @@ class TmuxBackend(TerminalBackend):
         if not pane_id:
             return
         self._tmux_run(["select-pane", "-t", pane_id, "-T", title or ""], check=False)
+        self.set_pane_user_option(pane_id, "@ccb_marker", title or "")
 
     def set_pane_user_option(self, pane_id: str, name: str, value: str) -> None:
         """
@@ -585,18 +586,25 @@ class TmuxBackend(TerminalBackend):
         marker = (marker or "").strip()
         if not marker:
             return None
-        cp = self._tmux_run(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"], capture=True)
+        cp = self._tmux_run(
+            ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}\t#{@ccb_marker}"],
+            capture=True,
+        )
         if cp.returncode != 0:
             return None
         for line in (cp.stdout or "").splitlines():
             if not line.strip():
                 continue
             if "\t" in line:
-                pid, title = line.split("\t", 1)
+                parts = line.split("\t", 2)
+                pid = parts[0]
+                title = parts[1] if len(parts) > 1 else ""
+                stable_marker = parts[2] if len(parts) > 2 else ""
             else:
                 parts = line.split(" ", 1)
                 pid, title = (parts[0], parts[1] if len(parts) > 1 else "")
-            if (title or "").startswith(marker):
+                stable_marker = ""
+            if (title or "").startswith(marker) or stable_marker == marker:
                 pid = pid.strip()
                 if self._looks_like_pane_id(pid):
                     return pid

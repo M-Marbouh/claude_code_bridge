@@ -46,14 +46,15 @@ def test_tmux_split_pane_builds_command_and_parses_pane_id(monkeypatch: pytest.M
 def test_tmux_find_pane_by_title_marker_parses_list_panes(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
                       input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-        assert args == ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"]
+        assert args == ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}\t#{@ccb_marker}"]
         assert capture is True
-        return _cp(stdout="%1\tCCB-opencode-abc\n%2\tOTHER\n")
+        return _cp(stdout="%1\tCCB-opencode-abc\t\n%2\tOTHER\tCCB-stable\n")
 
     backend = terminal.TmuxBackend()
     monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
 
     assert backend.find_pane_by_title_marker("CCB-opencode") == "%1"
+    assert backend.find_pane_by_title_marker("CCB-stable") == "%2"
     assert backend.find_pane_by_title_marker("NOPE") is None
 
 

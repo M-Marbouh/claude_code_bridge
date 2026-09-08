@@ -1956,6 +1956,9 @@ class AILauncher:
                 "-c", 'approval_policy="never"',
                 "-c", 'sandbox_mode="danger-full-access"',
             ])
+        extra = self.launch_args.get("codex")
+        if isinstance(extra, str) and extra.strip():
+            cmd_parts.extend(shlex.split(extra.strip()))
         cmd = " ".join(cmd_parts)
         codex_resumed = False
         if self.resume:

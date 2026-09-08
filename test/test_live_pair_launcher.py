@@ -97,3 +97,12 @@ def test_pair_resume_refuses_without_disabling_unique_resume(monkeypatch):
     with pytest.raises(ValueError, match="native resume"):
         ccb.AILauncher(providers=["codex", "codex"], resume=True)
     assert not provider_pairing_error(["codex", "claude"], resume=True)
+
+
+def test_codex_launch_args_apply_to_each_pair_member(monkeypatch, tmp_path):
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir()
+    launcher = ccb.AILauncher(providers=["codex", "codex"],
+                              launch_args={"codex": "--model gpt-5.6-luna"})
+    assert launcher._build_codex_start_cmd().endswith("--model gpt-5.6-luna")

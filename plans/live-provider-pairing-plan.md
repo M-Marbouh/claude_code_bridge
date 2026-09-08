@@ -1,6 +1,6 @@
 # Live provider pairing — execution plan
 
-Status: Phases 1–4 committed through `b698bba`; Phase 5 in progress. This document is the execution source of truth until completion. It supersedes the June 2026 multi-instance plans for this feature.
+Status: Phases 1–5 implemented and tested; Phase 6 launcher work next. Live acceptance remains outstanding. This document is the execution source of truth until completion. It supersedes the June 2026 multi-instance plans for this feature.
 
 Current execution authorization: complete the repository implementation, tests, public documentation, local commits and push to main. Disposable live tests must use Luna for Codex and Haiku for Claude. Do not modify maintainer-global rules or deploy over installed CCB. Those restrictions do not prevent an isolated test installation.
 
@@ -339,11 +339,14 @@ with host permissions and isolated HOME/runtime directories. In-memory negative
 controls reverting empty-inventory refusal and exact peer dispatch each failed
 their targeted tests. No production panes or installed files were changed.
 
-Still required before Phase 5 completion: audit saved peer identity across all
-entry points and queue/send boundaries, listing identity/count semantics, and
-receipt capture for inventory-only senders. Live-provider, platform, clean-install,
-documentation, and role-template acceptance remain unperformed. Passing fixture
-tests do not establish those gates.
+Phase 5 closing checks: inventory-only peer receipts capture the exact caller
+member and marker (`7de5aa9`); empty/invalid inventories never manufacture a
+provider marker. Direct fallback revalidates after lock acquisition, immediately
+before send. Negative controls disabling each check fail its regression test.
+Same-window duplicate offers retain the real window identity and count as one
+window, not two. Full host suite: **631 passed, 1 skipped**. Live-provider,
+platform, clean-install, documentation, and role-template acceptance remain
+unperformed. Passing fixture tests do not establish those gates.
 
 Implement phases in dependency order. Each phase is a bounded implementation/review unit with focused tests; do not enable public duplicate launch until preservation phases pass. The implementing agent owns its diff and test evidence; the reviewer checks the exact resulting diff. Current user assignment determines who fills those responsibilities. No provider/model is prescribed.
 

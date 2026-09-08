@@ -577,6 +577,9 @@ def main(argv: list[str] | None = None) -> int:
         lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
         try:
             if direct_backend is not None:
+                # Revalidate after acquiring the transport lock, just as
+                # queued daemon delivery revalidates at its send boundary.
+                target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
                 exit_code, reply, meta = _send_to_direct_reply_target(
                     target,
                     direct_backend,

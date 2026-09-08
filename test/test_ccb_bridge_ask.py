@@ -846,6 +846,31 @@ def test_reverse_reply_continues_when_bridge_lock_filesystem_is_read_only(
     assert "[RECOVERABLE] Reply saved for task task-erofs" in captured.err
 
 
+def test_direct_reply_revalidates_after_lock(monkeypatch, tmp_path: Path) -> None:
+    bridge = _load_bridge_module()
+    backend = _DirectBackend()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude", "caller_pane_id": "%7", "caller_terminal": "tmux",
+        "caller_pane_title_marker": "ccb-claude-sender", "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234", "reply_expected": True,
+        "peer_reply_file": str(tmp_path / "reply"), "status_file": str(tmp_path / "status"),
+    }
+    monkeypatch.setattr(bridge, "find_receipt", lambda _: (tmp_path / "receipt", receipt))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [])
+    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _: backend)
+
+    def acquire(*_):
+        backend.pane_matches_cwd_strict = lambda *_: False
+        return _Lock(), _Fcntl()
+
+    monkeypatch.setattr(bridge, "_acquire_lock", acquire)
+    assert bridge.main(["--target", str(tmp_path), "--provider", "claude",
+                        "--reply-to", "task", "saved reply"]) == 1
+    assert backend.sent == []
+    assert (tmp_path / "reply").read_text().strip() == "saved reply"
+
+
 def test_reverse_reply_rejects_reused_pane_but_preserves_result(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:

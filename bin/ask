@@ -560,6 +560,8 @@ def _send_via_unified_daemon(
     suppress_completion_hook: bool = False,
     daemon_context: _UnifiedDaemonContext | None = None,
     route: ResolvedRoute | None = None,
+    async_submit: bool = False,
+    request_id: str = "",
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
     import askd_rpc
@@ -599,11 +601,12 @@ def _send_via_unified_daemon(
         "caller_terminal": caller_terminal,
         "delivery_only": delivery_only,
         "suppress_completion_hook": suppress_completion_hook,
+        "async_submit": async_submit,
     }
     # Async callers create the durable task ID before entering foreground mode.
     # Preserve it as the provider request ID so receipts, CCB_REQ_ID, completion
     # hooks, and `pend <task-id>` all refer to one canonical identity.
-    outer_req_id = (os.environ.get("CCB_REQ_ID") or "").strip()
+    outer_req_id = (request_id or os.environ.get("CCB_REQ_ID") or "").strip()
     if outer_req_id:
         req["req_id"] = outer_req_id
     if _env_bool("CCB_CODEX_SHOW_TIER", False):
@@ -1544,6 +1547,32 @@ def main(argv: list[str]) -> int:
         status_file,
         f"submitted task={task_id} provider={provider} caller={caller} work_dir={os.getcwd()}",
     )
+
+    # A managed Codex tool shell may terminate detached child processes as
+    # soon as the tool call returns. Hand explicit background work to the
+    # already-running host daemon instead, which owns the worker lifetime.
+    if inside_managed_codex_sandbox() and _use_unified_daemon():
+        rc = _send_via_unified_daemon(
+            provider,
+            message,
+            timeout,
+            no_wrap,
+            caller,
+            daemon_context=daemon_context,
+            route=local_route,
+            async_submit=True,
+            request_id=task_id,
+        )
+        if rc != EXIT_OK:
+            _append_task_status_line(status_file, f"failed exit_code={rc}")
+            return rc
+        _append_task_status_line(status_file, "accepted by host daemon")
+        print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
+        print(f"{display_name(provider)} processing (task: {task_id})")
+        print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
+        print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
+        print(f"[CCB_ASYNC_RECEIPT_FILE task={task_id}] {receipt_file}")
+        return EXIT_OK
 
     # Get the path to this script for recursive call with --foreground
     ask_cmd = str(Path(__file__).resolve())

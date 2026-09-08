@@ -1307,6 +1307,46 @@ def test_default_async_background_script_carries_resolved_route_via_env(
         assert "export CCB_ROUTE_CALLER_LIVE_ID=s1" in content
 
 
+def test_managed_codex_background_submits_to_host_daemon_without_detached_child(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(tmp_path / "askd.json", {"token": "tok"}, tmp_path)
+    captured: dict = {}
+
+    def _preflight(_provider, **kwargs):
+        kwargs["route_out"].update(
+            live_id="s2", launch_id="ai-1", caller_live_id="s1",
+            caller_token="secret", caller_pane_id="%1", caller_terminal="tmux",
+            pane_id="%2", terminal="tmux", session_file=str(tmp_path / "s2.json"),
+            ccb_project_id="project-1",
+        )
+        return True
+
+    def _send(*args, **kwargs):
+        captured.update(kwargs)
+        return ask.EXIT_OK
+
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setenv("CCB_LIVE_ID", "s1")
+    monkeypatch.setenv("CCB_LIVE_TOKEN", "secret")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(ask, "make_task_id", lambda: "task-fixed")
+    monkeypatch.setattr(ask, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "_preflight_target", _preflight)
+    monkeypatch.setattr(ask, "_send_via_unified_daemon", _send)
+    monkeypatch.setattr(
+        ask.subprocess, "Popen",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("detached child started")),
+    )
+
+    assert ask.main(["ask", "codex", "--background", "hello"]) == ask.EXIT_OK
+    assert captured["async_submit"] is True
+    assert captured["request_id"] == "task-fixed"
+
+
 def test_pair_credential_ignores_unrelated_ambient_terminal_pane(monkeypatch, tmp_path: Path) -> None:
     ask = _load_ask_module()
     context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())

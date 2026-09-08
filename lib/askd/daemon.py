@@ -361,6 +361,17 @@ class UnifiedAskDaemon:
                 "reply": f"Failed to submit task for provider: {provider}",
             }
 
+        if _request_bool(msg.get("async_submit")):
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": request.client_id,
+                "req_id": task.req_id,
+                "exit_code": 0,
+                "reply": "",
+                "accepted": True,
+            }
+
         wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
         task.done_event.wait(timeout=wait_timeout)
         result = task.result

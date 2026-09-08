@@ -389,6 +389,34 @@ def test_handle_request_parses_route_from_message_into_provider_request(monkeypa
     assert seen.present is True
 
 
+def test_handle_request_async_submit_returns_before_task_completion() -> None:
+    adapter = _RouteAwareAdapter()
+    registry = ProviderRegistry()
+    registry.register(adapter)
+    daemon = UnifiedAskDaemon(registry=registry, work_dir="/tmp/proj")
+    pending = QueuedTask(
+        request=ProviderRequest(
+            client_id="r1", work_dir="/tmp/proj", timeout_s=5.0,
+            quiet=False, message="hi", caller="codex",
+        ),
+        created_ms=0,
+        req_id="task-1",
+        done_event=threading.Event(),
+    )
+    daemon.pool.submit = lambda _provider, _request: pending
+
+    response = daemon._handle_request({
+        "id": "r1", "provider": "codex", "work_dir": "/tmp/proj",
+        "timeout_s": 5.0, "message": "hi", "caller": "codex",
+        "async_submit": True, "req_id": "task-1",
+    })
+
+    assert response["exit_code"] == 0
+    assert response["accepted"] is True
+    assert response["req_id"] == "task-1"
+    assert pending.done_event.is_set() is False
+
+
 def test_handle_request_rejects_malformed_route_without_reaching_adapter(monkeypatch) -> None:
     # Finding 5: a non-dict or partial route arriving over RPC must be
     # rejected outright, never silently ignored and downgraded to a

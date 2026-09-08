@@ -61,6 +61,31 @@ def test_queued_peer_send_is_pinned_not_provider_default(monkeypatch, tmp_path, 
         assert "sentinel" in sent[0][1]
 
 
+def test_wezterm_peer_destination_uses_stable_pane_and_cwd_not_dynamic_title(monkeypatch, tmp_path):
+    import terminal
+    from askd.adapters.base import PeerDestination
+    from peer_routing import revalidate_peer_destination
+
+    class Backend:
+        def is_alive(self, pane):
+            return pane == "2"
+        def pane_matches_cwd_strict(self, pane, cwd):
+            return pane == "2" and cwd == str(tmp_path)
+        def find_pane_by_title_marker(self, marker, cwd):
+            return None  # Claude has replaced CCB's launch title.
+
+    monkeypatch.setattr(terminal, "get_backend_for_session", lambda data: Backend())
+    destination = PeerDestination(
+        pane_id="2",
+        terminal="wezterm",
+        work_dir=str(tmp_path),
+        ccb_project_id="project",
+        pane_title_marker="CCB-Claude-project",
+    )
+
+    assert revalidate_peer_destination(destination).ok
+
+
 class _NoopThread(threading.Thread):
     def __init__(self, session_key: str, started: list[str]):
         super().__init__(daemon=True)

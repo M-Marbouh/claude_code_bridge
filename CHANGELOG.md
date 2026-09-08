@@ -16,6 +16,7 @@
 ### Fixed
 
 - Prevented descendant Codex rollout logs with copied request anchors from winning destination reply selection.
+- Kept WezTerm peer delivery valid when Claude or Codex replaces CCB's launch-time pane title.
 
 ## 0.13.1 - 2026-07-29
 

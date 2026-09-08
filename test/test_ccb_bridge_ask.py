@@ -463,6 +463,25 @@ class _DirectBackend:
         self.sent.append((pane_id, prompt))
 
 
+def test_wezterm_direct_reply_accepts_dynamic_application_title(monkeypatch, tmp_path: Path) -> None:
+    bridge = _load_bridge_module()
+    backend = _DirectBackend("2")
+    backend.find_pane_by_title_marker = lambda _marker, _work_dir: None
+    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
+    receipt = {
+        "caller_pane_id": "2",
+        "caller_terminal": "wezterm",
+        "caller_pane_title_marker": "CCB-Claude-project",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "project",
+    }
+
+    target, resolved_backend = bridge._validated_direct_reply_target(receipt, "claude")
+
+    assert target["providers"]["claude"]["pane_id"] == "2"
+    assert resolved_backend is backend
+
+
 def test_direct_reply_fallback_wraps_claude_and_codex_delivery_prompts() -> None:
     bridge = _load_bridge_module()
 

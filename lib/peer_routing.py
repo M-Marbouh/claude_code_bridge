@@ -407,9 +407,13 @@ def revalidate_peer_destination(destination) -> DestinationResolution:
             error=UNAVAILABLE, detail="destination pane no longer matches its recorded project"
         )
 
-    if not destination.pane_title_marker:
+    # WezTerm pane titles are application-controlled and routinely change
+    # while Claude/Codex is working.  The registry's own mounted check uses
+    # the stable pane id plus cwd for WezTerm for that reason.  Keep the
+    # stronger stable-marker check for tmux, where CCB stores @ccb_marker.
+    if destination.terminal != "wezterm" and not destination.pane_title_marker:
         return DestinationResolution(error=UNAVAILABLE, detail="destination has no saved pane marker")
-    if destination.pane_title_marker:
+    if destination.terminal != "wezterm" and destination.pane_title_marker:
         resolver = getattr(backend, "find_pane_by_title_marker", None)
         resolved_pane = str(resolver(destination.pane_title_marker, destination.work_dir) or "").strip() if callable(resolver) else ""
         if resolved_pane != destination.pane_id:

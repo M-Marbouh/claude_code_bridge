@@ -196,12 +196,13 @@ def _validated_direct_reply_target(
     if not callable(cwd_check) or not bool(cwd_check(pane_id, work_dir)):
         raise RuntimeError("original peer pane no longer matches the receipt project")
 
-    marker = str(receipt.get("caller_pane_title_marker") or "").strip()
-    if not marker:
-        raise RuntimeError("peer reply receipt has no CCB pane marker")
-    resolver = getattr(backend, "find_pane_by_title_marker", None)
-    if not callable(resolver) or str(resolver(marker, work_dir) or "").strip() != pane_id:
-        raise RuntimeError("original peer pane no longer matches its CCB marker")
+    if terminal != "wezterm":
+        marker = str(receipt.get("caller_pane_title_marker") or "").strip()
+        if not marker:
+            raise RuntimeError("peer reply receipt has no CCB pane marker")
+        resolver = getattr(backend, "find_pane_by_title_marker", None)
+        if not callable(resolver) or str(resolver(marker, work_dir) or "").strip() != pane_id:
+            raise RuntimeError("original peer pane no longer matches its CCB marker")
 
     target = {
         "work_dir": work_dir,

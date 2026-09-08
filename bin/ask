@@ -741,6 +741,9 @@ def _usage() -> None:
     print("  --peer TARGET           Send to the selected provider in another CCB project", file=sys.stderr)
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
     print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Local pair: in ccb codex codex, ask codex addresses the verified sibling.", file=sys.stderr)
+    print("Peer targets must be unique in the remote project; ambiguity is an error.", file=sys.stderr)
 
 
 def _peer_caller_pane_info() -> tuple[str, str]:

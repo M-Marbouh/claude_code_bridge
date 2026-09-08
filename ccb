@@ -5196,9 +5196,9 @@ def main():
     start_parser.add_argument(
         "providers",
         nargs="*",
-        help="Backends to start (space or comma separated): codex, gemini, opencode, claude (add cmd for a shell pane)",
+        help="Backends to start (space or comma separated): codex, gemini, opencode, claude (codex may appear twice; add cmd for a shell pane)",
     )
-    start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context")
+    start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context (unique-provider launches only)")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")
     args = start_parser.parse_args(argv)
     return cmd_start(args)

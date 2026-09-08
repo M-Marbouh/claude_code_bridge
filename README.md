@@ -4,8 +4,8 @@ Lightweight, single-machine coordination for Claude, Codex, Gemini, and OpenCode
 
 This fork follows the upstream v5 terminal-pane architecture while keeping a deliberately small operating model:
 
-- One instance of each provider per project
-- No workers, provider suffixes, abstract roles, or sub-agents
+- One top-level session per provider, or an independent two-Codex pair
+- No workers, provider suffixes, provider-bound roles, or CCB-managed subagents
 - Visible sessions in WezTerm or tmux
 - Linux shell and Windows/PowerShell support
 - Request-scoped async results
@@ -43,6 +43,16 @@ ccb codex claude gemini opencode
 
 Starting another CCB session for the same directory reuses the existing provider pane when possible and otherwise fails clearly. Qualified names such as `codex:worker` are rejected.
 
+To open two independent Codex sessions:
+
+```bash
+ccb codex codex
+```
+
+Inside either Codex pane, `ask codex` means the other verified Codex session in that launch. CCB assigns neither pane a role: give each session a short current assignment such as “lead and synthesize this task” or “implement and report evidence.” Either provider in `ccb codex claude` or `ccb claude codex` may take either assignment. Provider order is layout, not authority.
+
+Model, reasoning effort, account, and native subagent choices remain native tool settings. They may differ between panes and may be changed independently; CCB does not select or persist that policy. A third Codex or a repeated non-Codex provider is rejected. Duplicate-provider `ccb -r` is not supported; start a fresh pair and use each tool's native session controls if needed. Existing unique-provider `ccb -r` behavior is unchanged.
+
 ## Ask and retrieve results
 
 ```bash
@@ -66,7 +76,7 @@ pend local
 pend codex 3
 ```
 
-`peer` is relative to the current Claude or Codex pane; `local` is the provider in that pane. Provider lookup
+`peer` is the sole other session in an unambiguous two-session launch; `local` is the current bound session. In a two-Codex pair, `pend codex` selects the sibling's replies. Provider lookup
 normalizes ordinary and peer receipts, so `pend codex` can retrieve either `codex` or `peer-codex` tasks.
 Both paired panes can retrieve receipts from their shared tab, while another same-project tab cannot win merely
 because it has a newer task. `pend codex 3` prints the newest three completed matching replies with task IDs,
@@ -134,6 +144,7 @@ ask codex --peer ~/dev/codex-only-project --background "Review the parser"
 
 Targets may be an exact path, a `ccb-list` index, or a project-hash prefix of at least four characters.
 Plain `ask --peer` retains the historical `--wait` behavior. Background consultations do not trigger the end-turn guardrail, and notifications do not include a reply target.
+The destination provider must be unique in the remote project. An initial peer request to a remote two-Codex project is rejected as ambiguous; local “other Codex” context never crosses project boundaries. Correlated replies use the exact saved return identity and are not re-resolved by provider.
 Peer responses preserve the original task with `--reply-to <task-id>`. A notification is terminal and cannot end with a direct question; use `--background` when a follow-up answer is expected.
 Claude and Codex targets both use delivery-only transport. The receiving provider sends any result with
 an explicit reverse `ask --peer` message; CCB never captures a later local pane response as the peer reply.
@@ -155,6 +166,8 @@ so without receiver-side idempotency could create real duplicates.
 
 CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Implicit `pend` lookup is strict to that session; pre-restart receipts remain available by exact task ID. An unfinished task whose host PID is invisible inside a sandbox remains pending until its recorded timeout plus a short grace period has elapsed, preventing PID-namespace isolation from causing false incomplete results. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.
 
+Each duplicate launch receives fresh internal live identities and separate binding files. The recipient is selected once, then revalidated at queue and send boundaries; receipts and delayed completion retain exact sender and recipient identity. If CCB cannot safely confirm a completion destination after a native conversation change, the result remains saved and recoverable with `pend <task-id>` instead of being injected into an uncertain conversation.
+
 ## Configuration
 
 The project configuration lives at `.ccb/ccb.config`:
@@ -163,7 +176,23 @@ The project configuration lives at `.ccb/ccb.config`:
 codex,claude
 ```
 
-Provider instances and `instances` overrides are no longer supported. Existing `provider_instances` and `instances` keys are ignored during configuration normalization, and stale worker session files are not loaded.
+The same-provider pair can also be declared as JSON:
+
+```json
+{"providers": ["codex", "codex"]}
+```
+
+Provider instance names and `instances` overrides are not supported. Existing `provider_instances` and `instances` keys are ignored during configuration normalization, and stale worker session files are not loaded.
+
+## Troubleshooting
+
+- `ambiguous` means CCB cannot prove one destination. Run the request from a mounted member of the local pair, or choose a remote project with one session of that provider; CCB never guesses by launch order.
+- `unavailable` means the identified sibling, pane, daemon, or conversation binding is no longer usable. Restart the affected fresh launch rather than expecting a duplicate-provider resume.
+- `unknown_caller` means the command was not attributable to one mounted top-level session. Run it inside the intended CCB pane and restart sessions created before upgrading.
+- If a native conversation or account switch changes the provider's log root, send a new request only after that pane has established a usable binding. CCB will not scan arbitrary account homes or copy credentials.
+- If a reply was saved but not injected after a caller switch, use the task ID printed at submission: `pend <task-id>`.
+
+Optional project-memory integrations such as Memsearch and codebase-memory are shared project facilities, not CCB requirements. CCB neither installs nor partitions them. Configure both providers to resolve the same project root—especially when launching from a subdirectory—if you want their memory namespaces to match. Recalled historical roles are context only; the current explicit session assignment controls operational ownership.
 
 ## Maintenance
 
@@ -178,6 +207,8 @@ ccb version
 `--project`, and `--all-projects` apply to both stale session records and reply artifacts.
 
 ## Fork changes
+
+- `Unreleased` — added independent `ccb codex codex` pairing with contextual sibling routing, exact live-session receipts and completion delivery, preserved cross-project peer behavior, provider-neutral role guidance, and explicit ambiguity failures.
 
 - `0.13.1` — hardened peer routing and failure reporting, restored exact `pend` overlays, bounded agent-visible replies, persisted delivery evidence, and added explicit reply-artifact cleanup.
 - `0.13.0` — replaced relay-style review roles with symmetric mutual ratification and moved managed Codex guidance to the real global `${CODEX_HOME:-~/.codex}/AGENTS.md` target.

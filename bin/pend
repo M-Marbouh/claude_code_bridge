@@ -966,7 +966,7 @@ def _positive_count(value: str) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="pend")
-    parser.add_argument("target", nargs="?", default="", help="Provider, peer/local relation, or exact task ID")
+    parser.add_argument("target", nargs="?", default="", help="Provider, peer/local relation, or exact task ID (pair provider selects the sibling)")
     parser.add_argument("count", nargs="?", type=_positive_count, help="Show the latest N task replies")
     parser.add_argument("--legacy", action="store_true", help="Use the provider's legacy conversation reader")
     args = parser.parse_intermixed_args(argv[1:])

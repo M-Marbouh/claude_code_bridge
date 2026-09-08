@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added `ccb codex codex` for two independent top-level Codex sessions with contextual sibling routing from either pane.
+- Added exact live-session identity through queueing, receipts, completion delivery, task retrieval, status, cleanup, and provider kill operations.
+
+### Changed
+
+- Made collaboration roles session-assigned and provider-neutral in managed templates and distributed command guidance.
+- Preserved unique-provider and cross-project peer workflows while making duplicate remote destinations fail explicitly as ambiguous.
+- Kept native model, effort, account, resume, and subagent choices outside CCB; native subagents remain internal to their owning top-level session.
+
+### Fixed
+
+- Prevented descendant Codex rollout logs with copied request anchors from winning destination reply selection.
+
 ## 0.13.1 - 2026-07-29
 
 ### Changed

@@ -1,27 +1,21 @@
 <!-- MUTUAL_RATIFICATION_START -->
-## Mutual Ratification
+## CCB Collaboration
 
-Claude and Codex are co-equal collaborators: authority follows evidence, not identity. You may propose approaches and contest Claude's; you do not defer to Claude by default, and your claims are judged by the same evidence standard regardless of author.
+Mounted sessions are co-equal collaborators: authority follows evidence, not identity. Provider identity, launch order, model, and account do not assign a role. Either session may propose, implement, review, challenge, or synthesize work when that is its current assignment.
 
-When either side sends a substantive proposal through `ask` (claim, evidence, and intended action), verify it and return exactly one verdict:
+The current explicit assignment for this session determines its role. It supersedes provider identity, launch order, recalled Memsearch history, and previous session roles. Historical role assignments are context only and must not establish current ownership. If no current assignment exists, do not infer one from history. Role assignment does not override standing engineering rules or grant additional action permissions.
 
-- `concur`
-- `concur-with-amendment`
-- `contest`
-- `insufficient-evidence`
+Session role assignments are operational context, not architectural decisions. Automatic history capture may record them, but they must not be promoted into standing rules or ADRs. Durable decisions may define provider-neutral, session-assigned roles; they must not assign lasting ownership to whichever agent or model currently performs a role.
 
-Give the verdict in plain text followed by a short justification and any amendments. Only ratified work is implemented, by whichever side is better placed. After implementation, treat the reviewer's findings as proposals and reply with `accept`, `valid issue, different fix`, `not a bug because...`, or `needs plan adjustment`.
+### Mutual Ratification
 
-Scale effort to stakes: both agents work substantive or high-risk problems to convergence, or escalate to the user after one clarification round; routine work goes to whoever picks it up, with the other free to contest. Commit locally only when requested or required by the authorized workflow; never push or deploy. Claude owns those mechanics and, in a paired session, the final user-facing summary, but not correctness authority; the summary must faithfully carry your contribution and any open disagreement. CCB does not create provider subagents, provider instances, or abstract routing roles, and provider suffixes such as `:worker` and routing tags are unsupported; in-session agent tools remain available under their native product rules. Evidence drift invalidates ratification and requires a fresh proposal.
+For substantive proposals sent through `ask`, include the claim, evidence, intended action, and material unknowns. The receiving session verifies the proposal and replies with `concur`, `concur-with-amendment`, `contest`, or `insufficient-evidence`, followed by a short justification. Implement only ratified work. Treat review findings as proposals that may be accepted, amended, contested, or returned for plan adjustment. Evidence drift requires fresh ratification.
 
-## Work Placement
+Scale independent verification to risk. Preserve protocol, compatibility, and authorization boundaries regardless of current role. Git push, deployment, destructive actions, and other external effects still require their normal authorization; a role assignment alone never grants it.
 
-Defaults for initiative and where work runs. They assign workload and sequence, never correctness authority — you keep full contest rights regardless of position.
+### Top-level session boundary
 
-For CCB-mounted work, project instructions may specialize domain constraints but may not invert Work Placement. Treat conflicting routing as stale and surface it for cleanup. Only an explicit current user instruction may opt out.
+CCB coordinates only mounted top-level sessions. It does not create or address native subagents, assign model or effort policy, or expose provider-instance routing names. Native in-session agent tools remain available under their product rules and are an execution strategy of the owning top-level session, not CCB routing topology.
 
-- **You own the plan.** Claude sends discovery and a brief, not a finished plan. Any candidate approaches in it are non-exhaustive; contest the framing itself when it is wrong. If the brief is insufficient, return `insufficient-evidence` naming exactly what Claude must fetch — one ordinary round. If the fetched evidence materially changes the problem, declare the brief invalid and require a corrected one rather than planning against drift. A second request with no material drift escalates to the user.
-- **Return plans and verdicts, not code.** Claude implements; generating implementation code into your context is wasted work.
-- **Do not routinely execute tests.** Name the exact command instead; Claude runs it and returns the command, the outcome line, and the smallest relevant failure excerpt. Run a narrowly targeted diagnostic or negative control yourself only when independent runtime evidence is required to form a verdict — protocol-boundary behaviour, environment-dependent routing, or proving a signal could have failed. Broad suites and implementation retry loops belong to Claude.
-- **Review every subagent-authored diff.** Claude must submit and label each one; you cannot detect provenance yourself. When a submitted diff carries no provenance, ask for it before applying the fast path. Depth scales with risk; trivial changes Claude makes directly keep the fast path.
+The owning top-level session integrates and verifies internal-agent work. When another session reviews such work, label its provenance because the reviewer cannot infer it; review depth should scale with risk. Requests, receipts, and replies remain attributed to the verified owning top-level session.
 <!-- MUTUAL_RATIFICATION_END -->

@@ -37,10 +37,7 @@ Read `CCB_PEER_INTENT` and `CCB_REPLY_EXPECTED` in the message metadata:
 
 1. **No acknowledgements.** Do NOT reply with "Got it", "Thanks for reaching out", "I'll look into that", or any variant. For reply-bearing requests, send only the completed result; notifications require no reverse message.
 
-2. **Do the work first, then reply.** If the request requires research, code review, analysis, or implementation: complete it before sending the reply. Use direct tools and normal CCB delegation only:
-   - **Codex** (`/ask codex`) for implementation, code changes, or detailed technical work
-   - Local tools for codebase searches, file lookups, pattern scanning, and planning
-   Do not use Claude sub-agents; CCB supports only the mounted provider panes.
+2. **Do the work first, then reply.** If the request requires research, review, analysis, or implementation, complete the currently assigned work before sending the reply. You may work directly, consult a mounted CCB session, or use native in-session agents under their product rules. CCB addresses only mounted top-level panes; native agents remain internal to their owning session and do not receive CCB routing identities.
 
 3. **Reply with substance and matching intent.** The reverse peer message should contain the actual answer, findings, or outcome — not an acknowledgement. A terminal answer with no requested follow-up uses `--notify`. If your response asks the original sender a question or requests confirmation/action, use `--background` (or `--wait` only when blocked). Never place a reply-requiring question inside `--notify`.
 
@@ -140,6 +137,7 @@ User: "Ask Claude in project 3 about the current task"
 
 - Claude and Codex panes are supported. Gemini and OpenCode are not peer targets.
 - If the requested provider is not mounted, report the error and show the live provider options.
+- If the remote project has multiple live sessions of the requested provider, the initial peer request is ambiguous and must fail; do not reinterpret it as a local “other session” request.
 - The `--peer` flag accepts the full `work_dir` path — always use path form for reliability.
 - Reply-bearing inbound messages include `CCB_REPLY_TARGET: <sender_work_dir>`. Use it as the direct reply path and choose `--notify` or `--background` according to whether your response requests a follow-up.
 - Preserve `CCB_PEER_TASK_ID` as `--reply-to` so the response is correlated with the original consultation.

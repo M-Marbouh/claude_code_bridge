@@ -374,9 +374,26 @@ def test_managed_templates_have_symmetric_authority_without_fixed_roles() -> Non
     assert "When Claude sends a substantive proposal" not in agents_template
 
 
-def test_managed_templates_state_work_placement_precedence() -> None:
-    """Project instructions may specialize, but may not invert Work Placement."""
+def test_managed_templates_make_roles_current_session_operational_state() -> None:
     for name in ("claude-md-ccb.md", "agents-md-ccb.md"):
         content = (REPO_ROOT / "config" / name).read_text(encoding="utf-8")
-        assert "may not invert Work Placement" in content
-        assert "Only an explicit current user instruction may opt out." in content
+        assert "current explicit assignment for this session determines its role" in content
+        assert "Historical role assignments are context only" in content
+        assert "Role assignment does not override standing engineering rules" in content
+        assert "operational context, not architectural decisions" in content
+        assert "Claude owns" not in content
+        assert "Codex reviews" not in content
+
+
+def test_managed_templates_keep_native_agents_outside_ccb_topology() -> None:
+    for name in ("claude-md-ccb.md", "agents-md-ccb.md"):
+        content = (REPO_ROOT / "config" / name).read_text(encoding="utf-8")
+        assert "coordinates only mounted top-level sessions" in content
+        assert "Native in-session agent tools remain available" in content
+        assert "do not receive CCB routing identities" not in content
+
+    peer_skill = (REPO_ROOT / "claude_skills" / "peer-ask" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Do not use Claude sub-agents" not in peer_skill
+    assert "CCB addresses only mounted top-level panes" in peer_skill

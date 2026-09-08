@@ -17,7 +17,7 @@ Prefer the exact task being discussed. Provider and peer/local lookups are stric
 4. If the user names a provider, use `pend <provider>`.
 5. Bare `pend` is allowed only when context has no better selector; it fails rather than guessing when multiple current-tab tasks exist.
 
-`peer` is relative to the bound pane: Claude's peer is Codex, and Codex's peer is Claude. `local` is the model in the bound pane.
+`peer` is relative to the bound pane: it means the sole other session in an unambiguous two-session launch. `local` means the bound session itself. With two sessions of the same provider, a provider target means the verified sibling.
 
 ## Async Guardrail (MANDATORY)
 

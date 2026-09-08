@@ -15,6 +15,7 @@ The first argument must be the provider name, followed by the message:
 - `gemini` - Send to Gemini
 - `codex` - Send to Codex
 - `opencode` - Send to OpenCode
+- `claude` - Send to Claude
 
 **NOT for cross-project messaging.** If the user says "Ask PRG Claude..." or references another project, use the `peer-ask` skill instead.
 
@@ -35,6 +36,7 @@ Bash(CCB_CALLER=claude ask $PROVIDER "$MESSAGE")
   - Reply with exactly one line: `[Provider] submit failed: <short error or 'no async marker in output'>`
   - End your turn immediately.
 - If `ask` fails with `CCB_ROUTE_ERROR ... reason=not_mounted`, check your cwd: run from the project root shown by `ccb-list`. Only shells without `CCB_RUN_DIR` (non-CCB-managed) are cwd-sensitive.
+- In a verified `ccb codex codex` pair, `ask codex` from either member addresses the other member. Unknown or ambiguous callers fail instead of guessing.
 
 ## Examples
 

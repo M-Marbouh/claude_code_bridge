@@ -32,6 +32,7 @@ EOF
 - Do not wait for results or check status in the same turn.
 - The task ID and log file path will be displayed for tracking.
 - If `ask` fails with `CCB_ROUTE_ERROR ... reason=not_mounted`, check your cwd: run from the project root shown by `ccb-list`. Only shells without `CCB_RUN_DIR` (non-CCB-managed) are cwd-sensitive.
+- In a verified `ccb codex codex` pair, `ask codex` from either member addresses the other member. Unknown or ambiguous callers fail instead of guessing.
 
 ## Examples
 

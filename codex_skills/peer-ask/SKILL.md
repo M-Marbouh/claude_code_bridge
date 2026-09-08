@@ -80,6 +80,7 @@ Use the exact `work_dir` returned by `ccb-list`.
 ## Notes
 
 - Supported peer targets are Claude and Codex. Gemini and OpenCode remain same-project only.
+- If the remote project has multiple live sessions of the requested provider, the initial peer request is ambiguous and must fail; do not reinterpret it as a local “other session” request.
 - Claude and Codex peer messages are delivery-only; replies are explicit reverse peer messages.
 - A local Codex answer is never captured or forwarded merely because it followed an inbound peer message.
 - Do not narrate transport diagnostics unless delivery fails.

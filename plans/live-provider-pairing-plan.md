@@ -1,6 +1,6 @@
 # Live provider pairing — execution plan
 
-Status: Phases 1–5 implemented and tested; Phase 6 launcher work next. Live acceptance remains outstanding. This document is the execution source of truth until completion. It supersedes the June 2026 multi-instance plans for this feature.
+Status: Required implementation, public templates, documentation, and the reduced release gate are complete. Final suite: 654 passed, 1 skipped. Live acceptance covered the core pairing and mixed-provider paths; additional quota-intensive permutations are recorded below as deferred rather than claimed. This document remains the implementation record and supersedes the June 2026 multi-instance plans for this feature.
 
 Current execution authorization: complete the repository implementation, tests, public documentation, local commits and push to main. Disposable live tests must use Luna for Codex and Haiku for Claude. Do not modify maintainer-global rules or deploy over installed CCB. Those restrictions do not prevent an isolated test installation.
 
@@ -326,7 +326,7 @@ Optional future work, excluded now: explicit initial peer destination selector; 
 
 ### Implementation verification — 2026-09-08
 
-Phases 1–4 are committed through `b698bba`. Phase 5 remains under integration:
+Phases 1–4 are committed through `b698bba`. Phase 5 was completed by:
 peer sends with saved endpoints now use endpoint-keyed daemon queues and send
 to the validated pane rather than reloading a provider default. Sender lookup
 distinguishes legacy absence from present-empty/invalid inventories and fails
@@ -361,7 +361,24 @@ Update this authoritative plan only for material implementation discoveries, the
 | Peer addressing | Project selector + provider verified; no initial duplicate discriminator; receipt direct route exists but live-provider precedence must change. |
 | Rule conflicts | Global and project files and installer template sources inspected; no migration performed. |
 | Shared knowledge | Same-root collection helpers agree; inspected Claude/Codex hook root derivation differs for subdirectories. |
-| Feature tests and real-provider probes | Not run for this plan; implementation not started. |
+| Feature tests and real-provider probes | COMPLETE for the reduced gate. Full suite: 654 passed, 1 skipped. Real tmux `ccb codex codex` used two Luna sessions and passed A→B, B→A, simultaneous distinguishable routes, exact task-ID recovery, `/new` recipient rebinding, stopped-sibling refusal, and pair-aware kill. Mixed Codex/Claude used Luna and Haiku and passed routing in both launch orders. |
+
+### Completion evidence — 2026-09-08
+
+- Phase 6 launch activation: `f30a938`, with follow-up launch-option and stable-marker correction `10caf18`, authenticated sandbox caller identity `a69e678`, exact caller preservation `ea42940`, nested tmux caller selection `c9de1a2`, and Claude binding liveness preservation `7c5492a`.
+- Phase 7 public role-neutral templates and distributed command guidance: `8b0e58b`. Installer fixture: 10 passed, 1 skipped. Maintainer-global files were not changed and remain a separately authorized migration, not a public feature gate.
+- Phase 8 README, troubleshooting, CLI help, and changelog: `254661a`. Help entry points executed successfully from source and from an isolated installation.
+- Isolated Linux install used a temporary HOME, Codex home, install prefix, executable directory, and Claude command directory under `/tmp/ccb-install-acceptance`; it installed successfully and rendered provider-neutral rules and duplicate-Codex help. The installed user CCB was not modified.
+- Phase 9 deterministic gate: `python3 -m compileall -q lib bin ccb`, `git diff --check`, and `python3 -m pytest -q test` succeeded; 654 passed, 1 skipped.
+- Live pair evidence used the repository source explicitly, never the installed CCB. Both panes reported `gpt-5.6-luna`; mixed launches reported Luna for Codex and Haiku 4.5 for Claude. A copied request anchor in a descendant rollout remains excluded by the Phase 1 regression fixture.
+
+### Reduced live gate and deferred permutations
+
+The owner approved reducing quota-intensive live repetition after the core invariants had passed. No release claim depends on the following unrun permutations: a separate live WezTerm duplicate launch, live Gemini/OpenCode sessions, switching real accounts, changing effort during an active task, native resume into an older conversation, repeated role-behavior prompts, or another live cross-project round trip. Their unchanged or failure behavior remains covered by the automated terminal, peer, inventory, binding, receipt, and compatibility suites where applicable. The cross-project peer preservation implementation was ratified through Phase 5 and has exact-route negative controls, but this completion record does not mislabel it as a new live peer run.
+
+The observed optional integration evidence is limited to matching Memsearch collection names for the two same-root Codex panes and for the mixed-provider disposable projects. The known subdirectory root-derivation difference remains integration configuration outside CCB; the feature neither partitions nor manages Memsearch or codebase-memory. No shared-memory claim is required for stock CCB operation.
+
+One interactive limitation was confirmed and documented rather than treated as a routing defect: two panes must not both issue blocking foreground asks to each other simultaneously, because each top-level tool is then unavailable to answer. Concurrent routing was instead verified with simultaneous authenticated clients while both destination panes remained available. Background processes launched from a provider's restricted tool shell may also be terminated by that shell; exact task-ID retrieval remains the recovery mechanism, and host/ordinary-shell asynchronous behavior is covered by the receipt suite.
 
 ## Artifact placement
 

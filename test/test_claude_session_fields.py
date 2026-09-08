@@ -27,6 +27,7 @@ def test_laskd_session_update_backfills_work_dir_fields(tmp_path: Path) -> None:
     session.update_claude_binding(session_path=tmp_path / "new-id.jsonl", session_id="new-id")
 
     data = json.loads(session_file.read_text(encoding="utf-8"))
+    assert data["active"] is True
     assert data["work_dir"] == str(tmp_path)
     assert data["work_dir_norm"] == normalize_work_dir(str(tmp_path))
 

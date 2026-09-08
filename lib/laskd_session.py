@@ -234,8 +234,10 @@ class ClaudeProjectSession:
             if old_path or old_id:
                 self.data["old_updated_at"] = _now_str()
             self.data["updated_at"] = _now_str()
-            if self.data.get("active") is False:
-                self.data["active"] = True
+            # A positively identified live conversation is an active binding.
+            # Some resolver-created session objects predate the launch file's
+            # lifecycle field; writing them back must not erase routability.
+            self.data["active"] = True
             self._write_back()
             changed = False
             if session_path_str:

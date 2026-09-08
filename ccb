@@ -4426,7 +4426,7 @@ def _get_version_info(dir_path: Path) -> dict:
     if ccb_file.exists():
         try:
             content = ccb_file.read_text(encoding='utf-8', errors='replace')
-            for line in content.split('\n')[:60]:
+            for line in content.split('\n')[:100]:
                 line = line.strip()
                 if line.startswith('VERSION') and '=' in line:
                     info["version"] = line.split('=')[1].strip().strip('"').strip("'")

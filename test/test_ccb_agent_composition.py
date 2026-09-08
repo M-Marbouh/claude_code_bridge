@@ -140,3 +140,21 @@ def test_every_agent_launcher_routes_through_the_typed_seam() -> None:
     }
     assert "_compose_agent_shell" not in cmd_pane_calls
     assert "_compose_agent_argv" not in cmd_pane_calls
+
+
+def test_version_parser_finds_embedded_constants_after_import_block(tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    lines = ["# padding"] * 65 + [
+        'VERSION = "0.13.1"',
+        'GIT_COMMIT = "abc1234"',
+        'GIT_DATE = "2026-09-08"',
+    ]
+    (installed / "ccb").write_text("\n".join(lines), encoding="utf-8")
+
+    assert ccb._get_version_info(installed) == {
+        "version": "0.13.1",
+        "commit": "abc1234",
+        "date": "2026-09-08",
+    }

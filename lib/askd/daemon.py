@@ -158,9 +158,10 @@ class _UnifiedWorkerPool:
                 session_file=request.route.session_file,
                 ccb_project_id=request.route.ccb_project_id,
                 request_project_id=request_project_id,
-                caller_pane_id=request.caller_pane_id,
-                caller_terminal=request.caller_terminal,
+                caller_pane_id=request.caller_pane_id or request.route.caller_pane_id,
+                caller_terminal=request.caller_terminal or request.route.caller_terminal,
                 caller_live_id=request.route.caller_live_id,
+                caller_token=request.route.caller_token,
             )
             if not outcome.ok:
                 task.result = ProviderResult(
@@ -538,6 +539,7 @@ class UnifiedAskDaemon:
                 caller_pane_id=str(msg.get("caller_pane_id") or ""),
                 caller_terminal=str(msg.get("caller_terminal") or ""),
                 caller_live_id=str(msg.get("caller_live_id") or ""),
+                caller_token=str(msg.get("caller_token") or ""),
                 check_daemon=_request_bool(msg.get("check_daemon", True)),
             )
             payload = _live_session_to_route_outcome_dict(outcome)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import os
 import sys
 import time
@@ -397,6 +398,7 @@ def validate_route(
     caller_pane_id: str = "",
     caller_terminal: str = "",
     caller_live_id: str = "",
+    caller_token: str = "",
 ) -> Resolution:
     """Re-confirm that a previously resolved route still names the SAME
     live session, without re-running selection.
@@ -504,32 +506,39 @@ def validate_route(
     # Evidence supplied on top of that is still validated (Hole 2): once
     # supplied, it is never ignored.
     duplicate_provider_pool = sum(1 for entry in inventory.sessions if entry.provider == session.provider) > 1
-    must_verify_caller = duplicate_provider_pool or bool(caller_live_id) or bool(caller_pane_id or caller_terminal)
+    must_verify_caller = duplicate_provider_pool or bool(caller_live_id) or bool(
+        caller_token or caller_pane_id or caller_terminal
+    )
 
     if must_verify_caller:
-        if not (caller_pane_id or caller_terminal):
-            return Resolution(
-                error=UNKNOWN_CALLER,
-                detail="caller evidence is required to validate this route but none was supplied",
-                candidates=(session.live_id,),
+        if caller_pane_id or caller_terminal:
+            actual_caller = find_caller(
+                inventory.sessions,
+                pane_id=caller_pane_id,
+                terminal=caller_terminal,
             )
-        # Hole 2: this must FAIL OPEN-TO-REFUSAL, never fail open-to-pass.
-        # The caller must resolve UNIQUELY within this same snapshot, must
-        # be CONSISTENT with the caller identity the route itself saved,
-        # and only then is the destination checked against it. Evidence
-        # that is unknown, unmatched, or contradictory refuses -- it never
-        # simply skips the check and lets validation carry on. NEVER is
-        # `caller_live_id` alone -- without this fresh corroboration --
-        # trusted to establish identity.
-        actual_caller = find_caller(
-            inventory.sessions,
-            pane_id=caller_pane_id,
-            terminal=caller_terminal,
-        )
+        elif caller_live_id and caller_token:
+            actual_caller = find_caller(inventory.sessions, live_id=caller_live_id)
+            if actual_caller is not None and (
+                not actual_caller.auth_token
+                or not hmac.compare_digest(actual_caller.auth_token, caller_token)
+            ):
+                actual_caller = None
+        else:
+            actual_caller = None
         if actual_caller is None:
             return Resolution(
                 error=UNKNOWN_CALLER,
-                detail="the request's own caller pane could not be uniquely identified in this launch",
+                detail="the request's caller identity could not be uniquely verified in this launch",
+                candidates=(session.live_id,),
+            )
+        if caller_token and (
+            not actual_caller.auth_token
+            or not hmac.compare_digest(actual_caller.auth_token, caller_token)
+        ):
+            return Resolution(
+                error=UNKNOWN_CALLER,
+                detail="the request's caller credential contradicts the route's saved caller",
                 candidates=(session.live_id,),
             )
         if caller_live_id and actual_caller.live_id != caller_live_id.strip():

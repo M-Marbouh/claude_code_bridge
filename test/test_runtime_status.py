@@ -1242,6 +1242,35 @@ def test_resolve_live_route_rejects_forged_caller_live_id_contradicting_pane(run
     assert caller is None
 
 
+def test_resolve_live_route_uses_verified_live_credential_when_sandbox_strips_pane(
+    runtime_env, monkeypatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(home, "ai-1", {
+        "ccb_session_id": "ai-1", "ccb_project_id": project_id,
+        "work_dir": str(work_dir), "terminal": "tmux", "updated_at": int(time.time()),
+        "live_sessions": [
+            {"live_id": "s1", "provider": "codex", "pane_id": "%2", "auth_token": "token-1"},
+            {"live_id": "s2", "provider": "codex", "pane_id": "%3", "auth_token": "token-2"},
+        ],
+    })
+    monkeypatch.setattr(ccb_runtime_status, "_operational_refusal", lambda *_a, **_k: None)
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_live_id="s1", caller_token="token-1",
+        check_daemon=False, _allow_daemon_proxy=False,
+    )
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.session.live_id == "s2"
+    assert caller.live_id == "s1"
+    forged = resolve_live_route(
+        "codex", work_dir, caller_live_id="s1", caller_token="wrong",
+        check_daemon=False, _allow_daemon_proxy=False,
+    )
+    assert forged is not None
+    assert forged[0].error == ccb_runtime_status.UNKNOWN_CALLER
+
+
 def test_resolve_live_route_refuses_two_competing_launches_without_caller_evidence(runtime_env) -> None:
     # Finding 3: two unrelated CCB launches in the same project, both
     # carrying a codex inventory. Without caller evidence to place the
@@ -1804,6 +1833,33 @@ def test_validate_route_refuses_duplicate_pool_no_evidence_saved_caller_is_sibli
 
     assert outcome.ok is False
     assert outcome.error == pane_registry.UNKNOWN_CALLER
+
+
+def test_validate_route_accepts_verified_live_credential_without_terminal_evidence(runtime_env) -> None:
+    home, work_dir, project_id = runtime_env
+    _write_registry(home, "ai-1", {
+        "ccb_session_id": "ai-1", "ccb_project_id": project_id,
+        "work_dir": str(work_dir), "terminal": "tmux", "updated_at": int(time.time()),
+        "live_sessions": [
+            {"live_id": "s1", "provider": "codex", "pane_id": "%2", "auth_token": "token-1"},
+            {"live_id": "s2", "provider": "codex", "pane_id": "%3", "auth_token": "token-2"},
+        ],
+    })
+    outcome = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_live_id="s1", caller_token="token-1",
+    )
+    assert outcome.ok
+    forged = pane_registry.validate_route(
+        live_id="s2", launch_id="ai-1", provider="codex",
+        caller_live_id="s1", caller_token="wrong",
+    )
+    assert forged.error == pane_registry.UNKNOWN_CALLER
+    self_route = pane_registry.validate_route(
+        live_id="s1", launch_id="ai-1", provider="codex",
+        caller_live_id="s1", caller_token="token-1",
+    )
+    assert self_route.error == pane_registry.SELF_ONLY
 
 
 def test_validate_route_refuses_saved_caller_without_corroborating_evidence_even_in_unique_pool(

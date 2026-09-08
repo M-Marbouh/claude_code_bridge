@@ -634,6 +634,7 @@ class AILauncher:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         # Occurrence identity is private launch state, never a provider or role.
         self._live_slots = [uuid.uuid4().hex for _ in self.providers] if self.providers.count("codex") == 2 else []
+        self._live_tokens = [uuid.uuid4().hex for _ in self._live_slots]
         self._launch_slot = len(self.providers) - 1
         self._cleaned = False
         self._askd_checked = False
@@ -681,6 +682,7 @@ class AILauncher:
                     env[k.strip()] = str(v)
         if self._live_slots and prov == self.providers[self._launch_slot]:
             env["CCB_LIVE_ID"] = self._live_slots[self._launch_slot]
+            env["CCB_LIVE_TOKEN"] = self._live_tokens[self._launch_slot]
         return env
 
     def _provider_slot_key(self, provider: str) -> str:
@@ -701,7 +703,7 @@ class AILauncher:
         if not self._live_slots:
             return True
         entries = []
-        for provider, live_id in zip(self.providers, self._live_slots):
+        for provider, live_id, auth_token in zip(self.providers, self._live_slots, self._live_tokens):
             path = (self.runtime_dir / live_id / f".{provider}-session"
                     if self.providers.count(provider) > 1
                     else resolve_project_config_dir(self.project_root) / f".{provider}-session")
@@ -713,6 +715,7 @@ class AILauncher:
                 "pane_id": str(data.get("pane_id") or "") if owned else "",
                 "pane_title_marker": str(data.get("pane_title_marker") or "") if owned else "",
                 "terminal": self.terminal_type, "session_file": str(path),
+                "auth_token": auth_token,
                 "active": bool(owned and data.get("active")),
             })
         return upsert_registry({

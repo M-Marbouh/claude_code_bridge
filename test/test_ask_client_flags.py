@@ -1036,7 +1036,10 @@ def test_preflight_target_route_supersedes_ambiguous_status(monkeypatch) -> None
     assert route_out == {
         "live_id": "s2",
         "launch_id": "ai-1",
-        "caller_live_id": "s1",
+            "caller_live_id": "s1",
+                "caller_token": "",
+            "caller_pane_id": "%2",
+            "caller_terminal": "",
         "pane_id": "%3",
         "terminal": "",
         "session_file": "",
@@ -1218,7 +1221,8 @@ def test_default_async_background_script_carries_resolved_route_via_env(
     def _popen(cmd, **kwargs):
         return _Proc()
 
-    def _fake_preflight(_provider, *, work_dir=None, caller_pane_id="", caller_terminal="", route_out=None):
+    def _fake_preflight(_provider, *, work_dir=None, caller_pane_id="", caller_terminal="",
+                        caller_live_id="", caller_token="", route_out=None):
         if route_out is not None:
             route_out.update(
                 live_id="s2",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import os
 import time
 from dataclasses import dataclass
@@ -862,6 +863,7 @@ def _resolve_live_route_host(
     caller_pane_id: str = "",
     caller_terminal: str = "",
     caller_live_id: str = "",
+    caller_token: str = "",
     check_daemon: bool = True,
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
     """The real, host-side route resolution: filesystem and (via the
@@ -877,7 +879,7 @@ def _resolve_live_route_host(
 
     qualifying = list(_iter_qualifying_registry_records(project_id=project_id))
     records = [record for record, _wd, _eff, _ts, _stale in qualifying]
-    have_evidence = bool(caller_pane_id or caller_terminal or caller_live_id)
+    have_evidence = bool(caller_pane_id or caller_terminal or caller_live_id or caller_token)
 
     # Finding 3: establish the CALLER'S OWN LAUNCH first, by searching
     # every qualifying record's own inventory for a session matching the
@@ -895,6 +897,12 @@ def _resolve_live_route_host(
                 terminal=caller_terminal,
             )
             if found is not None:
+                credential_only = bool(caller_live_id) and not (caller_pane_id or caller_terminal)
+                if caller_token:
+                    if not found.auth_token or not hmac.compare_digest(found.auth_token, caller_token):
+                        continue
+                elif credential_only:
+                    continue
                 caller_matches.append((record, found))
 
     if len(caller_matches) > 1:
@@ -1063,6 +1071,7 @@ def _daemon_resolve_live_route(
     caller_pane_id: str,
     caller_terminal: str,
     caller_live_id: str,
+    caller_token: str,
     check_daemon: bool,
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
     """Finding 1: a sandboxed caller cannot see real terminal/daemon state
@@ -1093,6 +1102,7 @@ def _daemon_resolve_live_route(
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,
         "caller_live_id": caller_live_id,
+        "caller_token": caller_token,
         "check_daemon": check_daemon,
     }
     response = askd_rpc.request_daemon(
@@ -1116,6 +1126,7 @@ def resolve_live_route(
     caller_pane_id: str = "",
     caller_terminal: str = "",
     caller_live_id: str = "",
+    caller_token: str = "",
     check_daemon: bool = True,
     _allow_daemon_proxy: bool = True,
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
@@ -1149,6 +1160,7 @@ def resolve_live_route(
             caller_pane_id=caller_pane_id,
             caller_terminal=caller_terminal,
             caller_live_id=caller_live_id,
+            caller_token=caller_token,
             check_daemon=check_daemon,
         )
     return _resolve_live_route_host(
@@ -1157,5 +1169,6 @@ def resolve_live_route(
         caller_pane_id=caller_pane_id,
         caller_terminal=caller_terminal,
         caller_live_id=caller_live_id,
+        caller_token=caller_token,
         check_daemon=check_daemon,
     )

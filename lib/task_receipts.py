@@ -63,7 +63,7 @@ def _identity_fields_from_route(route: Optional[ResolvedRoute]) -> dict[str, Any
     """
     if route is None or not route.present:
         return {}
-    return {
+    fields = {
         "route_launch_id": route.launch_id,
         "destination_live_id": route.live_id,
         "destination_pane_id": route.pane_id,
@@ -72,6 +72,11 @@ def _identity_fields_from_route(route: Optional[ResolvedRoute]) -> dict[str, Any
         "destination_ccb_project_id": route.ccb_project_id,
         "caller_live_id": route.caller_live_id,
     }
+    if route.caller_pane_id:
+        fields["caller_pane_id"] = route.caller_pane_id
+    if route.caller_terminal:
+        fields["caller_terminal"] = route.caller_terminal
+    return fields
 
 
 def new_receipt(

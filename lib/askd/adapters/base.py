@@ -43,6 +43,9 @@ class ResolvedRoute:
     live_id: str = ""
     launch_id: str = ""
     caller_live_id: str = ""
+    caller_token: str = ""
+    caller_pane_id: str = ""
+    caller_terminal: str = ""
     pane_id: str = ""
     terminal: str = ""
     session_file: str = ""
@@ -93,7 +96,9 @@ _ROUTE_ANCHOR_FIELDS = ("live_id", "launch_id")
 _ROUTE_MANDATORY_EVIDENCE_FIELDS = ("pane_id", "terminal", "session_file", "ccb_project_id")
 # Legitimately optional: a route can be resolved with no caller identified
 # at all (a single unambiguous destination needs no caller to pick it).
-_ROUTE_OPTIONAL_FIELDS = ("caller_live_id",)
+_ROUTE_OPTIONAL_FIELDS = (
+    "caller_live_id", "caller_token", "caller_pane_id", "caller_terminal",
+)
 _ROUTE_MAPPING_FIELDS = _ROUTE_ANCHOR_FIELDS + _ROUTE_MANDATORY_EVIDENCE_FIELDS + _ROUTE_OPTIONAL_FIELDS
 
 

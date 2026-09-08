@@ -36,6 +36,7 @@ class LiveSession:
     # no record-level "session_file" to fall back to, only what one specific
     # entry names for itself.
     session_file: str = ""
+    auth_token: str = ""
 
     def matches_pane(self, pane_id: str, terminal: str = "") -> bool:
         """Pane identity is only comparable within the same terminal backend."""
@@ -232,6 +233,7 @@ def read_inventory(record: Dict[str, Any]) -> InventoryResult:
                     # Inherits nothing from the record — only this entry's
                     # own value, or the field-default empty string.
                     session_file=_clean(entry.get("session_file")),
+                    auth_token=_clean(entry.get("auth_token")),
                 )
             )
         return InventoryResult(sessions=tuple(out), status=INVENTORY_VALID)

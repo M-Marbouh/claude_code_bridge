@@ -529,9 +529,10 @@ class ClaudeAdapter(BaseProviderAdapter):
                 session_file=req.route.session_file,
                 ccb_project_id=req.route.ccb_project_id,
                 request_project_id=request_project_id,
-                caller_pane_id=req.caller_pane_id,
-                caller_terminal=req.caller_terminal,
+                caller_pane_id=req.caller_pane_id or req.route.caller_pane_id,
+                caller_terminal=req.caller_terminal or req.route.caller_terminal,
                 caller_live_id=req.route.caller_live_id,
+                caller_token=req.route.caller_token,
             )
             if not outcome.ok:
                 return ProviderResult(
@@ -684,8 +685,8 @@ class ClaudeAdapter(BaseProviderAdapter):
             email_msg_id=req.email_msg_id,
             email_from=req.email_from,
             work_dir=req.work_dir,
-            caller_pane_id=req.caller_pane_id,
-            caller_terminal=req.caller_terminal,
+            caller_pane_id=req.caller_pane_id or (req.route.caller_pane_id if req.route.present else ""),
+            caller_terminal=req.caller_terminal or (req.route.caller_terminal if req.route.present else ""),
             caller_live_id=req.route.caller_live_id if req.route.present else "",
             route_launch_id=req.route.launch_id if req.route.present else "",
         )

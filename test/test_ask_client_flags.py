@@ -100,6 +100,14 @@ def test_unified_daemon_request_omits_show_tier_by_default(monkeypatch, tmp_path
     assert "show_tier" not in sent
 
 
+def test_caller_pane_prefers_active_tmux_over_outer_wezterm(monkeypatch) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setenv("WEZTERM_PANE", "outer-pane")
+
+    assert ask._caller_pane_info() == ("%7", "tmux")
+
+
 def test_unified_daemon_uses_authenticated_route_caller_over_ambient_pane(
     monkeypatch, tmp_path: Path
 ) -> None:

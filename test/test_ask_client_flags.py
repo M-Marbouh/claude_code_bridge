@@ -100,6 +100,42 @@ def test_unified_daemon_request_omits_show_tier_by_default(monkeypatch, tmp_path
     assert "show_tier" not in sent
 
 
+def test_unified_daemon_uses_authenticated_route_caller_over_ambient_pane(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ask = _load_ask_module()
+    sent: dict = {}
+    context = ask._UnifiedDaemonContext(
+        tmp_path / "askd.json", {"token": "tok"}, tmp_path
+    )
+    monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("outer-pane", "wezterm"))
+    monkeypatch.setattr(
+        askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: sent.update(request) or {"exit_code": 0, "reply": ""},
+    )
+    route = ask.ResolvedRoute(
+        live_id="s2",
+        launch_id="ai-1",
+        caller_live_id="s1",
+        caller_token="secret",
+        caller_pane_id="%2",
+        caller_terminal="tmux",
+        pane_id="%3",
+        terminal="tmux",
+        session_file=str(tmp_path / "s2.json"),
+        ccb_project_id="project-1",
+    )
+
+    rc = ask._send_via_unified_daemon(
+        "codex", "hello", 1.0, False, "codex", daemon_context=context, route=route
+    )
+
+    assert rc == 0
+    assert sent["caller_pane_id"] == "%2"
+    assert sent["caller_terminal"] == "tmux"
+
+
 def test_unified_daemon_preserves_outer_async_request_id(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("CCB_REQ_ID", "20260711-220118-845-190737")
 
@@ -1261,6 +1297,29 @@ def test_default_async_background_script_carries_resolved_route_via_env(
         assert "export CCB_ROUTE_LIVE_ID=s2" in content
         assert "export CCB_ROUTE_LAUNCH_ID=ai-1" in content
         assert "export CCB_ROUTE_CALLER_LIVE_ID=s1" in content
+
+
+def test_pair_credential_ignores_unrelated_ambient_terminal_pane(monkeypatch, tmp_path: Path) -> None:
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+    seen = {}
+
+    def preflight(_provider, **kwargs):
+        seen.update(kwargs)
+        return False
+
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setenv("CCB_LIVE_ID", "live-one")
+    monkeypatch.setenv("CCB_LIVE_TOKEN", "secret")
+    monkeypatch.setenv("WEZTERM_PANE", "unrelated-outer-pane")
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "_preflight_target", preflight)
+    assert ask.main(["ask", "codex", "hello"]) == ask.EXIT_ERROR
+    assert seen["caller_live_id"] == "live-one"
+    assert seen["caller_token"] == "secret"
+    assert seen["caller_pane_id"] == ""
+    assert seen["caller_terminal"] == ""
 
 
 def test_foreground_re_invocation_inherits_route_without_resolving_again(monkeypatch) -> None:

@@ -1025,6 +1025,8 @@ def _live_session_to_route_outcome_dict(
         "session_file": session.session_file,
         "active": session.active,
         "caller_live_id": caller.live_id if caller else "",
+        "caller_pane_id": caller.pane_id if caller else "",
+        "caller_terminal": caller.terminal if caller else "",
     }
 
 
@@ -1056,7 +1058,13 @@ def _route_outcome_dict_to_live_session(
         )
         caller_live_id = str(payload.get("caller_live_id") or "")
         caller = (
-            LiveSession(live_id=caller_live_id, provider=session.provider, launch_id=session.launch_id)
+            LiveSession(
+                live_id=caller_live_id,
+                provider=session.provider,
+                launch_id=session.launch_id,
+                pane_id=str(payload.get("caller_pane_id") or ""),
+                terminal=str(payload.get("caller_terminal") or ""),
+            )
             if caller_live_id
             else None
         )

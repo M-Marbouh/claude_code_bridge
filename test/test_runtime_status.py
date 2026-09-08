@@ -1437,6 +1437,8 @@ def test_resolve_live_route_proxies_through_daemon_rpc_inside_managed_sandbox(mo
                 "session_file": "/tmp/s2.json",
                 "active": True,
                 "caller_live_id": "s1",
+                "caller_pane_id": "%2",
+                "caller_terminal": "tmux",
             },
         }
 
@@ -1452,6 +1454,8 @@ def test_resolve_live_route_proxies_through_daemon_rpc_inside_managed_sandbox(mo
     assert resolution.session.live_id == "s2"
     assert resolution.session.launch_id == "ai-1"
     assert caller is not None and caller.live_id == "s1"
+    assert caller.pane_id == "%2"
+    assert caller.terminal == "tmux"
     assert captured["request"]["operation"] == "resolve_route"
     assert captured["request"]["provider"] == "codex"
     assert captured["request"]["caller_pane_id"] == "%2"

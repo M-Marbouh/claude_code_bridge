@@ -577,6 +577,12 @@ def _send_via_unified_daemon(
         return EXIT_ERROR
 
     caller_pane_id, caller_terminal = _caller_pane_info()
+    if route is not None and route.present and route.caller_live_id and route.caller_token:
+        # The host already authenticated this caller and returned its exact
+        # launch pane. Do not replace that evidence with an unrelated outer
+        # terminal variable retained by a provider sandbox.
+        caller_pane_id = route.caller_pane_id
+        caller_terminal = route.caller_terminal
 
     req = {
         "type": "ask.request",
@@ -1368,6 +1374,12 @@ def main(argv: list[str]) -> int:
             caller_pane_id, caller_terminal = _caller_pane_info()
             caller_live_id = (os.environ.get("CCB_LIVE_ID") or "").strip()
             caller_token = (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+            if caller_live_id and caller_token:
+                # Codex tool sandboxes may drop TMUX_PANE while retaining an
+                # unrelated outer WEZTERM_PANE. The per-launch credential is
+                # the authoritative pair identity; do not mix ambient pane
+                # evidence from another terminal backend into it.
+                caller_pane_id, caller_terminal = "", ""
             route_fields: dict = {}
             if not _preflight_target(
                 provider,
@@ -1412,6 +1424,8 @@ def main(argv: list[str]) -> int:
                 notify_caller_pane_id, notify_caller_terminal = _caller_pane_info()
                 notify_caller_live_id = (os.environ.get("CCB_LIVE_ID") or "").strip()
                 notify_caller_token = (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+                if notify_caller_live_id and notify_caller_token:
+                    notify_caller_pane_id, notify_caller_terminal = "", ""
                 notify_route_fields: dict = {}
                 if not _preflight_target(
                     provider,

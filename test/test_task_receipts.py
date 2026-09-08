@@ -867,6 +867,31 @@ def test_receipt_without_route_has_no_identity_fields(tmp_path: Path) -> None:
     assert set(data.keys()) == set(data_absent_route.keys())
 
 
+def test_peer_receipt_uses_exact_inventory_member(tmp_path: Path, monkeypatch) -> None:
+    from live_sessions import LiveSession
+
+    monkeypatch.setenv("CCB_CALLER_PANE_ID", "%8")
+    monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")
+    entries = [({}, LiveSession(
+        live_id=f"s{n}", provider="codex", launch_id="launch",
+        pane_id=f"%{n}", terminal="tmux", pane_title_marker=f"marker-{n}",
+    )) for n in (7, 8)]
+    monkeypatch.setattr("peer_routing._live_entries_for_project", lambda *_: (entries, True))
+    monkeypatch.setattr("pane_registry.load_registry_by_project_id", lambda *_: (_ for _ in ()).throw(
+        AssertionError("inventory must not fall back to provider lookup")))
+    kwargs = dict(task_id="task", peer_provider="claude", caller="codex", intent="background",
+                  work_dir=tmp_path, status_file=tmp_path / "task.status",
+                  log_file=tmp_path / "task.log", reply_file=tmp_path / "task.reply")
+    data = new_peer_receipt(**kwargs)
+    assert data["caller_live_id"] == "s8"
+    assert data["caller_registry_session_id"] == "launch"
+    assert data["caller_pane_title_marker"] == "marker-8"
+    entries.clear()
+    data = new_peer_receipt(**kwargs)
+    assert not data.get("caller_pane_title_marker")
+    assert not data.get("caller_live_id")
+
+
 def test_peer_receipt_preserves_direct_return_route(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CCB_CALLER_PANE_ID", "%7")
     monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")

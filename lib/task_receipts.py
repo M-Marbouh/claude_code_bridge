@@ -146,6 +146,25 @@ def new_peer_receipt(
     if not pane_id or not project_id or caller not in {"claude", "codex"}:
         return receipt
 
+    # Inventory topology is authoritative, including an empty or broken
+    # inventory. Never invent a provider-wide return marker for a pair.
+    try:
+        from peer_routing import _live_entries_for_project
+
+        entries, inventory_present = _live_entries_for_project(project_id, caller)
+    except Exception:
+        return receipt
+    if inventory_present:
+        terminal = str(receipt.get("caller_terminal") or "").strip().lower()
+        matches = [session for _record, session in entries
+                   if session.matches_pane(pane_id, terminal) and session.active]
+        if len(matches) == 1:
+            session = matches[0]
+            receipt["caller_live_id"] = session.live_id
+            receipt["caller_registry_session_id"] = session.launch_id
+            receipt["caller_pane_title_marker"] = session.pane_title_marker
+        return receipt
+
     try:
         from pane_registry import load_registry_by_project_id
 

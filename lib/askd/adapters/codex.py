@@ -37,7 +37,7 @@ from completion_hook import (
     default_reply_for_status,
     notify_completion,
 )
-from pane_registry import session_data_from_live, validate_route
+from pane_registry import load_registry_by_session_id, read_inventory_for_record, session_data_from_live, validate_route
 from project_id import compute_ccb_project_id, normalize_work_dir
 from providers import CASKD_SPEC
 from task_receipts import PersistOutcome, persist_proven_result
@@ -211,8 +211,9 @@ def _scan_latest_candidate_log(
     *,
     exclude_session_ids: set[str] | None = None,
     req_id: str | None = None,
+    root: Path | None = None,
 ) -> Optional[Path]:
-    root = Path(os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
+    root = Path(root or os.environ.get("CODEX_SESSION_ROOT") or (Path.home() / ".codex" / "sessions")).expanduser()
     if not root.exists():
         return None
     excluded = {str(s or "").strip() for s in (exclude_session_ids or set()) if str(s or "").strip()}
@@ -255,6 +256,25 @@ def _is_log_stale(preferred: Optional[Path], latest: Optional[Path], threshold_s
     except OSError:
         return True
     return latest_mtime - preferred_mtime >= threshold_s
+
+
+def _sibling_conversation_ids(route) -> set[str]:
+    """Conversation IDs owned by other Codex members in this exact launch."""
+    if not route.present:
+        return set()
+    record = load_registry_by_session_id(route.launch_id)
+    inventory = read_inventory_for_record(record or {})
+    if not inventory.valid:
+        return set()
+    result = set()
+    for sibling in inventory.sessions:
+        if sibling.live_id == route.live_id or sibling.provider != "codex":
+            continue
+        data = session_data_from_live(sibling) or {}
+        session_id = str(data.get("codex_session_id") or "").strip()
+        if session_id:
+            result.add(session_id)
+    return result
 
 
 class CodexAdapter(BaseProviderAdapter):
@@ -446,8 +466,22 @@ class CodexAdapter(BaseProviderAdapter):
             prompt = wrap_codex_prompt(req.message, task.req_id)
         preferred_log = session.codex_session_path or None
         codex_session_id = session.codex_session_id or None
+        sibling_session_ids = _sibling_conversation_ids(req.route)
+        if codex_session_id and codex_session_id in sibling_session_ids:
+            return ProviderResult(
+                exit_code=1,
+                reply="Routed Codex session is bound to its sibling's conversation.",
+                req_id=task.req_id,
+                session_key=session_key,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
+        # The daemon's own account/root need not be the mounted pane's.
+        recorded_root = session.data.get("codex_session_root")
+        reader_options = {"root": Path(recorded_root).expanduser()} if recorded_root else {}
         require_anchor_before_collect = True
         reader = CodexLogReader(
+            **reader_options,
             log_path=preferred_log,
             session_id_filter=codex_session_id,
             work_dir=Path(session.work_dir),
@@ -548,13 +582,16 @@ class CodexAdapter(BaseProviderAdapter):
                         last_stale_check = now
                         latest_log = _scan_latest_candidate_log(
                             Path(session.work_dir),
+                            exclude_session_ids=sibling_session_ids,
                             req_id=task.req_id,
+                            **reader_options,
                         )
                         current_log = state.get("log_path")
                         if isinstance(current_log, str):
                             current_log = Path(current_log)
                         if latest_log and latest_log != current_log and _is_log_stale(current_log, latest_log, stale_threshold_s):
                             reader = CodexLogReader(
+                                **reader_options,
                                 log_path=latest_log,
                                 session_id_filter=None,
                                 work_dir=Path(session.work_dir),
@@ -584,11 +621,15 @@ class CodexAdapter(BaseProviderAdapter):
             role, text, phase = event
             if role == "user":
                 if f"{REQ_ID_PREFIX} {task.req_id}" in text:
+                    anchor_log = state.get("log_path") if isinstance(state, dict) else None
+                    if anchor_log and _codex_log_is_descendant(Path(anchor_log)):
+                        # Eligibility applies to the initial reader too,
+                        # not just the stale-binding candidate scanner.
+                        continue
                     anchor_seen = True
                     if anchor_ms is None:
                         anchor_ms = _now_ms() - started_ms
                     if codex_log_path_at_anchor is None:
-                        anchor_log = state.get("log_path") if isinstance(state, dict) else None
                         if anchor_log:
                             codex_log_path_at_anchor = str(anchor_log)
                             try:

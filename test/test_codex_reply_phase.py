@@ -542,6 +542,20 @@ def test_handle_task_anchor_confirmed_completion_repairs_binding(monkeypatch, tm
     assert session.bindings == [{"log_path": str(log_path), "session_id": sid}]
 
 
+def test_scan_uses_recorded_root_not_daemon_account(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    own_root = tmp_path / "pane-account" / "sessions"
+    daemon_root = tmp_path / "daemon-account" / "sessions"
+    for root in (own_root, daemon_root):
+        root.mkdir(parents=True)
+        (root / "conversation.jsonl").write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {"id": root.parent.name, "cwd": str(tmp_path)}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": f"{REQ_ID_PREFIX} {req_id}"}}),
+        ]) + "\n")
+    monkeypatch.setenv("CODEX_SESSION_ROOT", str(daemon_root))
+    assert codex_adapter._scan_latest_candidate_log(tmp_path, req_id=req_id, root=own_root) == own_root / "conversation.jsonl"
+
+
 def test_scan_latest_candidate_requires_anchor_and_honors_exclusions(monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "codex-root"
     root.mkdir(parents=True, exist_ok=True)
@@ -713,6 +727,51 @@ def test_scan_latest_candidate_skips_descendant_transcript_even_when_newer(monke
     assert codex_adapter._codex_log_work_dir_matches(child_log, tmp_path)
     assert codex_adapter._codex_log_is_descendant(child_log)
     assert not codex_adapter._codex_log_is_descendant(top_log)
+
+
+def test_handle_task_rejects_helper_anchor_from_initial_reader(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    child = tmp_path / "child.jsonl"
+    _write_rollout(child, sid="child", cwd=tmp_path, req_id=req_id,
+                   meta_extra={"parent_thread_id": "parent", "source": {"subagent": {}}})
+    session = _FakeSession(tmp_path)
+    result = _drive_handle_task(
+        monkeypatch, tmp_path, req_id,
+        [("assistant", f"wrong helper reply\nCCB_DONE: {req_id}", "final_answer")],
+        log_path=child, session_obj=session, timeout_s=0.02,
+    )
+    assert not result.anchor_seen
+    assert not result.done_seen
+    assert "wrong helper reply" not in result.reply
+    assert session.bindings == []
+
+
+def test_routed_pair_refuses_shared_native_conversation(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    live = LiveSession("dest", "codex", "launch", pane_id="%2", terminal="tmux",
+                       session_file=str(tmp_path / "binding"), work_dir=str(tmp_path),
+                       ccb_project_id="project")
+    route = ResolvedRoute(live_id="dest", launch_id="launch", caller_live_id="caller",
+                          pane_id="%2", terminal="tmux", session_file=live.session_file,
+                          ccb_project_id="project")
+    session = _FakeSession(tmp_path)
+    session.codex_session_id = "conversation-owned-by-sibling"
+    monkeypatch.setattr(codex_adapter, "validate_route", lambda **_: Resolution(session=live))
+    monkeypatch.setattr(codex_adapter, "session_data_from_live", lambda _: {"active": True})
+    monkeypatch.setattr(codex_adapter, "CodexProjectSession", lambda **_: session)
+    monkeypatch.setattr(codex_adapter, "_sibling_conversation_ids",
+                        lambda _: {"conversation-owned-by-sibling"})
+    backend = _FakeBackend()
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda _: backend)
+    req = ProviderRequest(client_id="c", work_dir=str(tmp_path), timeout_s=1, quiet=True,
+                          message="do it", caller="codex", req_id=req_id, route=route,
+                          caller_pane_id="%1", caller_terminal="tmux")
+    result = codex_adapter.CodexAdapter().handle_task(
+        QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+    )
+    assert result.exit_code == 1
+    assert "sibling's conversation" in result.reply
+    assert backend.sent == []
 
 
 def test_scan_latest_candidate_keeps_rollouts_without_lineage_metadata(monkeypatch, tmp_path: Path) -> None:

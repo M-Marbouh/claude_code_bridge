@@ -71,6 +71,52 @@ def test_cmd_kill_is_local_only_by_default(monkeypatch, tmp_path: Path) -> None:
     assert data["ended_at"]
 
 
+def test_cmd_kill_terminates_every_verified_codex_pair_member(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    import ccb_runtime_status
+
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    session_id = "ai-1-999999"
+    entries = []
+    for index in (1, 2):
+        live_id = f"live-{index}"
+        marker = f"CCB-Codex-{project_id[:8]}-{live_id}"
+        path = tmp_path / f"binding-{index}.json"
+        path.write_text(json.dumps({
+            "active": True, "session_id": session_id, "live_id": live_id,
+            "terminal": "tmux", "pane_id": f"%{index}", "pane_title_marker": marker,
+            "work_dir": str(tmp_path), "ccb_project_id": project_id,
+        }))
+        entries.append({
+            "live_id": live_id, "provider": "codex", "launch_id": session_id,
+            "pane_id": f"%{index}", "pane_title_marker": marker, "terminal": "tmux",
+            "work_dir": str(tmp_path), "ccb_project_id": project_id,
+            "session_file": str(path), "active": True,
+        })
+    record = {"ccb_session_id": session_id, "ccb_project_id": project_id,
+              "work_dir": str(tmp_path), "terminal": "tmux", "live_sessions": entries}
+    killed = []
+
+    class Backend:
+        def is_alive(self, pane): return pane in {"%1", "%2"}
+        pane_exists = is_alive
+        def pane_matches_cwd_strict(self, pane, work_dir): return self.is_alive(pane) and work_dir == str(tmp_path)
+        def find_pane_by_title_marker(self, marker, work_dir=""):
+            return next((entry["pane_id"] for entry in entries if entry["pane_title_marker"] == marker), None)
+        def kill_pane(self, pane): killed.append(pane)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "TmuxBackend", Backend)
+    monkeypatch.setattr(ccb, "load_registry_by_session_id", lambda _: record)
+    monkeypatch.setattr(ccb_runtime_status, "_iter_qualifying_registry_records",
+                        lambda **_: [(record, str(tmp_path), project_id, 1, False)])
+    monkeypatch.setattr(ccb, "upsert_registry", lambda update: record.update(update) or True)
+    assert ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=["codex"])) == 0
+    assert killed == ["%1", "%2"]
+    assert all(not entry["active"] for entry in record["live_sessions"])
+    assert all(not json.loads(Path(entry["session_file"]).read_text())["active"] for entry in entries)
+
+
 def test_cmd_kill_skips_inactive_stale_wezterm_pane(monkeypatch, tmp_path: Path) -> None:
     ccb = _load_ccb_module()
     session_dir = tmp_path / ".ccb"

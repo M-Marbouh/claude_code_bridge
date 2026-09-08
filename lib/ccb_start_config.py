@@ -41,14 +41,7 @@ def _parse_tokens(raw: str) -> list[str]:
 
 def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], bool]:
     providers: list[str] = []
-    seen_providers: set[str] = set()
     cmd_enabled = False
-
-    def add_provider(provider: str) -> None:
-        if provider in seen_providers:
-            return
-        seen_providers.add(provider)
-        providers.append(provider)
 
     for raw in tokens:
         token = str(raw).strip().lower()
@@ -59,8 +52,20 @@ def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], bool]:
             continue
         if token not in _ALLOWED_PROVIDERS:
             continue
-        add_provider(token)
+        providers.append(token)
     return providers, cmd_enabled
+
+
+def provider_pairing_error(providers: list[str], *, resume: bool = False) -> str:
+    if providers.count("codex") == 2 and len(providers) != 2:
+        return "A Codex pair must be launched as exactly: ccb codex codex."
+    for provider in set(providers):
+        count = providers.count(provider)
+        if count > (2 if provider == "codex" else 1):
+            return "Only two Codex sessions may share a provider; other providers must be unique."
+    if resume and providers.count("codex") == 2:
+        return "CCB resume is unsupported for a Codex pair. Start fresh, then use native resume inside each pane."
+    return ""
 
 
 def _normalize_providers(tokens: list[str]) -> tuple[list[str], bool]:

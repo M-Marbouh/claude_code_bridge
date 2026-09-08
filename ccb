@@ -30,7 +30,7 @@ sys.path.insert(0, str(script_dir / "lib"))
 from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_shell_type, get_backend_for_session
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
-from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config
+from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, provider_pairing_error
 from ccb_mcpv_bridge import (
     Decision,
     DecisionKind,
@@ -50,7 +50,7 @@ from session_utils import (
     resolve_project_config_dir,
     safe_write_session,
 )
-from pane_registry import upsert_registry, load_registry_by_project_id, load_registry_by_session_id
+from pane_registry import upsert_registry, load_registry_by_project_id, load_registry_by_session_id, read_inventory_for_record
 from project_id import compute_ccb_project_id
 from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC
 from process_lock import ProviderLock
@@ -608,6 +608,9 @@ class AILauncher:
         launch_env: dict | None = None,
     ):
         self.providers = providers or ["codex"]
+        pairing_error = provider_pairing_error(self.providers, resume=resume)
+        if pairing_error:
+            raise ValueError(pairing_error)
         self.resume = resume
         self.auto = auto
         self.cmd_config = self._normalize_cmd_config(cmd_config)
@@ -629,6 +632,9 @@ class AILauncher:
         self.temp_base = Path(tempfile.gettempdir())
         self.runtime_dir = self.temp_base / f"claude-ai-{getpass.getuser()}" / self.session_id
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        # Occurrence identity is private launch state, never a provider or role.
+        self._live_slots = [uuid.uuid4().hex for _ in self.providers] if self.providers.count("codex") == 2 else []
+        self._launch_slot = len(self.providers) - 1
         self._cleaned = False
         self._askd_checked = False
         self._auto_prune_done = False
@@ -673,12 +679,55 @@ class AILauncher:
             for k, v in extra.items():
                 if isinstance(k, str) and k.strip():
                     env[k.strip()] = str(v)
+        if self._live_slots and prov == self.providers[self._launch_slot]:
+            env["CCB_LIVE_ID"] = self._live_slots[self._launch_slot]
         return env
+
+    def _provider_slot_key(self, provider: str) -> str:
+        if self._live_slots and self.providers.count(provider) > 1:
+            return self._live_slots[self._launch_slot]
+        return provider
+
+    def _provider_runtime(self, provider: str) -> Path:
+        return self.runtime_dir / self._provider_slot_key(provider)
+
+    def _provider_marker(self, provider: str) -> str:
+        marker = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
+        if self._live_slots:
+            marker += "-" + self._live_slots[self._launch_slot]
+        return marker
+
+    def _publish_live_inventory(self) -> bool:
+        if not self._live_slots:
+            return True
+        entries = []
+        for provider, live_id in zip(self.providers, self._live_slots):
+            path = (self.runtime_dir / live_id / f".{provider}-session"
+                    if self.providers.count(provider) > 1
+                    else resolve_project_config_dir(self.project_root) / f".{provider}-session")
+            data = self._read_json_file(path) if path.exists() else {}
+            # A previous launch's file is never this launch's mounted member.
+            owned = data.get("session_id") == self.session_id
+            entries.append({
+                "live_id": live_id, "provider": provider,
+                "pane_id": str(data.get("pane_id") or "") if owned else "",
+                "pane_title_marker": str(data.get("pane_title_marker") or "") if owned else "",
+                "terminal": self.terminal_type, "session_file": str(path),
+                "active": bool(owned and data.get("active")),
+            })
+        return upsert_registry({
+            "ccb_session_id": self.session_id, "ccb_project_id": self.project_id,
+            "work_dir": str(self.project_root), "terminal": self.terminal_type,
+            "ccb_pid": self.ccb_pid, "live_sessions": entries,
+        })
 
     def _project_config_dir(self) -> Path:
         return resolve_project_config_dir(self.project_root)
 
     def _project_session_file(self, filename: str) -> Path:
+        provider = filename.removeprefix(".").removesuffix("-session")
+        if self._live_slots and self.providers.count(provider) > 1:
+            return self._provider_runtime(provider) / filename
         cfg = self._project_config_dir()
         return cfg / filename
 
@@ -835,6 +884,8 @@ class AILauncher:
 
     def _provider_pane_id(self, provider: str) -> str:
         prov = (provider or "").strip().lower()
+        if self.providers.count(prov) > 1:
+            return ""
         anchor = (self.anchor_provider or "").strip().lower()
         if prov and prov == anchor and self.anchor_pane_id:
             return str(self.anchor_pane_id)
@@ -850,7 +901,7 @@ class AILauncher:
         try:
             backend = TmuxBackend()
             pane_id = backend.get_current_pane_id()
-            title = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
+            title = self._provider_marker(provider)
             backend.set_pane_title(pane_id, title)
             backend.set_pane_user_option(pane_id, "@ccb_agent", provider.capitalize())
         except Exception:
@@ -1377,7 +1428,7 @@ class AILauncher:
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / provider
+        runtime = self._provider_runtime(provider)
         runtime.mkdir(parents=True, exist_ok=True)
 
         start_cmd = self._compose_agent_shell(provider, self._get_start_cmd(provider))
@@ -1392,19 +1443,19 @@ class AILauncher:
             except StopIteration:
                 use_parent = None
 
-        pane_title_marker = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
+        pane_title_marker = self._provider_marker(provider)
         title_cmd = _build_pane_title_cmd(pane_title_marker)
         env_overrides = self._provider_env_overrides(provider)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
         backend = WeztermBackend()
         pane_id = backend.create_pane(full_cmd, str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
-        self.wezterm_panes[provider] = pane_id
+        self.wezterm_panes[self._provider_slot_key(provider)] = pane_id
 
         if provider == "codex":
             input_fifo = runtime / "input.fifo"
             output_fifo = runtime / "output.fifo"
             # WezTerm mode injects text via pane, no strong FIFO dependency; Windows/WSL may not support mkfifo
-            self._write_codex_session(
+            if not self._write_codex_session(
                 runtime,
                 None,
                 input_fifo,
@@ -1412,7 +1463,8 @@ class AILauncher:
                 pane_id=pane_id,
                 pane_title_marker=pane_title_marker,
                 codex_start_cmd=start_cmd,
-            )
+            ):
+                return None
         elif provider == "gemini":
             self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         elif provider == "opencode":
@@ -2230,7 +2282,7 @@ class AILauncher:
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / "codex"
+        runtime = self._provider_runtime("codex")
         runtime.mkdir(parents=True, exist_ok=True)
 
         input_fifo = runtime / "input.fifo"
@@ -2247,7 +2299,7 @@ class AILauncher:
             ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd()),
         )
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
-        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
+        pane_title_marker = self._provider_marker("codex")
 
         backend = TmuxBackend()
 
@@ -2274,7 +2326,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Codex")
 
-        self.tmux_panes["codex"] = pane_id
+        self.tmux_panes[self._provider_slot_key("codex")] = pane_id
 
         bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
         bridge_env = os.environ.copy()
@@ -2314,7 +2366,7 @@ class AILauncher:
         except Exception:
             pass
 
-        self._write_codex_session(
+        if not self._write_codex_session(
             runtime,
             None,
             input_fifo,
@@ -2322,7 +2374,8 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
-        )
+        ):
+            return None
 
         print(f"✅ {t('started_backend', provider='Codex', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
@@ -2475,7 +2528,7 @@ class AILauncher:
         return pane_id
 
     def _start_codex_current_pane(self) -> int:
-        runtime = self.runtime_dir / "codex"
+        runtime = self._provider_runtime("codex")
         runtime.mkdir(parents=True, exist_ok=True)
 
         input_fifo = runtime / "input.fifo"
@@ -2486,7 +2539,7 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Codex", file=sys.stderr)
             return 1
 
-        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
+        pane_title_marker = self._provider_marker("codex")
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2513,7 +2566,7 @@ class AILauncher:
             + recorded_agent_cmd
         )
 
-        self._write_codex_session(
+        if not self._write_codex_session(
             runtime,
             None,
             input_fifo,
@@ -2521,7 +2574,8 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
-        )
+        ):
+            return 1
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
         self._maybe_start_caskd()
@@ -2743,9 +2797,15 @@ class AILauncher:
             "active": True,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
+        if self._live_slots:
+            data["live_id"] = self._live_slots[self._launch_slot]
         if codex_start_cmd:
             data["codex_start_cmd"] = str(codex_start_cmd)
             data["start_cmd"] = str(codex_start_cmd)
+        if self._live_slots:
+            env = {**os.environ, **self._provider_env_overrides("codex")}
+            codex_home = Path(env.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+            data["codex_session_root"] = str(Path(env.get("CODEX_SESSION_ROOT") or codex_home / "sessions").expanduser().resolve())
         decision = self._agent_policy_decisions.get("codex", Decision.plain())
         data["project_root"] = str(self.project_root)
         data["ccb_managed_launch"] = True
@@ -2757,6 +2817,11 @@ class AILauncher:
         if not ok:
             print(err, file=sys.stderr)
             return False
+        if self._live_slots:
+            if not self._publish_live_inventory():
+                return False
+            self._maybe_start_provider_daemon("codex")
+            return True
         try:
             upsert_registry({
                 "ccb_session_id": self.session_id,
@@ -2798,6 +2863,8 @@ class AILauncher:
         return ok
 
     def _sync_cend_registry(self) -> None:
+        if self._live_slots:
+            return
         if "codex" not in self.providers or "claude" not in self.providers:
             return
         codex_pane_id = self._provider_pane_id("codex")
@@ -3239,22 +3306,33 @@ class AILauncher:
                         backend.kill_pane(pane_id)
 
         if clear_sessions:
-            for session_file in [
+            session_files = [
                 self._project_session_file(".codex-session"),
                 self._project_session_file(".gemini-session"),
                 self._project_session_file(".opencode-session"),
                 self._project_session_file(".claude-session"),
-            ]:
+            ]
+            if self._live_slots:
+                session_files = [
+                    self.runtime_dir / live_id / f".{provider}-session"
+                    if self.providers.count(provider) > 1
+                    else resolve_project_config_dir(self.project_root) / f".{provider}-session"
+                    for provider, live_id in zip(self.providers, self._live_slots)
+                ]
+            for session_file in session_files:
                 if session_file.exists():
                     try:
                         data = self._read_json_file(session_file)
                         if not data:
+                            continue
+                        if self._live_slots and data.get("session_id") != self.session_id:
                             continue
                         data["active"] = False
                         data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                         safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
                     except Exception:
                         pass
+            self._publish_live_inventory()
 
         # Ensure unified askd daemon exits when CCB exits (with ownership safety).
         try:
@@ -3321,6 +3399,9 @@ class AILauncher:
             return 2
 
         self._preflight_agent_policies()
+        if not self._publish_live_inventory():
+            print("❌ Cannot publish live session inventory.", file=sys.stderr)
+            return 2
 
         self.anchor_provider = self.providers[-1]
         self.anchor_pane_id = self._current_pane_id()
@@ -3410,13 +3491,20 @@ class AILauncher:
             except Exception:
                 pass
 
+        pending_slots = list(reversed(range(len(self.providers) - 1)))
+
         def _start_item(item: str, *, parent: str | None, direction: str | None) -> str | None:
             if item == "cmd":
                 return self._start_cmd_pane(parent_pane=parent, direction=direction, cmd_settings=cmd_settings)
+            self._launch_slot = next(index for index in pending_slots if self.providers[index] == item)
+            pending_slots.remove(self._launch_slot)
             if item == "claude":
-                return self._start_claude_pane(parent_pane=parent, direction=direction)
-            pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
-            if pane_id:
+                pane_id = self._start_claude_pane(parent_pane=parent, direction=direction)
+            else:
+                pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
+            if pane_id and not self._publish_live_inventory():
+                return None
+            if pane_id and self.providers.count(item) == 1 and item != "claude":
                 self._warmup_provider(item)
             return pane_id
 
@@ -3452,6 +3540,7 @@ class AILauncher:
                 self._sync_cend_registry()
             except Exception:
                 pass
+            self._launch_slot = len(self.providers) - 1
             return self._start_provider_in_current_pane(self.anchor_provider)
         finally:
             self.cleanup(**cleanup_kwargs)
@@ -3685,6 +3774,10 @@ def cmd_start(args):
 
     flags = config_data.get("flags") if isinstance(config_data.get("flags"), dict) else {}
     resume = bool(args.resume or flags.get("resume") or flags.get("restore") or flags.get("auto_resume"))
+    pairing_error = provider_pairing_error(providers, resume=resume)
+    if pairing_error:
+        print(f"❌ {pairing_error}", file=sys.stderr)
+        return 2
     auto = bool(args.auto or flags.get("auto") or flags.get("auto_mode"))
     cmd_config = config_data.get("cmd") if isinstance(config_data, dict) else None
     if cmd_enabled:
@@ -3960,6 +4053,7 @@ def _pane_matches_session_record(backend, pane_id: str, project_root: Path) -> b
 def _registry_matches_kill_target(
     provider: str,
     data: dict,
+    session_file: Path,
     project_root: Path,
     project_id: str,
     pane_id: str,
@@ -3986,6 +4080,20 @@ def _registry_matches_kill_target(
     if registry_work_dir != _normalize_path_for_match(str(project_root)):
         return False
 
+    inventory = read_inventory_for_record(registry)
+    if inventory.present:
+        if not inventory.valid:
+            return False
+        live_id = str(data.get("live_id") or "").strip()
+        matches = [session for session in inventory.sessions if session.live_id == live_id]
+        return (
+            len(matches) == 1
+            and matches[0].provider == provider
+            and matches[0].pane_id == pane_id
+            and matches[0].pane_title_marker.casefold() == marker.casefold()
+            and Path(matches[0].session_file) == session_file
+        )
+
     providers = registry.get("providers")
     if not isinstance(providers, dict):
         return False
@@ -4003,7 +4111,8 @@ def _verified_kill_target(provider: str, session_file: Path, data: dict):
     if data.get("active") is not True:
         return None, "inactive session record"
 
-    project_root = _session_project_root(session_file)
+    recorded_work_dir = str(data.get("work_dir") or "").strip()
+    project_root = Path(recorded_work_dir) if recorded_work_dir else _session_project_root(session_file)
     project_norm = _normalize_path_for_match(str(project_root))
     record_work_dir = _extract_session_work_dir_norm(data)
     if not project_norm or record_work_dir != project_norm:
@@ -4021,10 +4130,13 @@ def _verified_kill_target(provider: str, session_file: Path, data: dict):
     marker = str(data.get("pane_title_marker") or "").strip()
     provider_label = {"opencode": "OpenCode"}.get(provider, provider.capitalize())
     expected_marker = f"CCB-{provider_label}-{project_id[:8]}"
+    live_id = str(data.get("live_id") or "").strip()
+    if live_id:
+        expected_marker += f"-{live_id}"
     if not pane_id or marker.casefold() != expected_marker.casefold():
         return None, "session pane identity is incomplete or invalid"
 
-    if not _registry_matches_kill_target(provider, data, project_root, project_id, pane_id, marker):
+    if not _registry_matches_kill_target(provider, data, session_file, project_root, project_id, pane_id, marker):
         return None, "session registry does not own the recorded pane"
 
     terminal = str(data.get("terminal") or "").strip().lower()
@@ -4067,6 +4179,64 @@ def cmd_kill(args):
     # Project-level cleanup (original behavior)
     providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude"], allow_unknown=True)
     if not providers:
+        return 2
+
+    # A live inventory owns duplicate project runtime files that deliberately do
+    # not appear at the legacy project-wide filenames. Kill every verified
+    # matching member and retain its inactive tombstone for safe routing.
+    try:
+        from ccb_runtime_status import _iter_qualifying_registry_records
+
+        project_root = Path.cwd().resolve()
+        project_id = compute_ccb_project_id(project_root)
+        inventory_records = []
+        for record, _work_dir, _effective, _updated, _stale in _iter_qualifying_registry_records(
+            project_id=project_id
+        ):
+            inventory = read_inventory_for_record(record)
+            if inventory.present:
+                inventory_records.append((record, inventory))
+        if inventory_records:
+            if any(not inventory.valid for _record, inventory in inventory_records):
+                print("❌ Refusing kill: live session inventory is invalid")
+                return 2
+            wanted = set(providers)
+            for record, inventory in inventory_records:
+                changed = False
+                entries = [dict(entry) for entry in record.get("live_sessions", [])]
+                by_id = {str(entry.get("live_id") or ""): entry for entry in entries}
+                for session in inventory.sessions:
+                    if session.provider not in wanted:
+                        continue
+                    session_file = Path(session.session_file)
+                    self_data = {}
+                    try:
+                        self_data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+                    except Exception:
+                        pass
+                    target, reason = _verified_kill_target(session.provider, session_file, self_data)
+                    if target is None:
+                        print(f"ℹ️  {session.provider}: Skipped ({reason})")
+                        continue
+                    backend, pane_id = target
+                    backend.kill_pane(pane_id)
+                    self_data["active"] = False
+                    self_data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    safe_write_session(session_file, json.dumps(self_data, ensure_ascii=False, indent=2))
+                    if session.live_id in by_id:
+                        by_id[session.live_id]["active"] = False
+                        changed = True
+                    print(f"✅ {session.provider.capitalize()} session terminated ({session.live_id[:8]})")
+                if changed:
+                    upsert_registry({
+                        "ccb_session_id": record.get("ccb_session_id"),
+                        "live_sessions": entries,
+                    })
+            if daemon:
+                _shutdown_shared_askd_for_project_kill(project_root)
+            return 0
+    except Exception as exc:
+        print(f"❌ Refusing kill: could not verify live inventory ({exc})")
         return 2
 
     for provider in providers:
@@ -4178,7 +4348,7 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
       - space-separated: `ccb codex gemini opencode claude`
       - comma-separated: `ccb codex,gemini,opencode,claude`
 
-    Returns a de-duplicated list preserving order.
+    Preserves order and provider occurrences.
     """
     allowed = {"codex", "gemini", "opencode", "claude"}
     raw_parts = _split_provider_tokens(values)
@@ -4186,13 +4356,9 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
     if not raw_parts:
         return []
 
-    seen: set[str] = set()
     parsed: list[str] = []
     unknown: list[str] = []
     for p in raw_parts:
-        if p in seen:
-            continue
-        seen.add(p)
         if p in allowed or allow_unknown:
             parsed.append(p)
         else:
@@ -4204,6 +4370,10 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
         print("💡 allowed: codex, gemini, opencode, claude", file=sys.stderr)
         return []
 
+    error = provider_pairing_error(parsed)
+    if error and not allow_unknown:
+        print(f"❌ {error}", file=sys.stderr)
+        return []
     return parsed
 
 
@@ -4217,7 +4387,6 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
     if not raw_parts:
         return [], False, True
 
-    seen: set[str] = set()
     parsed: list[str] = []
     unknown: list[str] = []
     cmd_enabled = False
@@ -4226,9 +4395,6 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
         if p == "cmd":
             cmd_enabled = True
             continue
-        if p in seen:
-            continue
-        seen.add(p)
         if p in allowed:
             parsed.append(p)
         else:
@@ -4240,6 +4406,10 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
         print("💡 allowed: codex, gemini, opencode, claude, cmd", file=sys.stderr)
         return [], cmd_enabled, False
 
+    error = provider_pairing_error(parsed)
+    if error:
+        print(f"❌ {error}", file=sys.stderr)
+        return [], cmd_enabled, False
     return parsed, cmd_enabled, True
 
 

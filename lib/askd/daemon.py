@@ -17,10 +17,12 @@ from typing import Callable, Dict, Optional
 from askd.adapters.base import (
     BaseProviderAdapter,
     MalformedRouteError,
+    PeerDestination,
     ProviderRequest,
     ProviderResult,
     QueuedTask,
     ResolvedRoute,
+    parse_peer_destination_mapping,
     parse_route_mapping,
     route_session_key,
 )
@@ -71,6 +73,32 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
         self.adapter = adapter
 
     def _handle_task(self, task: QueuedTask) -> ProviderResult:
+        request = task.request
+        if request.peer_destination.present:
+            # Checkpoint B (Item 1): re-confirm the saved peer destination
+            # immediately before the actual send -- at ENQUEUE time
+            # (`_UnifiedWorkerPool.submit`) this was already checked once;
+            # this closes the gap between a task sitting queued behind
+            # this session's other work and this worker actually acting on
+            # it. Never redirected to a sibling; a destination that fails
+            # here is refused outright. Delivery uses this exact endpoint,
+            # without asking the adapter to select a provider-default pane.
+            from peer_routing import revalidate_peer_destination
+
+            outcome = revalidate_peer_destination(request.peer_destination)
+            if not outcome.ok:
+                return ProviderResult(
+                    exit_code=1,
+                    reply=f"Peer destination is no longer available ({outcome.error}).",
+                    req_id=task.req_id,
+                    session_key=self.session_key,
+                    done_seen=False,
+                    status=COMPLETION_STATUS_FAILED,
+                )
+            # Peer messages are delivery-only. The validated endpoint is
+            # the send target, never an adapter's mutable provider default.
+            from peer_routing import send_peer_message
+            return send_peer_message(task, self.adapter.key, self.session_key)
         return self.adapter.handle_task(task)
 
     def _handle_exception(self, exc: Exception, task: QueuedTask) -> ProviderResult:
@@ -147,8 +175,38 @@ class _UnifiedWorkerPool:
                 return task
             session_key = route_session_key(provider, request.route)
         else:
-            session = adapter.load_session(Path(request.work_dir))
-            session_key = adapter.compute_session_key(session) if session else f"{provider}:unknown"
+            if request.peer_destination.present:
+                # Checkpoint A (Item 1): re-confirm the saved peer
+                # destination fresh, before this task is ever enqueued to
+                # a worker -- the same shape `validate_route` gives LOCAL
+                # routing's enqueue-time check, applied here without
+                # requiring the `live_sessions` inventory that mechanism
+                # depends on (no production destination carries one yet,
+                # and gating peer delivery on it would refuse every
+                # ordinary single-session peer reply). Peer queue keys and
+                # sends use the saved endpoint, not adapter.load_session.
+                from peer_routing import revalidate_peer_destination
+
+                outcome = revalidate_peer_destination(request.peer_destination)
+                if not outcome.ok:
+                    task.result = ProviderResult(
+                        exit_code=1,
+                        reply=f"Peer destination is no longer available ({outcome.error}).",
+                        req_id=req_id,
+                        session_key=f"{provider}:peer:{request.peer_destination.pane_id}",
+                        done_seen=False,
+                        status=COMPLETION_STATUS_FAILED,
+                    )
+                    task.done_event.set()
+                    return task
+            if request.peer_destination.present:
+                destination = request.peer_destination
+                session_key = "peer:" + json.dumps(
+                    [provider, destination.terminal, destination.pane_id, destination.pane_title_marker]
+                )
+            else:
+                session = adapter.load_session(Path(request.work_dir))
+                session_key = adapter.compute_session_key(session) if session else f"{provider}:unknown"
 
         pool = self._get_pool(provider)
         worker = pool.get_or_create(
@@ -193,6 +251,8 @@ class UnifiedAskDaemon:
             return self._handle_runtime_status(msg)
         if operation == "resolve_route":
             return self._handle_resolve_route(msg)
+        if operation == "peer_identify_sender":
+            return self._handle_peer_identify_sender(msg)
 
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
@@ -248,6 +308,17 @@ class UnifiedAskDaemon:
             }
 
         try:
+            peer_destination = parse_peer_destination_mapping(msg.get("peer_destination"))
+        except MalformedRouteError as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Malformed peer_destination: {exc}",
+            }
+
+        try:
             request = ProviderRequest(
                 client_id=str(msg.get("id") or ""),
                 work_dir=str(msg.get("work_dir") or ""),
@@ -268,6 +339,7 @@ class UnifiedAskDaemon:
                 caller_terminal=str(msg.get("caller_terminal") or ""),
                 caller_work_dir=str(msg.get("caller_work_dir") or ""),
                 route=route,
+                peer_destination=peer_destination,
             )
         except Exception as exc:
             return {
@@ -484,6 +556,65 @@ class UnifiedAskDaemon:
             "exit_code": 0,
             "reply": "",
             "route_outcome": payload,
+        }
+
+    def _handle_peer_identify_sender(self, msg: dict) -> dict:
+        """Host-side peer-sender identity (Task 2 / Item 3): run here,
+        unsandboxed, with real filesystem AND terminal/daemon visibility,
+        for a caller (e.g. a managed Codex sandbox) that cannot reliably
+        enumerate `~/.ccb/run/*` or inspect real terminal state itself.
+
+        Identifies the caller's EXACT candidate session (through the
+        record's own authoritative `live_sessions` inventory, never a
+        collapsed provider-wide aggregate) and validates THAT candidate's
+        own operational availability -- so a sandboxed sender that is one
+        of several sibling sessions of one provider is identified as
+        itself instead of being falsely rejected, or falsely authorised,
+        by another sibling's status.
+        """
+        raw_work_dir = msg.get("work_dir")
+        if not isinstance(raw_work_dir, str) or not raw_work_dir.strip():
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Sender identification requires a work_dir",
+            }
+        provider = str(msg.get("provider") or "").strip().lower()
+        if not provider:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Sender identification requires a provider",
+            }
+        try:
+            from peer_routing import identify_sender_host, resolution_to_dict
+
+            resolution = identify_sender_host(
+                raw_work_dir,
+                provider,
+                pane_id=str(msg.get("pane_id") or ""),
+                terminal=str(msg.get("terminal") or ""),
+                check_daemon=_request_bool(msg.get("check_daemon", False)),
+            )
+        except Exception as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Sender identification failed: {exc}",
+            }
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0,
+            "reply": "",
+            "resolution": resolution_to_dict(resolution),
         }
 
     def serve_forever(self) -> int:

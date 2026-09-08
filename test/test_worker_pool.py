@@ -2,10 +2,63 @@ from __future__ import annotations
 
 import threading
 import time
+import pytest
 from dataclasses import dataclass
 from typing import Optional
 
 from worker_pool import BaseSessionWorker, PerSessionWorkerPool
+
+
+@pytest.mark.parametrize("replace_saved_pane", [False, True])
+def test_queued_peer_send_is_pinned_not_provider_default(monkeypatch, tmp_path, replace_saved_pane):
+    import terminal
+    from askd.adapters.base import PeerDestination, ProviderRequest
+    from askd.daemon import _SessionWorker, _UnifiedWorkerPool
+    from askd.registry import ProviderRegistry
+
+    sent = []
+    marker_pane = ["%1"]
+    class Backend:
+        def is_alive(self, pane):
+            return True  # A stays alive while the default points to B.
+        def pane_matches_cwd_strict(self, pane, cwd):
+            return True
+        def find_pane_by_title_marker(self, marker, cwd):
+            return marker_pane[0]
+        def send_text(self, pane, prompt):
+            sent.append((pane, prompt))
+    monkeypatch.setattr(terminal, "get_backend_for_session", lambda data: Backend())
+    adapter = _RouteAwareAdapter()
+    monkeypatch.setattr(adapter, "load_session", lambda wd: pytest.fail("provider-default lookup"))
+    monkeypatch.setattr(adapter, "handle_task", lambda task: pytest.fail("provider-default send"))
+    registry = ProviderRegistry()
+    registry.register(adapter)
+    pool = _UnifiedWorkerPool(registry)
+    queued = []
+    class HoldingPool:
+        def get_or_create(self, key, factory):
+            worker = _SessionWorker(key, adapter)
+            worker.enqueue = queued.append
+            return worker
+    monkeypatch.setattr(pool, "_get_pool", lambda provider: HoldingPool())
+    request = ProviderRequest(
+        client_id="peer", work_dir=str(tmp_path), timeout_s=1, quiet=True,
+        message="sentinel", caller="claude", delivery_only=True,
+        peer_destination=PeerDestination(pane_id="%1", terminal="tmux",
+            work_dir=str(tmp_path), ccb_project_id="p", pane_title_marker="owner-A"),
+    )
+    task = pool.submit("codex", request)
+    assert queued == [task]
+    if replace_saved_pane:
+        marker_pane[0] = "%2"
+    result = _SessionWorker("peer-key", adapter)._handle_task(task)
+    if replace_saved_pane:
+        assert result.exit_code != 0
+        assert sent == []
+    else:
+        assert result.exit_code == 0
+        assert [pane for pane, prompt in sent] == ["%1"]
+        assert "sentinel" in sent[0][1]
 
 
 class _NoopThread(threading.Thread):

@@ -605,6 +605,184 @@ def test_reverse_reply_prefers_live_project_and_saves_correlated_result(
     assert "delivery=live exit_code=0" in status_file.read_text(encoding="utf-8")
 
 
+def test_bridge_refuses_ambiguous_remote_destination_before_delivery(monkeypatch, capsys) -> None:
+    """Task 3: an initial peer send whose target project has more than one
+    live session of the requested provider must fail explicitly, before
+    anything is delivered -- no role inference, no first-or-newest
+    default."""
+    bridge = _load_bridge_module()
+    target = {
+        "index": 1,
+        "work_dir": "/tmp/project",
+        "ccb_project_id": "abcd1234",
+        "peer_capable": False,
+        "providers": {
+            "claude": {
+                "alive": True,
+                "mounted": False,
+                "ambiguous": True,
+                "candidates": [
+                    {"launch_id": "ai-1", "pane_id": "%1", "terminal": "tmux", "session_file": ""},
+                    {"launch_id": "ai-2", "pane_id": "%2", "terminal": "tmux", "session_file": ""},
+                ],
+            }
+        },
+    }
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    monkeypatch.setattr(
+        bridge,
+        "_send_to_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("delivery must not be attempted")),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "get_backend_for_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("delivery must not be attempted")),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_acquire_lock",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("delivery must not be attempted")),
+    )
+
+    rc = bridge.main(["--target", "1", "--provider", "claude", "hello"])
+
+    assert rc == 1
+    assert "more than one live" in capsys.readouterr().err
+
+
+def test_bridge_reply_uses_saved_identity_over_ambiguous_or_mismatched_generic_view(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Task 4: a correlated reply whose receipt carries a saved return pane
+    must be delivered there, even when the generic project+provider lookup
+    also looks mounted (at a DIFFERENT pane) -- the saved identity is
+    validated first and used instead, never overridden by a live-looking
+    but unrelated session."""
+    bridge = _load_bridge_module()
+    reply_file = tmp_path / "ask-peer-codex-task-dup.reply"
+    status_file = tmp_path / "ask-peer-codex-task-dup.status"
+    reply_file.touch()
+    status_file.touch()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude",
+        "caller_pane_id": "%7",
+        "caller_terminal": "tmux",
+        "caller_pane_title_marker": "ccb-claude-sender",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "reply_expected": True,
+        "peer_reply_file": str(reply_file),
+        "status_file": str(status_file),
+    }
+    backend = _DirectBackend(pane_id="%7")
+    # The generic project+provider view ALSO looks perfectly usable -- but
+    # at a DIFFERENT, unrelated pane. If the saved identity were not
+    # checked first, this is what a naive "prefer the live project" pick
+    # would deliver to instead.
+    other_target = {
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "providers": {"claude": {"alive": True, "mounted": True, "pane_id": "%99"}},
+    }
+
+    monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
+    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
+    monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [other_target])
+    monkeypatch.setattr(
+        bridge,
+        "_send_to_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("daemon path must not be used for a saved identity")),
+    )
+
+    rc = bridge.main(
+        [
+            "--target",
+            str(tmp_path),
+            "--provider",
+            "claude",
+            "--reply-to",
+            "task-dup",
+            "exact reply",
+        ]
+    )
+
+    assert rc == 0
+    assert backend.sent and backend.sent[0][0] == "%7"
+    assert reply_file.read_text(encoding="utf-8").strip() == "exact reply"
+
+
+def test_bridge_reply_uses_saved_identity_when_generic_lookup_is_ambiguous(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 4: a correlated reply whose receipt carries a saved return pane
+    stays exact even when the generic project+provider lookup itself is
+    AMBIGUOUS (more than one live session of that provider) -- the saved
+    identity wins and is delivered via the validated direct fallback,
+    never refused and never guessed at via the daemon path."""
+    bridge = _load_bridge_module()
+    reply_file = tmp_path / "ask-peer-codex-task-amb.reply"
+    status_file = tmp_path / "ask-peer-codex-task-amb.status"
+    reply_file.touch()
+    status_file.touch()
+    receipt = {
+        "provider": "peer-codex",
+        "caller": "claude",
+        "caller_pane_id": "%7",
+        "caller_terminal": "tmux",
+        "caller_pane_title_marker": "ccb-claude-sender",
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "reply_expected": True,
+        "peer_reply_file": str(reply_file),
+        "status_file": str(status_file),
+    }
+    backend = _DirectBackend(pane_id="%7")
+    ambiguous_target = {
+        "work_dir": str(tmp_path),
+        "ccb_project_id": "abcd1234",
+        "providers": {
+            "claude": {
+                "alive": True,
+                "mounted": False,
+                "ambiguous": True,
+                "candidates": [
+                    {"launch_id": "ai-1", "pane_id": "%7", "terminal": "tmux", "session_file": ""},
+                    {"launch_id": "ai-2", "pane_id": "%8", "terminal": "tmux", "session_file": ""},
+                ],
+            }
+        },
+    }
+
+    monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
+    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
+    monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [ambiguous_target])
+    monkeypatch.setattr(
+        bridge,
+        "_send_to_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("daemon path must not be used when ambiguous")),
+    )
+
+    rc = bridge.main(
+        [
+            "--target",
+            str(tmp_path),
+            "--provider",
+            "claude",
+            "--reply-to",
+            "task-amb",
+            "exact reply",
+        ]
+    )
+
+    assert rc == 0
+    assert backend.sent and backend.sent[0][0] == "%7"
+    assert reply_file.read_text(encoding="utf-8").strip() == "exact reply"
+
+
 def test_reverse_reply_continues_when_bridge_lock_filesystem_is_read_only(
     monkeypatch,
     tmp_path: Path,

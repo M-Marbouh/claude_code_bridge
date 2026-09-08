@@ -145,6 +145,74 @@ def parse_route_mapping(raw: Any) -> ResolvedRoute:
     return ResolvedRoute(**values)
 
 
+@dataclass(frozen=True)
+class PeerDestination:
+    """A cross-project peer reply's saved return-pane identity, carried
+    from `bin/ccb-bridge-ask` through the daemon RPC exactly the way
+    `ResolvedRoute` carries a LOCAL destination -- captured once, from the
+    correlated receipt, and used ONLY to REFUSE on a mismatch, never
+    substituted for a fresh read and never picked among candidates.
+
+    Separate from ResolvedRoute because a peer sender belongs to a
+    different launch and legacy return receipts need not carry a live ID.
+    Local caller-exclusion is not a peer return-address rule.
+    This type is revalidated by
+    `peer_routing.revalidate_peer_destination` instead, using the same
+    pane-alive / cwd-match / marker-match criteria
+    `bin/ccb-bridge-ask._validated_direct_reply_target` already applies,
+    at the SAME two checkpoints `validate_route` uses for local routing:
+    daemon-side enqueue (`_UnifiedWorkerPool.submit`) and immediately
+    before the actual send (`_SessionWorker._handle_task`).
+    """
+
+    pane_id: str = ""
+    terminal: str = ""
+    work_dir: str = ""
+    ccb_project_id: str = ""
+    pane_title_marker: str = ""
+
+    @property
+    def present(self) -> bool:
+        return bool(self.pane_id) and bool(self.terminal) and bool(self.work_dir)
+
+
+_PEER_DESTINATION_FIELDS = ("pane_id", "terminal", "work_dir", "ccb_project_id", "pane_title_marker")
+_PEER_DESTINATION_MANDATORY_FIELDS = ("pane_id", "terminal", "work_dir")
+
+
+def parse_peer_destination_mapping(raw: Any) -> PeerDestination:
+    """Parse a `peer_destination` mapping the same way `parse_route_mapping`
+    parses a route: absent (`None` or all-empty) returns the empty
+    `PeerDestination`; present but missing a mandatory field, or of the
+    wrong type, raises `MalformedRouteError` -- never silently downgraded
+    to absent.
+    """
+    if raw is None:
+        return PeerDestination()
+    if not isinstance(raw, dict):
+        raise MalformedRouteError("peer_destination must be an object")
+
+    values: dict[str, str] = {}
+    for key in _PEER_DESTINATION_FIELDS:
+        value = raw.get(key)
+        if value is None:
+            values[key] = ""
+            continue
+        if not isinstance(value, str):
+            raise MalformedRouteError(f"peer_destination.{key} must be a string")
+        values[key] = value.strip()
+
+    if not any(values.values()):
+        return PeerDestination()
+
+    missing = [name for name in _PEER_DESTINATION_MANDATORY_FIELDS if not values[name]]
+    if missing:
+        raise MalformedRouteError(
+            "peer_destination is present but missing required field(s): " + ", ".join(missing)
+        )
+    return PeerDestination(**values)
+
+
 @dataclass
 class ProviderRequest:
     """Unified request structure for all providers."""
@@ -175,6 +243,10 @@ class ProviderRequest:
     # may re-run provider lookup to pick a destination, only re-validate
     # this exact one (see `pane_registry.validate_route`).
     route: ResolvedRoute = field(default_factory=ResolvedRoute)
+    # A cross-project peer reply's saved return-pane identity, if any --
+    # see `PeerDestination`. Defaults empty, so every existing
+    # construction site (including every non-peer request) is unaffected.
+    peer_destination: PeerDestination = field(default_factory=PeerDestination)
 
 
 @dataclass

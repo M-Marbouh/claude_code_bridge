@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import pytest
 from pathlib import Path
 
 from project_id import compute_ccb_project_id
@@ -588,6 +589,270 @@ def test_ccb_list_marks_inactive_session_file_unbound(tmp_path: Path) -> None:
     assert claude["mounted"] is False
     assert claude["reason"] == "session_unbound"
     assert entries[0]["peer_capable"] is False
+
+
+def _two_window_sessions(work_dir: Path, project_id: str, *, newest_first: bool) -> list[dict]:
+    older = {
+        "session_id": "first",
+        "work_dir": str(work_dir),
+        "ccb_project_id": project_id,
+        "terminal": "tmux",
+        "window_id": "window:$1:@1",
+        "updated_at": 100,
+        "alive": True,
+        "providers": {"claude": {"alive": True, "session_bound": True, "pane_id": "%1"}},
+    }
+    newer = {
+        "session_id": "second",
+        "work_dir": str(work_dir),
+        "ccb_project_id": project_id,
+        "terminal": "tmux",
+        "window_id": "window:$1:@2",
+        "updated_at": 200,
+        "alive": True,
+        "providers": {"claude": {"alive": True, "session_bound": True, "pane_id": "%2"}},
+    }
+    return [newer, older] if newest_first else [older, newer]
+
+
+def test_ccb_list_marks_two_live_claude_sessions_ambiguous(monkeypatch, tmp_path: Path) -> None:
+    """Task 5/3: two SEPARATE, both-alive registry records offering the
+    same provider (e.g. two CCB windows) must not collapse into one
+    provider entry -- the aggregated view must say so explicitly instead of
+    silently picking the newest."""
+    ccb_list = _load_ccb_list_module()
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    project_id = compute_ccb_project_id(work_dir)
+    monkeypatch.setattr(
+        ccb_list,
+        "_registry_sessions",
+        lambda _include_stale: _two_window_sessions(work_dir, project_id, newest_first=True),
+    )
+    monkeypatch.setattr(ccb_list, "is_project_askd_online", lambda *_args: True)
+
+    entries = ccb_list._session_entries(include_stale=False)
+
+    assert len(entries) == 1
+    claude_status = entries[0]["providers"]["claude"]
+    assert claude_status["ambiguous"] is True
+    assert claude_status["mounted"] is False
+    assert {c["pane_id"] for c in claude_status["candidates"]} == {"%1", "%2"}
+    assert entries[0]["peer_capable"] is False
+    assert entries[0]["peer_providers"] == []
+
+
+def test_ccb_list_ambiguity_is_independent_of_launch_order(monkeypatch, tmp_path: Path) -> None:
+    """Task 3: the ambiguity verdict must not depend on which live session
+    was registered/discovered first."""
+    ccb_list = _load_ccb_list_module()
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    project_id = compute_ccb_project_id(work_dir)
+    monkeypatch.setattr(
+        ccb_list,
+        "_registry_sessions",
+        lambda _include_stale: _two_window_sessions(work_dir, project_id, newest_first=False),
+    )
+    monkeypatch.setattr(ccb_list, "is_project_askd_online", lambda *_args: True)
+
+    entries = ccb_list._session_entries(include_stale=False)
+
+    assert entries[0]["providers"]["claude"]["ambiguous"] is True
+    assert entries[0]["providers"]["claude"]["mounted"] is False
+
+
+def test_ccb_list_single_record_two_codex_live_sessions_ambiguous(tmp_path: Path) -> None:
+    """Item 1/Task 3: the case this feature exists for -- ONE registry
+    record whose OWN `live_sessions` inventory names TWO Codex panes (not
+    two separate registry records). The destination must be reported
+    ambiguous, never collapsed to one."""
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [
+            {"pane_id": "%1", "title": "CCB-Codex-1", "cwd": str(work_dir), "dead": "0", "window_id": "@1"},
+            {"pane_id": "%2", "title": "CCB-Codex-2", "cwd": str(work_dir), "dead": "0", "window_id": "@2"},
+        ],
+    )
+    (run_dir / "ccb-session-ai-dup.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": "ai-dup",
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "live_sessions": [
+                    {"live_id": "l1", "provider": "codex", "pane_id": "%1", "pane_title_marker": "CCB-Codex-1"},
+                    {"live_id": "l2", "provider": "codex", "pane_id": "%2", "pane_title_marker": "CCB-Codex-2"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = _run_ccb_list(tmp_path)
+
+    assert len(entries) == 1
+    codex_status = entries[0]["providers"]["codex"]
+    assert codex_status["ambiguous"] is True
+    assert codex_status["mounted"] is False
+    assert {c["pane_id"] for c in codex_status["candidates"]} == {"%1", "%2"}
+
+
+def test_ccb_list_two_codex_panes_in_same_window_both_preserved(tmp_path: Path) -> None:
+    """Item 3: two mounted Codex panes sharing the SAME terminal window/tab
+    must both be preserved through aggregation, not overwritten -- the
+    destination is reported ambiguous, never silently picked as one."""
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [
+            {"pane_id": "%1", "title": "CCB-Codex-1", "cwd": str(work_dir), "dead": "0", "window_id": "@1"},
+            {"pane_id": "%2", "title": "CCB-Codex-2", "cwd": str(work_dir), "dead": "0", "window_id": "@1"},
+        ],
+    )
+    (run_dir / "ccb-session-ai-samewin.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": "ai-samewin",
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "live_sessions": [
+                    {"live_id": "l1", "provider": "codex", "pane_id": "%1", "pane_title_marker": "CCB-Codex-1"},
+                    {"live_id": "l2", "provider": "codex", "pane_id": "%2", "pane_title_marker": "CCB-Codex-2"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = _run_ccb_list(tmp_path)
+
+    assert len(entries) == 1
+    codex_status = entries[0]["providers"]["codex"]
+    assert codex_status["ambiguous"] is True
+    assert codex_status["mounted"] is False
+    assert {c["pane_id"] for c in codex_status["candidates"]} == {"%1", "%2"}
+    assert entries[0]["session_count"] == 1
+    assert len({session["window_id"] for session in entries[0]["sessions"]}) == 1
+
+
+@pytest.mark.parametrize("legacy_map", [True, False])
+def test_ccb_list_invalid_inventory_refuses_legacy_fallback(tmp_path: Path, legacy_map: bool) -> None:
+    """Item 1/4: a record whose `live_sessions` key is PRESENT but
+    malformed must refuse -- never fall back to the legacy `providers`
+    map beside it, even though that map alone would look perfectly
+    healthy -- and that refusal must be visible in ORDINARY discovery
+    (not only behind `--stale`), since a broken inventory is a
+    data-corruption condition, not routine "nothing alive right now"."""
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [{"pane_id": "%9", "title": "CCB-Codex-test", "cwd": str(work_dir), "dead": "0"}],
+    )
+    (run_dir / "ccb-session-ai-broken.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": "ai-broken",
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "live_sessions": [{"provider": "codex"}],  # missing live_id -> malformed
+                "providers": {"codex": {"pane_id": "%9", "pane_title_marker": "CCB-Codex-test"}} if legacy_map else {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = _run_ccb_list(tmp_path)
+    assert len(entries) == 1
+    assert entries[0]["providers"]["codex"]["reason"] == "invalid_inventory"
+    assert entries[0]["providers"]["codex"]["pane_id"] == ""
+    assert entries[0]["providers"]["codex"]["alive"] is False
+
+    stale = _run_ccb_list(tmp_path, "--stale")
+    assert stale[0]["providers"]["codex"]["reason"] == "invalid_inventory"
+    assert stale[0]["providers"]["codex"]["pane_id"] == ""
+
+
+def test_ccb_list_inventory_session_binding_uses_its_own_file_not_the_default(tmp_path: Path) -> None:
+    """Item 4: a `live_sessions` entry's OWN `session_file` must be what
+    binding is validated against -- never the work_dir-wide default file,
+    even when that default exists and contradicts it."""
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [{"pane_id": "%1", "title": "CCB-Codex-test", "cwd": str(work_dir), "dead": "0"}],
+    )
+    project_id = compute_ccb_project_id(work_dir)
+
+    # The DEFAULT file `_session_binding` would fall back to if the
+    # entry's own file were ignored -- deliberately contradictory
+    # (inactive), so a wrongly-defaulted lookup would report unbound.
+    default_dir = work_dir / ".ccb"
+    default_dir.mkdir()
+    (default_dir / ".codex-session").write_text(
+        json.dumps({"active": False, "ccb_project_id": project_id, "pane_id": "%1"}),
+        encoding="utf-8",
+    )
+
+    # The session's OWN file -- correct and active.
+    own_file = tmp_path / "codex-own-session.json"
+    own_file.write_text(
+        json.dumps({"active": True, "ccb_project_id": project_id, "pane_id": "%1"}),
+        encoding="utf-8",
+    )
+
+    (run_dir / "ccb-session-ai-bind.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": "ai-bind",
+                "work_dir": str(work_dir),
+                "ccb_project_id": project_id,
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "live_sessions": [
+                    {
+                        "live_id": "l1",
+                        "provider": "codex",
+                        "pane_id": "%1",
+                        "pane_title_marker": "CCB-Codex-test",
+                        "session_file": str(own_file),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = _run_ccb_list(tmp_path)
+
+    assert len(entries) == 1
+    codex_status = entries[0]["providers"]["codex"]
+    assert codex_status["session_bound"] is True
+    assert codex_status["session_file"] == str(own_file)
 
 
 def test_ccb_list_delegates_discovery_from_managed_codex_sandbox(monkeypatch, capsys) -> None:

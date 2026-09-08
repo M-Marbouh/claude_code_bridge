@@ -19,7 +19,14 @@ from askd_runtime import find_running_state_file
 from compat import setup_windows_encoding
 from ccb_runtime_status import is_project_askd_online
 from ccb_start_config import load_start_config
-from pane_registry import _get_providers_map, _is_stale, _iter_registry_files, _registry_owner_alive
+from live_sessions import INVENTORY_INVALID
+from pane_registry import (
+    _get_providers_map,
+    _is_stale,
+    _iter_registry_files,
+    _registry_owner_alive,
+    read_inventory_for_record,
+)
 from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file
 
@@ -292,6 +299,8 @@ def _session_binding(
     provider_data: dict[str, Any],
 ) -> tuple[bool, str]:
     raw = str(provider_data.get("session_file") or "").strip()
+    if provider_data.get("live_id") and not raw:
+        return False, ""
     session_file = Path(raw).expanduser() if raw else find_project_session_file(work_dir, SESSION_FILENAMES[provider])
     if not session_file or not session_file.is_file():
         return False, str(session_file or "")
@@ -359,8 +368,45 @@ def _provider_status(
     return status, _provider_group(terminal, pane) if candidate_alive else ""
 
 
+def _invalid_inventory_status(
+    provider: str, *, configured: set[str], timestamp_stale: bool, updated_at: int
+) -> dict[str, Any]:
+    """A provider whose record's `live_sessions` inventory is PRESENT but
+    broken. Never derived from the legacy `providers` map sitting beside it
+    -- an invalid inventory refuses outright, exactly like every other
+    consumer of `read_inventory` (`pane_registry.validate_route`,
+    `ccb_runtime_status.resolve_project_runtime_status`), rather than
+    quietly falling back to whatever the legacy map happens to say.
+    """
+    return {
+        "pane_id": "",
+        "pane_title_marker": "",
+        "alive": False,
+        "mounted": False,
+        "capable": True,
+        "configured": provider in configured if configured else True,
+        "registered": True,
+        "pane_alive": False,
+        "session_bound": False,
+        "daemon_online": False,
+        "reason": "invalid_inventory",
+        "timestamp_stale": timestamp_stale,
+        "session_file": "",
+        "updated_at": updated_at,
+        "_candidate_alive": False,
+        "_identity_proven": False,
+    }
+
+
 def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
     pane_cache: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def _panes_for(term: str) -> dict[str, dict[str, Any]]:
+        key = (term or "tmux").strip().lower() or "tmux"
+        if key not in pane_cache:
+            pane_cache[key] = _tmux_panes() if key == "tmux" else (_wezterm_panes() if key == "wezterm" else {})
+        return pane_cache[key]
+
     sessions: list[dict[str, Any]] = []
     for path in _iter_registry_files():
         record = _load_json_dict(path)
@@ -382,37 +428,101 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
             except Exception:
                 continue
         terminal = str(record.get("terminal") or "tmux").strip().lower() or "tmux"
-        if terminal not in pane_cache:
-            pane_cache[terminal] = (
-                _tmux_panes() if terminal == "tmux" else (_wezterm_panes() if terminal == "wezterm" else {})
-            )
-        panes = pane_cache[terminal]
+        panes = _panes_for(terminal)
         session_id = str(record.get("ccb_session_id") or record.get("session_id") or path.stem).strip()
         updated_at = int(_updated_at(record, path))
         timestamp_stale = _is_stale(updated_at)
         configured = _configured_providers(work_dir)
 
-        statuses: dict[str, tuple[dict[str, Any], str]] = {}
-        for provider, provider_data in _get_providers_map(record).items():
-            if provider not in SUPPORTED_PROVIDERS or not isinstance(provider_data, dict):
-                continue
-            statuses[provider] = _provider_status(
-                provider=provider,
-                provider_data=provider_data,
-                terminal=terminal,
-                work_dir=work_dir,
-                project_id=project_id,
-                session_id=session_id,
-                updated_at=updated_at,
-                timestamp_stale=timestamp_stale,
-                configured=configured,
-                panes=panes,
-            )
+        # Item 1: the record's OWN live-session inventory is authoritative
+        # whenever it is present at all -- the legacy `providers` map is
+        # consulted ONLY when there is no `live_sessions` key. A present
+        # but INVALID inventory never falls back to that map; it refuses.
+        # A VALID inventory is read directly, so two sessions of ONE
+        # provider inside this SAME launch (e.g. two Codex panes started
+        # under one CCB launch) surface as two separate offers below,
+        # exactly the way two separate launches already do -- never
+        # collapsed into one.
+        inventory = read_inventory_for_record(record)
+
+        # `entries`: (unique_key, provider, status, group) -- unique_key is
+        # keyed by live_id (or a fixed "0" for the at-most-one-per-provider
+        # legacy/invalid cases) so two live sessions of one provider are
+        # never forced to share one slot.
+        entries: list[tuple[str, str, dict[str, Any], str]] = []
+
+        if inventory.status == INVENTORY_INVALID:
+            for provider in sorted(SUPPORTED_PROVIDERS):
+                if provider not in SUPPORTED_PROVIDERS:
+                    continue
+                status = _invalid_inventory_status(
+                    provider, configured=configured, timestamp_stale=timestamp_stale, updated_at=updated_at
+                )
+                entries.append((f"{provider}:0", provider, status, ""))
+        elif inventory.present:
+            for live_session in inventory.sessions:
+                if live_session.provider not in SUPPORTED_PROVIDERS:
+                    continue
+                live_terminal = (live_session.terminal or terminal).strip().lower() or terminal
+                # Item 4: `session_file` must be on the synthetic entry
+                # BEFORE `_provider_status` (and the `_session_binding`
+                # check it runs internally) ever sees it -- attaching it
+                # to the resulting status afterwards is too late to affect
+                # which file binding was validated against, and silently
+                # leaves this session's binding checked against the
+                # work_dir-wide DEFAULT file instead of its own.
+                synthetic_entry = {
+                    "live_id": live_session.live_id,
+                    "pane_id": live_session.pane_id,
+                    "pane_title_marker": live_session.pane_title_marker,
+                    "session_file": live_session.session_file,
+                }
+                status, group = _provider_status(
+                    provider=live_session.provider,
+                    provider_data=synthetic_entry,
+                    terminal=live_terminal,
+                    work_dir=work_dir,
+                    project_id=project_id,
+                    session_id=session_id,
+                    updated_at=updated_at,
+                    timestamp_stale=timestamp_stale,
+                    configured=configured,
+                    panes=_panes_for(live_terminal),
+                )
+                if not live_session.active:
+                    status = dict(status)
+                    status["_candidate_alive"] = False
+                    status["_identity_proven"] = False
+                # Keep terminal/launch identity through this and every
+                # later stage -- never reduced to a bare pane-id string.
+                status["launch_id"] = session_id
+                status["live_id"] = live_session.live_id
+                entries.append((f"{live_session.provider}:{live_session.live_id}", live_session.provider, status, group))
+        else:
+            # ABSENT: today's legacy per-provider projection, unchanged.
+            for provider, provider_data in _get_providers_map(record).items():
+                if provider not in SUPPORTED_PROVIDERS or not isinstance(provider_data, dict):
+                    continue
+                status, group = _provider_status(
+                    provider=provider,
+                    provider_data=provider_data,
+                    terminal=terminal,
+                    work_dir=work_dir,
+                    project_id=project_id,
+                    session_id=session_id,
+                    updated_at=updated_at,
+                    timestamp_stale=timestamp_stale,
+                    configured=configured,
+                    panes=panes,
+                )
+                entries.append((f"{provider}:0", provider, status, group))
+
+        statuses: dict[str, tuple[str, dict[str, Any], str]] = {
+            key: (provider, status, group) for key, provider, status, group in entries
+        }
 
         live_groups = (
-            {
-                group for status, group in statuses.values() if status.get("_candidate_alive") and group
-            }
+            {group for _provider, status, group in statuses.values() if status.get("_candidate_alive") and group}
             if launcher_alive is not False
             else set()
         )
@@ -420,11 +530,15 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
         for group_id in live_groups:
             members = [
                 (provider, status)
-                for provider, (status, provider_group) in statuses.items()
+                for provider, status, provider_group in statuses.values()
                 if status.get("_candidate_alive") and provider_group == group_id
             ]
             cohort_proven = len(members) >= 2
-            providers: dict[str, dict[str, Any]] = {}
+            # Item 3: two mounted panes of the SAME provider can share one
+            # terminal window/tab (e.g. two Codex panes split in one tmux
+            # window) -- group offers BY PROVIDER first, so a later one
+            # never silently overwrites an earlier one under the same key.
+            by_provider: dict[str, list[dict[str, Any]]] = {}
             for provider, status in members:
                 eligible = bool(
                     include_stale or status.get("configured") or status.get("session_bound")
@@ -442,28 +556,48 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                 status.pop("_candidate_alive", None)
                 status.pop("_identity_proven", None)
                 if alive:
-                    providers[provider] = status
-            if not providers:
+                    by_provider.setdefault(provider, []).append(status)
+            if not by_provider:
                 continue
-            sessions.append(
-                {
-                    "session_id": session_id,
-                    "work_dir": str(work_dir.resolve()),
-                    "ccb_project_id": project_id,
-                    "terminal": terminal,
-                    "window_id": group_id,
-                    "updated_at": updated_at,
-                    "timestamp_stale": timestamp_stale,
-                    "launcher_alive": launcher_alive,
-                    "alive": True,
-                    "providers": providers,
+            # Emit one session per "slot": the first offer of each
+            # provider in this group shares the primary session entry;
+            # any ADDITIONAL offer of a provider already seen in this
+            # SAME group gets a separate inventory slot, retaining the
+            # real window_id, so panes sharing one window/tab are still
+            # visible as two distinct offers to `_session_entries`'s
+            # per-project aggregation, never collapsed into one.
+            max_offers = max(len(offers) for offers in by_provider.values())
+            for slot in range(max_offers):
+                providers: dict[str, dict[str, Any]] = {
+                    provider: offers[slot] for provider, offers in by_provider.items() if slot < len(offers)
                 }
-            )
+                if not providers:
+                    continue
+                sessions.append(
+                    {
+                        "session_id": session_id,
+                        "work_dir": str(work_dir.resolve()),
+                        "ccb_project_id": project_id,
+                        "terminal": terminal,
+                        "window_id": group_id,
+                        "live_slot": slot,
+                        "updated_at": updated_at,
+                        "timestamp_stale": timestamp_stale,
+                        "launcher_alive": launcher_alive,
+                        "alive": True,
+                        "providers": providers,
+                    }
+                )
             appended_live = True
 
-        if include_stale and not appended_live and statuses:
+        # Item 4: an invalid inventory is a data-corruption condition, not
+        # a routine "nothing alive right now" -- it must be visible in
+        # ORDINARY discovery as an explicit refusal, not only behind
+        # `--stale`, so it can never be mistaken for "nothing registered
+        # at all" here or downstream.
+        if (include_stale or inventory.status == INVENTORY_INVALID) and not appended_live and statuses:
             historical: dict[str, dict[str, Any]] = {}
-            for provider, (status, _group) in statuses.items():
+            for _key, (provider, status, _group) in statuses.items():
                 status = dict(status)
                 status.pop("_candidate_alive", None)
                 status.pop("_identity_proven", None)
@@ -488,12 +622,13 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
 
 
 def _dedupe_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected: dict[tuple[str, str, str], dict[str, Any]] = {}
+    selected: dict[tuple[str, str, str, int], dict[str, Any]] = {}
     for session in sessions:
         key = (
             str(session.get("ccb_project_id") or ""),
             str(session.get("terminal") or ""),
             str(session.get("window_id") or ""),
+            int(session.get("live_slot") or 0),
         )
         current = selected.get(key)
         if current is None:
@@ -540,7 +675,11 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
         work_dir = Path(str(project.get("work_dir") or "")).expanduser()
         daemon_online = is_project_askd_online(work_dir, project_id)
         sessions = sorted(project["sessions"], key=lambda item: int(item.get("updated_at") or 0), reverse=True)
-        aggregated: dict[str, dict[str, Any]] = {}
+        # Every session's OWN offer for each provider, in the same
+        # newest-first order the original single-pick loop used -- so
+        # `offers[0]` below reproduces that pick byte-for-byte whenever
+        # there is nothing to disambiguate.
+        provider_offers: dict[str, list[dict[str, Any]]] = {}
         for session in sessions:
             for provider, provider_status in (session.get("providers") or {}).items():
                 provider_status["daemon_online"] = daemon_online
@@ -554,8 +693,57 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
                         provider_status["reason"] = "daemon_offline"
                     else:
                         provider_status["reason"] = ""
-                if provider not in aggregated:
-                    aggregated[provider] = dict(provider_status)
+                # Additive identity fields: which launch/window this offer
+                # came from, needed to tell two live sessions of one
+                # provider apart instead of silently picking one.
+                provider_status["launch_id"] = str(session.get("session_id") or "")
+                provider_status["terminal"] = str(session.get("terminal") or "")
+                provider_offers.setdefault(provider, []).append(provider_status)
+
+        aggregated: dict[str, dict[str, Any]] = {}
+        for provider, offers in provider_offers.items():
+            invalid = next((status for status in offers if status.get("reason") == "invalid_inventory"), None)
+            if invalid is not None:
+                aggregated[provider] = dict(invalid)
+                continue
+            alive_offers = [status for status in offers if status.get("alive")]
+            if len(alive_offers) > 1:
+                # Task 5: more than one LIVE session offers this provider in
+                # this project (e.g. two CCB windows) -- there is no single
+                # pane to report here, so say that explicitly instead of
+                # silently picking one (today's first-match-wins). `mounted`
+                # stays False so nothing downstream treats this as a usable,
+                # unique destination.
+                aggregated[provider] = {
+                    "pane_id": "",
+                    "pane_title_marker": "",
+                    "alive": True,
+                    "mounted": False,
+                    "capable": True,
+                    "configured": True,
+                    "registered": True,
+                    "pane_alive": False,
+                    "session_bound": False,
+                    "daemon_online": daemon_online,
+                    "reason": "ambiguous_sessions",
+                    "session_file": "",
+                    "terminal": "",
+                    "launch_id": "",
+                    "timestamp_stale": False,
+                    "updated_at": max(int(status.get("updated_at") or 0) for status in alive_offers),
+                    "ambiguous": True,
+                    "candidates": [
+                        {
+                            "launch_id": status.get("launch_id", ""),
+                            "pane_id": status.get("pane_id", ""),
+                            "terminal": status.get("terminal", ""),
+                            "session_file": status.get("session_file", ""),
+                        }
+                        for status in alive_offers
+                    ],
+                }
+            else:
+                aggregated[provider] = dict(offers[0])
         project["sessions"] = sessions
         project["providers"] = aggregated
         project["peer_providers"] = [
@@ -565,8 +753,16 @@ def _session_entries(include_stale: bool) -> list[dict[str, Any]]:
         ]
         # Preserve the legacy field's Claude-specific meaning for older peer clients.
         project["peer_capable"] = "claude" in project["peer_providers"]
-        project["session_count"] = sum(1 for session in sessions if session.get("alive"))
-        if include_stale or any(status.get("alive") for status in aggregated.values()):
+        project["session_count"] = len({
+            (session.get("terminal"), session.get("window_id"))
+            for session in sessions if session.get("alive")
+        })
+        # Item 4: a project whose ONLY signal is an invalid inventory
+        # (nothing else alive) must still surface in ordinary discovery --
+        # that refusal is a data-corruption condition, never routine
+        # "nothing here" noise to hide behind `--stale`.
+        has_invalid_inventory = any(status.get("reason") == "invalid_inventory" for status in aggregated.values())
+        if include_stale or has_invalid_inventory or any(status.get("alive") for status in aggregated.values()):
             entries.append(project)
 
     entries.sort(key=lambda entry: int(entry.get("updated_at") or 0), reverse=True)

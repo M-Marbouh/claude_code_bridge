@@ -349,6 +349,18 @@ def _send_to_daemon(
     }
     if peer_task_id:
         req["req_id"] = peer_task_id
+    peer_destination = target.get("peer_destination") if isinstance(target, dict) else None
+    if peer_destination:
+        # Item 1: carry the saved return-pane identity THROUGH the daemon
+        # dispatch, so it can be re-confirmed fresh at both of askd's own
+        # checkpoints (enqueue, and immediately before the actual send --
+        # see `askd.daemon._UnifiedWorkerPool.submit` /
+        # `_SessionWorker._handle_task`) instead of being checked once here
+        # and then trusted for however long the request sits queued.
+        # Carried on `target` itself (never a new positional parameter)
+        # so this function's own call signature -- and every existing
+        # caller of it -- stays exactly as it is.
+        req["peer_destination"] = dict(peer_destination)
 
     try:
         resp = askd_rpc.request_daemon(
@@ -487,8 +499,57 @@ def main(argv: list[str] | None = None) -> int:
             provider_status = (target.get("providers") or {}).get(args.provider)
             provider_alive = isinstance(provider_status, dict) and bool(provider_status.get("alive"))
             provider_mounted = isinstance(provider_status, dict) and provider_status.get("mounted") is not False
+            provider_ambiguous = isinstance(provider_status, dict) and bool(provider_status.get("ambiguous"))
             legacy_claude_block = args.provider == "claude" and target.get("peer_capable") is False
-            if not provider_alive or not provider_mounted or legacy_claude_block:
+
+            # Task 4 / Item 2: a correlated reply whose receipt names a
+            # saved return pane is PINNED to that exact session -- daemon
+            # delivery (the preferred, existing transport) is trusted only
+            # when the generic project+provider lookup demonstrably
+            # resolved to that SAME pane; disagreement, ambiguity, or no
+            # generic pane at all all fall through to the validated direct
+            # fallback using the saved identity, never to a generic guess.
+            # This is re-checked here, fresh, immediately before any send
+            # is attempted -- never cached from an earlier resolution.
+            receipt_pane_id = str(reply_receipt.get("caller_pane_id") or "").strip() if reply_receipt is not None else ""
+            if receipt_pane_id:
+                resolved_pane_id = str((provider_status or {}).get("pane_id") or "").strip()
+                identity_confirmed = (
+                    not provider_ambiguous
+                    and provider_alive
+                    and provider_mounted
+                    and not legacy_claude_block
+                    and resolved_pane_id == receipt_pane_id
+                )
+                if not identity_confirmed:
+                    target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
+                else:
+                    # Item 1: the daemon path is being trusted for this
+                    # reply -- carry the exact saved identity along with
+                    # it (on `target` itself, never a new call-signature
+                    # parameter) so askd's own two checkpoints (enqueue,
+                    # and immediately before the actual send) can
+                    # re-confirm it fresh, instead of this one check, made
+                    # before the RPC round-trip, being the only guarantee
+                    # for however long the request then sits queued.
+                    target = dict(target)
+                    target["peer_destination"] = {
+                        "pane_id": receipt_pane_id,
+                        "terminal": str(reply_receipt.get("caller_terminal") or "").strip(),
+                        "work_dir": str(reply_receipt.get("work_dir") or ""),
+                        "ccb_project_id": str(reply_receipt.get("ccb_project_id") or ""),
+                        "pane_title_marker": str(reply_receipt.get("caller_pane_title_marker") or "").strip(),
+                    }
+            elif provider_ambiguous:
+                # Task 3: more than one live session of this provider in
+                # the target project -- refuse outright, before anything
+                # is delivered, rather than picking one implicitly. No
+                # role inference, no first-or-newest default.
+                raise RuntimeError(
+                    f"target project has more than one live {args.provider} session; "
+                    "refusing to guess which one to deliver to"
+                )
+            elif not provider_alive or not provider_mounted or legacy_claude_block:
                 if reply_receipt is None:
                     print(
                         f"[ERROR] Target project has no mounted {args.provider.capitalize()} pane",
@@ -496,6 +557,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 1
                 target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
+
+        if direct_backend is None and not target.get("peer_destination"):
+            status = (target.get("providers") or {}).get(args.provider) or {}
+            # Current registry-derived targets carry pane evidence. Keep
+            # identity-less legacy discovery compatible, but never discard
+            # evidence when it is available.
+            if status.get("pane_title_marker") or status.get("live_id"):
+                target = dict(target)
+                target["peer_destination"] = {
+                    "pane_id": str(status.get("pane_id") or ""),
+                    "terminal": str(status.get("terminal") or target.get("terminal") or ""),
+                    "work_dir": str(target.get("work_dir") or ""),
+                    "ccb_project_id": str(target.get("ccb_project_id") or ""),
+                    "pane_title_marker": str(status.get("pane_title_marker") or ""),
+                }
 
         target_hash = str(target.get("ccb_project_id") or "")
         lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)

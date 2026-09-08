@@ -59,6 +59,8 @@ from ccb_runtime_status import (
     resolve_daemon_work_dir,
     resolve_live_route,
 )
+import peer_routing
+from peer_routing import identify_sender
 from project_id import compute_ccb_project_id
 from reply_artifacts import prepare_agent_visible_reply
 from session_utils import find_project_session_file
@@ -766,6 +768,35 @@ def _active_sender_records(candidate: Path, caller: str) -> list[RegistryProvide
 def _sender_candidate_evidence(candidate: Path, caller: str) -> _SenderCandidateEvidence:
     if not candidate.is_dir():
         return _SenderCandidateEvidence(False, frozenset())
+
+    # Task 2 / Item 3: identify the caller's OWN exact candidate session
+    # first, validated against ITS OWN operational availability -- never
+    # against a sibling's, and never against the provider-wide aggregate,
+    # which reports the whole provider "ambiguous"/unmounted the instant
+    # two live sessions of it exist (e.g. two Codex panes in one launch),
+    # regardless of which one is actually asking. This works the same way
+    # in both execution contexts below (it proxies through the host daemon
+    # when sandboxed -- see `peer_routing.identify_sender`).
+    caller_pane_id, caller_terminal = _peer_caller_pane_info()
+    try:
+        resolution = identify_sender(candidate, caller, pane_id=caller_pane_id, terminal=caller_terminal)
+    except Exception:
+        return _SenderCandidateEvidence(False, frozenset())
+    if resolution is not None and resolution.ok:
+        return _SenderCandidateEvidence(True, frozenset({resolution.candidate.pane_id}))
+    if resolution is not None and resolution.error and resolution.error != peer_routing.NO_CANDIDATES:
+        # Item 2 (the eighth instance of this defect): the authoritative
+        # inventory WAS consulted -- ambiguity, an invalid inventory, or
+        # an operational failure on the caller's own exact candidate --
+        # and it gave a definitive "no". That must STOP the ask outright;
+        # it must never resume the older, less rigorous legacy lookup
+        # below, which could accept a pane the authoritative source just
+        # refused. Only `NO_CANDIDATES` -- genuinely nothing for the
+        # inventory to have an opinion about (no evidence, or no
+        # registered session anywhere for this provider/project) -- falls
+        # through to today's per-context behaviour below, unchanged.
+        return _SenderCandidateEvidence(False, frozenset())
+
     if inside_managed_codex_sandbox():
         try:
             status = provider_status_for_target(caller, work_dir=candidate)

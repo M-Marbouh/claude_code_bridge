@@ -8,6 +8,7 @@ from pathlib import Path
 import askd_rpc
 import askd_runtime
 import ccb_runtime_status
+import peer_routing
 import pytest
 from ccb_runtime_status import ProviderRuntimeStatus
 
@@ -521,6 +522,7 @@ def test_sender_work_dir_uses_daemon_proxy_when_sandbox_cannot_see_host_pid(
     tmp_path: Path,
 ) -> None:
     ask = _load_ask_module()
+    monkeypatch.setattr(ask, "identify_sender", lambda *a, **k: peer_routing.SenderResolution(error=peer_routing.NO_CANDIDATES))
     scratch = tmp_path / "scratch"
     project = tmp_path / "project"
     scratch.mkdir()
@@ -578,6 +580,7 @@ def test_sender_work_dir_rejects_sandbox_daemon_pane_mismatch(
     tmp_path: Path,
 ) -> None:
     ask = _load_ask_module()
+    monkeypatch.setattr(ask, "identify_sender", lambda *a, **k: peer_routing.SenderResolution(error=peer_routing.NO_CANDIDATES))
     project = tmp_path / "project"
     project.mkdir()
 
@@ -626,6 +629,162 @@ def test_sender_work_dir_rejects_environment_daemon_disagreement(
         env_project.resolve(),
         daemon_project.resolve(),
     )
+
+
+def test_sender_work_dir_accepts_one_of_two_live_provider_sessions(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Task 2: a sender that is one of TWO live sessions of its provider in
+    the same project must be identified as itself (by its own exact pane),
+    not rejected because only one record happens to be checked."""
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    first = _registry_record(ask, project, "codex", pane_id="%1")
+    second = _registry_record(ask, project, "codex", pane_id="%2")
+
+    monkeypatch.setenv("CCB_WORK_DIR", str(project))
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [first, second])
+    # The caller is running in the SECOND session's pane, not the first.
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("%2", "tmux"))
+
+    assert ask._resolve_sender_work_dir("codex") == project.resolve()
+
+
+def test_sender_work_dir_accepts_sandboxed_sibling_session(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Task 2 / Item 3: inside a managed Codex sandbox,
+    `provider_status_for_target` collapses every live session of a
+    provider down to ONE record and reports the provider "ambiguous" the
+    instant two live sessions exist. A sandboxed sender actually running
+    in a DIFFERENT, equally live sibling session must still be accepted --
+    identified as itself, validated against its OWN operational
+    availability via `identify_sender`, not rejected just because the
+    provider-wide aggregate collapsed to (or excluded) some other pane."""
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CCB_MANAGED", "1")
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask, "resolve_daemon_work_dir", lambda: project)
+    monkeypatch.setattr(ask, "iter_registry_provider_records", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_args, **_kwargs: _provider_status(mounted=False, pane_id=""),
+    )
+    monkeypatch.setattr(
+        ask,
+        "identify_sender",
+        lambda *_a, **_k: ask.peer_routing.SenderResolution(
+            candidate=ask.peer_routing.SenderCandidate(
+                launch_id="ai-2-200",
+                live_id="live-2",
+                provider="codex",
+                pane_id="8",
+                terminal="tmux",
+                session_file="",
+                ccb_project_id="proj",
+                work_dir=str(project),
+            )
+        ),
+    )
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("8", "tmux"))
+
+    assert ask._resolve_sender_work_dir("codex") == project.resolve()
+
+
+@pytest.mark.parametrize("pane_id", ["%9", ""])
+def test_peer_sender_empty_inventory_never_allows_legacy(monkeypatch, tmp_path, pane_id):
+    record = {
+        "ccb_session_id": "launch", "work_dir": str(tmp_path),
+        "live_sessions": [], "providers": {"codex": {"pane_id": "%9"}},
+    }
+    monkeypatch.setattr(
+        ccb_runtime_status, "_iter_qualifying_registry_records",
+        lambda **kwargs: [(record, str(tmp_path), "project", 1, False)],
+    )
+    result = peer_routing.identify_sender_host(tmp_path, "codex", pane_id=pane_id)
+    assert not result.ok
+    assert result.error != peer_routing.NO_CANDIDATES
+
+
+def test_peer_sender_rpc_failure_never_allows_legacy(monkeypatch, tmp_path):
+    ask = _load_ask_module()
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("host unavailable")
+    monkeypatch.setattr(ask, "identify_sender", unavailable)
+    monkeypatch.setattr(ask, "_active_sender_records", lambda *args: pytest.fail("legacy fallback"))
+    assert not ask._sender_candidate_evidence(tmp_path, "codex").valid
+
+
+def test_identify_sender_finds_itself_in_single_record_two_codex_inventory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 1/3: the case this feature exists for -- ONE registry record
+    whose OWN `live_sessions` inventory names TWO Codex sessions (not two
+    separate registry records). The sender running in the SECOND one must
+    be identified as itself and validated against its own operational
+    availability, never confused with or blocked by its sibling."""
+    project = tmp_path / "project"
+    project.mkdir()
+    record = {
+        "ccb_session_id": "ai-dup",
+        "work_dir": str(project),
+        "ccb_project_id": "proj",
+        "terminal": "tmux",
+        "live_sessions": [
+            {"live_id": "l1", "provider": "codex", "pane_id": "%1", "terminal": "tmux"},
+            {"live_id": "l2", "provider": "codex", "pane_id": "%2", "terminal": "tmux"},
+        ],
+    }
+    monkeypatch.setattr(
+        ccb_runtime_status,
+        "_iter_qualifying_registry_records",
+        lambda **_kwargs: [(record, str(project), "proj", 1, False)],
+    )
+    monkeypatch.setattr(ccb_runtime_status, "_operational_refusal", lambda *_a, **_k: None)
+
+    resolution = peer_routing.identify_sender_host(project, "codex", pane_id="%2", terminal="tmux")
+
+    assert resolution.ok
+    assert resolution.candidate.pane_id == "%2"
+    assert resolution.candidate.launch_id == "ai-dup"
+
+
+def test_identify_sender_refuses_when_inventory_invalid_beside_healthy_legacy_map(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 1: a record whose `live_sessions` key is PRESENT but malformed
+    must refuse -- never quietly fall back to the healthy-looking legacy
+    `providers` map sitting right beside it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    record = {
+        "ccb_session_id": "ai-broken",
+        "work_dir": str(project),
+        "ccb_project_id": "proj",
+        "terminal": "tmux",
+        "live_sessions": [{"provider": "codex"}],  # missing live_id -> malformed
+        "providers": {"codex": {"pane_id": "%9", "pane_title_marker": "CCB-Codex"}},
+    }
+    monkeypatch.setattr(
+        ccb_runtime_status,
+        "_iter_qualifying_registry_records",
+        lambda **_kwargs: [(record, str(project), "proj", 1, False)],
+    )
+
+    resolution = peer_routing.identify_sender_host(project, "codex", pane_id="%9", terminal="tmux")
+
+    assert not resolution.ok
+    assert resolution.error == peer_routing.INVALID_INVENTORY
 
 
 @pytest.mark.parametrize("foreground", [True, False])

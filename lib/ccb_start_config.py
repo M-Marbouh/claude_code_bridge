@@ -57,8 +57,6 @@ def normalize_provider_tokens(tokens: list[str]) -> tuple[list[str], bool]:
 
 
 def provider_pairing_error(providers: list[str], *, resume: bool = False) -> str:
-    if providers.count("codex") == 2 and len(providers) != 2:
-        return "A Codex pair must be launched as exactly: ccb codex codex."
     for provider in set(providers):
         count = providers.count(provider)
         if count > (2 if provider == "codex" else 1):

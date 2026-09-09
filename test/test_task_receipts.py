@@ -162,6 +162,45 @@ def test_completion_hook_delivers_when_caller_pane_still_confirms(
     assert sent == [("tmux", "7")]
 
 
+def test_completion_hook_isolated_to_exact_codex_caller_in_three_member_inventory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A shared Claude responder must deliver each completion to its exact
+    Codex caller when the launch contains two Codex sessions."""
+    from pane_registry import upsert_registry
+
+    hook = _load_completion_hook_module()
+    assert upsert_registry(
+        {
+            "ccb_session_id": "ai-1",
+            "work_dir": str(tmp_path),
+            "live_sessions": [
+                {"live_id": "codex-a", "provider": "codex", "pane_id": "7", "terminal": "tmux"},
+                {"live_id": "codex-b", "provider": "codex", "pane_id": "8", "terminal": "tmux"},
+                {"live_id": "claude", "provider": "claude", "pane_id": "9", "terminal": "tmux"},
+            ],
+        }
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(hook, "send_via_tmux", lambda pane_id, message: sent.append(("tmux", pane_id)) or True)
+    monkeypatch.setattr(hook.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setenv("CCB_ROUTE_LAUNCH_ID", "ai-1")
+    monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")
+
+    for live_id, pane_id in (("codex-a", "7"), ("codex-b", "8")):
+        monkeypatch.setenv("CCB_CALLER_LIVE_ID", live_id)
+        monkeypatch.setenv("CCB_CALLER_PANE_ID", pane_id)
+        monkeypatch.setattr(
+            hook.sys,
+            "argv",
+            ["ccb-completion-hook", "--provider", "claude", "--caller", "codex",
+             "--req-id", f"task-{live_id}", "--reply", "Hello"],
+        )
+        assert hook.main() == 0
+
+    assert sent == [("tmux", "7"), ("tmux", "8")]
+
+
 def test_completion_hook_delivers_for_todays_universal_legacy_registry_shape(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -2170,6 +2209,30 @@ def test_current_session_receipts_identity_filters_never_merge_crossed_exchanges
 
     as_a = pend._current_session_receipts("p", "ai-1", "codex", destination_live_id="codex-B")
     as_b = pend._current_session_receipts("p", "ai-1", "codex", destination_live_id="codex-A")
+
+    assert [d["task_id"] for _p, d in as_a] == ["from-a"]
+    assert [d["task_id"] for _p, d in as_b] == ["from-b"]
+
+
+def test_three_member_exact_task_retrieval_keeps_codex_callers_isolated() -> None:
+    pend = _load_pend_module()
+    from_a = _identity_receipt(
+        "from-a", "claude", session="ai-1", project="p", submitted="2",
+        caller_live_id="codex-A", destination_live_id="claude-C",
+    )
+    from_b = _identity_receipt(
+        "from-b", "claude", session="ai-1", project="p", submitted="1",
+        caller_live_id="codex-B", destination_live_id="claude-C",
+    )
+    records = [(Path("a.json"), from_a), (Path("b.json"), from_b)]
+    pend.iter_receipts = lambda: records
+
+    as_a = pend._current_session_receipts(
+        "p", "ai-1", "claude", caller_live_id="codex-A", destination_live_id="claude-C"
+    )
+    as_b = pend._current_session_receipts(
+        "p", "ai-1", "claude", caller_live_id="codex-B", destination_live_id="claude-C"
+    )
 
     assert [d["task_id"] for _p, d in as_a] == ["from-a"]
     assert [d["task_id"] for _p, d in as_b] == ["from-b"]

@@ -368,6 +368,21 @@ def test_unique_provider_resolves_without_a_caller() -> None:
     assert res.session.live_id == "s1"
 
 
+def test_three_member_inventory_resolves_unique_claude_and_refuses_generic_codex() -> None:
+    codex_a = _session("codex-a", "codex", "7")
+    codex_b = _session("codex-b", "codex", "8")
+    claude = _session("claude", "claude", "9")
+    sessions = [codex_a, codex_b, claude]
+
+    assert resolve_local_target(sessions, provider="claude", caller=codex_a).session == claude
+    assert resolve_local_target(sessions, provider="claude", caller=codex_b).session == claude
+
+    generic = resolve_local_target(sessions, provider="codex", caller=claude)
+    assert not generic.ok
+    assert generic.error == AMBIGUOUS
+    assert sorted(generic.candidates) == ["codex-a", "codex-b"]
+
+
 def test_pair_member_selects_the_other_in_both_directions() -> None:
     a, b = _session("s1", "codex", "7"), _session("s2", "codex", "8")
 

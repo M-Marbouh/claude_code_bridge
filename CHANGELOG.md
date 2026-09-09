@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `ccb codex codex` for two independent top-level Codex sessions with contextual sibling routing from either pane.
+- Added duplicate Codex pairing, including coexistence with other unique providers, with contextual sibling routing from either Codex pane.
 - Added exact live-session identity through queueing, receipts, completion delivery, task retrieval, status, cleanup, and provider kill operations.
 
 ### Changed

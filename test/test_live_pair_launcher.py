@@ -81,8 +81,8 @@ def test_launch_parser_preserves_occurrences_and_order(tokens):
     assert normalize_start_config_data({"providers": expected})["providers"] == expected
 
 
-@pytest.mark.parametrize("providers", [["codex"] * 3, ["codex", "codex", "claude"],
-                                       ["claude"] * 2, ["gemini"] * 2, ["opencode"] * 2])
+@pytest.mark.parametrize("providers", [["codex"] * 3, ["claude"] * 2,
+                                       ["gemini"] * 2, ["opencode"] * 2])
 def test_unsupported_duplicates_refuse_before_launcher_mutation(monkeypatch, providers):
     ccb = _load_ccb_module()
     monkeypatch.setattr(ccb, "compute_ccb_project_id", lambda *_: pytest.fail("must refuse before project access"))
@@ -91,11 +91,45 @@ def test_unsupported_duplicates_refuse_before_launcher_mutation(monkeypatch, pro
         ccb.AILauncher(providers=providers)
 
 
-def test_pair_resume_refuses_without_disabling_unique_resume(monkeypatch):
+@pytest.mark.parametrize("providers", [
+    ["codex", "codex", "claude"],
+    ["codex", "claude", "codex"],
+    ["claude", "codex", "codex"],
+    ["gemini", "codex", "claude", "codex", "opencode"],
+])
+def test_codex_pair_with_unique_provider_is_accepted(providers):
+    assert provider_pairing_error(providers) == ""
+
+
+def test_three_member_inventory_has_distinct_live_bindings(monkeypatch, tmp_path):
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir()
+    monkeypatch.setattr(ccb, "detect_terminal", lambda: "tmux")
+    launcher = ccb.AILauncher(providers=["codex", "codex", "claude"])
+    launcher.runtime_dir = tmp_path / "runtime"
+    monkeypatch.setattr(launcher, "_maybe_start_provider_daemon", lambda _: None)
+
+    assert launcher._publish_live_inventory()
+    sessions = read_inventory(load_registry_by_session_id(launcher.session_id)).sessions
+
+    assert [session.provider for session in sessions] == ["codex", "codex", "claude"]
+    assert len({session.live_id for session in sessions}) == 3
+    assert len({session.auth_token for session in sessions}) == 3
+    assert len({session.session_file for session in sessions}) == 3
+    assert sessions[0].session_file != sessions[1].session_file
+
+
+@pytest.mark.parametrize("providers", [
+    ["codex", "codex"],
+    ["codex", "codex", "claude"],
+    ["claude", "codex", "codex"],
+])
+def test_pair_resume_refuses_without_disabling_unique_resume(monkeypatch, providers):
     ccb = _load_ccb_module()
     monkeypatch.setattr(ccb, "compute_ccb_project_id", lambda *_: pytest.fail("must refuse before project access"))
     with pytest.raises(ValueError, match="native resume"):
-        ccb.AILauncher(providers=["codex", "codex"], resume=True)
+        ccb.AILauncher(providers=providers, resume=True)
     assert not provider_pairing_error(["codex", "claude"], resume=True)
 
 

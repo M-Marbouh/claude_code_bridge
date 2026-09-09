@@ -4,7 +4,7 @@ Lightweight, single-machine coordination for Claude, Codex, Gemini, and OpenCode
 
 This fork follows the upstream v5 terminal-pane architecture while keeping a deliberately small operating model:
 
-- One top-level session per provider, or an independent two-Codex pair
+- One top-level session per provider, with up to two Codex sessions alongside other unique providers
 - No workers, provider suffixes, provider-bound roles, or CCB-managed subagents
 - Visible sessions in WezTerm or tmux
 - Linux shell and Windows/PowerShell support
@@ -47,6 +47,12 @@ To open two independent Codex sessions:
 
 ```bash
 ccb codex codex
+```
+
+A Codex pair may coexist with other unique providers, for example:
+
+```bash
+ccb codex codex claude
 ```
 
 Inside either Codex pane, `ask codex` means the other verified Codex session in that launch. CCB assigns neither pane a role: give each session a short current assignment such as “lead and synthesize this task” or “implement and report evidence.” Either provider in `ccb codex claude` or `ccb claude codex` may take either assignment. Provider order is layout, not authority.

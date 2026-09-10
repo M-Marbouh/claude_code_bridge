@@ -676,7 +676,7 @@ def test_bridge_reply_uses_saved_identity_over_ambiguous_or_mismatched_generic_v
     """Task 4: a correlated reply whose receipt carries a saved return pane
     must be delivered there, even when the generic project+provider lookup
     also looks mounted (at a DIFFERENT pane) -- the saved identity is
-    validated first and used instead, never overridden by a live-looking
+    carried through the host daemon, never overridden by a live-looking
     but unrelated session."""
     bridge = _load_bridge_module()
     reply_file = tmp_path / "ask-peer-codex-task-dup.reply"
@@ -695,7 +695,7 @@ def test_bridge_reply_uses_saved_identity_over_ambiguous_or_mismatched_generic_v
         "peer_reply_file": str(reply_file),
         "status_file": str(status_file),
     }
-    backend = _DirectBackend(pane_id="%7")
+    sent: dict = {}
     # The generic project+provider view ALSO looks perfectly usable -- but
     # at a DIFFERENT, unrelated pane. If the saved identity were not
     # checked first, this is what a naive "prefer the live project" pick
@@ -707,13 +707,17 @@ def test_bridge_reply_uses_saved_identity_over_ambiguous_or_mismatched_generic_v
     }
 
     monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
-    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
     monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
     monkeypatch.setattr(bridge, "_load_targets", lambda: [other_target])
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("daemon path must not be used for a saved identity")),
+        lambda target, *_a, **_k: sent.update(target=target) or (0, "delivered", {}),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "get_backend_for_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("sandbox-unsafe direct fallback used")),
     )
 
     rc = bridge.main(
@@ -729,7 +733,8 @@ def test_bridge_reply_uses_saved_identity_over_ambiguous_or_mismatched_generic_v
     )
 
     assert rc == 0
-    assert backend.sent and backend.sent[0][0] == "%7"
+    assert sent["target"]["peer_destination"]["pane_id"] == "%7"
+    assert sent["target"]["peer_destination"]["pane_title_marker"] == "ccb-claude-sender"
     assert reply_file.read_text(encoding="utf-8").strip() == "exact reply"
 
 
@@ -739,8 +744,8 @@ def test_bridge_reply_uses_saved_identity_when_generic_lookup_is_ambiguous(
     """Item 4: a correlated reply whose receipt carries a saved return pane
     stays exact even when the generic project+provider lookup itself is
     AMBIGUOUS (more than one live session of that provider) -- the saved
-    identity wins and is delivered via the validated direct fallback,
-    never refused and never guessed at via the daemon path."""
+    identity wins and is carried through the host daemon for fresh
+    revalidation, never refused and never guessed from the aggregate."""
     bridge = _load_bridge_module()
     reply_file = tmp_path / "ask-peer-codex-task-amb.reply"
     status_file = tmp_path / "ask-peer-codex-task-amb.status"
@@ -758,7 +763,7 @@ def test_bridge_reply_uses_saved_identity_when_generic_lookup_is_ambiguous(
         "peer_reply_file": str(reply_file),
         "status_file": str(status_file),
     }
-    backend = _DirectBackend(pane_id="%7")
+    sent: dict = {}
     ambiguous_target = {
         "work_dir": str(tmp_path),
         "ccb_project_id": "abcd1234",
@@ -776,13 +781,17 @@ def test_bridge_reply_uses_saved_identity_when_generic_lookup_is_ambiguous(
     }
 
     monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
-    monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
     monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
     monkeypatch.setattr(bridge, "_load_targets", lambda: [ambiguous_target])
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("daemon path must not be used when ambiguous")),
+        lambda target, *_a, **_k: sent.update(target=target) or (0, "delivered", {}),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "get_backend_for_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("sandbox-unsafe direct fallback used")),
     )
 
     rc = bridge.main(
@@ -798,7 +807,7 @@ def test_bridge_reply_uses_saved_identity_when_generic_lookup_is_ambiguous(
     )
 
     assert rc == 0
-    assert backend.sent and backend.sent[0][0] == "%7"
+    assert sent["target"]["peer_destination"]["pane_id"] == "%7"
     assert reply_file.read_text(encoding="utf-8").strip() == "exact reply"
 
 

@@ -926,6 +926,106 @@ def test_peer_sandbox_forces_foreground_instead_of_detached_worker(
     assert captured == [("background", project.resolve())]
 
 
+def test_peer_sandbox_foreground_wait_creates_correlated_receipt(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    ask = _load_ask_module()
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def _receipt(**kwargs):
+        captured["receipt_kwargs"] = kwargs
+        return {"task_id": kwargs["task_id"]}
+
+    def _run(cmd, **kwargs):
+        captured.update(cmd=cmd, run_kwargs=kwargs)
+        return _Result()
+
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(ask, "make_task_id", lambda: "task-fixed")
+    monkeypatch.setattr(ask, "_cleanup_task_logs", lambda _path: None)
+    monkeypatch.setattr(ask, "_resolve_sender_work_dir", lambda _caller: project.resolve())
+    monkeypatch.setattr(ask, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("30", "wezterm"))
+    monkeypatch.setattr(
+        ask,
+        "identify_sender",
+        lambda *_args, **_kwargs: ask.peer_routing.SenderResolution(
+            candidate=ask.peer_routing.SenderCandidate(
+                launch_id="launch",
+                live_id="sender-live-id",
+                provider="codex",
+                pane_id="30",
+                terminal="wezterm",
+                session_file="sender.json",
+                ccb_project_id="sender-project",
+                work_dir=str(project),
+                pane_title_marker="sender-marker",
+            )
+        ),
+    )
+    monkeypatch.setattr(ask, "new_peer_receipt", _receipt)
+    monkeypatch.setattr(ask.subprocess, "run", _run)
+
+    rc = ask._run_peer_bridge(
+        "/peer",
+        "codex",
+        10.0,
+        "hello",
+        False,
+        "wait",
+        live_id="target-live-id",
+    )
+
+    assert rc == ask.EXIT_OK
+    assert captured["receipt_kwargs"]["caller_pane_id"] == "30"
+    assert captured["receipt_kwargs"]["caller_terminal"] == "wezterm"
+    assert captured["receipt_kwargs"]["caller_live_id"] == "sender-live-id"
+    assert captured["receipt_kwargs"]["caller_pane_title_marker"] == "sender-marker"
+    assert captured["cmd"][captured["cmd"].index("--peer-task-id") + 1] == "task-fixed"
+    assert captured["cmd"][captured["cmd"].index("--live-id") + 1] == "target-live-id"
+    assert captured["run_kwargs"]["env"]["CCB_REQ_ID"] == "task-fixed"
+    output = capsys.readouterr().out
+    assert "[CCB_ASYNC_SUBMITTED provider=peer-codex intent=wait]" in output
+    assert "task-fixed" in output
+
+
+def test_peer_foreground_notify_remains_receipt_free(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("30", "wezterm"))
+    monkeypatch.setattr(
+        ask,
+        "_prepare_peer_task",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("notify created a receipt")),
+    )
+    monkeypatch.setattr(
+        ask.subprocess,
+        "run",
+        lambda cmd, **kwargs: captured.update(cmd=cmd, run_kwargs=kwargs) or _Result(),
+    )
+
+    rc = ask._run_peer_bridge_foreground(
+        "/peer", "codex", 10.0, "FYI", "codex", "notify", "", tmp_path
+    )
+
+    assert rc == ask.EXIT_OK
+    assert "--peer-task-id" not in captured["cmd"]
+    assert "CCB_REQ_ID" not in captured["run_kwargs"]["env"]
+    assert "CCB_ASYNC_SUBMITTED" not in capsys.readouterr().out
+
+
 def test_peer_background_uses_resolved_sender_for_receipt_status_and_bridge(
     monkeypatch,
     tmp_path: Path,

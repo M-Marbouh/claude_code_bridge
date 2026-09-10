@@ -697,32 +697,30 @@ def main(argv: list[str] | None = None) -> int:
             # is attempted -- never cached from an earlier resolution.
             receipt_pane_id = str(reply_receipt.get("caller_pane_id") or "").strip() if reply_receipt is not None else ""
             if receipt_pane_id:
-                resolved_pane_id = str((provider_status or {}).get("pane_id") or "").strip()
-                identity_confirmed = (
-                    not provider_ambiguous
-                    and provider_alive
-                    and provider_mounted
-                    and not legacy_claude_block
-                    and resolved_pane_id == receipt_pane_id
-                )
-                if not identity_confirmed:
+                receipt_terminal = str(reply_receipt.get("caller_terminal") or "").strip().lower()
+                receipt_work_dir = str(reply_receipt.get("work_dir") or "").strip()
+                receipt_project_id = str(reply_receipt.get("ccb_project_id") or "").strip()
+                receipt_marker = str(reply_receipt.get("caller_pane_title_marker") or "").strip()
+                if (
+                    receipt_terminal not in {"tmux", "wezterm"}
+                    or not receipt_work_dir
+                    or not receipt_project_id
+                    or (receipt_terminal != "wezterm" and not receipt_marker)
+                ):
                     target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
                 else:
-                    # Item 1: the daemon path is being trusted for this
-                    # reply -- carry the exact saved identity along with
-                    # it (on `target` itself, never a new call-signature
-                    # parameter) so askd's own two checkpoints (enqueue,
-                    # and immediately before the actual send) can
-                    # re-confirm it fresh, instead of this one check, made
-                    # before the RPC round-trip, being the only guarantee
-                    # for however long the request then sits queued.
+                    # A sandboxed responder cannot reliably inspect or
+                    # send to the original terminal pane directly. Carry
+                    # the receipt's exact return identity through askd so
+                    # the host daemon revalidates it at enqueue and again
+                    # immediately before delivery.
                     target = dict(target)
                     target["peer_destination"] = {
                         "pane_id": receipt_pane_id,
-                        "terminal": str(reply_receipt.get("caller_terminal") or "").strip(),
-                        "work_dir": str(reply_receipt.get("work_dir") or ""),
-                        "ccb_project_id": str(reply_receipt.get("ccb_project_id") or ""),
-                        "pane_title_marker": str(reply_receipt.get("caller_pane_title_marker") or "").strip(),
+                        "terminal": receipt_terminal,
+                        "work_dir": receipt_work_dir,
+                        "ccb_project_id": receipt_project_id,
+                        "pane_title_marker": receipt_marker,
                     }
             elif provider_ambiguous:
                 # Task 3: more than one live session of this provider in

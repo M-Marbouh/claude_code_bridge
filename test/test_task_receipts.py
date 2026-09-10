@@ -931,6 +931,67 @@ def test_peer_receipt_uses_exact_inventory_member(tmp_path: Path, monkeypatch) -
     assert not data.get("caller_live_id")
 
 
+def test_peer_receipt_explicit_caller_identity_overrides_ambient_pane(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from live_sessions import LiveSession
+
+    monkeypatch.setenv("CCB_CALLER_PANE_ID", "%7")
+    monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")
+    entries = [({}, LiveSession(
+        live_id=f"s{n}", provider="codex", launch_id="launch",
+        pane_id=f"%{n}", terminal="tmux", pane_title_marker=f"marker-{n}",
+    )) for n in (7, 8)]
+    monkeypatch.setattr("peer_routing._live_entries_for_project", lambda *_: (entries, True))
+
+    data = new_peer_receipt(
+        task_id="task",
+        peer_provider="claude",
+        caller="codex",
+        intent="wait",
+        work_dir=tmp_path,
+        status_file=tmp_path / "task.status",
+        log_file=tmp_path / "task.log",
+        reply_file=tmp_path / "task.reply",
+        caller_pane_id="%8",
+        caller_terminal="tmux",
+    )
+
+    assert data["caller_pane_id"] == "%8"
+    assert data["caller_live_id"] == "s8"
+    assert data["caller_pane_title_marker"] == "marker-8"
+
+
+def test_peer_receipt_keeps_host_validated_identity_when_local_inventory_is_unreadable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "peer_routing._live_entries_for_project",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("sandbox")),
+    )
+
+    data = new_peer_receipt(
+        task_id="task",
+        peer_provider="claude",
+        caller="codex",
+        intent="wait",
+        work_dir=tmp_path,
+        status_file=tmp_path / "task.status",
+        log_file=tmp_path / "task.log",
+        reply_file=tmp_path / "task.reply",
+        caller_pane_id="30",
+        caller_terminal="wezterm",
+        caller_live_id="sender-live-id",
+        caller_registry_session_id="launch",
+        caller_pane_title_marker="sender-marker",
+    )
+
+    assert data["caller_pane_id"] == "30"
+    assert data["caller_live_id"] == "sender-live-id"
+    assert data["caller_registry_session_id"] == "launch"
+    assert data["caller_pane_title_marker"] == "sender-marker"
+
+
 def test_peer_receipt_preserves_direct_return_route(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CCB_CALLER_PANE_ID", "%7")
     monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")

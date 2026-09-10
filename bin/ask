@@ -119,6 +119,14 @@ class _SenderCandidateEvidence(NamedTuple):
     pane_ids: frozenset[str]
 
 
+class _PeerTaskFiles(NamedTuple):
+    task_id: str
+    log_file: Path
+    status_file: Path
+    msg_file: Path
+    reply_file: Path
+
+
 def _caller_pane_info() -> tuple[str, str]:
     """Return (pane_id, terminal_type) from the current environment."""
     tmux = (os.environ.get("TMUX_PANE") or "").strip()
@@ -1020,6 +1028,20 @@ def _run_peer_bridge_foreground(
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir_str = str(sender_work_dir)
+    task = None
+    if intent != "notify":
+        task = _prepare_peer_task(
+            peer_provider,
+            message,
+            caller,
+            intent,
+            sender_work_dir,
+            timeout,
+            caller_pane_id,
+            caller_terminal,
+        )
+        if task is None:
+            return EXIT_ERROR
     cmd = _peer_bridge_cmd(
         peer_target,
         peer_provider,
@@ -1029,6 +1051,7 @@ def _run_peer_bridge_foreground(
         sender_work_dir_str,
         caller,
         intent,
+        task_id=task.task_id if task is not None else "",
         reply_to=reply_to,
         foreground=True,
         live_id=live_id,
@@ -1036,33 +1059,39 @@ def _run_peer_bridge_foreground(
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
     env["CCB_WORK_DIR"] = sender_work_dir_str
+    if task is not None:
+        env["CCB_REQ_ID"] = task.task_id
+        env["CCB_PEER_STATUS_FILE"] = str(task.status_file)
+        env["CCB_PEER_LOG_FILE"] = str(task.log_file)
+        env["CCB_PEER_PROVIDER"] = peer_provider
+    if reply_to:
+        env["CCB_PEER_REPLY_TO"] = reply_to
     if caller_pane_id:
         env["CCB_CALLER_PANE_ID"] = caller_pane_id
     if caller_terminal:
         env["CCB_CALLER_TERMINAL"] = caller_terminal
     try:
         result = subprocess.run(cmd, input=message, text=True, env=env)
+        if result.returncode == EXIT_OK and task is not None:
+            _print_peer_task_submission(peer_provider, intent, task, caller)
         return result.returncode
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         return EXIT_ERROR
 
 
-def _run_peer_bridge_background(
-    peer_target: str,
+def _prepare_peer_task(
     peer_provider: str,
-    timeout: float,
     message: str,
     caller: str,
     intent: str,
-    reply_to: str,
     sender_work_dir: Path,
-    *,
-    live_id: str = "",
-) -> int:
+    timeout: float,
+    caller_pane_id: str,
+    caller_terminal: str,
+) -> _PeerTaskFiles | None:
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.log"
     status_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.status"
     msg_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.msg"
@@ -1070,6 +1099,26 @@ def _run_peer_bridge_background(
     receipt_file = receipt_path(f"peer-{peer_provider}", task_id, root=log_dir)
 
     try:
+        caller_live_id = ""
+        caller_registry_session_id = ""
+        caller_pane_title_marker = ""
+        if caller in PEER_PROVIDERS:
+            resolution = identify_sender(
+                sender_work_dir,
+                caller,
+                pane_id=caller_pane_id,
+                terminal=caller_terminal,
+            )
+            if resolution.ok:
+                candidate = resolution.candidate
+                caller_live_id = candidate.live_id
+                caller_registry_session_id = candidate.launch_id
+                caller_pane_title_marker = candidate.pane_title_marker
+            elif resolution.error != peer_routing.NO_CANDIDATES:
+                raise RuntimeError(
+                    resolution.detail or "could not pin the peer sender's live session"
+                )
+        log_dir.mkdir(parents=True, exist_ok=True)
         log_file.touch(exist_ok=True)
         status_file.touch(exist_ok=True)
         msg_file.write_text(message, encoding="utf-8")
@@ -1086,14 +1135,70 @@ def _run_peer_bridge_background(
                 log_file=log_file,
                 reply_file=reply_file,
                 timeout_seconds=timeout,
+                caller_pane_id=caller_pane_id,
+                caller_terminal=caller_terminal,
+                caller_live_id=caller_live_id,
+                caller_registry_session_id=caller_registry_session_id,
+                caller_pane_title_marker=caller_pane_title_marker,
             ),
         )
     except Exception as e:
         print(f"[ERROR] Failed to create peer task receipt: {e}", file=sys.stderr)
-        return EXIT_ERROR
+        return None
     _cleanup_task_logs(log_dir)
+    return _PeerTaskFiles(task_id, log_file, status_file, msg_file, reply_file)
 
+
+def _print_peer_task_submission(
+    peer_provider: str,
+    intent: str,
+    task: _PeerTaskFiles,
+    caller: str,
+) -> None:
+    if intent == "background":
+        print(f"[CCB_BACKGROUND_SUBMITTED provider=peer-{peer_provider} intent=background]")
+        print(f"Peer {display_name(peer_provider)} consulted in background (task: {task.task_id}); continue current work.")
+    else:
+        print(f"[CCB_ASYNC_SUBMITTED provider=peer-{peer_provider} intent=wait]")
+        print(f"Peer {display_name(peer_provider)} processing (task: {task.task_id})")
+    print(f"[CCB_ASYNC_STATUS_FILE task={task.task_id}] {task.status_file}")
+    print(f"[CCB_ASYNC_LOG_FILE task={task.task_id}] {task.log_file}")
+    if intent == "wait" and _should_emit_async_guardrail(caller):
+        print(
+            f"MANDATORY: END YOUR TURN NOW. Reply ONLY "
+            f"'Peer {display_name(peer_provider)} processing...', then stop."
+        )
+
+
+def _run_peer_bridge_background(
+    peer_target: str,
+    peer_provider: str,
+    timeout: float,
+    message: str,
+    caller: str,
+    intent: str,
+    reply_to: str,
+    sender_work_dir: Path,
+    *,
+    live_id: str = "",
+) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
+    task = _prepare_peer_task(
+        peer_provider,
+        message,
+        caller,
+        intent,
+        sender_work_dir,
+        timeout,
+        caller_pane_id,
+        caller_terminal,
+    )
+    if task is None:
+        return EXIT_ERROR
+    task_id = task.task_id
+    log_file = task.log_file
+    status_file = task.status_file
+    msg_file = task.msg_file
     sender_work_dir_str = str(sender_work_dir)
     bridge_cmd = _peer_bridge_cmd(
         peer_target,
@@ -1150,23 +1255,14 @@ def _run_peer_bridge_background(
     )
     _append_task_status_line(status_file, f"spawned pid={proc.pid}")
 
-    if intent == "background":
-        print(f"[CCB_BACKGROUND_SUBMITTED provider=peer-{peer_provider} intent=background]")
-        print(f"Peer {display_name(peer_provider)} consulted in background (task: {task_id}); continue current work.")
-    elif intent == "notify":
+    if intent == "notify":
         print(f"[CCB_NOTIFY_SUBMITTED provider=peer-{peer_provider} intent=notify]")
         print(f"Peer {display_name(peer_provider)} notified (task: {task_id}); continue current work.")
+        print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
+        print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
     else:
-        print(f"[CCB_ASYNC_SUBMITTED provider=peer-{peer_provider} intent=wait]")
-        print(f"Peer {display_name(peer_provider)} processing (task: {task_id})")
+        _print_peer_task_submission(peer_provider, intent, task, caller)
     print(f"[CCB_ASYNC_PID task={task_id} pid={proc.pid}]")
-    print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
-    print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
-    if intent == "wait" and _should_emit_async_guardrail(caller):
-        print(
-            f"MANDATORY: END YOUR TURN NOW. Reply ONLY "
-            f"'Peer {display_name(peer_provider)} processing...', then stop."
-        )
     return EXIT_OK
 
 

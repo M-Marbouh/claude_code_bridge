@@ -126,6 +126,11 @@ def new_peer_receipt(
     log_file: Path,
     reply_file: Path,
     timeout_seconds: float | None = None,
+    caller_pane_id: str | None = None,
+    caller_terminal: str | None = None,
+    caller_live_id: str = "",
+    caller_registry_session_id: str = "",
+    caller_pane_title_marker: str = "",
 ) -> dict[str, Any]:
     """Create a peer receipt with a validated reverse-route snapshot."""
     receipt = new_receipt(
@@ -137,6 +142,16 @@ def new_peer_receipt(
         log_file=log_file,
         timeout_seconds=timeout_seconds,
     )
+    if caller_pane_id is not None:
+        receipt["caller_pane_id"] = str(caller_pane_id).strip()
+    if caller_terminal is not None:
+        receipt["caller_terminal"] = str(caller_terminal).strip()
+    if caller_live_id:
+        receipt["caller_live_id"] = caller_live_id.strip()
+    if caller_registry_session_id:
+        receipt["caller_registry_session_id"] = caller_registry_session_id.strip()
+    if caller_pane_title_marker:
+        receipt["caller_pane_title_marker"] = caller_pane_title_marker.strip()
     receipt.update(
         {
             "peer_provider": peer_provider,

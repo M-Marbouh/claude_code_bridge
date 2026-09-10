@@ -80,6 +80,7 @@ class SenderCandidate:
     ccb_project_id: str
     work_dir: str
     active: bool = True
+    pane_title_marker: str = ""
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ def _candidate_from_live_session(session) -> SenderCandidate:
         ccb_project_id=session.ccb_project_id,
         work_dir=session.work_dir,
         active=session.active,
+        pane_title_marker=session.pane_title_marker,
     )
 
 
@@ -293,6 +295,7 @@ def _resolution_from_dict(payload: dict) -> SenderResolution:
             ccb_project_id=str(candidate_payload.get("ccb_project_id") or ""),
             work_dir=str(candidate_payload.get("work_dir") or ""),
             active=bool(candidate_payload.get("active", True)),
+            pane_title_marker=str(candidate_payload.get("pane_title_marker") or ""),
         )
     raw_candidates = payload.get("candidates")
     return SenderResolution(
@@ -319,6 +322,7 @@ def resolution_to_dict(resolution: SenderResolution) -> dict:
             "ccb_project_id": c.ccb_project_id,
             "work_dir": c.work_dir,
             "active": c.active,
+            "pane_title_marker": c.pane_title_marker,
         }
     return {
         "candidate": candidate_dict,

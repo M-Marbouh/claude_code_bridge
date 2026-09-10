@@ -744,9 +744,11 @@ def _usage() -> None:
     print("  --peer TARGET           Send to the selected provider in another CCB project", file=sys.stderr)
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
     print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
+    print("  --live-id ID            Peer only: deliver to this exact live session", file=sys.stderr)
     print("", file=sys.stderr)
     print("Local pair: in ccb codex codex, ask codex addresses the verified sibling.", file=sys.stderr)
     print("Peer targets must be unique in the remote project; ambiguity is an error.", file=sys.stderr)
+    print("Use --live-id (from ccb-list --json) to name one session when several are live.", file=sys.stderr)
 
 
 def _peer_caller_pane_info() -> tuple[str, str]:
@@ -917,6 +919,44 @@ def _valid_peer_correlation_id(value: str) -> bool:
     return not value or _PEER_CORRELATION_ID_RE.fullmatch(value) is not None
 
 
+def _valid_peer_live_id(value: str) -> bool:
+    # The registry owns live-ID syntax. The client only requires the
+    # non-empty opaque value emitted by ccb-list.
+    return bool(value.strip())
+
+
+def _peer_live_id_error(
+    live_id: str,
+    live_id_seen: bool,
+    peer_target: str,
+    reply_to: str,
+) -> str:
+    """Every `--live-id` refusal, applied before any dispatch.
+
+    The selector names an exact remote session, so it is meaningless
+    without a peer target, and it must never compete with the saved
+    return address of a correlated reply -- that destination is already
+    pinned by the receipt. Both cases refuse outright rather than
+    resolving a precedence rule the sender cannot see.
+    """
+    if not live_id_seen:
+        return ""
+    if not live_id:
+        return "[ERROR] --live-id requires a live session ID"
+    if not _valid_peer_live_id(live_id):
+        # Checked before the peer-target rule so a selector that swallowed
+        # the following option token reports its real cause.
+        return "[ERROR] Invalid --live-id"
+    if not peer_target:
+        return "[ERROR] --live-id requires --peer"
+    if reply_to:
+        return (
+            "[ERROR] --live-id cannot be combined with --reply-to; a correlated "
+            "reply is delivered to the saved return session"
+        )
+    return ""
+
+
 def _peer_bridge_cmd(
     peer_target: str,
     peer_provider: str,
@@ -929,6 +969,7 @@ def _peer_bridge_cmd(
     task_id: str = "",
     reply_to: str = "",
     foreground: bool = False,
+    live_id: str = "",
 ) -> list[str]:
     bridge_cmd = Path(__file__).resolve().parent / "ccb-bridge-ask"
     cmd = [
@@ -955,6 +996,11 @@ def _peer_bridge_cmd(
         cmd.extend(["--peer-task-id", task_id])
     if reply_to:
         cmd.extend(["--reply-to", reply_to])
+    if live_id:
+        # Threaded as its own option -- never folded into the target
+        # string or the message body, so the bridge resolves the project
+        # and the session selector independently.
+        cmd.extend(["--live-id", live_id])
     if foreground:
         cmd.append("--foreground")
     return cmd
@@ -969,6 +1015,8 @@ def _run_peer_bridge_foreground(
     intent: str,
     reply_to: str,
     sender_work_dir: Path,
+    *,
+    live_id: str = "",
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir_str = str(sender_work_dir)
@@ -983,6 +1031,7 @@ def _run_peer_bridge_foreground(
         intent,
         reply_to=reply_to,
         foreground=True,
+        live_id=live_id,
     )
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
@@ -1008,6 +1057,8 @@ def _run_peer_bridge_background(
     intent: str,
     reply_to: str,
     sender_work_dir: Path,
+    *,
+    live_id: str = "",
 ) -> int:
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
@@ -1055,6 +1106,7 @@ def _run_peer_bridge_background(
         intent,
         task_id,
         reply_to,
+        live_id=live_id,
     )
     env = os.environ.copy()
     env["CCB_REQ_ID"] = task_id
@@ -1126,6 +1178,8 @@ def _run_peer_bridge(
     foreground_mode: bool,
     intent: str,
     reply_to: str = "",
+    *,
+    live_id: str = "",
 ) -> int:
     if peer_provider not in PEER_PROVIDERS:
         print(
@@ -1156,6 +1210,7 @@ def _run_peer_bridge(
             intent,
             reply_to,
             sender_work_dir,
+            live_id=live_id,
         )
     return _run_peer_bridge_background(
         peer_target,
@@ -1166,6 +1221,7 @@ def _run_peer_bridge(
         intent,
         reply_to,
         sender_work_dir,
+        live_id=live_id,
     )
 
 
@@ -1175,6 +1231,8 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
     foreground_mode = _default_foreground()
     peer_intent = "wait"
     peer_reply_to = ""
+    peer_live_id = ""
+    peer_live_id_seen = False
     parts: list[str] = []
 
     it = iter(argv)
@@ -1206,6 +1264,21 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
                 print("[ERROR] --reply-to requires a task ID", file=sys.stderr)
                 return EXIT_ERROR
             continue
+        if token == "--live-id":
+            if peer_live_id_seen:
+                print("[ERROR] --live-id may only be given once", file=sys.stderr)
+                return EXIT_ERROR
+            try:
+                peer_live_id = next(it)
+            except StopIteration:
+                print("[ERROR] --live-id requires a live session ID", file=sys.stderr)
+                return EXIT_ERROR
+            if peer_live_id.startswith("--") or peer_live_id in ("-h", "-t"):
+                print("[ERROR] --live-id requires a live session ID", file=sys.stderr)
+                return EXIT_ERROR
+            peer_live_id = peer_live_id.strip()
+            peer_live_id_seen = True
+            continue
         if token == "--foreground":
             foreground_mode = True
             continue
@@ -1235,11 +1308,22 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
     if not _valid_peer_correlation_id(peer_reply_to):
         print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
         return EXIT_ERROR
+    live_id_error = _peer_live_id_error(peer_live_id, peer_live_id_seen, peer_target, peer_reply_to)
+    if live_id_error:
+        print(live_id_error, file=sys.stderr)
+        return EXIT_ERROR
     if peer_intent == "notify" and _notify_requests_reply(message):
         print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
         return EXIT_ERROR
     return _run_peer_bridge(
-        peer_target, peer_provider, timeout, message, foreground_mode, peer_intent, peer_reply_to
+        peer_target,
+        peer_provider,
+        timeout,
+        message,
+        foreground_mode,
+        peer_intent,
+        peer_reply_to,
+        live_id=peer_live_id,
     )
 
 
@@ -1278,6 +1362,8 @@ def main(argv: list[str]) -> int:
     foreground_mode = _default_foreground()
     peer_intent = "wait"
     peer_reply_to = ""
+    peer_live_id = ""
+    peer_live_id_seen = False
     peer_foreground_explicit = False
     parts: list[str] = []
 
@@ -1302,6 +1388,21 @@ def main(argv: list[str]) -> int:
             except StopIteration:
                 print("[ERROR] --reply-to requires a task ID", file=sys.stderr)
                 return EXIT_ERROR
+            continue
+        if token == "--live-id":
+            if peer_live_id_seen:
+                print("[ERROR] --live-id may only be given once", file=sys.stderr)
+                return EXIT_ERROR
+            try:
+                peer_live_id = next(it)
+            except StopIteration:
+                print("[ERROR] --live-id requires a live session ID", file=sys.stderr)
+                return EXIT_ERROR
+            if peer_live_id.startswith("--") or peer_live_id in ("-h", "-t"):
+                print("[ERROR] --live-id requires a live session ID", file=sys.stderr)
+                return EXIT_ERROR
+            peer_live_id = peer_live_id.strip()
+            peer_live_id_seen = True
             continue
         if token == "--notify":
             notify_mode = True
@@ -1340,6 +1441,10 @@ def main(argv: list[str]) -> int:
     if not _valid_peer_correlation_id(peer_reply_to):
         print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
         return EXIT_ERROR
+    live_id_error = _peer_live_id_error(peer_live_id, peer_live_id_seen, peer_target, peer_reply_to)
+    if live_id_error:
+        print(live_id_error, file=sys.stderr)
+        return EXIT_ERROR
 
     if _REMOVED_ROUTE_TAG_RE.match(message):
         print("[ERROR] [WORKER]/[ARCHITECT] routing tags are no longer supported", file=sys.stderr)
@@ -1353,7 +1458,14 @@ def main(argv: list[str]) -> int:
                 print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
                 return EXIT_ERROR
         return _run_peer_bridge(
-            peer_target, provider, timeout, message, foreground_mode, peer_intent, peer_reply_to
+            peer_target,
+            provider,
+            timeout,
+            message,
+            foreground_mode,
+            peer_intent,
+            peer_reply_to,
+            live_id=peer_live_id,
         )
 
     daemon_context: _UnifiedDaemonContext | None = None

@@ -407,6 +407,8 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
         foreground: bool,
         intent: str,
         reply_to: str,
+        *,
+        live_id: str = "",
     ) -> int:
         captured.update(
             target=target,
@@ -455,7 +457,7 @@ def test_peer_reply_to_is_forwarded(monkeypatch) -> None:
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge",
-        lambda target, provider, timeout, message, foreground, intent, reply_to: captured.update(
+        lambda target, provider, timeout, message, foreground, intent, reply_to, **_kwargs: captured.update(
             target=target,
             provider=provider,
             intent=intent,
@@ -478,7 +480,7 @@ def test_codex_peer_notify_runs_in_background_and_preserves_provider(monkeypatch
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge",
-        lambda target, provider, timeout, message, foreground, intent, reply_to: captured.update(
+        lambda target, provider, timeout, message, foreground, intent, reply_to, **_kwargs: captured.update(
             target=target,
             provider=provider,
             foreground=foreground,
@@ -851,12 +853,12 @@ def test_peer_sender_rejection_precedes_foreground_or_background_dispatch(
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_foreground",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("foreground bridge dispatched")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("foreground bridge dispatched")),
     )
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_background",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("background receipt created")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("background receipt created")),
     )
 
     rc = ask._run_peer_bridge("/peer", "claude", 10.0, "hello", foreground, "wait")
@@ -885,12 +887,12 @@ def test_peer_foreground_and_background_receive_same_resolved_sender(
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_foreground",
-        lambda *_args: captured.append(_args[-1]) or 0,
+        lambda *_args, **_kwargs: captured.append(_args[-1]) or 0,
     )
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_background",
-        lambda *_args: captured.append(_args[-1]) or 0,
+        lambda *_args, **_kwargs: captured.append(_args[-1]) or 0,
     )
 
     assert ask._run_peer_bridge("/peer", "claude", 10.0, "hello", foreground, "wait") == 0
@@ -912,12 +914,12 @@ def test_peer_sandbox_forces_foreground_instead_of_detached_worker(
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_foreground",
-        lambda *_args: captured.append((_args[-3], _args[-1])) or 0,
+        lambda *_args, **_kwargs: captured.append((_args[-3], _args[-1])) or 0,
     )
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_background",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("sandbox spawned detached worker")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sandbox spawned detached worker")),
     )
 
     assert ask._run_peer_bridge("/peer", "claude", 10.0, "hello", False, "background") == 0
@@ -1031,7 +1033,7 @@ def test_peer_notify_does_not_require_mounted_sender(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         ask,
         "_run_peer_bridge_foreground",
-        lambda *_args: captured.append(_args[-1]) or 0,
+        lambda *_args, **_kwargs: captured.append(_args[-1]) or 0,
     )
 
     rc = ask._run_peer_bridge("/peer", "claude", 10.0, "FYI", True, "notify")
@@ -1591,3 +1593,132 @@ def test_foreground_ask_refuses_and_never_sends_when_caller_evidence_matches_not
     rc = ask.main(["ask", "codex", "--foreground", "hello"])
 
     assert rc == ask.EXIT_ERROR
+
+
+# --- `--live-id`: peer-only selector plumbing and refusals ---
+
+
+def test_peer_bridge_cmd_threads_live_id_as_its_own_option() -> None:
+    ask = _load_ask_module()
+
+    cmd = ask._peer_bridge_cmd(
+        "/tmp/peer", "codex", 10.0, "%1", "tmux", "/tmp/sender", "claude", "wait",
+        live_id="live-b",
+    )
+
+    assert "--live-id" in cmd
+    assert cmd[cmd.index("--live-id") + 1] == "live-b"
+    # Never folded into the target or the message.
+    assert cmd[cmd.index("--target") + 1] == "/tmp/peer"
+
+
+def test_peer_bridge_cmd_without_live_id_is_unchanged() -> None:
+    ask = _load_ask_module()
+
+    cmd = ask._peer_bridge_cmd(
+        "/tmp/peer", "codex", 10.0, "%1", "tmux", "/tmp/sender", "claude", "wait"
+    )
+
+    assert "--live-id" not in cmd
+
+
+def test_ask_forwards_live_id_for_provider_peer_form(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda *_args, **kwargs: captured.update(kwargs) or 0,
+    )
+
+    rc = ask.main(
+        ["ask", "codex", "--peer", "/tmp/peer", "--live-id", "live-b", "--notify", "FYI"]
+    )
+
+    assert rc == 0
+    assert captured == {"live_id": "live-b"}
+
+
+def test_peer_mode_parser_forwards_live_id(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda *_args, **kwargs: captured.update(kwargs) or 0,
+    )
+
+    rc = ask._handle_peer_mode(["--peer", "/tmp/peer", "--live-id", "live-b", "--notify", "FYI"])
+
+    assert rc == 0
+    assert captured == {"live_id": "live-b"}
+
+
+def _refuse_dispatch(ask, monkeypatch) -> None:
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("dispatched despite refusal")),
+    )
+
+
+def test_ask_live_id_without_peer_refuses(monkeypatch, capsys) -> None:
+    ask = _load_ask_module()
+    _refuse_dispatch(ask, monkeypatch)
+
+    rc = ask.main(["ask", "codex", "--live-id", "live-b", "hello"])
+
+    assert rc == 1
+    assert "--live-id requires --peer" in capsys.readouterr().err
+
+
+def test_ask_live_id_requires_a_value(monkeypatch, capsys) -> None:
+    ask = _load_ask_module()
+    _refuse_dispatch(ask, monkeypatch)
+
+    rc = ask.main(["ask", "codex", "--peer", "/tmp/peer", "--live-id"])
+
+    assert rc == 1
+    assert "--live-id requires a live session ID" in capsys.readouterr().err
+
+
+def test_ask_live_id_rejects_repeated_use(monkeypatch, capsys) -> None:
+    """The selector deliberately breaks the CLI's last-wins habit: a
+    repeated selector is a conflicting instruction, not an override."""
+    ask = _load_ask_module()
+    _refuse_dispatch(ask, monkeypatch)
+
+    rc = ask.main(
+        ["ask", "codex", "--peer", "/tmp/peer", "--live-id", "live-a", "--live-id", "live-b", "hi"]
+    )
+
+    assert rc == 1
+    assert "--live-id may only be given once" in capsys.readouterr().err
+
+
+def test_ask_live_id_rejects_reply_to_combination(monkeypatch, capsys) -> None:
+    ask = _load_ask_module()
+    _refuse_dispatch(ask, monkeypatch)
+
+    rc = ask.main(
+        [
+            "ask", "codex", "--peer", "/tmp/peer",
+            "--live-id", "live-b",
+            "--reply-to", "20260711-212112-453-72347",
+            "Done.",
+        ]
+    )
+
+    assert rc == 1
+    assert "cannot be combined with --reply-to" in capsys.readouterr().err
+
+
+def test_ask_live_id_requires_value_without_swallowing_option(monkeypatch, capsys) -> None:
+    """A missing value can never swallow the following option token."""
+    ask = _load_ask_module()
+    _refuse_dispatch(ask, monkeypatch)
+
+    rc = ask.main(["ask", "codex", "--live-id", "--peer", "/tmp/peer", "hello"])
+
+    assert rc == 1
+    assert "--live-id requires a live session ID" in capsys.readouterr().err

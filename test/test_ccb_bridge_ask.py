@@ -935,3 +935,194 @@ def test_reverse_reply_rejects_reused_pane_but_preserves_result(
     captured = capsys.readouterr()
     assert "no longer matches the receipt project" in captured.err
     assert f"pend task-2" in captured.err
+
+
+# --- `--live-id`: explicit selection among several live peer sessions ---
+
+
+def _live_status(live_id: str, pane_id: str, *, alive: bool = True, mounted: bool = True,
+                 marker: str | None = None, reason: str = "") -> dict:
+    return {"live_id": live_id, "pane_id": pane_id,
+            "pane_title_marker": f"CCB-Codex-abcd1234-{live_id}" if marker is None else marker,
+            "terminal": "tmux", "alive": alive, "mounted": mounted, "reason": reason}
+
+
+def _session(providers: dict, *, session_id: str = "ai-1", alive: bool = True) -> dict:
+    return {"session_id": session_id, "work_dir": "/tmp/project", "ccb_project_id": "abcd1234",
+            "terminal": "tmux", "alive": alive, "providers": providers}
+
+
+def _two_codex_session_target(sessions: list | None = None) -> dict:
+    return {"index": 1, "work_dir": "/tmp/project", "ccb_project_id": "abcd1234", "terminal": "tmux",
+            "providers": {"codex": {"alive": True, "mounted": False, "ambiguous": True,
+                                      "pane_id": "", "reason": "ambiguous_sessions"}},
+            "sessions": sessions or [_session({"codex": _live_status("live-a", "%28")}),
+                                      _session({"codex": _live_status("live-b", "%27")})]}
+
+
+def _no_delivery(bridge, monkeypatch) -> None:
+    for name in ("_send_to_daemon", "get_backend_for_session", "_acquire_lock"):
+        monkeypatch.setattr(bridge, name,
+                            lambda *_a, **_k: (_ for _ in ()).throw(
+                                AssertionError("delivery must not be attempted")))
+
+
+def test_bridge_live_id_selects_one_of_two_codex_sessions(monkeypatch) -> None:
+    bridge = _load_bridge_module()
+    captured: dict = {}
+    target = _two_codex_session_target([_session({"codex": _live_status("live-a", "%28")}),
+                                        _session({"codex": _live_status("live-b/opaque id", "%27")})])
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    monkeypatch.setattr(bridge, "_acquire_lock", lambda _hash, _provider: (_Lock(), _Fcntl()))
+    monkeypatch.setattr(bridge, "_send_to_daemon",
+                        lambda target, *_a, **_k: (captured.update(target=target), (0, "ok", {}))[1])
+
+    assert bridge.main(["--target", "1", "--provider", "codex", "--live-id", "live-b/opaque id", "hello"]) == 0
+    target = captured["target"]
+    assert target["peer_destination"] == {"pane_id": "%27", "terminal": "tmux", "work_dir": "/tmp/project",
+                                           "ccb_project_id": "abcd1234",
+                                           "pane_title_marker": "CCB-Codex-abcd1234-live-b/opaque id"}
+    assert target["providers"]["codex"]["live_id"] == "live-b/opaque id"
+    assert target["providers"]["codex"]["pane_id"] == "%27"
+
+
+@pytest.mark.parametrize(
+    ("target", "live_id", "expected"),
+    [
+        (_two_codex_session_target(), "live-zz", "matches no live codex session"),
+        (_two_codex_session_target([_session({"codex": _live_status("live-a", "%28")}),
+                                    _session({"claude": _live_status("live-c", "%30")})]),
+         "live-c", "belongs to a different provider"),
+        (_two_codex_session_target([_session({"codex": _live_status("live-a", "%28")}),
+                                    _session({"codex": _live_status("live-b", "%27", mounted=False,
+                                                                       reason="daemon_offline")})]),
+         "live-b", "not a usable codex session"),
+        (_two_codex_session_target([_session({"codex": _live_status("live-a", "%28")}),
+                                    _session({"codex": _live_status("live-b", "%27")}, alive=False)]),
+         "live-b", "no longer live"),
+        (_two_codex_session_target([_session({"codex": _live_status("live-a", "%28")}, session_id="ai-1"),
+                                    _session({"codex": _live_status("live-a", "%27")}, session_id="ai-2")]),
+         "live-a", "more than one live codex session"),
+        (_two_codex_session_target([_session({"codex": _live_status("live-a", "%28")}),
+                                    _session({"codex": _live_status("live-a", "%27", alive=False)})]),
+         "live-a", "more than one live codex session"),
+        (_two_codex_session_target([_session({"codex": _live_status("", "", alive=False, mounted=False,
+                                                                       marker="", reason="invalid_inventory")},
+                                              alive=False)]),
+         "live-a", "invalid live-session inventory"),
+    ],
+)
+def test_bridge_live_id_refuses_non_unique_or_unavailable_inventory(target, live_id, expected, monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    _no_delivery(bridge, monkeypatch)
+    assert bridge.main(["--target", "1", "--provider", "codex", "--live-id", live_id, "hello"]) == 1
+    assert expected in capsys.readouterr().err
+
+
+def _set_value(data: dict, path: tuple, value) -> None:
+    for key in path[:-1]:
+        data = data[key]
+    data[path[-1]] = value
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "expected"),
+    [
+        (("sessions", 0, "providers", "codex", "live_id"), 7, "non-string"),
+        (("sessions", 0, "providers", "codex", "pane_id"), 7, "non-string"),
+        (("sessions", 0, "providers", "codex", "terminal"), 7, "non-string"),
+        (("sessions", 0, "work_dir"), 7, "non-string"),
+        (("ccb_project_id",), 7, "non-string"),
+        (("sessions", 0, "providers", "codex", "pane_title_marker"), 7, "non-string"),
+        (("sessions", 0, "alive"), "false", "non-boolean"),
+        (("sessions", 0, "providers", "codex", "alive"), "false", "non-boolean"),
+        (("sessions", 0, "providers", "codex", "mounted"), "false", "non-boolean"),
+    ],
+)
+def test_bridge_live_id_rejects_malformed_inventory_fields(path, value, expected, monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    target = _two_codex_session_target([_session({"codex": _live_status("live-a", "%28")})])
+    _set_value(target, path, value)
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    _no_delivery(bridge, monkeypatch)
+    assert bridge.main(["--target", "1", "--provider", "codex", "--live-id", "live-a", "hello"]) == 1
+    assert expected in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [(("sessions", 0, "work_dir"), "/tmp/other-project"),
+     (("sessions", 0, "ccb_project_id"), "other-project"),
+     (("sessions", 0, "terminal"), "wezterm"),
+     (("sessions", 0, "providers", "codex", "pane_title_marker"), "other-marker")],
+)
+def test_bridge_live_id_rejects_conflicting_endpoint_identity(path, value, monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    target = _two_codex_session_target([_session({"codex": _live_status("live-a", "%28")})])
+    if path[-1] == "pane_title_marker":
+        target["sessions"][0]["pane_title_marker"] = "session-marker"
+    _set_value(target, path, value)
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    _no_delivery(bridge, monkeypatch)
+    assert bridge.main(["--target", "1", "--provider", "codex", "--live-id", "live-a", "hello"]) == 1
+    assert "conflicting" in capsys.readouterr().err
+
+
+def test_bridge_live_id_requires_complete_endpoint(monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    target = _two_codex_session_target([_session({"codex": _live_status("live-a", "%28")})])
+    target["ccb_project_id"] = ""
+    target["sessions"][0]["ccb_project_id"] = ""
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    _no_delivery(bridge, monkeypatch)
+    assert bridge.main(["--target", "1", "--provider", "codex", "--live-id", "live-a", "hello"]) == 1
+    assert "incomplete endpoint identity" in capsys.readouterr().err
+
+
+def test_bridge_live_id_without_pane_marker_refuses_before_lock(monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    target = _two_codex_session_target([_session({"codex": _live_status("live-a", "%28", marker="")})])
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [target])
+    _no_delivery(bridge, monkeypatch)
+    assert bridge.main(["--target", "1", "--provider", "codex", "--live-id", "live-a", "hello"]) == 1
+    assert "no CCB pane marker" in capsys.readouterr().err
+
+
+def test_bridge_live_id_rejected_with_reply_to(monkeypatch, capsys) -> None:
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(
+        bridge,
+        "_load_targets",
+        lambda: (_ for _ in ()).throw(AssertionError("must refuse before resolving")),
+    )
+
+    rc = bridge.main(
+        [
+            "--target",
+            "1",
+            "--provider",
+            "codex",
+            "--live-id",
+            "live-a",
+            "--reply-to",
+            "20260711-212112-453-72347",
+            "hello",
+        ]
+    )
+
+    assert rc == 1
+    assert "cannot be combined with --reply-to" in capsys.readouterr().err
+
+
+def test_bridge_without_live_id_still_refuses_ambiguous_sessions(monkeypatch, capsys) -> None:
+    """Item 6: with no selector, the existing refusal is unchanged even
+    though the inventory now names both candidates."""
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(bridge, "_load_targets", lambda: [_two_codex_session_target()])
+    _no_delivery(bridge, monkeypatch)
+
+    rc = bridge.main(["--target", "1", "--provider", "codex", "hello"])
+
+    assert rc == 1
+    assert "more than one live" in capsys.readouterr().err

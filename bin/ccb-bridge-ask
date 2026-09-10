@@ -141,6 +141,165 @@ def _resolve_target(entries: list[dict[str, Any]], target: str) -> dict[str, Any
     raise ValueError(f"no active CCB project matches target: {raw}")
 
 
+def _select_live_session_target(
+    target: dict[str, Any], provider: str, live_id: str
+) -> dict[str, Any]:
+    """Narrow a resolved peer project to the ONE live session the sender
+    named by `--live-id`, or refuse.
+
+    The aggregate `target["providers"][provider]` view deliberately reports
+    nothing usable when a project has several live sessions of a provider.
+    An explicit selector resolves that from the project's own authoritative
+    `sessions` list instead -- it NEVER falls back to the aggregate, and it
+    never picks among candidates: anything other than exactly one live,
+    mounted, fully-identified session of the requested provider fails
+    closed here, before the transport lock and before any send.
+    """
+    sessions = target.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        raise RuntimeError(
+            f"target project publishes no live session inventory; cannot honor --live-id {live_id}"
+        )
+
+    wanted = live_id.strip()
+    requested_matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    wrong_provider = False
+    rejected: list[str] = []
+    invalid_inventory = False
+
+    def _text(mapping: dict[str, Any], field: str, label: str) -> str:
+        if field not in mapping:
+            return ""
+        value = mapping[field]
+        if not isinstance(value, str):
+            raise RuntimeError(
+                f"target project session inventory has a non-string {label}; refusing --live-id"
+            )
+        return value.strip()
+
+    # Validate the JSON boundary before eligibility filtering. In particular,
+    # a stale or unmounted duplicate still counts as an identity occurrence;
+    # truthiness and str() coercion must never make malformed inventory usable.
+    for field in ("pane_id", "terminal", "work_dir", "ccb_project_id", "pane_title_marker"):
+        _text(target, field, f"target {field}")
+
+    for session in sessions:
+        if not isinstance(session, dict):
+            raise RuntimeError("target project session inventory is malformed; refusing --live-id")
+        if not isinstance(session.get("alive"), bool):
+            raise RuntimeError("target project session inventory has non-boolean session.alive; refusing --live-id")
+        for field in ("pane_id", "terminal", "work_dir", "ccb_project_id", "pane_title_marker"):
+            _text(session, field, f"session {field}")
+        providers = session.get("providers")
+        if not isinstance(providers, dict):
+            raise RuntimeError("target project session inventory is malformed; refusing --live-id")
+        for candidate_provider, status in providers.items():
+            if not isinstance(candidate_provider, str) or not isinstance(status, dict):
+                raise RuntimeError("target project session inventory is malformed; refusing --live-id")
+            if not isinstance(status.get("alive"), bool) or not isinstance(status.get("mounted"), bool):
+                raise RuntimeError(
+                    "target project session inventory has non-boolean provider state; refusing --live-id"
+                )
+            status_live_id = _text(status, "live_id", "provider live_id")
+            for field in ("pane_id", "terminal", "work_dir", "ccb_project_id", "pane_title_marker"):
+                _text(status, field, f"provider {field}")
+            if candidate_provider == provider and status.get("reason") == "invalid_inventory":
+                invalid_inventory = True
+            if status_live_id != wanted:
+                continue
+            if candidate_provider != provider:
+                wrong_provider = True
+            else:
+                # Cardinality is deliberately collected before this
+                # candidate's alive/mounted state is examined.
+                requested_matches.append((session, status))
+
+    if invalid_inventory:
+        raise RuntimeError(
+            f"target project has an invalid live-session inventory for {provider}; refusing --live-id {wanted}"
+        )
+    if len(requested_matches) > 1:
+        raise RuntimeError(
+            f"--live-id {wanted} matches more than one live {provider} session; refusing to guess"
+        )
+    if wrong_provider:
+        raise RuntimeError(
+            f"--live-id {wanted} belongs to a different provider in the target project"
+        )
+    if not requested_matches:
+        raise RuntimeError(
+            f"--live-id {wanted} matches no live {provider} session in the target project"
+        )
+
+    session, status = requested_matches[0]
+    if not session["alive"]:
+        rejected.append("its CCB session is no longer live")
+    elif not status["alive"]:
+        rejected.append("that pane is no longer alive")
+    elif not status["mounted"]:
+        reason = status.get("reason")
+        rejected.append(reason if isinstance(reason, str) and reason else "it is not mounted")
+    if rejected:
+        raise RuntimeError(
+            f"--live-id {wanted} is not a usable {provider} session: {rejected[0]}"
+        )
+
+    sources = (("target", target), ("session", session), ("provider", status))
+    endpoint: dict[str, str] = {}
+    for field in ("pane_id", "terminal", "work_dir", "ccb_project_id", "pane_title_marker"):
+        values = [(name, _text(mapping, field, f"{name} {field}")) for name, mapping in sources]
+        present = [(name, value) for name, value in values if value]
+        if not present:
+            endpoint[field] = ""
+            continue
+        first = present[0][1]
+        for name, value in present[1:]:
+            agrees = _same_path(first, value) if field == "work_dir" else (
+                first.lower() == value.lower() if field == "terminal" else first == value
+            )
+            if not agrees:
+                raise RuntimeError(
+                    f"--live-id {wanted} has conflicting {field} identity between {present[0][0]} and {name}; refusing to deliver"
+                )
+        endpoint[field] = first.lower() if field == "terminal" else first
+
+    pane_id = endpoint["pane_id"]
+    terminal = endpoint["terminal"]
+    work_dir = endpoint["work_dir"]
+    project_id = endpoint["ccb_project_id"]
+    marker = endpoint["pane_title_marker"]
+    # The same identity `peer_routing.revalidate_peer_destination` demands
+    # at askd's enqueue and send checkpoints. Missing it there would surface
+    # as a late delivery failure; refuse here instead, before the lock.
+    if not pane_id or not terminal or not work_dir or not project_id:
+        raise RuntimeError(
+            f"--live-id {wanted} has incomplete endpoint identity; refusing to deliver"
+        )
+    if terminal not in {"tmux", "wezterm"}:
+        raise RuntimeError(
+            f"--live-id {wanted} has unsupported terminal endpoint; refusing to deliver"
+        )
+    if terminal != "wezterm" and not marker:
+        raise RuntimeError(
+            f"--live-id {wanted} has no CCB pane marker; refusing to deliver"
+        )
+
+    selected = dict(target)
+    selected["work_dir"] = work_dir
+    selected["ccb_project_id"] = project_id
+    # Narrow a COPY: the aggregate providers map is shared with the rest of
+    # the ccb-list entry and must not be mutated by this selection.
+    selected["providers"] = {provider: dict(status)}
+    selected["peer_destination"] = {
+        "pane_id": pane_id,
+        "terminal": terminal,
+        "work_dir": work_dir,
+        "ccb_project_id": project_id,
+        "pane_title_marker": marker,
+    }
+    return selected
+
+
 def _correlated_reply_receipt(reply_to: str, target: str, provider: str) -> dict[str, Any] | None:
     if not reply_to:
         return None
@@ -461,6 +620,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--intent", choices=("wait", "background", "notify"), default="wait", help=argparse.SUPPRESS)
     parser.add_argument("--peer-task-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--reply-to", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--live-id",
+        default=None,
+        help="Deliver to this exact live session of the target provider.",
+    )
     parser.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
@@ -476,6 +640,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.reply_to and not PEER_CORRELATION_ID_RE.fullmatch(str(args.reply_to)):
         print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
+        return 1
+    live_id = args.live_id.strip() if isinstance(args.live_id, str) else ""
+    if args.live_id is not None and not live_id:
+        print("[ERROR] --live-id requires a live session ID", file=sys.stderr)
+        return 1
+    if live_id and args.reply_to:
+        # A correlated reply is pinned to the saved return session; a
+        # sender-supplied selector must never override that address.
+        print(
+            "[ERROR] --live-id cannot be combined with --reply-to; a correlated "
+            "reply is delivered to the saved return session",
+            file=sys.stderr,
+        )
         return 1
 
     reply_receipt: dict[str, Any] | None = None
@@ -496,7 +673,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise
             target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
 
-        if direct_backend is None:
+        if direct_backend is None and live_id:
+            # Item 4: an explicit selector resolves from the project's own
+            # session inventory and NEVER falls back to the aggregate
+            # provider view -- including its ambiguity refusal, which this
+            # selector exists to answer.
+            target = _select_live_session_target(target, args.provider, live_id)
+        elif direct_backend is None:
             provider_status = (target.get("providers") or {}).get(args.provider)
             provider_alive = isinstance(provider_status, dict) and bool(provider_status.get("alive"))
             provider_mounted = isinstance(provider_status, dict) and provider_status.get("mounted") is not False

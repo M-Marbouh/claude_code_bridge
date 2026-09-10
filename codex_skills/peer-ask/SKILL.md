@@ -34,8 +34,9 @@ EOF
 ```
 
 Use `--background` instead of `--notify` when the response asks a follow-up question or requests
-confirmation. If `CCB_PEER_TASK_ID` is missing, omit `--reply-to` rather than inventing an ID. Do not
-produce a local `CCB_DONE`; peer delivery is complete once the message reaches this pane.
+confirmation. If `CCB_PEER_TASK_ID` is missing, omit `--reply-to` rather than inventing an ID. Never
+add `--live-id` to a correlated reply: the receipt pins its return endpoint. Do not produce a local
+`CCB_DONE`; peer delivery is complete once the message reaches this pane.
 
 ## Send a Peer Request
 
@@ -47,14 +48,28 @@ Run:
 ccb-list --json
 ```
 
-Each project exposes `work_dir`, `ccb_project_id`, `peer_providers`, and detailed provider status.
-Only select a provider listed in `peer_providers`.
+Parse the fresh JSON array. Each project exposes `work_dir`, `ccb_project_id`, `providers`, and a
+`sessions` array. Do not discard a project because a provider is absent from aggregate
+`peer_providers`; inspect `sessions[].providers[provider]` when the aggregate is ambiguous or
+incomplete.
 
 If the user names Claude or Codex, require that provider. If no provider is named, prefer Claude for
 backward compatibility; when Claude is unavailable and Codex is the sole peer provider, select Codex.
 
 Match projects by remembered alias, exact directory basename, clear abbreviation, or list index. Ask
 the user only when multiple projects remain plausible.
+
+Within the selected project, inspect the requested provider's session offers. A usable candidate has
+an exact non-empty `live_id`, `alive: true`, and `mounted: true`. Preserve the existing unique-provider
+behavior: when exactly one usable candidate exists, send without a selector. When several live
+sessions of that provider exist, never guess. Use a user-supplied exact current `live_id`; or match a
+user-supplied `pane_id` or `live_slot` only within this project and provider, require exactly one
+current match, and immediately use that candidate's `live_id`. A `live_slot` is only a current display
+position, not durable identity.
+
+If no candidate can be mapped uniquely and safely, show concise candidates (`live_slot`, `pane_id`,
+`live_id`, mounted state) and ask which one. Do not infer a session from provider, pane, slot, order,
+title, history, or aliases; a remembered alias may identify only the project.
 
 ### 2. Choose intent
 
@@ -70,7 +85,17 @@ CCB_CALLER=codex ask <provider> --peer "<work_dir>" --background <<'EOF'
 EOF
 ```
 
-Use the exact `work_dir` returned by `ccb-list`.
+Use the exact `work_dir` returned by `ccb-list`. For an explicitly selected session, pass its identity
+as a discrete option:
+
+```bash
+CCB_CALLER=codex ask <provider> --peer "<work_dir>" --live-id "<live_id>" --background <<'EOF'
+<message>
+EOF
+```
+
+Never encode a selector in `work_dir` or message text. If the session is uniquely usable, omit
+`--live-id` for compatibility.
 
 - `CCB_ASYNC_SUBMITTED` for `--wait`: end the turn immediately.
 - `CCB_BACKGROUND_SUBMITTED`: continue current work; do not poll immediately.
@@ -80,7 +105,8 @@ Use the exact `work_dir` returned by `ccb-list`.
 ## Notes
 
 - Supported peer targets are Claude and Codex. Gemini and OpenCode remain same-project only.
-- If the remote project has multiple live sessions of the requested provider, the initial peer request is ambiguous and must fail; do not reinterpret it as a local “other session” request.
+- Multiple live sessions are an unresolved ambiguity, not an unconditional refusal: an exact current
+  session selection may use `--live-id`.
 - Claude and Codex peer messages are delivery-only; replies are explicit reverse peer messages.
 - A local Codex answer is never captured or forwarded merely because it followed an inbound peer message.
 - Do not narrate transport diagnostics unless delivery fails.

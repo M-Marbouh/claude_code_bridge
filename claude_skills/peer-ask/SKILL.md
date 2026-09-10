@@ -51,6 +51,7 @@ EOF
 
 If the result needs a follow-up answer, replace `--notify` with `--background`. Preserve `--reply-to` in either case.
 For legacy inbound messages without `CCB_PEER_TASK_ID`, omit `--reply-to` rather than inventing an ID.
+Do not add `--live-id` to a correlated reply: the receipt pins the return endpoint.
 
 Do not add a local `CCB_DONE` for the inbound peer delivery. CCB treats peer delivery as complete once the message lands in your pane; the real answer is the reverse `ask --peer` message.
 
@@ -60,12 +61,14 @@ Do not add a local `CCB_DONE` for the inbound peer delivery. CCB treats peer del
 Bash(ccb-list --json)
 ```
 
-Parse the JSON array. Each entry has: `index`, `work_dir`, `ccb_project_id`, `peer_providers`, and
-provider status under `providers`.
+Parse this fresh JSON array. Each entry has: `index`, `work_dir`, `ccb_project_id`, `providers`, and
+a `sessions` array. Do not discard a project because a provider is absent from aggregate
+`peer_providers`; inspect `sessions[].providers[provider]` when the aggregate is ambiguous or
+incomplete.
 
-Filter to entries where the requested provider appears in `peer_providers`. If the user did not name a
-provider, prefer Claude for compatibility; if Claude is unavailable and Codex is the sole peer provider,
-select Codex.
+If the user names Claude or Codex, require that provider. If the user did not name a provider, prefer
+Claude for compatibility; if Claude is unavailable and Codex is the sole usable peer provider, select
+Codex.
 
 ### Step 2 — Match the target project
 
@@ -88,6 +91,18 @@ Which project did you mean? (reply with number or name)
 ```
 Wait for user selection before continuing.
 
+After selecting the project, inspect `sessions[].providers[provider]`. A usable candidate has an exact
+non-empty `live_id`, `alive: true`, and `mounted: true`. If exactly one usable candidate exists and
+provider identity is unambiguous, keep the ordinary `ask <provider> --peer <work_dir>` form.
+
+If multiple live sessions of the requested provider exist, never guess. Use a user-supplied exact
+current `live_id`; or match a supplied `pane_id` or `live_slot` only within this project and provider,
+require exactly one current match, and immediately convert it to that candidate's `live_id`.
+`live_slot` is a current display position, not durable identity. If mapping is not unique and safe,
+show concise candidates (`live_slot`, `pane_id`, `live_id`, mounted state) and ask which one. Do not
+infer a session from provider, pane, slot, order, title, history, or aliases; a remembered alias may
+identify only the project.
+
 ### Step 3 — Remember the alias
 
 Once a target is confirmed (by match or user selection), save the alias for this session:
@@ -108,7 +123,18 @@ EOF
 )
 ```
 
-Use the exact `work_dir` from `ccb-list --json` as the target. Pass the full message the user wanted to convey.
+Use the exact `work_dir` from the fresh `ccb-list --json` output and pass the full message the user
+wanted to convey. For an explicitly selected session, add a discrete option:
+
+```bash
+Bash(CCB_CALLER=claude ask <provider> --peer "<work_dir>" --live-id "<live_id>" --background <<'EOF'
+<message>
+EOF
+)
+```
+
+Never encode a selector in `work_dir` or message text. Omit `--live-id` when the usable provider
+candidate is unique.
 
 - For `--wait`, follow the Async Guardrail and end the turn when `CCB_ASYNC_SUBMITTED` appears.
 - For `--background`, `CCB_BACKGROUND_SUBMITTED` means continue the current plan; do not stop or call `pend` immediately.
@@ -137,7 +163,8 @@ User: "Ask Claude in project 3 about the current task"
 
 - Claude and Codex panes are supported. Gemini and OpenCode are not peer targets.
 - If the requested provider is not mounted, report the error and show the live provider options.
-- If the remote project has multiple live sessions of the requested provider, the initial peer request is ambiguous and must fail; do not reinterpret it as a local “other session” request.
+- Multiple live sessions are an unresolved ambiguity, not an unconditional refusal: an exact current
+  selection may use `--live-id`.
 - The `--peer` flag accepts the full `work_dir` path — always use path form for reliability.
 - Reply-bearing inbound messages include `CCB_REPLY_TARGET: <sender_work_dir>`. Use it as the direct reply path and choose `--notify` or `--background` according to whether your response requests a follow-up.
 - Preserve `CCB_PEER_TASK_ID` as `--reply-to` so the response is correlated with the original consultation.

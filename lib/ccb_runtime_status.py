@@ -219,6 +219,62 @@ def _daemon_project_runtime_status(
         raise RuntimeError(f"askd returned an invalid runtime status: {exc}") from exc
 
 
+def daemon_queue_status(work_dir: Path, provider: str = "") -> list[dict]:
+    """Ask the running askd for each provider queue's depth and in-flight task."""
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=work_dir,
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
+    if not state or not str(state.get("token") or ""):
+        raise RuntimeError("Unified askd daemon state is unavailable")
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"queue-status-{os.getpid()}",
+        "token": str(state.get("token")),
+        "operation": "queue_status",
+        "provider": provider,
+    }
+    response = askd_rpc.request_daemon(state, request, connect_timeout_s=2.0, response_timeout_s=8.0)
+    if response.get("type") != "ask.response" or int(response.get("exit_code", 1)) != 0:
+        raise RuntimeError(str(response.get("reply") or "askd rejected queue status"))
+    queues = response.get("queues")
+    if not isinstance(queues, list):
+        raise RuntimeError("askd does not report queue status (restart it to pick up this version)")
+    return [q for q in queues if isinstance(q, dict)]
+
+
+def describe_queue_status(queues: list[dict], *, stuck_after_s: float = 600.0) -> tuple[bool, str]:
+    """Summarize provider queues as (stuck, one line).
+
+    Stuck means a delivered task has gone quiet without finishing: the
+    adapter flagged it, or it has run longer than `stuck_after_s` with
+    other requests waiting behind it.
+    """
+    busy = [q for q in queues if q.get("in_flight")]
+    waiting = sum(int(q.get("waiting") or 0) for q in queues)
+    if not busy:
+        return False, f"queue: idle, {waiting} waiting" if waiting else "queue: idle"
+    parts: list[str] = []
+    stuck = False
+    for q in busy:
+        task = q["in_flight"]
+        progress = task.get("progress") or {}
+        running = float(task.get("running_s") or 0.0)
+        phase = str(progress.get("phase") or "running")
+        task_stuck = bool(progress.get("stalled")) or (running >= stuck_after_s and int(q.get("waiting") or 0) > 0)
+        stuck = stuck or task_stuck
+        label = "STUCK" if task_stuck else "busy"
+        parts.append(
+            f"{label}: task {task.get('req_id')} {phase} for {int(running)}s, "
+            f"{int(q.get('waiting') or 0)} waiting behind it"
+        )
+    return stuck, "queue: " + "; ".join(parts)
+
+
 def daemon_work_dir_from_state(state: dict[str, Any] | None, *, fallback: str | Path | None = None) -> Path:
     """Return a valid daemon project root, or the caller's work directory."""
     fallback_path = Path(fallback or Path.cwd()).expanduser()

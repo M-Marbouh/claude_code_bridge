@@ -20,6 +20,8 @@ sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
 from ccb_runtime_status import (
+    daemon_queue_status,
+    describe_queue_status,
     inside_managed_codex_sandbox,
     provider_status_for_target,
     resolve_daemon_work_dir,
@@ -59,6 +61,35 @@ def _resolve_work_dir(session_file: str | None) -> Path:
     return p.parent
 
 
+def _queue_report(provider: str, work_dir: Path) -> tuple[bool, str]:
+    """(stuck, line) for the provider's request queue in the project daemon.
+
+    Connectivity alone cannot show a queue blocked behind a task that was
+    delivered but never finished, so ping reports the queue separately.
+    """
+    try:
+        queues = daemon_queue_status(work_dir, provider)
+    except Exception as exc:
+        return False, f"queue: unknown ({exc})"
+    try:
+        stuck_after = float(os.environ.get("CCB_PING_STUCK_AFTER_S", "600") or 600)
+    except ValueError:
+        stuck_after = 600.0
+    return describe_queue_status(queues, stuck_after_s=stuck_after)
+
+
+def _finish(provider: str, work_dir: Path, healthy: bool) -> int:
+    stuck, line = _queue_report(provider, work_dir)
+    print(line)
+    if stuck:
+        print(
+            f"❌ {provider.capitalize()} is connected but its request queue is stuck; "
+            "new requests will wait behind the task above."
+        )
+        return 1
+    return 0 if healthy else 1
+
+
 def main():
     if len(sys.argv) < 2:
         _usage()
@@ -94,7 +125,7 @@ def main():
             return 1
         if status.mounted:
             print(f"✅ {provider.capitalize()} connection OK (host runtime verified)")
-            return 0
+            return _finish(provider, status_work_dir, True)
         print(f"❌ {provider.capitalize()} connection error: {status.reason or 'not_mounted'}")
         return 1
 
@@ -133,7 +164,13 @@ def main():
         comm = comm_class()
         healthy, message = comm.ping(display=False)
         print(message)
-        return 0 if healthy else 1
+        if not healthy:
+            return 1
+        try:
+            queue_work_dir = work_dir if args.session_file else resolve_daemon_work_dir(work_dir)
+        except Exception:
+            queue_work_dir = work_dir
+        return _finish(provider, queue_work_dir, healthy)
     except ImportError as e:
         print(f"[ERROR] Module import failed: {e}", file=sys.stderr)
         return 1

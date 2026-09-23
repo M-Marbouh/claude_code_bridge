@@ -74,50 +74,74 @@ def _load_claude_skills() -> str:
     return _SKILL_CACHE
 
 
-def extract_reply_for_req(text: str, req_id: str) -> str:
-    """
-    Extract the reply segment for req_id from a Claude message.
+def _reply_bounds(lines: list[str], req_id: str) -> tuple[int, int | None] | None:
+    """Locate this request's reply as (first line, done-line index or None).
 
-    Claude sometimes emits multiple replies in a single assistant message, each ending with its own
-    `CCB_DONE: <req_id>` line. In that case, we want only the segment between the previous done line
-    (any req_id) and the done line for our req_id.
+    Pairs the latest `CCB_BEGIN: <req_id>` that is followed by a done line
+    with the FIRST done line after it. When a stalled request is released
+    turns later by a bare `CCB_DONE`, this keeps the original reply and
+    drops the unrelated turns in between. A BEGIN with no done line yet
+    (the reply was never finished) runs to the end of the text.
     """
-    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
-    if not lines:
-        return ""
-
-    # Find last done-line index for this req_id (may not be last line if the model misbehaves).
     target_re = re.compile(rf"^\s*CCB_DONE:\s*{re.escape(req_id)}\s*$", re.IGNORECASE)
     begin_re = re.compile(rf"^\s*{re.escape(BEGIN_PREFIX)}\s*{re.escape(req_id)}\s*$", re.IGNORECASE)
-    done_idxs = [i for i, ln in enumerate(lines) if ANY_DONE_LINE_RE.match(ln or "")]
-    target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
+    target_idxs = [i for i, ln in enumerate(lines) if target_re.match(ln or "")]
+    done_idxs = sorted(set(target_idxs) | {i for i, ln in enumerate(lines) if ANY_DONE_LINE_RE.match(ln or "")})
+    begin_idxs = [i for i, ln in enumerate(lines) if begin_re.match(ln or "")]
 
-    if not target_idxs:
-        # Fallback: keep existing behavior (strip only if the last line matches).
-        return strip_done_text(text, req_id)
+    for begin_i in reversed(begin_idxs):
+        after = [i for i in target_idxs if i > begin_i]
+        if after:
+            return begin_i + 1, after[0]
+    if target_idxs:
+        # No BEGIN line: the reply runs from the previous done line (any req_id).
+        target_i = target_idxs[-1]
+        prev_done_i = max((i for i in done_idxs if i < target_i), default=-1)
+        return prev_done_i + 1, target_i
+    if begin_idxs:
+        return begin_idxs[-1] + 1, None
+    return None
 
-    target_i = target_idxs[-1]
-    begin_i = None
-    for i in range(target_i - 1, -1, -1):
-        if begin_re.match(lines[i] or ""):
-            begin_i = i
-            break
 
-    if begin_i is not None:
-        segment = lines[begin_i + 1 : target_i]
-    else:
-        prev_done_i = -1
-        for i in reversed(done_idxs):
-            if i < target_i:
-                prev_done_i = i
-                break
-        segment = lines[prev_done_i + 1 : target_i]
-    # Trim leading/trailing blank lines for nicer output.
+def _trim_blank_edges(segment: list[str]) -> str:
     while segment and segment[0].strip() == "":
         segment = segment[1:]
     while segment and segment[-1].strip() == "":
         segment = segment[:-1]
     return "\n".join(segment).rstrip()
+
+
+def extract_reply_for_req(text: str, req_id: str) -> str:
+    """
+    Extract the reply segment for req_id from Claude's assistant text.
+
+    Claude sometimes emits multiple replies in a single assistant message, each ending with its own
+    `CCB_DONE: <req_id>` line; each request gets only its own segment. Text after the done line is
+    never part of the reply (see `extract_trailing_for_req`).
+    """
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+    if not lines:
+        return ""
+    bounds = _reply_bounds(lines, req_id)
+    if bounds is None:
+        # No markers for this request at all: keep the legacy strip behavior.
+        return strip_done_text(text, req_id)
+    start, done_i = bounds
+    return _trim_blank_edges(lines[start : done_i if done_i is not None else len(lines)])
+
+
+def extract_trailing_for_req(text: str, req_id: str) -> str:
+    """Text Claude wrote after this request's done line, up to its next marker."""
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+    bounds = _reply_bounds(lines, req_id)
+    if bounds is None or bounds[1] is None:
+        return ""
+    trailing: list[str] = []
+    for ln in lines[bounds[1] + 1 :]:
+        if ANY_DONE_LINE_RE.match(ln or "") or ln.strip().startswith(BEGIN_PREFIX):
+            break
+        trailing.append(ln)
+    return _trim_blank_edges(trailing)
 
 
 def wrap_claude_prompt(message: str, req_id: str) -> str:
@@ -142,6 +166,8 @@ def wrap_claude_prompt(message: str, req_id: str) -> str:
         f"{BEGIN_PREFIX} {req_id}\n"
         "<reply>\n"
         f"{DONE_PREFIX} {req_id}\n"
+        "\n"
+        f"Nothing may follow the {DONE_PREFIX} line; put any other notes before {BEGIN_PREFIX}.\n"
     )
 
 
@@ -187,6 +213,7 @@ class LaskdResult:
 __all__ = [
     "wrap_claude_prompt",
     "extract_reply_for_req",
+    "extract_trailing_for_req",
     "LaskdRequest",
     "LaskdResult",
     "make_req_id",

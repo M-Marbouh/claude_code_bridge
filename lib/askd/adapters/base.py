@@ -288,6 +288,9 @@ class QueuedTask:
     result: Optional[ProviderResult] = None
     cancelled: bool = False  # Cancellation flag for timeout/expiry
     cancel_event: Optional[threading.Event] = None  # Event for cooperative cancellation
+    # Adapter-reported progress of the in-flight task (phase, timestamps),
+    # read by the daemon's queue status so a stuck queue is visible.
+    progress: dict = field(default_factory=dict)
 
 
 class BaseProviderAdapter(ABC):

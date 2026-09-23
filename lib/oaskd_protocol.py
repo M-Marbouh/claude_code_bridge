@@ -18,7 +18,7 @@ def wrap_opencode_prompt(message: str, req_id: str) -> str:
         f"{message}\n\n"
         "IMPORTANT:\n"
         "- Reply normally, in English.\n"
-        "- End your reply with this exact final line (verbatim, on its own line):\n"
+        "- End your reply with this exact final line (verbatim, on its own line). Nothing may follow it:\n"
         f"{DONE_PREFIX} {req_id}\n"
     )
 

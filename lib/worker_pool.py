@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Callable, Generic, Optional, Protocol, TypeVar
 
 
@@ -23,12 +24,28 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
         self.session_key = session_key
         self._q: "queue.Queue[TaskT]" = queue.Queue()
         self._stop_event = threading.Event()
+        self._current: Optional[TaskT] = None
+        self._current_started_at: Optional[float] = None
 
     def enqueue(self, task: TaskT) -> None:
         self._q.put(task)
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def queue_snapshot(self) -> dict:
+        """What this worker is doing now: the in-flight task and how many wait behind it."""
+        current = self._current
+        started = self._current_started_at
+        in_flight = None
+        if current is not None:
+            progress = getattr(current, "progress", None)
+            in_flight = {
+                "req_id": getattr(current, "req_id", ""),
+                "running_s": round(time.time() - started, 1) if started else None,
+                "progress": dict(progress) if isinstance(progress, dict) else {},
+            }
+        return {"session_key": self.session_key, "waiting": self._q.qsize(), "in_flight": in_flight}
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -42,11 +59,15 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
                 task.done_event.set()
                 continue
 
+            self._current = task
+            self._current_started_at = time.time()
             try:
                 task.result = self._handle_task(task)
             except Exception as exc:
                 task.result = self._handle_exception(exc, task)
             finally:
+                self._current = None
+                self._current_started_at = None
                 task.done_event.set()
 
     def _handle_task(self, task: TaskT) -> ResultT:
@@ -63,6 +84,10 @@ class PerSessionWorkerPool(Generic[WorkerT]):
     def __init__(self):
         self._lock = threading.Lock()
         self._workers: dict[str, WorkerT] = {}
+
+    def workers(self) -> list[WorkerT]:
+        with self._lock:
+            return list(self._workers.values())
 
     def get_or_create(self, session_key: str, factory: Callable[[str], WorkerT]) -> WorkerT:
         created = False

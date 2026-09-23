@@ -218,6 +218,21 @@ class _UnifiedWorkerPool:
         return task
 
 
+def _queue_entries(pools: Dict[str, PerSessionWorkerPool[_SessionWorker]], provider: str = "") -> list[dict]:
+    entries: list[dict] = []
+    for key, pool in sorted(pools.items()):
+        if provider and key != provider:
+            continue
+        for worker in pool.workers():
+            try:
+                snapshot = worker.queue_snapshot()
+            except Exception:
+                continue
+            snapshot["provider"] = key
+            entries.append(snapshot)
+    return entries
+
+
 class UnifiedAskDaemon:
     """
     Unified daemon server for all AI providers.
@@ -250,6 +265,8 @@ class UnifiedAskDaemon:
             return self._handle_list_projects(msg)
         if operation == "runtime_status":
             return self._handle_runtime_status(msg)
+        if operation == "queue_status":
+            return self._handle_queue_status(msg)
         if operation == "resolve_route":
             return self._handle_resolve_route(msg)
         if operation == "peer_identify_sender":
@@ -469,6 +486,20 @@ class UnifiedAskDaemon:
             "exit_code": 0,
             "reply": "",
             "entries": entries,
+        }
+
+    def _handle_queue_status(self, msg: dict) -> dict:
+        """Per-provider queue depth and the in-flight task, so a stuck queue is visible."""
+        provider = str(msg.get("provider") or "").strip().lower()
+        with self.pool._lock:
+            pools = dict(self.pool._pools)
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0,
+            "reply": "",
+            "queues": _queue_entries(pools, provider),
         }
 
     def _handle_runtime_status(self, msg: dict) -> dict:

@@ -140,6 +140,23 @@ def _extract_content_text(content: Any) -> Optional[str]:
     return "\n".join(texts).strip()
 
 
+# Event role emitted when the transcript records that Claude's turn is over.
+TURN_END_EVENT = "turn_end"
+# Claude Code writes a `system` entry with this subtype after every finished
+# turn, after any Stop hooks ran. An assistant `stop_reason: end_turn` is not
+# used: it is stamped on each content block and precedes Stop hooks, which can
+# still make Claude continue.
+_TURN_END_SYSTEM_SUBTYPES = frozenset({"turn_duration"})
+
+
+def _is_turn_end_entry(entry: dict) -> bool:
+    if not isinstance(entry, dict) or entry.get("isSidechain"):
+        return False
+    if str(entry.get("type") or "").strip().lower() != "system":
+        return False
+    return str(entry.get("subtype") or "").strip().lower() in _TURN_END_SYSTEM_SUBTYPES
+
+
 def _extract_message(entry: dict, role: str) -> Optional[str]:
     if not isinstance(entry, dict):
         return None
@@ -684,6 +701,9 @@ class ClaudeLogReader:
             try:
                 entry = json.loads(line.decode("utf-8", errors="replace"))
             except Exception:
+                continue
+            if _is_turn_end_entry(entry):
+                events.append((TURN_END_EVENT, ""))
                 continue
             user_msg = _extract_message(entry, "user")
             if user_msg:

@@ -21,7 +21,8 @@ from completion_hook import (
     notify_completion,
 )
 from env_utils import env_bool
-from oaskd_protocol import is_done_text, strip_done_text, wrap_opencode_prompt
+from ccb_protocol import append_trailing_notice, split_done_text
+from oaskd_protocol import is_done_text, wrap_opencode_prompt
 from oaskd_session import load_project_session
 from opencode_comm import OpenCodeLogReader
 from process_lock import ProviderLock
@@ -190,6 +191,11 @@ class OpenCodeAdapter(BaseProviderAdapter):
 
         pane_check_interval = float(os.environ.get("CCB_OASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
+        # OpenCode logs give no end-of-turn record. Output that has stopped
+        # changing for this long counts as a finished turn, so a whole-line
+        # marker followed by extra prose still completes the request.
+        settle_s = float(os.environ.get("CCB_OASKD_DONE_SETTLE_S", "10.0"))
+        last_change_at = time.time()
 
         while True:
             # Check for cancellation
@@ -224,7 +230,16 @@ class OpenCodeAdapter(BaseProviderAdapter):
 
             reply, state = log_reader.wait_for_message(state, wait_step)
             if not reply:
+                if (
+                    chunks
+                    and time.time() - last_change_at >= settle_s
+                    and is_done_text("\n".join(chunks), task.req_id, turn_ended=True)
+                ):
+                    done_seen = True
+                    done_ms = _now_ms() - started_ms
+                    break
                 continue
+            last_change_at = time.time()
             chunks.append(reply)
             combined = "\n".join(chunks)
             if is_done_text(combined, task.req_id):
@@ -233,7 +248,8 @@ class OpenCodeAdapter(BaseProviderAdapter):
                 break
 
         combined = "\n".join(chunks)
-        final_reply = strip_done_text(combined, task.req_id)
+        final_reply, trailing = split_done_text(combined, task.req_id)
+        final_reply = append_trailing_notice(final_reply, trailing)
         status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
         if task.cancelled:
             status = COMPLETION_STATUS_CANCELLED

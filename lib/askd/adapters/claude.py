@@ -20,7 +20,7 @@ from askd.adapters.base import (
 )
 from askd_runtime import log_path, write_log
 from ccb_protocol import BEGIN_PREFIX, REQ_ID_PREFIX
-from claude_comm import ClaudeLogReader
+from claude_comm import TURN_END_EVENT, ClaudeLogReader
 from completion_hook import (
     COMPLETION_STATUS_CANCELLED,
     COMPLETION_STATUS_COMPLETED,
@@ -30,7 +30,14 @@ from completion_hook import (
     notify_completion,
 )
 from laskd_registry import get_session_registry
-from laskd_protocol import extract_reply_for_req, is_done_text, wrap_claude_delivery_prompt, wrap_claude_prompt
+from ccb_protocol import append_trailing_notice
+from laskd_protocol import (
+    extract_reply_for_req,
+    extract_trailing_for_req,
+    is_done_text,
+    wrap_claude_delivery_prompt,
+    wrap_claude_prompt,
+)
 from laskd_session import ClaudeProjectSession, compute_session_key, load_project_session
 from pane_registry import session_data_from_live, upsert_registry, validate_route
 from project_id import compute_ccb_project_id
@@ -46,6 +53,31 @@ def _now_ms() -> int:
 
 def _write_log(line: str) -> None:
     write_log(log_path(LASKD_SPEC.log_file_name), line)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _has_begin_line(text: str, req_id: str) -> bool:
+    begin_re = re.compile(rf"^\s*{re.escape(BEGIN_PREFIX)}\s*{re.escape(req_id)}\s*$", re.MULTILINE)
+    return bool(begin_re.search(text or ""))
+
+
+def _warn_if_unbound_transcript(session: Any, anchor_session: Path, req_id: str) -> None:
+    """Log when a request lands in a Claude transcript other than the bound one."""
+    try:
+        bound = str(session.data.get("claude_session_path") or "").strip()
+    except Exception:
+        return
+    if bound and bound != str(anchor_session):
+        _write_log(
+            f"[WARN] claude req_id={req_id} delivered to transcript {anchor_session} "
+            f"but the binding names {bound}; it will be rebound on completion"
+        )
 
 
 def _tail_state_for_log(log_path_val: Optional[Path], *, tail_bytes: int) -> dict:
@@ -830,6 +862,16 @@ class ClaudeAdapter(BaseProviderAdapter):
         # seen (a timeout must not silently lose proof it already had).
         session_path_at_anchor: Optional[Path] = None
         session_id_at_anchor: Optional[str] = None
+        # A turn that ends without this request's marker is normal when Claude
+        # is waiting on work it delegated (e.g. "Codex processing..."), so it
+        # does not end the task. It is recorded so status output can show it.
+        unmarked_reply = False
+        stall_warn_s = _env_float("CCB_LASKD_STALL_WARN_S", 600.0)
+        stall_warned = False
+        progress = getattr(task, "progress", None)
+        if not isinstance(progress, dict):
+            progress = {}
+        progress.update({"phase": "sent", "sent_at": time.time()})
 
         anchor_grace_deadline = min(deadline, time.time() + 1.5) if deadline else (time.time() + 1.5)
         rebounded = False
@@ -870,6 +912,19 @@ class ClaudeAdapter(BaseProviderAdapter):
                     )
                 last_pane_check = time.time()
 
+            if (
+                anchor_seen
+                and not stall_warned
+                and stall_warn_s > 0
+                and time.time() - float(progress.get("last_activity_at") or time.time()) >= stall_warn_s
+            ):
+                stall_warned = True
+                progress["stalled"] = True
+                _write_log(
+                    f"[WARN] claude req_id={task.req_id} has had no transcript activity for "
+                    f"{int(stall_warn_s)}s without CCB_DONE; the queue behind it is blocked"
+                )
+
             events, state = log_reader.wait_for_events(state, wait_step)
             if not events:
                 if (not rebounded) and (not anchor_seen) and time.time() >= anchor_grace_deadline:
@@ -884,6 +939,7 @@ class ClaudeAdapter(BaseProviderAdapter):
                 if role == "user":
                     if f"{REQ_ID_PREFIX} {task.req_id}" in text:
                         anchor_seen = True
+                        progress.update({"phase": "delivered", "anchor_at": time.time(), "last_activity_at": time.time()})
                         if anchor_ms is None:
                             anchor_ms = _now_ms() - started_ms
                         if session_path_at_anchor is None:
@@ -891,11 +947,37 @@ class ClaudeAdapter(BaseProviderAdapter):
                             if isinstance(anchor_session, Path):
                                 session_path_at_anchor = anchor_session
                                 session_id_at_anchor = anchor_session.stem
-                    continue
-                if role != "assistant":
+                                _warn_if_unbound_transcript(session, anchor_session, task.req_id)
+                    elif anchor_seen:
+                        progress["last_activity_at"] = time.time()
                     continue
                 if not anchor_seen:
                     continue
+                if role == TURN_END_EVENT:
+                    combined = "\n".join(chunks)
+                    progress["last_activity_at"] = time.time()
+                    if is_done_text(combined, task.req_id, turn_ended=True):
+                        done_seen = True
+                        done_ms = _now_ms() - started_ms
+                        break
+                    if _has_begin_line(combined, task.req_id):
+                        # Claude wrote this request's reply but ended its
+                        # turn without the marker: nothing more is coming.
+                        unmarked_reply = True
+                        _write_log(
+                            f"[WARN] claude req_id={task.req_id} turn ended after CCB_BEGIN without CCB_DONE; "
+                            "releasing as incomplete"
+                        )
+                        break
+                    progress.update({"phase": "turn_ended_without_marker", "unmarked_turn_end_at": time.time()})
+                    _write_log(
+                        f"[INFO] claude req_id={task.req_id} turn ended without CCB_DONE; still waiting"
+                    )
+                    continue
+                if role != "assistant":
+                    continue
+                progress.update({"phase": "replying", "last_activity_at": time.time()})
+                progress.pop("unmarked_turn_end_at", None)
                 chunks.append(text)
                 combined = "\n".join(chunks)
                 if is_done_text(combined, task.req_id):
@@ -903,17 +985,33 @@ class ClaudeAdapter(BaseProviderAdapter):
                     done_ms = _now_ms() - started_ms
                     break
 
-            if done_seen:
+            if done_seen or unmarked_reply:
                 break
 
         combined = "\n".join(chunks)
         final_reply = extract_reply_for_req(combined, task.req_id)
+        if done_seen:
+            final_reply = append_trailing_notice(final_reply, extract_trailing_for_req(combined, task.req_id))
+        elif unmarked_reply:
+            final_reply = (
+                f"{final_reply}\n\n[CCB warning: Claude ended its turn without the CCB_DONE line for this "
+                "request, so this reply may be incomplete.]"
+            ).strip()
 
         session_path = None
         session_id = None
         if done_seen:
             session_path = state.get("session_path") if isinstance(state, dict) else None
             session_id = session_path.stem if isinstance(session_path, Path) else None
+            try:
+                old_binding = str(session.data.get("claude_session_path") or "")
+                if isinstance(session_path, Path) and old_binding and old_binding != str(session_path):
+                    _write_log(
+                        f"[INFO] claude binding change req_id={task.req_id} pane={session.pane_id or ''} "
+                        f"old={old_binding} new={session_path}"
+                    )
+            except Exception:
+                pass
             try:
                 session.update_claude_binding(
                     session_path=session_path if isinstance(session_path, Path) else None,

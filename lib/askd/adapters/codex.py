@@ -648,7 +648,9 @@ class CodexAdapter(BaseProviderAdapter):
 
             chunks.append(text)
             combined = "\n".join(chunks)
-            done_now = is_done_text(text, task.req_id)
+            # A final_answer record is Codex's complete last message of the
+            # turn, so a whole-line marker in it counts even if prose follows.
+            done_now = is_done_text(text, task.req_id, turn_ended=(phase == "final_answer"))
             # Keep only the latest canonical final for degraded idle completion.
             # The event_msg twin carrying CCB_DONE arrives before its canonical
             # final_answer record, so the DONE-bearing event is authoritative.

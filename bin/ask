@@ -1774,7 +1774,7 @@ def main(argv: list[str]) -> int:
         if rc != EXIT_OK:
             _append_task_status_line(status_file, f"failed exit_code={rc}")
             return rc
-        _append_task_status_line(status_file, "accepted by host daemon")
+        _append_task_status_line(status_file, "queued by host daemon (not yet delivered)")
         print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
         print(f"{display_name(provider)} processing (task: {task_id})")
         print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")

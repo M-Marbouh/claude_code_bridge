@@ -92,3 +92,47 @@ def test_ccb_ping_uses_daemon_project_root_for_implicit_managed_target(
     assert rc == 0
     assert seen == [project]
     assert "host runtime verified" in capsys.readouterr().out
+
+
+def test_ccb_ping_fails_when_connected_provider_queue_is_stuck(monkeypatch, capsys) -> None:
+    ping = _load_ping_module()
+    monkeypatch.setattr(sys, "argv", ["ccb-ping", "claude"])
+    monkeypatch.setattr(ping, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(ping, "resolve_daemon_work_dir", lambda work_dir: work_dir)
+    monkeypatch.setattr(ping, "provider_status_for_target", lambda *_args, **_kwargs: _status(mounted=True))
+    stuck_queue = [
+        {
+            "provider": "claude",
+            "waiting": 2,
+            "in_flight": {
+                "req_id": "20260923-195638-295-2386635-3",
+                "running_s": 900,
+                "progress": {"phase": "turn_ended_without_marker", "stalled": True},
+            },
+        }
+    ]
+    monkeypatch.setattr(ping, "daemon_queue_status", lambda *_args, **_kwargs: stuck_queue)
+
+    rc = ping.main()
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "STUCK" in out and "20260923-195638-295-2386635-3" in out
+
+
+def test_ccb_ping_reports_unknown_queue_without_failing(monkeypatch, capsys) -> None:
+    ping = _load_ping_module()
+    monkeypatch.setattr(sys, "argv", ["ccb-ping", "claude"])
+    monkeypatch.setattr(ping, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(ping, "resolve_daemon_work_dir", lambda work_dir: work_dir)
+    monkeypatch.setattr(ping, "provider_status_for_target", lambda *_args, **_kwargs: _status(mounted=True))
+
+    def _no_daemon(*_args, **_kwargs):
+        raise RuntimeError("Unified askd daemon state is unavailable")
+
+    monkeypatch.setattr(ping, "daemon_queue_status", _no_daemon)
+
+    rc = ping.main()
+
+    assert rc == 0
+    assert "queue: unknown" in capsys.readouterr().out

@@ -65,7 +65,7 @@ def wrap_codex_prompt(message: str, req_id: str) -> str:
         "- Reply normally.\n"
         "- Reply normally, in English.\n"
         "- The marker-bearing reply is the sole delivered result; make it self-contained and do not repeat interim reports.\n"
-        "- End your reply with this exact final line (verbatim, on its own line):\n"
+        "- End your reply with this exact final line (verbatim, on its own line). Nothing may follow it:\n"
         f"{DONE_PREFIX} {req_id}\n"
     )
 
@@ -90,13 +90,66 @@ def done_line_re(req_id: str) -> re.Pattern[str]:
     return re.compile(DONE_LINE_RE_TEMPLATE.format(req_id=re.escape(req_id)))
 
 
-def is_done_text(text: str, req_id: str) -> bool:
+def find_done_line(text: str, req_id: str) -> int | None:
+    """Index of the last line that is exactly `CCB_DONE: <req_id>`, or None.
+
+    Only a whole line counts: a marker quoted mid-sentence or in backticks
+    never matches.
+    """
+    pattern = done_line_re(req_id)
+    lines = (text or "").splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if pattern.match(lines[i] or ""):
+            return i
+    return None
+
+
+def is_done_text(text: str, req_id: str, *, turn_ended: bool = False) -> bool:
+    """Whether `text` completes `req_id`.
+
+    While the provider may still be writing, the marker must be the last
+    meaningful line: an earlier marker could be followed by more reply, and
+    accepting it would cut the reply short. Once the caller has seen the
+    provider's turn end (`turn_ended=True`), nothing more is coming, so a
+    whole-line marker anywhere in the text completes the request and any text
+    after it is ignored for the verdict.
+    """
+    if turn_ended:
+        return find_done_line(text, req_id) is not None
     lines = [ln.rstrip() for ln in (text or "").splitlines()]
     for i in range(len(lines) - 1, -1, -1):
         if _is_trailing_noise_line(lines[i]):
             continue
         return bool(done_line_re(req_id).match(lines[i]))
     return False
+
+
+def split_done_text(text: str, req_id: str) -> tuple[str, str]:
+    """Split `text` at its last whole-line done marker for `req_id`.
+
+    Returns (reply before the marker, text after it). Harness `*_DONE`
+    trailers and blank lines after the marker are not reported as trailing
+    text. Without a marker, returns (strip_done_text(text), "").
+    """
+    idx = find_done_line(text, req_id)
+    if idx is None:
+        return strip_done_text(text, req_id), ""
+    lines = (text or "").splitlines()
+    body = "\n".join(lines[:idx]).rstrip()
+    trailing = [ln for ln in lines[idx + 1 :] if not _is_trailing_noise_line(ln)]
+    return body, "\n".join(trailing).strip()
+
+
+def append_trailing_notice(reply: str, trailing: str) -> str:
+    """Tell the sender about text the provider wrote after its done marker."""
+    trailing = (trailing or "").strip()
+    if not trailing:
+        return reply
+    notice = (
+        "[CCB warning: the provider kept writing after its CCB_DONE line. "
+        "That text is not part of the reply; it is shown here so nothing is lost.]"
+    )
+    return f"{(reply or '').rstrip()}\n\n{notice}\n{trailing}".strip()
 
 
 def strip_done_text(text: str, req_id: str) -> str:
@@ -172,11 +225,12 @@ def select_codex_reply(
 ) -> str:
     """Select the single Codex reply that belongs to a completed request."""
     if terminal_reply:
-        selected = strip_done_text(terminal_reply, req_id)
+        selected, trailing = split_done_text(terminal_reply, req_id)
         if selected:
-            return selected
+            return append_trailing_notice(selected, trailing)
     if latest_final:
-        return strip_done_text(latest_final, req_id)
+        selected, trailing = split_done_text(latest_final, req_id)
+        return append_trailing_notice(selected, trailing)
     return extract_reply_for_req(combined, req_id)
 
 

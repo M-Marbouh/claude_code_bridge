@@ -57,6 +57,14 @@ ccb codex codex claude
 
 Inside either Codex pane, `ask codex` means the other verified Codex session in that launch. CCB assigns neither pane a role: give each session a short current assignment such as “lead and synthesize this task” or “implement and report evidence.” Either provider in `ccb codex claude` or `ccb claude codex` may take either assignment. Provider order is layout, not authority.
 
+From the third provider in such a launch (for example Claude leading a Codex pair), `ask codex` alone is ambiguous and is refused. `ccb-list` shows each pair member's live ID; send to one exact member with:
+
+```bash
+ask codex --live-id <id> "implementer: build the parser"
+```
+
+A session may record the role its conversation was given with `ccb-role set <role>` (and `ccb-role clear`), and `ccb-list` then shows it next to the live ID, so a lead that lost its context can find who is who. Roles are display only: routing never reads them and they grant nothing. Only the session itself can record its role, a role already held by another member is refused, and a role disappears when the launch ends or the member's pane dies or is replaced. A member that starts a new conversation in the same pane keeps its displayed role, so tasks should name the role they are for and a member should decline a role it does not hold.
+
 Model, reasoning effort, account, and native subagent choices remain native tool settings. They may differ between panes and may be changed independently; CCB does not select or persist that policy. A third Codex or a repeated non-Codex provider is rejected. Duplicate-provider `ccb -r` is not supported; start a fresh pair and use each tool's native session controls if needed. Existing unique-provider `ccb -r` behavior is unchanged.
 
 ## Ask and retrieve results

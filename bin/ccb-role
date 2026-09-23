@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""
+ccb-role - Record the role this session's conversation was assigned.
+
+Usage:
+    ccb-role set <role>     Record this session's role (e.g. implementer, ratifier)
+    ccb-role clear          Remove this session's role
+
+The role is shown by `ccb-list` so a lead can find who is who. It is a
+display name only: routing never reads it and it grants no permissions.
+Only the session itself can set its role, it lasts only for the current
+launch, and it disappears if the session's pane dies or is replaced.
+Roles exist only in launches with live session IDs (a Codex pair).
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+sys.path.insert(0, str(lib_dir))
+
+from compat import setup_windows_encoding
+from ccb_runtime_status import daemon_set_role, inside_managed_codex_sandbox, resolve_daemon_work_dir
+from live_roles import set_own_role
+
+setup_windows_encoding()
+
+
+def _usage() -> None:
+    print("Usage: ccb-role set <role> | ccb-role clear", file=sys.stderr)
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        _usage()
+        return 0 if argv else 1
+    action = argv[0]
+    if action == "set" and len(argv) == 2:
+        role = argv[1]
+    elif action == "clear" and len(argv) == 1:
+        role = ""
+    else:
+        _usage()
+        return 1
+
+    live_id = (os.environ.get("CCB_LIVE_ID") or "").strip()
+    live_token = (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+    if not live_id or not live_token:
+        print(
+            "[ERROR] This session has no live session ID. Roles are only recorded in a "
+            "CCB launch with a Codex pair.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        if inside_managed_codex_sandbox():
+            ok, detail = daemon_set_role(resolve_daemon_work_dir(Path.cwd()), live_id, live_token, role)
+        else:
+            ok, detail = set_own_role(live_id, live_token, role)
+    except Exception as exc:
+        print(f"[ERROR] Role update failed: {exc}", file=sys.stderr)
+        return 1
+    if not ok:
+        print(f"[ERROR] {detail}", file=sys.stderr)
+        return 1
+    print(detail)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

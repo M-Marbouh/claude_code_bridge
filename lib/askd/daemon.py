@@ -267,6 +267,8 @@ class UnifiedAskDaemon:
             return self._handle_runtime_status(msg)
         if operation == "queue_status":
             return self._handle_queue_status(msg)
+        if operation == "set_role":
+            return self._handle_set_role(msg)
         if operation == "resolve_route":
             return self._handle_resolve_route(msg)
         if operation == "peer_identify_sender":
@@ -488,6 +490,30 @@ class UnifiedAskDaemon:
             "entries": entries,
         }
 
+    def _handle_set_role(self, msg: dict) -> dict:
+        """Record a session's own role for a sandboxed caller that cannot write the run dir.
+
+        The session's own live ID and credential are the authorization;
+        `set_own_role` refuses anything else.
+        """
+        from live_roles import set_own_role
+
+        try:
+            ok, detail = set_own_role(
+                str(msg.get("live_id") or ""),
+                str(msg.get("live_token") or ""),
+                str(msg.get("role") or ""),
+            )
+        except Exception as exc:
+            ok, detail = False, f"role update failed: {exc}"
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0 if ok else 1,
+            "reply": detail,
+        }
+
     def _handle_queue_status(self, msg: dict) -> dict:
         """Per-provider queue depth and the in-flight task, so a stuck queue is visible."""
         provider = str(msg.get("provider") or "").strip().lower()
@@ -583,6 +609,7 @@ class UnifiedAskDaemon:
                 caller_live_id=str(msg.get("caller_live_id") or ""),
                 caller_token=str(msg.get("caller_token") or ""),
                 check_daemon=_request_bool(msg.get("check_daemon", True)),
+                target_live_id=str(msg.get("target_live_id") or ""),
             )
             payload = _live_session_to_route_outcome_dict(outcome)
         except Exception as exc:

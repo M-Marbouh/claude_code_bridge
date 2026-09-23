@@ -117,6 +117,7 @@ SCRIPTS_TO_LINK=(
   bin/ccb-mounted
   bin/ccb-bridge-ask
   bin/ccb-ping
+  bin/ccb-role
   bin/pend
   bin/autonew
   bin/ccb-completion-hook

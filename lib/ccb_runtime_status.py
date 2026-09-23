@@ -15,6 +15,7 @@ from ccb_start_config import load_start_config
 from live_sessions import (
     AMBIGUOUS,
     SELF_ONLY,
+    UNAVAILABLE,
     UNKNOWN_CALLER,
     LiveSession,
     Resolution,
@@ -245,6 +246,33 @@ def daemon_queue_status(work_dir: Path, provider: str = "") -> list[dict]:
     if not isinstance(queues, list):
         raise RuntimeError("askd does not report queue status (restart it to pick up this version)")
     return [q for q in queues if isinstance(q, dict)]
+
+
+def daemon_set_role(work_dir: Path, live_id: str, live_token: str, role: str) -> tuple[bool, str]:
+    """Ask the host daemon to record this session's own role (sandboxed callers)."""
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=work_dir,
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
+    if not state or not str(state.get("token") or ""):
+        raise RuntimeError("Unified askd daemon state is unavailable")
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"set-role-{os.getpid()}",
+        "token": str(state.get("token")),
+        "operation": "set_role",
+        "live_id": live_id,
+        "live_token": live_token,
+        "role": role,
+    }
+    response = askd_rpc.request_daemon(state, request, connect_timeout_s=2.0, response_timeout_s=8.0)
+    if response.get("type") != "ask.response":
+        raise RuntimeError("askd returned an invalid response")
+    return int(response.get("exit_code", 1)) == 0, str(response.get("reply") or "")
 
 
 def describe_queue_status(queues: list[dict], *, stuck_after_s: float = 600.0) -> tuple[bool, str]:
@@ -871,6 +899,24 @@ def _operational_refusal(
     return None
 
 
+def _resolve_exact_target(sessions: Iterable[LiveSession], provider: str, target_live_id: str) -> Resolution:
+    """The one session `target_live_id` names in this launch, or a refusal. Never selects."""
+    want = (provider or "").strip().lower()
+    matches = [s for s in sessions if s.live_id == target_live_id.strip()]
+    if len(matches) != 1:
+        return Resolution(error=UNAVAILABLE, detail="no session with that live ID in this launch")
+    session = matches[0]
+    if session.provider != want:
+        return Resolution(
+            error=AMBIGUOUS,
+            detail=f"live ID belongs to a {session.provider} session, not {want}",
+            candidates=(session.live_id,),
+        )
+    if not session.active:
+        return Resolution(error=UNAVAILABLE, detail="that live session is gone", candidates=(session.live_id,))
+    return Resolution(session=session)
+
+
 def _resolve_within_launch(
     record: dict[str, Any],
     provider: str,
@@ -878,9 +924,13 @@ def _resolve_within_launch(
     caller: Optional[LiveSession],
     project_id: str,
     check_daemon: bool,
+    target_live_id: str = "",
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
     """Resolve `provider`'s destination strictly within ONE already-
     identified launch record. Never consults any other record.
+
+    `target_live_id` names the exact session instead of selecting one; it
+    must exist in this launch, belong to `provider` and be active.
     """
     inventory = read_inventory_for_record(record)
     if not inventory.present:
@@ -888,7 +938,10 @@ def _resolve_within_launch(
     if not inventory.valid:
         return Resolution(error="invalid_inventory", detail="live_sessions inventory is invalid"), caller
 
-    resolution = resolve_local_target(inventory.sessions, provider=provider, caller=caller)
+    if target_live_id:
+        resolution = _resolve_exact_target(inventory.sessions, provider, target_live_id)
+    else:
+        resolution = resolve_local_target(inventory.sessions, provider=provider, caller=caller)
     if not resolution.ok:
         return resolution, caller
 
@@ -921,6 +974,7 @@ def _resolve_live_route_host(
     caller_live_id: str = "",
     caller_token: str = "",
     check_daemon: bool = True,
+    target_live_id: str = "",
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
     """The real, host-side route resolution: filesystem and (via the
     operational checks) real terminal/daemon state must be visible to run
@@ -970,7 +1024,12 @@ def _resolve_live_route_host(
     if caller_matches:
         caller_launch, caller = caller_matches[0]
         return _resolve_within_launch(
-            caller_launch, provider, caller=caller, project_id=project_id, check_daemon=check_daemon
+            caller_launch,
+            provider,
+            caller=caller,
+            project_id=project_id,
+            check_daemon=check_daemon,
+            target_live_id=target_live_id,
         )
 
     # Whether there is even a launch anywhere in the project the callerless
@@ -1050,7 +1109,12 @@ def _resolve_live_route_host(
     # refusal must never be softened into `None`, which would send the
     # request on to consult a legacy provider file sitting alongside it.
     return _resolve_within_launch(
-        only_record, provider, caller=None, project_id=project_id, check_daemon=check_daemon
+        only_record,
+        provider,
+        caller=None,
+        project_id=project_id,
+        check_daemon=check_daemon,
+        target_live_id=target_live_id,
     )
 
 
@@ -1137,6 +1201,7 @@ def _daemon_resolve_live_route(
     caller_live_id: str,
     caller_token: str,
     check_daemon: bool,
+    target_live_id: str = "",
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
     """Finding 1: a sandboxed caller cannot see real terminal/daemon state
     itself, so route resolution is proxied to the host daemon over the
@@ -1168,6 +1233,7 @@ def _daemon_resolve_live_route(
         "caller_live_id": caller_live_id,
         "caller_token": caller_token,
         "check_daemon": check_daemon,
+        "target_live_id": target_live_id,
     }
     response = askd_rpc.request_daemon(
         state,
@@ -1193,6 +1259,7 @@ def resolve_live_route(
     caller_token: str = "",
     check_daemon: bool = True,
     _allow_daemon_proxy: bool = True,
+    target_live_id: str = "",
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
     """Resolve the exact live-session destination `provider` names for this
     caller.
@@ -1226,6 +1293,7 @@ def resolve_live_route(
             caller_live_id=caller_live_id,
             caller_token=caller_token,
             check_daemon=check_daemon,
+            target_live_id=target_live_id,
         )
     return _resolve_live_route_host(
         provider,
@@ -1235,4 +1303,5 @@ def resolve_live_route(
         caller_live_id=caller_live_id,
         caller_token=caller_token,
         check_daemon=check_daemon,
+        target_live_id=target_live_id,
     )

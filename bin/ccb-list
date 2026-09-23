@@ -19,6 +19,7 @@ from askd_runtime import find_running_state_file
 from compat import setup_windows_encoding
 from ccb_runtime_status import is_project_askd_online
 from ccb_start_config import load_start_config
+from live_roles import roles_for_record
 from live_sessions import INVENTORY_INVALID
 from pane_registry import (
     _get_providers_map,
@@ -460,6 +461,10 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                 )
                 entries.append((f"{provider}:0", provider, status, ""))
         elif inventory.present:
+            try:
+                roles = roles_for_record(record)
+            except Exception:
+                roles = {}
             for live_session in inventory.sessions:
                 if live_session.provider not in SUPPORTED_PROVIDERS:
                     continue
@@ -497,6 +502,7 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                 # later stage -- never reduced to a bare pane-id string.
                 status["launch_id"] = session_id
                 status["live_id"] = live_session.live_id
+                status["role"] = roles.get(live_session.live_id, "")
                 entries.append((f"{live_session.provider}:{live_session.live_id}", live_session.provider, status, group))
         else:
             # ABSENT: today's legacy per-provider projection, unchanged.
@@ -792,6 +798,11 @@ def _print_human(entries: list[dict[str, Any]]) -> None:
                 dot = "●" if provider_data.get("mounted") else ("◐" if provider_data.get("alive") else "○")
                 reason = provider_data.get("reason") or ""
                 suffix = f" reason:{reason}" if reason and not provider_data.get("mounted") else ""
+                live_id = str(provider_data.get("live_id") or "")
+                if live_id:
+                    suffix += f"  id:{live_id}"
+                    role = str(provider_data.get("role") or "")
+                    suffix += f"  role:{role}" if role else "  role:-"
                 print(f"          {provider:<14} pane:{pane_id}  {dot} {state}{suffix}")
 
 

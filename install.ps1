@@ -251,7 +251,7 @@ function Install-Native {
     "gask", "gping", "gpend",
     "oask", "oping", "opend",
     "lask", "lping", "lpend",
-    "ask", "ccb-list", "ccb-mounted", "ccb-bridge-ask", "ccb-ping", "pend",
+    "ask", "ccb-list", "ccb-mounted", "ccb-bridge-ask", "ccb-ping", "ccb-role", "pend",
     "autonew", "ccb-completion-hook", "maild", "ctx-transfer"
   )
 

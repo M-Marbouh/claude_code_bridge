@@ -379,6 +379,7 @@ def _preflight_target(
     caller_live_id: str = "",
     caller_token: str = "",
     route_out: dict | None = None,
+    target_live_id: str = "",
 ) -> bool:
     """Answer whether `provider` can be reached, and -- when the record this
     answer is based on carries a `live_sessions` inventory -- resolve the
@@ -415,9 +416,20 @@ def _preflight_target(
             caller_terminal=caller_terminal,
             caller_live_id=caller_live_id,
             caller_token=caller_token,
+            target_live_id=target_live_id,
         )
     except Exception as exc:
         print(f"[ERROR] Live-session route unavailable: {exc}", file=sys.stderr)
+        return False
+
+    if outcome is None and target_live_id:
+        # Without a live-session inventory there is no exact session to
+        # name; falling through would send to the provider default instead.
+        print(
+            f"CCB_ROUTE_ERROR target={provider} reason=no_inventory "
+            f"detail={shlex.quote('this launch has no live session IDs to address')}",
+            file=sys.stderr,
+        )
         return False
 
     if outcome is not None:
@@ -752,7 +764,7 @@ def _usage() -> None:
     print("  --peer TARGET           Send to the selected provider in another CCB project", file=sys.stderr)
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
     print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
-    print("  --live-id ID            Peer only: deliver to this exact live session", file=sys.stderr)
+    print("  --live-id ID            Deliver to this exact live session (this launch, or --peer's)", file=sys.stderr)
     print("", file=sys.stderr)
     print("Local pair: in ccb codex codex, ask codex addresses the verified sibling.", file=sys.stderr)
     print("Peer targets must be unique in the remote project; ambiguity is an error.", file=sys.stderr)
@@ -941,10 +953,10 @@ def _peer_live_id_error(
 ) -> str:
     """Every `--live-id` refusal, applied before any dispatch.
 
-    The selector names an exact remote session, so it is meaningless
-    without a peer target, and it must never compete with the saved
+    The selector names an exact session: in another project with --peer,
+    or in this launch without it. It must never compete with the saved
     return address of a correlated reply -- that destination is already
-    pinned by the receipt. Both cases refuse outright rather than
+    pinned by the receipt -- so that case refuses outright rather than
     resolving a precedence rule the sender cannot see.
     """
     if not live_id_seen:
@@ -955,8 +967,6 @@ def _peer_live_id_error(
         # Checked before the peer-target rule so a selector that swallowed
         # the following option token reports its real cause.
         return "[ERROR] Invalid --live-id"
-    if not peer_target:
-        return "[ERROR] --live-id requires --peer"
     if reply_to:
         return (
             "[ERROR] --live-id cannot be combined with --reply-to; a correlated "
@@ -1542,6 +1552,12 @@ def main(argv: list[str]) -> int:
         print(live_id_error, file=sys.stderr)
         return EXIT_ERROR
 
+    if peer_live_id and not peer_target and (
+        not _use_unified_daemon() or (notify_mode and provider not in PEER_PROVIDERS)
+    ):
+        print("[ERROR] --live-id needs the unified askd daemon for this provider", file=sys.stderr)
+        return EXIT_ERROR
+
     if _REMOVED_ROUTE_TAG_RE.match(message):
         print("[ERROR] [WORKER]/[ARCHITECT] routing tags are no longer supported", file=sys.stderr)
         return EXIT_ERROR
@@ -1603,6 +1619,7 @@ def main(argv: list[str]) -> int:
                 caller_live_id=caller_live_id,
                 caller_token=caller_token,
                 route_out=route_fields,
+                **({"target_live_id": peer_live_id} if peer_live_id else {}),
             ):
                 return EXIT_ERROR
             try:
@@ -1649,6 +1666,7 @@ def main(argv: list[str]) -> int:
                     caller_live_id=notify_caller_live_id,
                     caller_token=notify_caller_token,
                     route_out=notify_route_fields,
+                    **({"target_live_id": peer_live_id} if peer_live_id else {}),
                 ):
                     return EXIT_ERROR
                 try:

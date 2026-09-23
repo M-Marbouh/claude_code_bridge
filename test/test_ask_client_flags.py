@@ -1762,14 +1762,17 @@ def _refuse_dispatch(ask, monkeypatch) -> None:
     )
 
 
-def test_ask_live_id_without_peer_refuses(monkeypatch, capsys) -> None:
+def test_ask_local_live_id_without_inventory_refuses(monkeypatch, capsys) -> None:
+    """Without --peer, --live-id names a session of this launch. A launch
+    with no live-session inventory has nothing to name, and the request
+    must refuse rather than fall through to the provider default."""
     ask = _load_ask_module()
     _refuse_dispatch(ask, monkeypatch)
 
     rc = ask.main(["ask", "codex", "--live-id", "live-b", "hello"])
 
     assert rc == 1
-    assert "--live-id requires --peer" in capsys.readouterr().err
+    assert "reason=no_inventory" in capsys.readouterr().err
 
 
 def test_ask_live_id_requires_a_value(monkeypatch, capsys) -> None:
@@ -1822,3 +1825,57 @@ def test_ask_live_id_requires_value_without_swallowing_option(monkeypatch, capsy
 
     assert rc == 1
     assert "--live-id requires a live session ID" in capsys.readouterr().err
+
+
+def test_ask_local_live_id_resolves_that_exact_session(monkeypatch) -> None:
+    """A lead naming one member of a Codex pair passes that live ID to route
+    resolution and sends on the route it returns."""
+    from live_sessions import LiveSession, Resolution
+
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+    target = LiveSession(
+        live_id="cx2",
+        provider="codex",
+        launch_id="ai-1",
+        pane_id="%3",
+        terminal="tmux",
+        session_file="/tmp/cx2.json",
+        ccb_project_id="proj-1",
+    )
+    lead = LiveSession(live_id="lead", provider="claude", launch_id="ai-1", pane_id="%1")
+    seen: dict = {}
+    captured: dict = {}
+
+    def _resolve(*_a, **kwargs):
+        seen.update(kwargs)
+        return Resolution(session=target), lead
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setenv("CCB_LIVE_ID", "lead")
+    monkeypatch.setenv("CCB_LIVE_TOKEN", "tok-lead")
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "provider_status_for_target", lambda *_a, **_k: _provider_status(mounted=True))
+    monkeypatch.setattr(ask, "resolve_live_route", _resolve)
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda provider, message, timeout, no_wrap, caller, **kwargs: captured.update(kwargs=kwargs) or 0,
+    )
+
+    rc = ask.main(["ask", "codex", "--live-id", "cx2", "--notify", "implementer: status?"])
+
+    assert rc == 0
+    assert seen["target_live_id"] == "cx2"
+    assert captured["kwargs"]["route"].live_id == "cx2"
+
+
+def test_ask_local_live_id_refuses_without_unified_daemon(monkeypatch, capsys) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: False)
+
+    rc = ask.main(["ask", "codex", "--live-id", "cx2", "hello"])
+
+    assert rc == 1
+    assert "--live-id needs the unified askd daemon" in capsys.readouterr().err

@@ -4091,7 +4091,18 @@ def _registry_matches_kill_target(
         if not inventory.valid:
             return False
         live_id = str(data.get("live_id") or "").strip()
-        matches = [session for session in inventory.sessions if session.live_id == live_id]
+        if live_id:
+            matches = [session for session in inventory.sessions if session.live_id == live_id]
+        else:
+            # Only pair members' own binding files carry a live_id. A unique
+            # provider in the same launch (e.g. Claude leading a Codex pair)
+            # keeps the project-wide binding file, so identify its entry by
+            # provider and that exact file instead.
+            matches = [
+                session
+                for session in inventory.sessions
+                if session.provider == provider and Path(session.session_file) == session_file
+            ]
         return (
             len(matches) == 1
             and matches[0].provider == provider

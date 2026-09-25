@@ -547,3 +547,73 @@ def test_cmd_kill_daemon_skips_live_foreign_owner(monkeypatch, tmp_path: Path, c
 
     assert rc == 0
     assert "another live project" in capsys.readouterr().out
+
+
+def test_cmd_kill_terminates_the_unique_provider_beside_a_codex_pair(monkeypatch, tmp_path: Path) -> None:
+    """In a Codex-pair launch, only the pair members' own binding files carry
+    a live_id. The unique provider (e.g. Claude leading the pair) keeps the
+    project-wide binding file without one, and must still be killed."""
+    ccb = _load_ccb_module()
+    import ccb_runtime_status
+
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    session_id = "ai-1-999999"
+    entries = []
+    members = [("codex", "live-1", "%1", True), ("codex", "live-2", "%2", True), ("claude", "live-3", "%3", False)]
+    for provider, live_id, pane, stamped in members:
+        suffix = f"-{live_id}" if stamped else ""
+        marker = f"CCB-{provider.capitalize()}-{project_id[:8]}{suffix}"
+        path = tmp_path / f"{provider}-{live_id}.json"
+        binding = {
+            "active": True, "session_id": session_id, "terminal": "tmux", "pane_id": pane,
+            "pane_title_marker": marker, "work_dir": str(tmp_path), "ccb_project_id": project_id,
+        }
+        if stamped:
+            binding["live_id"] = live_id
+        path.write_text(json.dumps(binding))
+        entries.append({
+            "live_id": live_id, "provider": provider, "launch_id": session_id,
+            "pane_id": pane, "pane_title_marker": marker, "terminal": "tmux",
+            "work_dir": str(tmp_path), "ccb_project_id": project_id,
+            "session_file": str(path), "active": True,
+        })
+    record = {"ccb_session_id": session_id, "ccb_project_id": project_id,
+              "work_dir": str(tmp_path), "terminal": "tmux", "live_sessions": entries}
+    killed = []
+
+    class Backend:
+        def is_alive(self, pane): return pane in {"%1", "%2", "%3"}
+        pane_exists = is_alive
+        def pane_matches_cwd_strict(self, pane, work_dir): return self.is_alive(pane) and work_dir == str(tmp_path)
+        def find_pane_by_title_marker(self, marker, work_dir=""):
+            return next((entry["pane_id"] for entry in entries if entry["pane_title_marker"] == marker), None)
+        def kill_pane(self, pane): killed.append(pane)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "TmuxBackend", Backend)
+    monkeypatch.setattr(ccb, "load_registry_by_session_id", lambda _: record)
+    monkeypatch.setattr(ccb_runtime_status, "_iter_qualifying_registry_records",
+                        lambda **_: [(record, str(tmp_path), project_id, 1, False)])
+    monkeypatch.setattr(ccb, "upsert_registry", lambda update: record.update(update) or True)
+
+    assert ccb.cmd_kill(SimpleNamespace(force=False, daemon=False, providers=None)) == 0
+
+    assert sorted(killed) == ["%1", "%2", "%3"]
+    assert all(not entry["active"] for entry in record["live_sessions"])
+
+
+def test_kill_ownership_without_live_id_still_requires_a_unique_matching_entry(tmp_path: Path) -> None:
+    """The fallback for a binding with no live_id matches on provider AND the
+    exact binding file; a second session of that provider refuses it."""
+    ccb = _load_ccb_module()
+    project_id = ccb.compute_ccb_project_id(tmp_path)
+    shared = tmp_path / ".codex-session"
+    entry = {"provider": "codex", "pane_id": "%1", "pane_title_marker": "M", "terminal": "tmux",
+             "work_dir": str(tmp_path), "ccb_project_id": project_id, "session_file": str(shared), "active": True}
+    record = {"ccb_session_id": "ai-1-1", "ccb_project_id": project_id, "work_dir": str(tmp_path),
+              "terminal": "tmux",
+              "live_sessions": [dict(entry, live_id="a"), dict(entry, live_id="b", pane_id="%2")]}
+    ccb.load_registry_by_session_id = lambda _: record
+    data = {"session_id": "ai-1-1"}
+
+    assert ccb._registry_matches_kill_target("codex", data, shared, tmp_path, project_id, "%1", "M") is False

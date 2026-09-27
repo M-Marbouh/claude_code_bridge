@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import tempfile
 import threading
 from types import SimpleNamespace
 from importlib.machinery import SourceFileLoader
@@ -12,6 +13,7 @@ import askd.daemon as askd_daemon
 import askd_runtime
 from askd.adapters.base import ProviderRequest, QueuedTask, ResolvedRoute
 from askd.adapters.claude import ClaudeAdapter
+from askd.adapters.codex import CodexAdapter
 from askd.adapters.gemini import GeminiAdapter
 from askd.adapters.opencode import OpenCodeAdapter
 from codex_comm import CodexLogReader
@@ -153,6 +155,26 @@ def test_completion_hook_tmux_enter_retries_with_variants(monkeypatch) -> None:
 
     assert ok is True
     assert key_calls[:2] == ["Enter", "Return"]
+
+
+def test_completion_hook_debug_log_writes_default_path_without_env_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`_debug_log_path()` calls `tempfile.gettempdir()` while the module
+    never imported `tempfile` -- a `NameError` raised inside `_debug_log`
+    and swallowed by its own bare `except Exception: pass`, silently
+    disabling the default debug log whenever
+    `CCB_COMPLETION_HOOK_DEBUG_LOG` was left unset. Prove the default log
+    file actually gets written now that the import is present.
+    """
+    monkeypatch.delenv("CCB_COMPLETION_HOOK_DEBUG_LOG", raising=False)
+    hook = _load_script_module("ccb_completion_hook_debug_log", REPO_ROOT / "bin" / "ccb-completion-hook")
+
+    hook._debug_log("probe message")
+
+    expected_path = Path(tempfile.gettempdir()) / "ccb-completion-hook.debug.log"
+    assert expected_path.exists()
+    assert "probe message" in expected_path.read_text(encoding="utf-8")
 
 
 def test_maybe_start_unified_daemon_honors_autostart_opt_out(monkeypatch, tmp_path: Path) -> None:
@@ -419,6 +441,298 @@ def test_gemini_adapter_reports_cancelled_status(monkeypatch, tmp_path: Path) ->
     assert notifications[0]["status"] == "cancelled"
 
 
+def test_gemini_adapter_survives_unknown_and_isolated_gone_liveness_probes(monkeypatch, tmp_path: Path) -> None:
+    """A single "gone" (or "unknown") probe must never fail a task outright
+    -- only `CCB_PANE_GONE_PROBES` (default 3) consecutive "gone" probes
+    do. This mixes "unknown" probes and isolated "gone" probes (reset by
+    "alive" before reaching the threshold) with an eventual CCB_DONE, and
+    asserts the task still completes normally.
+    """
+    from askd.adapters import gemini as gemini_mod
+
+    notifications: list[dict] = []
+    liveness_script = iter(["unknown", "gone", "alive", "unknown", "gone"])
+
+    class _Session:
+        work_dir = str(tmp_path)
+        gemini_session_path = None
+        data = {}
+
+        def ensure_pane(self):
+            return True, "pane-1"
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def pane_liveness(self, pane_id: str) -> str:
+            return next(liveness_script, "alive")
+
+    class _Reader:
+        def __init__(self, work_dir: Path):
+            self.session_path = tmp_path / "session.json"
+            self._calls = 0
+
+        def set_preferred_session(self, path: Path) -> None:
+            return None
+
+        def capture_state(self) -> dict:
+            return {"msg_count": 0, "session_path": self.session_path}
+
+        def wait_for_message(self, state: dict, timeout: float):
+            self._calls += 1
+            count = self._calls
+            if count < 6:
+                return "", {"msg_count": count, "session_path": self.session_path}
+            return "Done.\nCCB_DONE: req-1", {"msg_count": count, "session_path": self.session_path}
+
+    monkeypatch.setenv("CCB_GASKD_PANE_CHECK_INTERVAL", "0")
+    monkeypatch.setattr(gemini_mod, "load_project_session", lambda work_dir, instance=None: _Session())
+    monkeypatch.setattr(gemini_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(gemini_mod, "GeminiLogReader", _Reader)
+    monkeypatch.setattr(gemini_mod, "notify_completion", lambda **kwargs: notifications.append(kwargs))
+    monkeypatch.setattr(gemini_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+        cancel_event=threading.Event(),
+    )
+
+    result = GeminiAdapter().handle_task(task)
+
+    assert result.status == "completed"
+    assert result.done_seen is True
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "completed"
+
+
+def test_gemini_adapter_declares_failed_after_gone_streak_and_notifies_once(monkeypatch, tmp_path: Path) -> None:
+    """`N` consecutive "gone" liveness probes must both produce a FAILED
+    result AND route through the same persist-then-notify tail normal
+    completion uses -- before this fix, the pane-died path `return`ed
+    straight out of the wait loop and the caller was never told anything.
+    """
+    from askd.adapters import gemini as gemini_mod
+
+    notifications: list[dict] = []
+
+    class _Session:
+        work_dir = str(tmp_path)
+        gemini_session_path = None
+        data = {}
+
+        def ensure_pane(self):
+            return True, "pane-1"
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def pane_liveness(self, pane_id: str) -> str:
+            return "gone"
+
+    class _Reader:
+        def __init__(self, work_dir: Path):
+            self.session_path = tmp_path / "session.json"
+
+        def set_preferred_session(self, path: Path) -> None:
+            return None
+
+        def capture_state(self) -> dict:
+            return {"msg_count": 0, "session_path": self.session_path}
+
+        def wait_for_message(self, state: dict, timeout: float):
+            count = int(state.get("msg_count") or 0) + 1
+            return "", {"msg_count": count, "session_path": self.session_path}
+
+    monkeypatch.setenv("CCB_GASKD_PANE_CHECK_INTERVAL", "0")
+    monkeypatch.setattr(gemini_mod, "load_project_session", lambda work_dir, instance=None: _Session())
+    monkeypatch.setattr(gemini_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(gemini_mod, "GeminiLogReader", _Reader)
+    monkeypatch.setattr(gemini_mod, "notify_completion", lambda **kwargs: notifications.append(kwargs))
+    monkeypatch.setattr(gemini_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+        cancel_event=threading.Event(),
+    )
+
+    result = GeminiAdapter().handle_task(task)
+
+    assert result.status == "failed"
+    assert result.done_seen is False
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "failed"
+    assert "Gemini pane died during request" in notifications[0]["reply"]
+
+
+def test_opencode_adapter_declares_failed_after_gone_streak_and_notifies_once(monkeypatch, tmp_path: Path) -> None:
+    from askd.adapters import opencode as opencode_mod
+
+    notifications: list[dict] = []
+
+    class _Session:
+        work_dir = str(tmp_path)
+        opencode_session_id_filter = None
+        data = {}
+
+        def ensure_pane(self):
+            return True, "pane-1"
+
+        def update_opencode_binding(self, **kwargs):
+            return None
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def pane_liveness(self, pane_id: str) -> str:
+            return "gone"
+
+    class _Reader:
+        def __init__(self, **kwargs):
+            pass
+
+        def capture_state(self) -> dict:
+            return {"session_id": None}
+
+        def wait_for_message(self, state: dict, timeout: float):
+            return "", state
+
+    class _Lock:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def acquire(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            return None
+
+    monkeypatch.setenv("CCB_OASKD_PANE_CHECK_INTERVAL", "0")
+    monkeypatch.setattr(opencode_mod, "load_project_session", lambda work_dir, instance=None: _Session())
+    monkeypatch.setattr(opencode_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(opencode_mod, "OpenCodeLogReader", _Reader)
+    monkeypatch.setattr(opencode_mod, "ProviderLock", _Lock)
+    monkeypatch.setattr(opencode_mod, "notify_completion", lambda **kwargs: notifications.append(kwargs))
+    monkeypatch.setattr(opencode_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+        cancel_event=threading.Event(),
+    )
+
+    result = OpenCodeAdapter().handle_task(task)
+
+    assert result.status == "failed"
+    assert result.done_seen is False
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "failed"
+    assert "OpenCode pane died during request" in notifications[0]["reply"]
+
+
+def test_codex_adapter_declares_failed_after_gone_streak_and_notifies_once(monkeypatch, tmp_path: Path) -> None:
+    from askd.adapters import codex as codex_mod
+
+    notifications: list[dict] = []
+
+    class _Session:
+        work_dir = str(tmp_path)
+        codex_session_path = None
+        codex_session_id = None
+        data = {}
+
+        def ensure_pane(self):
+            return True, "pane-1"
+
+        def update_codex_log_binding(self, **kwargs):
+            return None
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def pane_liveness(self, pane_id: str) -> str:
+            return "gone"
+
+    class _Reader:
+        def __init__(self, **kwargs):
+            pass
+
+        def capture_state(self) -> dict:
+            return {"log_path": None}
+
+        def wait_for_event(self, state: dict, timeout: float):
+            return None, state
+
+        def current_log_path(self):
+            return None
+
+    monkeypatch.setenv("CCB_CASKD_PANE_CHECK_INTERVAL", "0")
+    monkeypatch.setattr(codex_mod, "load_project_session", lambda work_dir, instance=None: _Session())
+    monkeypatch.setattr(codex_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(codex_mod, "CodexLogReader", _Reader)
+    monkeypatch.setattr(codex_mod, "notify_completion", lambda **kwargs: notifications.append(kwargs))
+    monkeypatch.setattr(codex_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+        cancel_event=threading.Event(),
+    )
+
+    result = CodexAdapter().handle_task(task)
+
+    assert result.status == "failed"
+    assert result.done_seen is False
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "failed"
+    assert "Codex pane died during request" in notifications[0]["reply"]
+
+
 def test_claude_adapter_honors_cancel_event(monkeypatch, tmp_path: Path) -> None:
     from askd.adapters import claude as claude_mod
 
@@ -481,6 +795,80 @@ def test_claude_adapter_honors_cancel_event(monkeypatch, tmp_path: Path) -> None
 
     assert result.status == "cancelled"
     assert notifications[0]["status"] == "cancelled"
+
+
+def test_claude_adapter_declares_failed_after_gone_streak_via_finalize_once(monkeypatch, tmp_path: Path) -> None:
+    """Unlike codex/gemini/opencode, Claude's `handle_task` already routes
+    every wait-loop result (including a pane-died one) through
+    `_finalize_result` -- so this only needs to prove the tri-state
+    liveness/death-streak change in `_wait_for_response` produces a FAILED
+    result, and that `_finalize_result` still notifies exactly once (no
+    second notification was added alongside the liveness change).
+    """
+    from askd.adapters import claude as claude_mod
+
+    notifications: list[dict] = []
+
+    class _Session:
+        work_dir = str(tmp_path)
+        claude_session_path = None
+        data = {}
+
+        def ensure_pane(self):
+            return True, "pane-1"
+
+    class _Backend:
+        def send_text(self, pane_id: str, prompt: str) -> None:
+            return None
+
+        def pane_liveness(self, pane_id: str) -> str:
+            return "gone"
+
+    class _Reader:
+        def __init__(self, work_dir: Path, use_sessions_index: bool = True):
+            self.work_dir = work_dir
+
+        def set_preferred_session(self, path: Path) -> None:
+            return None
+
+        def capture_state(self) -> dict:
+            return {}
+
+        def wait_for_events(self, state: dict, timeout: float):
+            return [], state
+
+        def current_session_path(self):
+            return None
+
+    monkeypatch.setenv("CCB_LASKD_PANE_CHECK_INTERVAL", "0")
+    monkeypatch.setattr(claude_mod, "load_project_session", lambda work_dir, instance=None: _Session())
+    monkeypatch.setattr(claude_mod, "get_backend_for_session", lambda data: _Backend())
+    monkeypatch.setattr(claude_mod, "ClaudeLogReader", _Reader)
+    monkeypatch.setattr(claude_mod, "notify_completion", lambda **kwargs: notifications.append(kwargs))
+    monkeypatch.setattr(claude_mod, "_write_log", lambda line: None)
+
+    req = ProviderRequest(
+        client_id="c1",
+        work_dir=str(tmp_path),
+        timeout_s=5.0,
+        quiet=False,
+        message="hello",
+        caller="claude",
+    )
+    task = QueuedTask(
+        request=req,
+        created_ms=0,
+        req_id="req-1",
+        done_event=threading.Event(),
+        cancel_event=threading.Event(),
+    )
+
+    result = ClaudeAdapter().handle_task(task)
+
+    assert result.status == "failed"
+    assert result.done_seen is False
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "failed"
 
 
 def test_claude_adapter_does_not_capture_assistant_without_anchor(tmp_path: Path, monkeypatch) -> None:

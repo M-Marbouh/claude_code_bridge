@@ -3,6 +3,7 @@ Base provider adapter interface for the unified ask daemon.
 """
 from __future__ import annotations
 
+import os
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -356,3 +357,64 @@ class BaseProviderAdapter(ABC):
     def on_stop(self) -> None:
         """Called when the daemon stops. Override for cleanup."""
         pass
+
+
+def _pane_gone_probes_threshold() -> int:
+    """How many consecutive "gone" liveness probes a wait loop must see
+    before declaring a pane dead.
+
+    Env-tunable via `CCB_PANE_GONE_PROBES` (default 3), shared by every
+    provider adapter's wait loop so they all agree on one number. Parsed
+    defensively: anything that doesn't parse as a positive int falls back
+    to the default rather than letting a bad env value disable the
+    death-streak requirement entirely.
+    """
+    raw = (os.environ.get("CCB_PANE_GONE_PROBES") or "").strip()
+    if not raw:
+        return 3
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, value)
+
+
+class PaneDeathTracker:
+    """Consecutive-"gone"-probe counter shared by every provider adapter's
+    wait loop.
+
+    This exists because a single "gone" (or exception) from a liveness
+    probe is exactly the failure it replaces: `wezterm cli list` and the
+    tmux control socket can both time out or error under load, and one
+    bad probe used to be enough to fail a task that was actually still
+    running (see `terminal.TerminalBackend.pane_liveness`). A pane is only
+    declared dead after `threshold` consecutive "gone" probes in a row.
+    "alive" resets the streak to zero; "unknown" -- a listing failure, a
+    timeout, or an exception from the probe itself -- is left untouched,
+    because it is evidence of nothing, not of death.
+    """
+
+    def __init__(self, threshold: Optional[int] = None):
+        self._threshold = threshold if threshold is not None else _pane_gone_probes_threshold()
+        self._streak = 0
+
+    def observe(self, liveness: str) -> bool:
+        """Record one probe result ("alive"/"gone"/"unknown"). Returns
+        True once the streak has reached the threshold -- the caller
+        should now treat the pane as dead."""
+        if liveness == "gone":
+            self._streak += 1
+        elif liveness == "alive":
+            self._streak = 0
+        return self._streak >= self._threshold
+
+
+def probe_pane_liveness(backend: Any, pane_id: str) -> str:
+    """Call `backend.pane_liveness(pane_id)`, folding any exception (or an
+    unrecognized return value) into "unknown". A probe that could not run
+    proves nothing about the pane, so it must never be counted as "gone"."""
+    try:
+        liveness = backend.pane_liveness(pane_id)
+    except Exception:
+        return "unknown"
+    return liveness if liveness in ("alive", "gone", "unknown") else "unknown"

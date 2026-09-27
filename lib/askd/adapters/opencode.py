@@ -10,7 +10,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
+from askd.adapters.base import (
+    BaseProviderAdapter,
+    PaneDeathTracker,
+    ProviderRequest,
+    ProviderResult,
+    QueuedTask,
+    probe_pane_liveness,
+)
 from askd_runtime import log_path, write_log
 from completion_hook import (
     COMPLETION_STATUS_CANCELLED,
@@ -42,6 +49,45 @@ def _write_log(line: str) -> None:
 
 def _cancel_detection_enabled(default: bool = False) -> bool:
     return env_bool("CCB_OASKD_CANCEL_DETECT", default)
+
+
+def _persist_and_notify(task: QueuedTask, req: ProviderRequest, result: ProviderResult, *, reply_for_hook: str, status: str) -> ProviderResult:
+    """Shared tail for every exit from the wait loop -- normal completion
+    AND the pane-died path -- so a caller declared dead is told about it
+    exactly the same way a caller told "done" is: persist the proven
+    result first (Task 2/Item 5 -- a receipt that exists but could not be
+    saved suppresses notification entirely), then notify. Before this
+    helper existed, the pane-died path `return`ed straight out of the
+    wait loop and skipped all of this -- the caller was never told
+    anything.
+    """
+    persist_outcome = PersistOutcome.NO_RECEIPT
+    try:
+        persist_outcome = persist_proven_result(task.req_id, reply=reply_for_hook, status=status)
+    except Exception:
+        persist_outcome = PersistOutcome.FAILED
+    if persist_outcome == PersistOutcome.FAILED:
+        _write_log(f"[WARN] proven result could not be saved; suppressing notification req_id={task.req_id}")
+        return result
+
+    notify_completion(
+        provider="opencode",
+        output_file=req.output_path,
+        reply=reply_for_hook,
+        req_id=task.req_id,
+        done_seen=result.done_seen,
+        status=status,
+        caller=req.caller,
+        email_req_id=req.email_req_id,
+        email_msg_id=req.email_msg_id,
+        email_from=req.email_from,
+        work_dir=req.work_dir,
+        caller_pane_id=req.caller_pane_id,
+        caller_terminal=req.caller_terminal,
+        caller_live_id=req.route.caller_live_id if req.route.present else "",
+        route_launch_id=req.route.launch_id if req.route.present else "",
+    )
+    return result
 
 
 class OpenCodeAdapter(BaseProviderAdapter):
@@ -191,6 +237,7 @@ class OpenCodeAdapter(BaseProviderAdapter):
 
         pane_check_interval = float(os.environ.get("CCB_OASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
+        pane_death_tracker = PaneDeathTracker()
         # OpenCode logs give no end-of-turn record. Output that has stopped
         # changing for this long counts as a finished turn, so a whole-line
         # marker followed by extra prose still completes the request.
@@ -212,13 +259,13 @@ class OpenCodeAdapter(BaseProviderAdapter):
                 wait_step = 1.0
 
             if time.time() - last_pane_check >= pane_check_interval:
-                try:
-                    alive = bool(backend.is_alive(pane_id))
-                except Exception:
-                    alive = False
-                if not alive:
-                    _write_log(f"[ERROR] Pane {pane_id} died during request req_id={task.req_id}")
-                    return ProviderResult(
+                liveness = probe_pane_liveness(backend, pane_id)
+                if pane_death_tracker.observe(liveness):
+                    _write_log(
+                        f"[ERROR] Pane {pane_id} died during request req_id={task.req_id} "
+                        f"(liveness={liveness})"
+                    )
+                    dead_result = ProviderResult(
                         exit_code=1,
                         reply="OpenCode pane died during request",
                         req_id=task.req_id,
@@ -226,6 +273,7 @@ class OpenCodeAdapter(BaseProviderAdapter):
                         done_seen=False,
                         status=COMPLETION_STATUS_FAILED,
                     )
+                    return _persist_and_notify(task, req, dead_result, reply_for_hook=dead_result.reply, status=COMPLETION_STATUS_FAILED)
                 last_pane_check = time.time()
 
             reply, state = log_reader.wait_for_message(state, wait_step)
@@ -268,33 +316,5 @@ class OpenCodeAdapter(BaseProviderAdapter):
         _write_log(f"[INFO] done provider=opencode req_id={task.req_id} exit={result.exit_code}")
 
         # Task 2/Item 5: persist the proven result BEFORE any notification.
-        # A receipt that exists but could not be saved suppresses
-        # notification entirely.
-        persist_outcome = PersistOutcome.NO_RECEIPT
-        try:
-            persist_outcome = persist_proven_result(task.req_id, reply=reply_for_hook, status=status)
-        except Exception:
-            persist_outcome = PersistOutcome.FAILED
-        if persist_outcome == PersistOutcome.FAILED:
-            _write_log(f"[WARN] proven result could not be saved; suppressing notification req_id={task.req_id}")
-            return result
-
-        notify_completion(
-            provider="opencode",
-            output_file=req.output_path,
-            reply=reply_for_hook,
-            req_id=task.req_id,
-            done_seen=done_seen,
-            status=status,
-            caller=req.caller,
-            email_req_id=req.email_req_id,
-            email_msg_id=req.email_msg_id,
-            email_from=req.email_from,
-            work_dir=req.work_dir,
-            caller_pane_id=req.caller_pane_id,
-            caller_terminal=req.caller_terminal,
-            caller_live_id=req.route.caller_live_id if req.route.present else "",
-            route_launch_id=req.route.launch_id if req.route.present else "",
-        )
-
-        return result
+        # `_persist_and_notify` is the same tail the pane-died path uses.
+        return _persist_and_notify(task, req, result, reply_for_hook=reply_for_hook, status=status)

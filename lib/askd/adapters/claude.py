@@ -13,9 +13,11 @@ from typing import Any, Optional
 
 from askd.adapters.base import (
     BaseProviderAdapter,
+    PaneDeathTracker,
     ProviderRequest,
     ProviderResult,
     QueuedTask,
+    probe_pane_liveness,
     route_session_key,
 )
 from askd_runtime import log_path, write_log
@@ -745,6 +747,7 @@ class ClaudeAdapter(BaseProviderAdapter):
         anchor_grace_deadline = min(local_deadline, time.time() + 1.5)
         pane_check_interval = float(os.environ.get("CCB_LASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
+        pane_death_tracker = PaneDeathTracker()
 
         while True:
             if task.cancel_event and task.cancel_event.is_set():
@@ -756,12 +759,12 @@ class ClaudeAdapter(BaseProviderAdapter):
             wait_step = min(remaining, 0.5)
 
             if time.time() - last_pane_check >= pane_check_interval:
-                try:
-                    alive = bool(backend.is_alive(pane_id))
-                except Exception:
-                    alive = False
-                if not alive:
-                    _write_log(f"[ERROR] Pane {pane_id} died during delivery req_id={task.req_id}")
+                liveness = probe_pane_liveness(backend, pane_id)
+                if pane_death_tracker.observe(liveness):
+                    _write_log(
+                        f"[ERROR] Pane {pane_id} died during delivery req_id={task.req_id} "
+                        f"(liveness={liveness})"
+                    )
                     return ProviderResult(
                         exit_code=1,
                         reply="Claude pane died during delivery",
@@ -878,6 +881,7 @@ class ClaudeAdapter(BaseProviderAdapter):
         tail_bytes = int(os.environ.get("CCB_LASKD_REBIND_TAIL_BYTES", str(2 * 1024 * 1024)))
         pane_check_interval = float(os.environ.get("CCB_LASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
+        pane_death_tracker = PaneDeathTracker()
 
         while True:
             if task.cancel_event and task.cancel_event.is_set():
@@ -893,12 +897,9 @@ class ClaudeAdapter(BaseProviderAdapter):
                 wait_step = 0.5
 
             if time.time() - last_pane_check >= pane_check_interval:
-                try:
-                    alive = bool(backend.is_alive(pane_id))
-                except Exception:
-                    alive = False
-                if not alive:
-                    _write_log(f"[ERROR] Pane {pane_id} died req_id={task.req_id}")
+                liveness = probe_pane_liveness(backend, pane_id)
+                if pane_death_tracker.observe(liveness):
+                    _write_log(f"[ERROR] Pane {pane_id} died req_id={task.req_id} (liveness={liveness})")
                     return ProviderResult(
                         exit_code=1,
                         reply="Claude pane died during request",

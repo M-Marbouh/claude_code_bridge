@@ -167,6 +167,62 @@ def test_create_auto_layout_topologies(monkeypatch: pytest.MonkeyPatch) -> None:
     assert split_calls == [("%root", "right"), ("%root", "bottom"), ("%r4", "bottom")]
 
 
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "stderr", "expected"),
+    [
+        ("0\n", 0, "", "alive"),
+        ("1\n", 0, "", "gone"),
+        ("", 1, "can't find pane %9\n", "gone"),
+        ("", 1, "no such pane\n", "gone"),
+        ("", 1, "some other tmux server error\n", "unknown"),
+        ("", 0, "", "unknown"),
+        ("garbage\n", 0, "", "unknown"),
+    ],
+)
+def test_tmux_pane_liveness_pane_target(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, stderr: str, expected: str
+) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
+                      input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        assert args == ["display-message", "-p", "-t", "%9", "#{pane_dead}"]
+        assert capture is True
+        return subprocess.CompletedProcess(args=["tmux"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+    assert backend.pane_liveness("%9") == expected
+
+
+def test_tmux_pane_liveness_timeout_is_unknown_not_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=["tmux", *args], timeout=3.0)
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+    assert backend.pane_liveness("%9") == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (0, "", "alive"),
+        (1, "can't find session: mysession\n", "gone"),
+        (1, "some other tmux server error\n", "unknown"),
+    ],
+)
+def test_tmux_pane_liveness_legacy_session_name(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stderr: str, expected: str
+) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
+                      input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        assert args == ["has-session", "-t", "mysession"]
+        return subprocess.CompletedProcess(args=["tmux"], returncode=returncode, stdout="", stderr=stderr)
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+    assert backend.pane_liveness("mysession") == expected
+
+
 def test_tmux_kill_pane_prefers_pane_id_over_session(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
 

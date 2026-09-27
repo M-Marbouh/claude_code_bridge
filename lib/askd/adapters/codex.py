@@ -13,9 +13,11 @@ from typing import Any, Optional
 
 from askd.adapters.base import (
     BaseProviderAdapter,
+    PaneDeathTracker,
     ProviderRequest,
     ProviderResult,
     QueuedTask,
+    probe_pane_liveness,
     route_session_key,
 )
 from askd_runtime import log_path, write_log
@@ -277,6 +279,71 @@ def _sibling_conversation_ids(route) -> set[str]:
     return result
 
 
+def _persist_and_notify(
+    task: QueuedTask,
+    req: ProviderRequest,
+    result: ProviderResult,
+    *,
+    reply_for_hook: str,
+    status: str,
+    transcript_path: str,
+    conversation_id: str,
+) -> ProviderResult:
+    """Shared tail for every exit from the wait loop -- normal completion
+    AND the pane-died path -- so a caller declared dead is told about it
+    exactly the same way a caller told "done" is: persist the proven
+    result first (Task 2/Item 5 -- a receipt that exists but could not be
+    saved suppresses notification entirely, since delivering "your task
+    is done/failed" when the durable answer failed to save is exactly the
+    failure this ordering prevents), then honour `suppress_completion_hook`,
+    then the `PersistOutcome.FAILED` suppression, then notify. Before this
+    helper existed, the pane-died path `return`ed straight out of the wait
+    loop and skipped all of this -- the caller was never told anything.
+    """
+    persist_outcome = PersistOutcome.NO_RECEIPT
+    try:
+        persist_outcome = persist_proven_result(
+            task.req_id,
+            reply=reply_for_hook,
+            status=status,
+            transcript_path=transcript_path,
+            conversation_id=conversation_id,
+        )
+    except Exception:
+        _write_log(f"[WARN] persist_proven_result raised req_id={task.req_id}")
+        persist_outcome = PersistOutcome.FAILED
+
+    if req.suppress_completion_hook:
+        _write_log(f"[INFO] completion hook suppressed req_id={task.req_id}")
+        return result
+
+    if persist_outcome == PersistOutcome.FAILED:
+        _write_log(
+            f"[WARN] proven result could not be saved; suppressing notification req_id={task.req_id}"
+        )
+        return result
+
+    _write_log(f"[INFO] notify_completion caller={req.caller} status={status} done_seen={result.done_seen}")
+    notify_completion(
+        provider="codex",
+        output_file=req.output_path,
+        reply=reply_for_hook,
+        req_id=task.req_id,
+        done_seen=result.done_seen,
+        status=status,
+        caller=req.caller,
+        email_req_id=req.email_req_id,
+        email_msg_id=req.email_msg_id,
+        email_from=req.email_from,
+        work_dir=req.caller_work_dir or req.work_dir,
+        caller_pane_id=req.caller_pane_id or (req.route.caller_pane_id if req.route.present else ""),
+        caller_terminal=req.caller_terminal or (req.route.caller_terminal if req.route.present else ""),
+        caller_live_id=req.route.caller_live_id if req.route.present else "",
+        route_launch_id=req.route.launch_id if req.route.present else "",
+    )
+    return result
+
+
 class CodexAdapter(BaseProviderAdapter):
     """Adapter for Codex (WezTerm) provider."""
 
@@ -523,6 +590,7 @@ class CodexAdapter(BaseProviderAdapter):
 
         anchor_collect_grace = min(deadline, time.time() + 2.0) if deadline else (time.time() + 2.0)
         last_pane_check = time.time()
+        pane_death_tracker = PaneDeathTracker()
         default_interval = "5.0" if is_windows() else "2.0"
         pane_check_interval = float(os.environ.get("CCB_CASKD_PANE_CHECK_INTERVAL", default_interval))
         stale_grace_s = float(os.environ.get("CCB_CASKD_STALE_LOG_GRACE_SECONDS", "2.5"))
@@ -545,12 +613,12 @@ class CodexAdapter(BaseProviderAdapter):
                 wait_step = 0.5
 
             if time.time() - last_pane_check >= pane_check_interval:
-                try:
-                    alive = bool(backend.is_alive(pane_id))
-                except Exception:
-                    alive = False
-                if not alive:
-                    _write_log(f"[ERROR] Pane {pane_id} died during request req_id={task.req_id}")
+                liveness = probe_pane_liveness(backend, pane_id)
+                if pane_death_tracker.observe(liveness):
+                    _write_log(
+                        f"[ERROR] Pane {pane_id} died during request req_id={task.req_id} "
+                        f"(liveness={liveness})"
+                    )
                     codex_log_path = None
                     try:
                         lp = reader.current_log_path()
@@ -558,7 +626,7 @@ class CodexAdapter(BaseProviderAdapter):
                             codex_log_path = str(lp)
                     except Exception:
                         pass
-                    return ProviderResult(
+                    dead_result = ProviderResult(
                         exit_code=1,
                         reply="Codex pane died during request",
                         req_id=task.req_id,
@@ -569,6 +637,15 @@ class CodexAdapter(BaseProviderAdapter):
                         anchor_ms=anchor_ms,
                         log_path=codex_log_path,
                         status=COMPLETION_STATUS_FAILED,
+                    )
+                    return _persist_and_notify(
+                        task,
+                        req,
+                        dead_result,
+                        reply_for_hook=dead_result.reply,
+                        status=COMPLETION_STATUS_FAILED,
+                        transcript_path=codex_log_path_at_anchor or "",
+                        conversation_id=codex_session_id_at_anchor or "",
                     )
                 last_pane_check = time.time()
 
@@ -731,56 +808,16 @@ class CodexAdapter(BaseProviderAdapter):
         if not reply_for_hook.strip():
             reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
 
-        # Task 2/Item 5: persist the proven result BEFORE any notification
-        # is even considered -- including when the hook ends up suppressed
-        # below. A receipt that exists but could not be saved suppresses
-        # notification entirely: delivering "your task is done" when the
-        # durable answer failed to save is exactly the failure this
-        # ordering exists to prevent. A task with no async receipt at all
-        # (NO_RECEIPT) is not a failure -- notification proceeds normally.
-        # `codex_log_path_at_anchor`/`codex_session_id_at_anchor` (Item 2)
+        # Item 2: `codex_log_path_at_anchor`/`codex_session_id_at_anchor`
         # are the transcript proof captured when the anchor was confirmed,
-        # not the finalization-time reader state.
-        persist_outcome = PersistOutcome.NO_RECEIPT
-        try:
-            persist_outcome = persist_proven_result(
-                task.req_id,
-                reply=reply_for_hook,
-                status=status,
-                transcript_path=codex_log_path_at_anchor or "",
-                conversation_id=codex_session_id_at_anchor or "",
-            )
-        except Exception:
-            _write_log(f"[WARN] persist_proven_result raised req_id={task.req_id}")
-            persist_outcome = PersistOutcome.FAILED
-
-        if req.suppress_completion_hook:
-            _write_log(f"[INFO] completion hook suppressed req_id={task.req_id}")
-            return result
-
-        if persist_outcome == PersistOutcome.FAILED:
-            _write_log(
-                f"[WARN] proven result could not be saved; suppressing notification req_id={task.req_id}"
-            )
-            return result
-
-        _write_log(f"[INFO] notify_completion caller={req.caller} status={status} done_seen={done_seen}")
-        notify_completion(
-            provider="codex",
-            output_file=req.output_path,
-            reply=reply_for_hook,
-            req_id=task.req_id,
-            done_seen=done_seen,
+        # not the finalization-time reader state. `_persist_and_notify`
+        # (below) is the same tail the pane-died path uses.
+        return _persist_and_notify(
+            task,
+            req,
+            result,
+            reply_for_hook=reply_for_hook,
             status=status,
-            caller=req.caller,
-            email_req_id=req.email_req_id,
-            email_msg_id=req.email_msg_id,
-            email_from=req.email_from,
-            work_dir=req.caller_work_dir or req.work_dir,
-            caller_pane_id=req.caller_pane_id or (req.route.caller_pane_id if req.route.present else ""),
-            caller_terminal=req.caller_terminal or (req.route.caller_terminal if req.route.present else ""),
-            caller_live_id=req.route.caller_live_id if req.route.present else "",
-            route_launch_id=req.route.launch_id if req.route.present else "",
+            transcript_path=codex_log_path_at_anchor or "",
+            conversation_id=codex_session_id_at_anchor or "",
         )
-
-        return result

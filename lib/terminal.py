@@ -342,6 +342,24 @@ class TerminalBackend(ABC):
     @abstractmethod
     def create_pane(self, cmd: str, cwd: str, direction: str = "right", percent: int = 50, parent_pane: Optional[str] = None) -> str: ...
 
+    def pane_liveness(self, pane_id: str) -> str:
+        """Tri-state liveness probe for provider wait loops: "alive",
+        "gone", or "unknown" -- distinct from `is_alive()`, which callers
+        outside a wait loop keep using unchanged.
+
+        `is_alive()` folds "the pane is dead" and "I couldn't tell" into
+        the same False, which is exactly the bug this exists to fix (a
+        flaky `wezterm cli list`/tmux probe used to be indistinguishable
+        from a genuinely dead pane). This base implementation is the
+        fallback for a backend that hasn't been taught the difference:
+        True maps to "alive", and False maps to "unknown" -- never to
+        "gone", because a generic is_alive() failure carries no proof of
+        death. Real backends (TmuxBackend, WeztermBackend) override this
+        with concrete alive/gone/unknown semantics instead of relying on
+        this fallback.
+        """
+        return "alive" if self.is_alive(pane_id) else "unknown"
+
 
 class TmuxBackend(TerminalBackend):
     """
@@ -750,6 +768,49 @@ class TmuxBackend(TerminalBackend):
         cp = self._tmux_run(["has-session", "-t", pane_id], capture=True)
         return cp.returncode == 0
 
+    def pane_liveness(self, pane_id: str) -> str:
+        """Tri-state probe used by wait loops (see `TerminalBackend.
+        pane_liveness`): "gone" only when tmux POSITIVELY reports the pane
+        or session missing, or reports `pane_dead == 1`; a timeout or any
+        other tmux-server error is "unknown", never folded into "gone" the
+        way `is_alive()` does. Kept separate from `is_alive()` so its ~44
+        existing callers keep today's binary semantics unchanged. Legacy
+        session-name targets keep working via `has-session`.
+        """
+        if not pane_id:
+            return "gone"
+        probe_timeout = _env_float("CCB_TMUX_LIVENESS_PROBE_TIMEOUT", 3.0)
+        if self._looks_like_tmux_target(pane_id):
+            try:
+                cp = self._tmux_run(
+                    ["display-message", "-p", "-t", pane_id, "#{pane_dead}"],
+                    capture=True,
+                    timeout=probe_timeout,
+                )
+            except Exception:
+                return "unknown"
+            if cp.returncode != 0:
+                err = (cp.stderr or cp.stdout or "").lower()
+                if "can't find pane" in err or "no such pane" in err:
+                    return "gone"
+                return "unknown"
+            pane_dead = (cp.stdout or "").strip()
+            if pane_dead == "0":
+                return "alive"
+            if pane_dead == "1":
+                return "gone"
+            return "unknown"
+
+        # Legacy: pane_id is a tmux session name.
+        try:
+            cp = self._tmux_run(["has-session", "-t", pane_id], capture=True, timeout=probe_timeout)
+        except Exception:
+            return "unknown"
+        if cp.returncode == 0:
+            return "alive"
+        err = (cp.stderr or cp.stdout or "").lower()
+        return "gone" if "can't find session" in err else "unknown"
+
     def kill_pane(self, pane_id: str) -> None:
         if not pane_id:
             return
@@ -1125,7 +1186,7 @@ class WeztermBackend(TerminalBackend):
                 entries.append({"pane_id": pane_token})
         return entries
 
-    def _list_panes(self) -> Optional[list[dict]]:
+    def _list_panes(self, timeout: float = 1.0) -> Optional[list[dict]]:
         self._last_list_error = None
         try:
             result = _run(
@@ -1134,7 +1195,7 @@ class WeztermBackend(TerminalBackend):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=1.0,
+                timeout=timeout,
             )
             if result.returncode == 0:
                 try:
@@ -1162,7 +1223,7 @@ class WeztermBackend(TerminalBackend):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=1.0,
+                timeout=timeout,
             )
             if fallback.returncode == 0:
                 panes = self._parse_list_output(fallback.stdout)
@@ -1307,6 +1368,26 @@ class WeztermBackend(TerminalBackend):
         if any(str(p.get("pane_id")) == str(pane_id) for p in panes):
             return True
         return self._pane_id_by_title_marker(panes, pane_id) is not None
+
+    def pane_liveness(self, pane_id: str) -> str:
+        """Tri-state probe used by wait loops (see `TerminalBackend.
+        pane_liveness`): "unknown" whenever `_list_panes()` could not
+        confirm anything one way or the other (`wezterm cli list` errored
+        or timed out) -- that is the exact case `is_alive()` folds into
+        "dead", which is the bug this exists to fix. "gone" only follows a
+        SUCCESSFUL listing that contains the pane neither by id nor via
+        its title marker (mirroring `is_alive()`'s own matching). Uses a
+        longer listing timeout than `is_alive()` since this is an
+        occasional wait-loop probe, not a hot path.
+        """
+        panes = self._list_panes(timeout=3.0)
+        if panes is None:
+            return "unknown"
+        if any(str(p.get("pane_id")) == str(pane_id) for p in panes):
+            return "alive"
+        if self._pane_id_by_title_marker(panes, pane_id) is not None:
+            return "alive"
+        return "gone"
 
     def get_text(self, pane_id: str, lines: int = 20) -> Optional[str]:
         """Get text content from pane (last N lines)."""

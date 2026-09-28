@@ -7,6 +7,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 import completion_hook
 from askd.adapters.base import ResolvedRoute
 from task_receipts import (
@@ -1286,13 +1288,15 @@ def test_bare_pend_fails_when_current_session_has_multiple_tasks(monkeypatch, ca
     ]
     monkeypatch.setattr(pend, "iter_receipts", lambda: records)
     monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "ccb-1", "codex"))
+    monkeypatch.setattr(pend, "_current_role_for_receipt", lambda receipt: "lead" if receipt["task_id"] == "a" else "worker")
 
     rc = pend.main(["pend"])
 
-    assert rc == pend.EXIT_ERROR
-    output = capsys.readouterr().err
-    assert "[AMBIGUOUS]" in output
-    assert "a, b" in output
+    assert rc == pend.EXIT_NO_REPLY
+    output = capsys.readouterr().out
+    assert "task id\tprovider\tcurrent role\tstatus\tage" in output
+    assert "a\tcodex\tlead" in output
+    assert "b\tclaude\tworker" in output
 
 
 def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:
@@ -1307,6 +1311,138 @@ def test_pend_reads_exact_completed_task_log(tmp_path: Path, capsys) -> None:
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == "exact reply"
+
+
+def test_exact_pend_writes_provenance_to_stderr_and_recovers_late_reply(tmp_path: Path, monkeypatch, capsys) -> None:
+    pend = _load_pend_module()
+    status = tmp_path / "task.status"
+    log = tmp_path / "task.log"
+    status.write_text("finished exit_code=2\n", encoding="utf-8")
+    log.write_text("partial\n", encoding="utf-8")
+    receipt = {
+        "task_id": "20260928-192146-818-2479138", "provider": "codex",
+        "status_file": str(status), "log_file": str(log), "destination_live_id": "codex-B",
+        "destination_ccb_project_id": "proj", "route_launch_id": "launch",
+    }
+    monkeypatch.setattr(pend, "read_server_result_status", lambda _r: "incomplete")
+    monkeypatch.setattr(pend, "read_server_result", lambda _r: "partial result")
+    monkeypatch.setattr(pend, "read_peer_reply", lambda _r: "")
+    monkeypatch.setattr(pend, "_recover_provider_reply", lambda _r: "final reply")
+    monkeypatch.setattr(pend, "_current_role_for_receipt", lambda _r: "implementer")
+
+    rc = pend._show_receipt(receipt, provenance=True)
+
+    captured = capsys.readouterr()
+    assert rc == pend.EXIT_OK
+    assert captured.out == "final reply\n"
+    assert "task id=20260928-192146-818-2479138" in captured.err
+    assert "provider=codex" in captured.err and "destination live-id=codex-B" in captured.err
+    assert "current role=implementer" in captured.err and "status=recovered-late" in captured.err
+
+
+def test_pend_help_documents_exact_late_recovery_and_member_selectors(capsys) -> None:
+    pend = _load_pend_module()
+    with pytest.raises(SystemExit) as exc:
+        pend.main(["pend", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "late final reply" in output
+    assert "pend <role>" in output
+    assert "--live-id" in output
+
+
+def test_pend_same_provider_pair_lists_current_members(monkeypatch, capsys) -> None:
+    from types import SimpleNamespace
+
+    pend = _load_pend_module()
+    sessions = [SimpleNamespace(live_id="codex-A", provider="codex"), SimpleNamespace(live_id="codex-B", provider="codex")]
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "launch", "codex"))
+    monkeypatch.setattr(pend, "_pair_scope", lambda *_a: (sessions, "codex-A", False, True))
+    monkeypatch.setattr(pend, "_current_roles", lambda *_a: {"codex-A": "lead"})
+    monkeypatch.setattr(pend, "_current_session_receipts", lambda *_a, **_kw: [])
+
+    rc = pend.main(["pend", "codex"])
+
+    assert rc == pend.EXIT_NO_REPLY
+    output = capsys.readouterr().out
+    assert "codex-A\tlead\tnone" in output
+    assert "codex-B\tnone\tnone" in output
+
+
+@pytest.mark.parametrize("selector", ["role", "live-id"])
+def test_pend_member_selectors_filter_by_exact_destination(monkeypatch, capsys, selector) -> None:
+    from types import SimpleNamespace
+
+    pend = _load_pend_module()
+    sessions = [SimpleNamespace(live_id="codex-A", provider="codex"), SimpleNamespace(live_id="codex-B", provider="codex")]
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "launch", "codex"))
+    monkeypatch.setattr(pend, "_pair_scope", lambda *_a: (sessions, "codex-A", False, True))
+    monkeypatch.setattr(pend, "_current_roles", lambda *_a: {"codex-A": "lead", "codex-B": "worker"})
+    calls = []
+    shown = []
+    receipt = {"task_id": "for-worker", "provider": "codex", "submitted_at": "2026-09-28T20:00:00Z", "destination_live_id": "codex-B"}
+    monkeypatch.setattr(pend, "_current_session_receipts", lambda *a, **kw: calls.append((a, kw)) or [(Path("for-worker.json"), receipt)])
+    monkeypatch.setattr(pend, "_show_receipt", lambda _r, *, provenance=False: shown.append(provenance) or pend.EXIT_OK)
+
+    argv = ["pend", "worker"] if selector == "role" else ["pend", "codex", "--live-id", "codex-B"]
+    rc = pend.main(argv)
+
+    assert rc == pend.EXIT_OK
+    assert calls and calls[0][1].get("destination_live_id") == "codex-B"
+    assert shown == [True]
+
+
+def test_pend_status_does_not_call_nonzero_finished_task_completed(monkeypatch, tmp_path: Path) -> None:
+    pend = _load_pend_module()
+    status = tmp_path / "failed.status"
+    status.write_text("finished exit_code=2\n", encoding="utf-8")
+    receipt = {"provider": "codex", "status_file": str(status)}
+    monkeypatch.setattr(pend, "read_server_result_status", lambda _r: "")
+    monkeypatch.setattr(pend, "read_peer_reply", lambda _r: "")
+    monkeypatch.setattr(pend, "read_server_result", lambda _r: "")
+
+    assert pend._saved_pend_status(receipt) == "failed"
+
+
+@pytest.mark.parametrize(
+    ("saved", "finished", "exit_code", "provider", "reply_expected", "expected"),
+    [
+        ("completed", True, 0, "codex", False, "completed"),
+        ("incomplete", False, None, "codex", False, "incomplete-running"),
+        ("incomplete", True, 2, "codex", False, "incomplete"),
+        ("cancelled", True, 2, "codex", False, "cancelled"),
+        ("failed", True, 2, "codex", False, "failed"),
+        ("", False, None, "codex", False, "pending"),
+        ("", True, 0, "peer-codex", True, "awaiting-peer"),
+    ],
+)
+def test_pend_status_uses_saved_result_and_waiter_state(
+    monkeypatch, saved, finished, exit_code, provider, reply_expected, expected
+) -> None:
+    pend = _load_pend_module()
+    monkeypatch.setattr(pend, "read_server_result_status", lambda _r: saved)
+    monkeypatch.setattr(pend, "read_peer_reply", lambda _r: "")
+    monkeypatch.setattr(pend, "read_server_result", lambda _r: "")
+    monkeypatch.setattr(pend, "_status_finished", lambda _p: (finished, exit_code, None))
+    monkeypatch.setattr(pend, "_status_pid", lambda _p: None)
+    receipt = {"provider": provider, "status_file": "missing", "reply_expected": reply_expected}
+
+    assert pend._saved_pend_status(receipt) == expected
+
+
+@pytest.mark.parametrize("target,available_expected", [("not-a-target", True), ("codex", False)])
+def test_pend_lists_available_providers_only_for_unknown_target(monkeypatch, capsys, target, available_expected) -> None:
+    pend = _load_pend_module()
+    monkeypatch.setattr(pend, "_current_session_context", lambda: ("p", "launch", "codex"))
+    # A present empty inventory makes codex a known selector that cannot be
+    # resolved in this launch; an absent inventory exercises unknown target.
+    inventory = ([], "", False, True) if target == "codex" else ([], "", False, False)
+    monkeypatch.setattr(pend, "_pair_scope", lambda *_a: inventory)
+
+    rc = pend.main(["pend", target])
+
+    assert rc == pend.EXIT_ERROR
+    assert ("Available providers:" in capsys.readouterr().err) is available_expected
 
 
 def test_pend_peer_task_waits_after_delivery_until_explicit_reply(tmp_path: Path, capsys) -> None:
@@ -1488,6 +1624,52 @@ def test_recover_reads_the_exact_recorded_codex_conversation_not_the_replacement
 
     assert pend._recover_from_recorded_conversation(receipt, "codex") == "Original reply."
     assert pend._recover_provider_reply(receipt) == "Original reply."
+
+
+def test_routed_recovery_requires_exact_transcript_done_marker(tmp_path: Path, monkeypatch) -> None:
+    pend = _load_pend_module()
+    req_id = "20260928-200214-383-2702627"
+    transcript = tmp_path / "rollout.jsonl"
+    receipt = {
+        "task_id": req_id,
+        "provider": "codex",
+        "work_dir": str(tmp_path),
+        "route_launch_id": "launch",
+        "destination_transcript_path": str(transcript),
+        "destination_conversation_id": "exact-session",
+    }
+    status = tmp_path / "task.status"
+    status.write_text("finished exit_code=2\n", encoding="utf-8")
+    receipt["status_file"] = str(status)
+    monkeypatch.setattr(pend, "read_server_result_status", lambda _r: "incomplete")
+    monkeypatch.setattr(pend, "read_peer_reply", lambda _r: "")
+    monkeypatch.setattr(pend, "read_server_result", lambda _r: "partial output")
+    anchor = {"type": "event_msg", "payload": {"type": "user_message", "message": f"CCB_REQ_ID: {req_id}\nquestion"}}
+    final = {"type": "response_item", "payload": {
+        "type": "message", "role": "assistant", "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "Final answer without marker."}],
+    }}
+    transcript.write_text(
+        "\n".join(json.dumps(item) for item in [
+            {"type": "session_meta", "payload": {"cwd": str(tmp_path)}}, anchor, final,
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    recovered = pend._recover_from_recorded_conversation(receipt, "codex")
+    assert recovered is None
+    assert pend._saved_pend_status(receipt, recovered=recovered or "") == "incomplete"
+
+    final["payload"]["content"][0]["text"] = f"Final answer.\nCCB_DONE: {req_id}"
+    transcript.write_text(
+        "\n".join(json.dumps(item) for item in [
+            {"type": "session_meta", "payload": {"cwd": str(tmp_path)}}, anchor, final,
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    recovered = pend._recover_from_recorded_conversation(receipt, "codex")
+    assert recovered == "Final answer."
+    assert pend._saved_pend_status(receipt, recovered=recovered) == "recovered-late"
 
 
 def test_recover_reads_the_exact_recorded_claude_conversation(tmp_path: Path) -> None:
@@ -2116,7 +2298,7 @@ def test_overlay_never_reads_manual_history_from_the_wrong_pane_under_a_pair(
 
     monkeypatch.setattr(pend, "provider_log_reader", _tracking_reader)
 
-    rc = pend.main(["pend", "codex"])
+    rc = pend.main(["pend", "codex", "--live-id", "codex-B"])
 
     assert rc == pend.EXIT_OK
     output = capsys.readouterr().out
@@ -2237,6 +2419,21 @@ def test_resolve_retrieval_target_refuses_when_more_than_two_sessions_of_provide
 
     assert responder == ""
     assert error != ""
+
+
+def test_peer_ambiguity_error_explains_current_member_selectors() -> None:
+    pend = _load_pend_module()
+    from live_sessions import live_sessions_from_record
+
+    sessions = live_sessions_from_record(_pair_record(
+        "p", "ai-1", _TWO_CODEX_SESSIONS + [{"live_id": "codex-C", "provider": "codex", "pane_id": "12"}]
+    ))
+    _responder, _caller, _destination, error = pend._resolve_retrieval_target(
+        "peer", "codex", sessions, "codex-A", True
+    )
+
+    assert "pend <role>" in error
+    assert "pend <provider> --live-id <id>" in error
 
 
 def test_resolve_retrieval_target_refuses_when_current_identity_unknown() -> None:

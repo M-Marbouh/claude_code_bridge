@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import caskd_session
@@ -154,6 +156,36 @@ class _ScriptedReader:
         return None
 
 
+class _TimedReader(_ScriptedReader):
+    def __init__(self, events, log_path=None, delays=None, event_paths=None):
+        super().__init__(events, log_path)
+        self._delays = list(delays or [])
+        self._event_paths = list(event_paths or [])
+        self._index = 0
+
+    def wait_for_event(self, state, timeout):
+        if not self._events:
+            time.sleep(timeout)
+            return None, state
+        delay = self._delays[self._index] if self._index < len(self._delays) else 0.0
+        if delay > timeout:
+            time.sleep(timeout)
+            return None, state
+        if delay:
+            time.sleep(delay)
+        event = self._events.pop(0)
+        if self._index < len(self._event_paths):
+            state = dict(state, log_path=self._event_paths[self._index])
+        self._index += 1
+        return event, state
+
+    def try_get_event(self, state):
+        if not self._events:
+            return None, state
+        self._index += 1
+        return self._events.pop(0), state
+
+
 def _drive_handle_task(
     monkeypatch,
     tmp_path: Path,
@@ -168,6 +200,12 @@ def _drive_handle_task(
     suppress_completion_hook: bool = False,
     notifications: list[dict] | None = None,
     caller_work_dir: str = "",
+    timeout_explicit: bool = True,
+    reader_delays: list[float] | None = None,
+    event_log_paths: list[Path | None] | None = None,
+    idle_timeout_s: float | None = None,
+    max_wait_s: float | None = None,
+    reader_factory=None,
 ):
     # Prepend the user anchor so anchor_seen flips before assistant events.
     scripted = list(events)
@@ -177,7 +215,10 @@ def _drive_handle_task(
     session = session_obj or _FakeSession(tmp_path)
     monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd: session)
     monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: _FakeBackend())
-    monkeypatch.setattr(codex_adapter, "CodexLogReader", lambda **kw: _ScriptedReader(scripted, log_path=log_path))
+    factory = reader_factory or (
+        lambda **kw: _TimedReader(scripted, log_path=log_path, delays=reader_delays, event_paths=event_log_paths)
+    )
+    monkeypatch.setattr(codex_adapter, "CodexLogReader", factory)
     monkeypatch.setattr(
         codex_adapter,
         "notify_completion",
@@ -187,6 +228,9 @@ def _drive_handle_task(
 
     req = ProviderRequest(
         client_id="c", work_dir=str(tmp_path), timeout_s=timeout_s, quiet=True,
+        timeout_explicit=timeout_explicit,
+        idle_timeout_s=idle_timeout_s,
+        max_wait_s=max_wait_s,
         message="do the thing", caller="claude", req_id=req_id,
         show_tier=show_tier,
         suppress_completion_hook=suppress_completion_hook,
@@ -1034,3 +1078,456 @@ def test_handle_task_refuses_duplicate_pool_route_missing_caller_evidence(monkey
     assert "no longer available" in result.reply
     # NO TERMINAL SEND OCCURRED.
     assert backend.sent == []
+
+
+def test_default_timeout_progress_mode_completes_after_timeout_with_done_and_notifies_once(
+    monkeypatch, tmp_path: Path
+) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+    final = f"Finished late.\nCCB_DONE: {req_id}"
+    notifications: list[dict] = []
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.4")
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", "Still working", "commentary"), ("assistant", final, "final_answer")],
+        timeout_s=0.04,
+        timeout_explicit=False,
+        reader_delays=[0.0, 0.03, 0.03],
+        log_path=transcript,
+        event_log_paths=[transcript, transcript, transcript],
+        notifications=notifications,
+    )
+
+    assert result.exit_code == 0
+    assert result.done_seen is True
+    assert result.status == codex_adapter.COMPLETION_STATUS_COMPLETED
+    assert len(notifications) == 1
+
+
+def test_explicit_timeout_keeps_wall_clock_deadline_during_transcript_activity(
+    monkeypatch, tmp_path: Path
+) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.4")
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", "Still working", "commentary"), ("assistant", f"CCB_DONE: {req_id}", "final_answer")],
+        timeout_s=0.04,
+        timeout_explicit=True,
+        reader_delays=[0.0, 0.025, 0.025],
+        log_path=transcript,
+        event_log_paths=[transcript, transcript, transcript],
+    )
+
+    assert result.exit_code == 2
+    assert result.status == codex_adapter.COMPLETION_STATUS_INCOMPLETE
+    assert result.done_seen is False
+
+
+def test_default_timeout_silence_expires_with_idle_notice(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.04")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.3")
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [],
+        timeout_s=0.03,
+        timeout_explicit=False,
+        log_path=transcript,
+        event_log_paths=[transcript],
+    )
+
+    assert result.exit_code == 2
+    assert result.status == codex_adapter.COMPLETION_STATUS_INCOMPLETE
+    assert "idle timeout" in result.reply
+
+
+def test_default_timeout_activity_cannot_extend_past_absolute_cap(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.06")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.08")
+    events = [("assistant", f"progress {i}", "commentary") for i in range(10)]
+    delays = [0.0, *([0.02] * len(events))]
+    paths = [transcript] * (len(events) + 1)
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        events,
+        timeout_s=0.03,
+        timeout_explicit=False,
+        reader_delays=delays,
+        log_path=transcript,
+        event_log_paths=paths,
+    )
+
+    assert result.exit_code == 2
+    assert result.status == codex_adapter.COMPLETION_STATUS_INCOMPLETE
+    assert "maximum wait cap" in result.reply
+
+
+def test_sibling_transcript_growth_does_not_reset_request_idle_timeout(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound-rollout.jsonl"
+    sibling = tmp_path / "sibling-rollout.jsonl"
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.04")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.3")
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [("assistant", "sibling growth", "commentary")],
+        timeout_s=0.03,
+        timeout_explicit=False,
+        reader_delays=[0.0, 0.025],
+        log_path=transcript,
+        event_log_paths=[transcript, sibling],
+    )
+
+    assert result.exit_code == 2
+    assert "idle timeout" in result.reply
+
+
+def test_wall_clock_jump_does_not_advance_progress_idle_or_cap(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    wall = [1000.0]
+    mono = [50.0]
+    notifications: list[dict] = []
+
+    class _JumpReader(_TimedReader):
+        def wait_for_event(self, state, timeout):
+            event, state = super().wait_for_event(state, timeout)
+            if self._index == 1:
+                wall[0] += 86400
+            return event, state
+
+    reader_factory = lambda **kw: _JumpReader(
+            [("user", f"{REQ_ID_PREFIX} {req_id}", ""), ("assistant", f"CCB_DONE: {req_id}", "final_answer")],
+            log_path=tmp_path / "rollout.jsonl",
+            delays=[0.0, 0.0],
+        )
+    monkeypatch.setattr(codex_adapter, "time", SimpleNamespace(time=lambda: wall[0], monotonic=lambda: mono[0]))
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.04")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.08")
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [],
+        include_anchor=False,
+        timeout_s=0.03,
+        timeout_explicit=False,
+        log_path=tmp_path / "rollout.jsonl",
+        notifications=notifications,
+        idle_timeout_s=0.04,
+        max_wait_s=0.08,
+        reader_factory=reader_factory,
+    )
+
+    assert wall[0] == 87400.0
+    assert mono[0] == 50.0
+    assert result.done_seen is True
+    assert result.exit_code == 0
+    assert len(notifications) == 1
+
+
+def test_idle_expiry_drain_completes_when_final_marker_is_already_readable(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+    notifications: list[dict] = []
+
+    class _DrainReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("user", f"{REQ_ID_PREFIX} {req_id}", "")], transcript)
+            self.drained = False
+
+        def wait_for_event(self, state, timeout):
+            if self._events:
+                return self._events.pop(0), state
+            time.sleep(timeout)
+            if not self.drained:
+                self.drained = True
+                return None, state
+            return None, state
+
+        def try_get_event(self, state):
+            if self.drained:
+                self.drained = False
+                return ("assistant", f"Final.\nCCB_DONE: {req_id}", "final_answer"), state
+            return None, state
+
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.02")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.2")
+
+    result = _drive_handle_task(
+        monkeypatch,
+        tmp_path,
+        req_id,
+        [],
+        include_anchor=False,
+        timeout_s=0.03,
+        timeout_explicit=False,
+        log_path=transcript,
+        notifications=notifications,
+        reader_factory=lambda **kw: _DrainReader(),
+    )
+
+    assert result.done_seen is True
+    assert result.exit_code == 0
+    assert len(notifications) == 1
+
+
+def _append_rollout_record(path: Path, value: dict) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value) + "\n")
+        handle.flush()
+
+
+def _run_real_rollout_activity(monkeypatch, tmp_path: Path, req_id: str, *, activity_on_bound: bool):
+    transcript = tmp_path / "bound.jsonl"
+    sibling = tmp_path / "sibling.jsonl"
+    transcript.touch()
+    sibling.touch()
+    session = _FakeSession(tmp_path)
+    session.codex_session_path = str(transcript)
+
+    def write_rollout():
+        _append_rollout_record(
+            transcript,
+            {"type": "event_msg", "payload": {"type": "user_message", "message": f"{REQ_ID_PREFIX} {req_id}"}},
+        )
+        for i in range(4):
+            time.sleep(0.025)
+            target = transcript if activity_on_bound else sibling
+            _append_rollout_record(target, {"type": "turn_context", "payload": {"n": i}})
+        time.sleep(0.025)
+        if activity_on_bound:
+            _append_rollout_record(
+                transcript,
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": f"Final.\nCCB_DONE: {req_id}"}],
+                    },
+                },
+            )
+
+    class _WriterBackend(_FakeBackend):
+        def send_text(self, pane_id, text):
+            super().send_text(pane_id, text)
+            threading.Thread(target=write_rollout, daemon=True).start()
+
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda wd: session)
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda data: _WriterBackend())
+    monkeypatch.setattr(codex_adapter, "notify_completion", lambda **kw: None)
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda line: None)
+    monkeypatch.setenv("CODEX_POLL_INTERVAL", "0.01")
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.07")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "2")
+
+    req = ProviderRequest(
+        client_id="c",
+        work_dir=str(tmp_path),
+        timeout_s=0.3,
+        quiet=True,
+        message="do the thing",
+        caller="claude",
+        req_id=req_id,
+        timeout_explicit=False,
+        idle_timeout_s=0.07,
+        max_wait_s=2,
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+    result = codex_adapter.CodexAdapter().handle_task(task)
+    return result
+
+
+def test_actual_reader_counts_nonmessage_records_appended_to_bound_rollout(monkeypatch, tmp_path: Path) -> None:
+    result = _run_real_rollout_activity(monkeypatch, tmp_path, make_req_id(), activity_on_bound=True)
+    assert result.done_seen is True
+    assert result.exit_code == 0
+
+
+def test_actual_reader_ignores_sibling_rollout_growth_for_idle(monkeypatch, tmp_path: Path) -> None:
+    result = _run_real_rollout_activity(monkeypatch, tmp_path, make_req_id(), activity_on_bound=False)
+    assert result.done_seen is False
+    assert result.exit_code == 2
+    assert "idle timeout" in result.reply
+
+
+def test_bound_rollout_done_is_read_when_newer_sibling_is_active(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    bound = tmp_path / "bound.jsonl"
+    sibling = tmp_path / "sibling.jsonl"
+    cwd = str(tmp_path)
+    _append_rollout_record(bound, {"type": "session_meta", "payload": {"cwd": cwd}})
+    session = _FakeSession(tmp_path)
+    session.codex_session_root = tmp_path
+    session.data["codex_session_root"] = str(tmp_path)
+    session.codex_session_path = str(bound)
+    scanned_paths: list[Path | None] = []
+    original_scan = CodexLogReader._scan_latest
+    observed_reader_paths: list[Path] = []
+    original_wait = CodexLogReader.wait_for_event
+
+    def tracking_scan(reader):
+        latest = original_scan(reader)
+        scanned_paths.append(latest)
+        return latest
+
+    def tracking_wait(reader, state, timeout):
+        event, next_state = original_wait(reader, state, timeout)
+        if next_state.get("log_path"):
+            observed_reader_paths.append(Path(next_state["log_path"]))
+        return event, next_state
+
+    monkeypatch.setattr(CodexLogReader, "_scan_latest", tracking_scan)
+    monkeypatch.setattr(CodexLogReader, "wait_for_event", tracking_wait)
+
+    def write_logs():
+        _append_rollout_record(
+            bound,
+            {"type": "event_msg", "payload": {"type": "user_message", "message": f"{REQ_ID_PREFIX} {req_id}"}},
+        )
+        time.sleep(0.05)  # make the sibling newest before the reader's first rescan
+        _append_rollout_record(sibling, {"type": "session_meta", "payload": {"cwd": cwd}})
+        for index in range(8):
+            _append_rollout_record(
+                sibling,
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": f"Sibling still active {index}"}},
+            )
+            time.sleep(0.04)
+        _append_rollout_record(
+            bound,
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "phase": "final_answer",
+                "content": [{"type": "output_text", "text": f"Bound final.\nCCB_DONE: {req_id}"}],
+            }},
+        )
+
+    class _WriterBackend(_FakeBackend):
+        def send_text(self, pane_id, text):
+            super().send_text(pane_id, text)
+            threading.Thread(target=write_logs, daemon=True).start()
+
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda _wd: session)
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda _data: _WriterBackend())
+    monkeypatch.setattr(codex_adapter, "notify_completion", lambda **_kw: None)
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda _line: None)
+    monkeypatch.setenv("CODEX_POLL_INTERVAL", "0.01")
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.8")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "2")
+
+    req = ProviderRequest(
+        client_id="c", work_dir=str(tmp_path), timeout_s=0.3, quiet=True,
+        message="do the thing", caller="claude", req_id=req_id,
+        timeout_explicit=False, idle_timeout_s=0.8, max_wait_s=2,
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert result.done_seen is True
+    assert result.exit_code == 0
+    assert sibling in scanned_paths
+    assert observed_reader_paths and set(observed_reader_paths) == {bound}
+
+
+def test_unfiltered_reader_discovers_new_rollout_before_anchor_and_done(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    old_log = tmp_path / "old-rollout.jsonl"
+    new_log = tmp_path / "new-rollout.jsonl"
+    cwd = str(tmp_path)
+    _append_rollout_record(old_log, {"type": "session_meta", "payload": {"cwd": cwd}})
+    session = _FakeSession(tmp_path)
+    session.data["codex_session_root"] = str(tmp_path)
+    session.codex_session_path = str(old_log)
+
+    class _WriterBackend(_FakeBackend):
+        def send_text(self, pane_id, text):
+            super().send_text(pane_id, text)
+            _append_rollout_record(new_log, {"type": "session_meta", "payload": {"cwd": cwd}})
+            _append_rollout_record(
+                new_log,
+                {"type": "event_msg", "payload": {"type": "user_message", "message": f"{REQ_ID_PREFIX} {req_id}"}},
+            )
+            _append_rollout_record(
+                new_log,
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": f"New rollout final.\nCCB_DONE: {req_id}"}],
+                }},
+            )
+
+    monkeypatch.setattr(codex_adapter, "load_project_session", lambda _wd: session)
+    monkeypatch.setattr(codex_adapter, "get_backend_for_session", lambda _data: _WriterBackend())
+    monkeypatch.setattr(codex_adapter, "notify_completion", lambda **_kw: None)
+    monkeypatch.setattr(codex_adapter, "_write_log", lambda _line: None)
+    monkeypatch.setenv("CODEX_POLL_INTERVAL", "0.01")
+    monkeypatch.setenv("CCB_CODEX_STALE_LOG_SECONDS", "10")
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.8")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "2")
+
+    req = ProviderRequest(
+        client_id="c", work_dir=str(tmp_path), timeout_s=0.3, quiet=True,
+        message="do the thing", caller="claude", req_id=req_id,
+        timeout_explicit=False, idle_timeout_s=0.8, max_wait_s=2,
+    )
+    task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+    result = codex_adapter.CodexAdapter().handle_task(task)
+
+    assert 0 <= new_log.stat().st_mtime - old_log.stat().st_mtime < 10
+    assert result.done_seen is True
+    assert result.exit_code == 0
+
+
+def test_explicit_preanchor_deadline_uses_monotonic_across_wall_clock_jump(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    wall = [1000.0]
+    mono = [50.0]
+
+    class _PreAnchorJumpReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([], tmp_path / "rollout.jsonl")
+            self.waits = 0
+
+        def wait_for_event(self, state, timeout):
+            self.waits += 1
+            if self.waits == 1:
+                wall[0] += 86400
+                return ("user", "unrelated prompt", ""), state
+            mono[0] += timeout
+            return None, state
+
+    reader = _PreAnchorJumpReader()
+    monkeypatch.setattr(codex_adapter, "time", SimpleNamespace(time=lambda: wall[0], monotonic=lambda: mono[0]))
+    monkeypatch.setenv("CCB_CASKD_STALE_LOG_GRACE_SECONDS", "99999")
+    result = _drive_handle_task(
+        monkeypatch, tmp_path, req_id, [], include_anchor=False, timeout_s=0.06,
+        timeout_explicit=True, reader_factory=lambda **_kw: reader,
+    )
+
+    assert wall[0] == 87400.0
+    assert reader.waits >= 2
+    assert mono[0] >= 50.06
+    assert result.status == codex_adapter.COMPLETION_STATUS_INCOMPLETE

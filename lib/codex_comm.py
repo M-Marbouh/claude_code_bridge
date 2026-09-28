@@ -185,6 +185,7 @@ class CodexLogReader:
                  allow_stale_switch: bool = True):
         self.root = Path(root).expanduser()
         self._preferred_log = self._normalize_path(log_path)
+        self._pinned_log_path: Optional[Path] = None
         self._session_id_filter = session_id_filter
         self._work_dir = self._normalize_work_dir(work_dir)
         self._allow_stale_switch = bool(allow_stale_switch)
@@ -264,6 +265,13 @@ class CodexLogReader:
 
     def set_preferred_log(self, log_path: Optional[Path]) -> None:
         self._preferred_log = self._normalize_path(log_path)
+
+    def pin_to_log(self, log_path: Path) -> None:
+        """Keep subsequent event reads on the transcript that proved the anchor."""
+        pinned = self._normalize_path(log_path)
+        if pinned is not None:
+            self._pinned_log_path = pinned
+            self._preferred_log = pinned
 
     def _normalize_work_dir(self, work_dir: Optional[Path]) -> Optional[str]:
         """Normalize work_dir for comparison with cwd in session logs"""
@@ -353,6 +361,8 @@ class CodexLogReader:
         return latest
 
     def _latest_log(self) -> Optional[Path]:
+        if self._pinned_log_path is not None:
+            return self._pinned_log_path if self._pinned_log_path.exists() else None
         preferred = self._preferred_log
         if preferred and preferred.exists():
             if self._session_id_filter:
@@ -476,6 +486,10 @@ class CodexLogReader:
         last_rescan = time.time()
 
         def ensure_log() -> Path:
+            if self._pinned_log_path is not None:
+                if self._pinned_log_path.exists():
+                    return self._pinned_log_path
+                raise FileNotFoundError("Pinned Codex transcript is unavailable")
             candidates = [
                 self._preferred_log if self._preferred_log and self._preferred_log.exists() else None,
                 current_path if current_path and current_path.exists() else None,
@@ -580,6 +594,10 @@ class CodexLogReader:
         last_rescan = time.time()
 
         def ensure_log() -> Path:
+            if self._pinned_log_path is not None:
+                if self._pinned_log_path.exists():
+                    return self._pinned_log_path
+                raise FileNotFoundError("Pinned Codex session log not found")
             candidates = [
                 self._preferred_log if self._preferred_log and self._preferred_log.exists() else None,
                 current_path if current_path and current_path.exists() else None,
@@ -647,7 +665,7 @@ class CodexLogReader:
 
             if time.time() - last_rescan >= rescan_interval:
                 latest = self._scan_latest()
-                if latest and latest != log_path:
+                if latest and latest != log_path and self._pinned_log_path is None:
                     current_path = latest
                     self._preferred_log = latest
                     offset = 0

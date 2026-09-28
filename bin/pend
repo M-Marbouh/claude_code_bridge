@@ -20,9 +20,10 @@ sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
-from claude_comm import ClaudeLogReader
+from claude_comm import ClaudeLogReader, _extract_message
 from codex_comm import CodexLogReader
 from live_sessions import INVENTORY_INVALID, find_caller
+from live_roles import roles_for_record
 from pane_registry import (
     load_registry_by_pane,
     load_registry_by_session_id,
@@ -37,6 +38,7 @@ from task_receipts import (
     iter_receipts,
     read_peer_reply,
     read_server_result,
+    read_server_result_status,
     update_peer_delivery,
 )
 
@@ -58,6 +60,11 @@ RECEIPT_COMPLETED = "completed"
 RECEIPT_PENDING = "pending"
 RECEIPT_PEER_AWAITING = "peer-awaiting"
 RECEIPT_INCOMPLETE = "incomplete"
+RECEIPT_INCOMPLETE_RUNNING = "incomplete-running"
+RECEIPT_RECOVERED_LATE = "recovered-late"
+RECEIPT_AWAITING_PEER = "awaiting-peer"
+RECEIPT_FAILED = "failed"
+RECEIPT_CANCELLED = "cancelled"
 
 
 class OverlayItem:
@@ -349,7 +356,8 @@ def _resolve_retrieval_target(
         # not even there (e.g. a genuinely empty launch).
         return "", "", "", (
             "'peer' could not be resolved from this launch's live-session inventory "
-            "(not reducible to exactly one other session); use a provider name or exact task ID"
+            "(not reducible to exactly one other session); select a member with "
+            "pend <role> or pend <provider> --live-id <id>, or use an exact task ID"
         )
 
     if target in PROVIDER_PENDS:
@@ -601,6 +609,47 @@ def _recover_from_recorded_conversation(receipt: dict, provider: str) -> str | N
 
     conversation_id = str(receipt.get("destination_conversation_id") or "").strip()
 
+    # A clean-looking exchange is not proof of completion: provider readers
+    # may expose a partial assistant turn as a fallback. Require this exact
+    # transcript to show both this task's anchor and its whole-line marker.
+    anchored = False
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict) or entry.get("isSidechain"):
+                    continue
+                if provider == "codex":
+                    event = CodexLogReader._extract_event(entry)
+                    if event is None:
+                        continue
+                    role, text, phase = event
+                    if role == "user":
+                        anchored = CodexLogReader._exchange_req_id(text) == task_id
+                        continue
+                    if anchored and role == "assistant" and is_done_text(
+                        text, task_id, turn_ended=(phase == "final_answer")
+                    ):
+                        break
+                else:
+                    user_text = _extract_message(entry, "user")
+                    if user_text:
+                        anchored = any(
+                            re.match(rf"^{re.escape(REQ_ID_PREFIX)}\s*{re.escape(task_id)}(?:\s|$)", part.strip())
+                            for part in user_text.splitlines()
+                        )
+                        continue
+                    assistant_text = _extract_message(entry, "assistant") if anchored else None
+                    if assistant_text and is_done_text(assistant_text, task_id):
+                        break
+            else:
+                return None
+    except OSError:
+        return None
+
     if provider == "codex":
         reader = CodexLogReader(
             log_path=path,
@@ -681,12 +730,65 @@ def _peer_delivery_label(receipt: dict) -> str:
     return confirmation
 
 
-def _show_receipt(receipt: dict) -> int:
+def _saved_pend_status(receipt: dict, *, recovered: str = "") -> str:
+    saved_status = read_server_result_status(receipt)
+    if read_peer_reply(receipt) or saved_status == "completed":
+        return "completed"
+    status_path = Path(str(receipt.get("status_file") or ""))
+    finished, exit_code, _finished_at = _status_finished(status_path)
+    if recovered:
+        return RECEIPT_RECOVERED_LATE if saved_status == "incomplete" else "completed"
+    if saved_status == "incomplete":
+        return RECEIPT_INCOMPLETE if finished else RECEIPT_INCOMPLETE_RUNNING
+    if saved_status == "cancelled":
+        return RECEIPT_CANCELLED
+    if saved_status == "failed":
+        return RECEIPT_FAILED
+    if (
+        finished and exit_code == 0
+        and str(receipt.get("provider") or "").startswith("peer-")
+        and bool(receipt.get("reply_expected"))
+    ):
+        return RECEIPT_AWAITING_PEER
+    if not finished:
+        pid = _status_pid(status_path)
+        if pid is not None and not _pid_is_alive(pid) and _status_is_stale(status_path, receipt):
+            return RECEIPT_INCOMPLETE
+        return RECEIPT_PENDING
+    return RECEIPT_FAILED if exit_code != 0 else RECEIPT_INCOMPLETE
+
+
+def _current_role_for_receipt(receipt: dict) -> str:
+    live_id = str(receipt.get("destination_live_id") or "").strip()
+    project_id = str(receipt.get("destination_ccb_project_id") or receipt.get("ccb_project_id") or "").strip()
+    launch_id = str(receipt.get("route_launch_id") or "").strip()
+    record = _current_tab_registry(project_id, launch_id)
+    if not live_id or record is None:
+        return "none"
+    return roles_for_record(record).get(live_id, "none")
+
+
+def _show_receipt(receipt: dict, *, provenance: bool = False) -> int:
     receipt = _reconcile_peer_delivery(receipt)
     task_id = str(receipt.get("task_id") or "")
     status_path = Path(str(receipt.get("status_file") or ""))
     log_path = Path(str(receipt.get("log_file") or ""))
     peer_reply = read_peer_reply(receipt)
+    server_status = read_server_result_status(receipt)
+    recovered = ""
+    finished, exit_code, _finished_at = _status_finished(status_path)
+    if not peer_reply and server_status != "completed" and (not finished or exit_code != 0 or server_status == "incomplete"):
+        recovered = _recover_provider_reply(receipt)
+    pend_status = _saved_pend_status(receipt, recovered=recovered)
+    if provenance:
+        provider = str(receipt.get("provider") or "")
+        destination = str(receipt.get("destination_live_id") or "none")
+        role = _current_role_for_receipt(receipt)
+        print(
+            f"[PEND] task id={task_id} provider={provider} destination live-id={destination} "
+            f"current role={role} status={pend_status}",
+            file=sys.stderr,
+        )
     if peer_reply:
         print(prepare_agent_visible_reply(peer_reply, task_id))
         return EXIT_OK
@@ -696,15 +798,15 @@ def _show_receipt(receipt: dict) -> int:
     # presence is proof the task is done regardless of what the transport-
     # side status file currently says.
     server_result = read_server_result(receipt)
+    if server_result and server_status != "incomplete":
+        print(prepare_agent_visible_reply(server_result, task_id))
+        return EXIT_OK
+    if recovered:
+        print(prepare_agent_visible_reply(recovered, task_id))
+        return EXIT_OK
     if server_result:
         print(prepare_agent_visible_reply(server_result, task_id))
         return EXIT_OK
-    finished, exit_code, _finished_at = _status_finished(status_path)
-    if not finished or exit_code != 0:
-        recovered = _recover_provider_reply(receipt)
-        if recovered:
-            print(prepare_agent_visible_reply(recovered, task_id))
-            return EXIT_OK
     if not finished:
         pid = _status_pid(status_path)
         if pid is not None and not _pid_is_alive(pid) and _status_is_stale(status_path, receipt):
@@ -920,13 +1022,15 @@ def _overlay_items(
     return items[:requested]
 
 
-def _show_overlay_items(items: list[OverlayItem], *, prefix_task_ids: bool) -> int:
+def _show_overlay_items(
+    items: list[OverlayItem], *, prefix_task_ids: bool, provenance: bool = False
+) -> int:
     result = EXIT_OK
     for index, item in enumerate(items):
         if item.source == "receipt" and item.receipt is not None:
             if prefix_task_ids:
                 print(f"[TASK {item.receipt.get('task_id', '')}]")
-            current = _show_receipt(item.receipt)
+            current = _show_receipt(item.receipt, provenance=provenance)
         else:
             print(prepare_agent_visible_reply(item.reply, ""))
             current = EXIT_OK
@@ -939,12 +1043,14 @@ def _show_overlay_items(items: list[OverlayItem], *, prefix_task_ids: bool) -> i
     return result
 
 
-def _show_receipts(records: list[tuple[Path, dict]], *, prefix_task_ids: bool) -> int:
+def _show_receipts(
+    records: list[tuple[Path, dict]], *, prefix_task_ids: bool, provenance: bool = False
+) -> int:
     result = EXIT_OK
     for index, (_path, receipt) in enumerate(records):
         if prefix_task_ids:
             print(f"[TASK {receipt.get('task_id', '')}]")
-        current = _show_receipt(receipt)
+        current = _show_receipt(receipt, provenance=provenance)
         if current == EXIT_ERROR:
             result = EXIT_ERROR
         elif current == EXIT_NO_REPLY and result == EXIT_OK:
@@ -952,6 +1058,54 @@ def _show_receipts(records: list[tuple[Path, dict]], *, prefix_task_ids: bool) -
         if index < len(records) - 1:
             print("---")
     return result
+
+
+def _current_roles(project_id: str, session_id: str) -> dict[str, str]:
+    record = _current_tab_registry(project_id, session_id)
+    return roles_for_record(record) if record else {}
+
+
+def _show_member_choices(
+    project_id: str, session_id: str, sessions: list, provider: str, roles: dict[str, str]
+) -> int:
+    members = [session for session in sessions if session.provider == provider]
+    print("provider\tlive-id\tcurrent role\tlatest task id")
+    for member in members:
+        records = _current_session_receipts(
+            project_id, session_id, provider, destination_live_id=member.live_id
+        )
+        latest = str(records[0][1].get("task_id") or "none") if records else "none"
+        print(f"{provider}\t{member.live_id}\t{roles.get(member.live_id, 'none')}\t{latest}")
+    return EXIT_NO_REPLY
+
+
+def _age_label(receipt: dict, now: float) -> str:
+    submitted = _parse_timestamp(receipt.get("submitted_at"))
+    if submitted is None:
+        return "?"
+    seconds = max(0, int(now - submitted))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _show_ambiguous_tasks(records: list[tuple[Path, dict]]) -> int:
+    now = time.time()
+    print("task id\tprovider\tcurrent role\tstatus\tage")
+    for _path, receipt in records:
+        task_id = str(receipt.get("task_id") or "")
+        provider = str(receipt.get("provider") or "")
+        status = _saved_pend_status(receipt)
+        if status in {RECEIPT_INCOMPLETE, RECEIPT_INCOMPLETE_RUNNING}:
+            recovered = _recover_provider_reply(receipt)
+            status = _saved_pend_status(receipt, recovered=recovered or "")
+        role = _current_role_for_receipt(receipt)
+        print(f"{task_id}\t{provider}\t{role}\t{status}\t{_age_label(receipt, now)}")
+    return EXIT_NO_REPLY
 
 
 def _positive_count(value: str) -> int:
@@ -965,13 +1119,21 @@ def _positive_count(value: str) -> int:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="pend")
-    parser.add_argument("target", nargs="?", default="", help="Provider, peer/local relation, or exact task ID (pair provider selects the sibling)")
+    parser = argparse.ArgumentParser(
+        prog="pend",
+        description="View a task reply. Exact task IDs can recover a late final reply after an incomplete result.",
+        epilog="Use pend <role> or pend <provider> --live-id <id> to select a current launch member.",
+    )
+    parser.add_argument("target", nargs="?", default="", help="Provider, current role, peer/local relation, or exact task ID")
     parser.add_argument("count", nargs="?", type=_positive_count, help="Show the latest N task replies")
     parser.add_argument("--legacy", action="store_true", help="Use the provider's legacy conversation reader")
+    parser.add_argument("--live-id", help="Select this provider's exact live session in the current launch")
     args = parser.parse_intermixed_args(argv[1:])
 
     target = args.target.strip().lower()
+    if args.live_id and not target:
+        print("[ERROR] --live-id requires a provider target", file=sys.stderr)
+        return EXIT_ERROR
     if TASK_ID_RE.match(target):
         if args.legacy or args.count is not None:
             print("[ERROR] Exact task lookup does not accept a count or --legacy", file=sys.stderr)
@@ -980,7 +1142,7 @@ def main(argv: list[str]) -> int:
         if not found:
             print(f"[ERROR] Unknown or ambiguous task ID: {target}", file=sys.stderr)
             return EXIT_ERROR
-        return _show_receipt(found[1])
+        return _show_receipt(found[1], provenance=True)
 
     project_id, session_id, current_provider = _current_session_context()
     # Task 5: only a REAL, valid `live_sessions` inventory ever populates
@@ -1035,14 +1197,44 @@ def main(argv: list[str]) -> int:
     responder = ""
     required_caller_live_id = ""
     required_destination_live_id = ""
+    member_selected = bool(args.live_id)
     if target:
-        responder, required_caller_live_id, required_destination_live_id, error = _resolve_retrieval_target(
-            target, current_provider, sessions, current_live_id, inventory_present
-        )
-        if error:
-            print(f"[ERROR] {error}", file=sys.stderr)
-            print(f"[ERROR] Available providers: {', '.join(PROVIDER_PENDS)}", file=sys.stderr)
-            return EXIT_ERROR
+        roles = _current_roles(project_id, session_id) if project_id and session_id and inventory_present else {}
+        if args.live_id:
+            if target not in PROVIDER_PENDS:
+                print("[ERROR] --live-id requires a provider target", file=sys.stderr)
+                return EXIT_ERROR
+            matches = [s for s in sessions if s.live_id == args.live_id]
+            if len(matches) != 1 or matches[0].provider != target:
+                print(f"[ERROR] live-id {args.live_id} is not a current {target} session", file=sys.stderr)
+                return EXIT_ERROR
+            responder, required_destination_live_id = target, args.live_id
+        elif target in PROVIDER_PENDS and inventory_present:
+            pool = [s for s in sessions if s.provider == target]
+            if len(pool) > 1:
+                return _show_member_choices(project_id, session_id, sessions, target, roles)
+            responder, required_caller_live_id, required_destination_live_id, error = _resolve_retrieval_target(
+                target, current_provider, sessions, current_live_id, inventory_present
+            )
+            if error:
+                print(f"[ERROR] {error}", file=sys.stderr)
+                return EXIT_ERROR
+        elif target in roles.values():
+            member_selected = True
+            selected = [s for s in sessions if roles.get(s.live_id) == target]
+            if len(selected) != 1:
+                print(f"[ERROR] role {target} is not uniquely held in the current launch", file=sys.stderr)
+                return EXIT_ERROR
+            responder, required_destination_live_id = selected[0].provider, selected[0].live_id
+        else:
+            responder, required_caller_live_id, required_destination_live_id, error = _resolve_retrieval_target(
+                target, current_provider, sessions, current_live_id, inventory_present
+            )
+            if error:
+                print(f"[ERROR] {error}", file=sys.stderr)
+                if error.startswith("Unknown provider, relation, or task ID:"):
+                    print(f"[ERROR] Available providers: {', '.join(PROVIDER_PENDS)}", file=sys.stderr)
+                return EXIT_ERROR
     if not project_id or not session_id:
         print(
             "[NO SESSION] Implicit pend unavailable for the current CCB session; "
@@ -1112,13 +1304,7 @@ def main(argv: list[str]) -> int:
             )
             return EXIT_NO_REPLY
         if len(records) > 1:
-            candidates = ", ".join(str(data.get("task_id") or "") for _path, data in records[:5])
-            print(
-                f"[AMBIGUOUS] Multiple tasks match the current CCB session: {candidates}; "
-                "use an exact task ID, provider, peer, or local",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
+            return _show_ambiguous_tasks(records)
         return _show_receipt(records[0][1])
 
     records = _current_session_receipts(
@@ -1164,7 +1350,9 @@ def main(argv: list[str]) -> int:
                     file=sys.stderr,
                 )
             return EXIT_NO_REPLY
-        return _show_overlay_items(items, prefix_task_ids=args.count is not None)
+        return _show_overlay_items(
+            items, prefix_task_ids=args.count is not None, provenance=member_selected
+        )
 
     if not records:
         print(
@@ -1183,7 +1371,9 @@ def main(argv: list[str]) -> int:
             return EXIT_NO_REPLY
     count = args.count if args.count is not None else 1
     selected = records[:count]
-    return _show_receipts(selected, prefix_task_ids=args.count is not None)
+    return _show_receipts(
+        selected, prefix_task_ids=args.count is not None, provenance=member_selected
+    )
 
 
 if __name__ == "__main__":

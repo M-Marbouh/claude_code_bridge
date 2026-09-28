@@ -27,6 +27,7 @@ from askd.adapters.base import (
     route_session_key,
 )
 from askd.registry import ProviderRegistry
+from askd_timeout import codex_idle_timeout_s, codex_max_wait_s, positive_timeout_s
 from askd_runtime import log_path, random_token, state_file_path, write_log
 from ccb_protocol import make_req_id
 from completion_hook import COMPLETION_STATUS_FAILED
@@ -346,6 +347,17 @@ class UnifiedAskDaemon:
                 quiet=bool(msg.get("quiet") or False),
                 message=str(msg.get("message") or ""),
                 caller=caller,
+                timeout_explicit=_request_bool(msg.get("timeout_explicit", True)),
+                idle_timeout_s=(
+                    positive_timeout_s(msg.get("idle_timeout_s"), codex_idle_timeout_s())
+                    if provider == "codex"
+                    else None
+                ),
+                max_wait_s=(
+                    positive_timeout_s(msg.get("max_wait_s"), codex_max_wait_s())
+                    if provider == "codex"
+                    else None
+                ),
                 output_path=str(msg.get("output_path")) if msg.get("output_path") else None,
                 req_id=str(msg.get("req_id")) if msg.get("req_id") else None,
                 no_wrap=bool(msg.get("no_wrap") or False),
@@ -391,7 +403,10 @@ class UnifiedAskDaemon:
                 "accepted": True,
             }
 
-        wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
+        if provider == "codex" and not request.timeout_explicit and not request.delivery_only:
+            wait_timeout = positive_timeout_s(request.max_wait_s, codex_max_wait_s()) + 5.0
+        else:
+            wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
         task.done_event.wait(timeout=wait_timeout)
         result = task.result
 

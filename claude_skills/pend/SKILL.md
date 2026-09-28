@@ -17,7 +17,9 @@ Prefer the exact task being discussed. Provider and peer/local lookups are stric
 4. If the user names a provider, use `pend <provider>`.
 5. Bare `pend` is allowed only when context has no better selector; it fails rather than guessing when multiple current-tab tasks exist.
 
-`peer` is relative to the bound pane: it means the sole other session in an unambiguous two-session launch. `local` means the bound session itself. With two sessions of the same provider, a provider target means the verified sibling.
+`peer` is relative to the bound pane: it means the sole other session in an unambiguous two-session launch. `local` means the bound session itself. If a provider has multiple current sessions, `pend <provider>` lists them; select one with `pend <provider> --live-id <id>`. A current role can also select its member with `pend <role>`.
+
+An exact task ID checks for a late final reply when the saved result is incomplete. Its provenance is written to stderr; stdout contains only the reply.
 
 ## Async Guardrail (MANDATORY)
 
@@ -37,3 +39,6 @@ pend $ARGUMENTS
 - `/pend codex`
 - `/pend codex 3` — latest three completed current-tab Codex task replies
 - `/pend codex --legacy 3` — explicit provider conversation history
+- `/pend implementer` — task for the member currently holding that role
+- `/pend codex --live-id codex-live-123` — task for that exact current Codex session
+- `/pend 20260711-120000-001-99` — inspect or recover the exact task, including a late final reply

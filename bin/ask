@@ -48,6 +48,7 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 from askd.adapters.base import MalformedRouteError, ResolvedRoute, parse_route_mapping
+from askd_timeout import codex_idle_timeout_s, codex_max_wait_s
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import (
     ProviderRuntimeStatus,
@@ -582,6 +583,7 @@ def _send_via_unified_daemon(
     route: ResolvedRoute | None = None,
     async_submit: bool = False,
     request_id: str = "",
+    timeout_explicit: bool = True,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
     import askd_rpc
@@ -614,6 +616,7 @@ def _send_via_unified_daemon(
         "provider": provider,
         "work_dir": daemon_work_dir,
         "timeout_s": timeout,
+        "timeout_explicit": timeout_explicit,
         "message": message,
         "no_wrap": no_wrap,
         "caller": caller,
@@ -623,6 +626,11 @@ def _send_via_unified_daemon(
         "suppress_completion_hook": suppress_completion_hook,
         "async_submit": async_submit,
     }
+    progress_mode = provider == "codex" and not timeout_explicit and not delivery_only
+    progress_max_wait = codex_max_wait_s() if progress_mode else None
+    if progress_mode:
+        req["idle_timeout_s"] = codex_idle_timeout_s()
+        req["max_wait_s"] = progress_max_wait
     # Async callers create the durable task ID before entering foreground mode.
     # Preserve it as the provider request ID so receipts, CCB_REQ_ID, completion
     # hooks, and `pend <task-id>` all refer to one canonical identity.
@@ -664,7 +672,11 @@ def _send_via_unified_daemon(
                 state,
                 req,
                 connect_timeout_s=5.0,
-                response_timeout_s=timeout + 10 if timeout > 0 else None,
+                response_timeout_s=(
+                    progress_max_wait + 10
+                    if progress_mode
+                    else (timeout + 10 if timeout > 0 else None)
+                ),
             )
             exit_code = int(resp.get("exit_code") or 0)
             reply = resp.get("reply") or ""
@@ -1462,6 +1474,7 @@ def main(argv: list[str]) -> int:
 
     # Parse remaining arguments
     timeout: float = 3600.0
+    timeout_explicit = False
     notify_mode = False
     no_wrap = False
     peer_target = ""
@@ -1487,6 +1500,12 @@ def main(argv: list[str]) -> int:
             except ValueError:
                 print("[ERROR] --timeout must be a number", file=sys.stderr)
                 return EXIT_ERROR
+            timeout_explicit = True
+            continue
+        if token == "--ccb-default-timeout":
+            # Internal detached-launcher flag: the numeric timeout is still
+            # carried for pre-anchor behavior, but came from the CLI default.
+            timeout_explicit = False
             continue
         if token == "--reply-to":
             try:
@@ -1684,6 +1703,7 @@ def main(argv: list[str]) -> int:
                 suppress_completion_hook=True,
                 daemon_context=daemon_context,
                 route=notify_route,
+                timeout_explicit=timeout_explicit,
             )
         if _use_unified_daemon():
             print("[WARN] Unified notify is unavailable for this provider; using legacy", file=sys.stderr)
@@ -1719,6 +1739,7 @@ def main(argv: list[str]) -> int:
                 caller,
                 daemon_context=daemon_context,
                 route=local_route,
+                timeout_explicit=timeout_explicit,
             )
         else:
             cmd = [daemon_cmd, "--sync", "--timeout", str(timeout)]
@@ -1788,6 +1809,7 @@ def main(argv: list[str]) -> int:
             route=local_route,
             async_submit=True,
             request_id=task_id,
+            timeout_explicit=timeout_explicit,
         )
         if rc != EXIT_OK:
             _append_task_status_line(status_file, f"failed exit_code={rc}")
@@ -1857,7 +1879,7 @@ function Write-CcbStatus([string]$line) {{
   Add-Content -Path $statusFile -Value ("{{0}} {{1}}" -f (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"), $line) -Encoding UTF8
 }}
 Write-CcbStatus "running pid=$PID"
-Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --foreground --timeout {timeout}
+Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --foreground --timeout {timeout}{' --ccb-default-timeout' if not timeout_explicit else ''}
 $rc = $LASTEXITCODE
 Write-CcbStatus "finished exit_code=$rc"
 if ($rc -ne 0) {{
@@ -1914,7 +1936,7 @@ echo "[CCB_TASK_START] task={task_id} provider={provider} caller={caller} pid=$$
 export CCB_REQ_ID="{task_id}"
 export CCB_CALLER="{caller}"
 export CCB_WORK_DIR="{os.getcwd()}"
-{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout} < {quoted_message}
+{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout}{' --ccb-default-timeout' if not timeout_explicit else ''} < {quoted_message}
 rc=$?
 echo "[CCB_TASK_END] task={task_id} provider={provider} exit_code=$rc"
 echo "$(_now) finished exit_code=$rc" >> {quoted_status}

@@ -48,6 +48,19 @@ def test_completion_hook_uses_status_marker_and_directional_workdir_matching() -
     assert hook._work_dirs_compatible("/repo/subdir", "/repo") is False
 
 
+def test_completion_hook_labels_incomplete_output_and_points_to_exact_pend_id() -> None:
+    hook = _load_script_module("ccb_completion_hook_incomplete", REPO_ROOT / "bin" / "ccb-completion-hook")
+
+    message = hook._render_terminal_message(
+        "Codex", "20260928-192146-818-2479138", "partial text",
+        output_file="", status="incomplete",
+    )
+
+    assert "Last partial output: partial text" in message
+    assert "A final reply may still arrive; check with: pend 20260928-192146-818-2479138" in message
+    assert "Result:" not in message
+
+
 def test_completion_hook_keeps_bounded_reply_inline(monkeypatch) -> None:
     hook = _load_script_module("ccb_completion_hook_inline", REPO_ROOT / "bin" / "ccb-completion-hook")
     monkeypatch.setenv("CCB_COMPLETION_INLINE_MAX_BYTES", "16")

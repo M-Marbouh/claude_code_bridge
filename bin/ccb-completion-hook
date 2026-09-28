@@ -365,6 +365,9 @@ def _render_terminal_message(
 ) -> str:
     marker = completion_status_marker(status)
     status_label = completion_status_label(status)
+    incomplete = status == "incomplete"
+    result_label = "Last partial output:" if incomplete else "Result:"
+    late_reply = f"\nA final reply may still arrive; check with: pend {req_id}\n" if incomplete else ""
     if output_file:
         return f"""CCB_REQ_ID: {req_id}
 
@@ -373,7 +376,7 @@ Provider: {provider_display}
 Status: {status_label}
 Output file: {output_file}
 
-Result: {reply_content}
+{result_label} {reply_content}{late_reply}
 """
     return f"""CCB_REQ_ID: {req_id}
 
@@ -381,7 +384,7 @@ Result: {reply_content}
 Provider: {provider_display}
 Status: {status_label}
 
-Result: {reply_content}
+{result_label} {reply_content}{late_reply}
 """
 
 

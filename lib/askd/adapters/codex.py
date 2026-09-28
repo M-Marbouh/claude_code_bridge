@@ -20,6 +20,7 @@ from askd.adapters.base import (
     probe_pane_liveness,
     route_session_key,
 )
+from askd_timeout import codex_idle_timeout_s, codex_max_wait_s, positive_timeout_s
 from askd_runtime import log_path, write_log
 from ccb_protocol import (
     REQ_ID_PREFIX,
@@ -376,7 +377,7 @@ class CodexAdapter(BaseProviderAdapter):
     ) -> ProviderResult:
         """Acknowledge peer delivery without collecting a Codex response."""
         ack_timeout = float(os.environ.get("CCB_CASKD_DELIVERY_ACK_TIMEOUT", "2.0"))
-        local_deadline = time.time() + max(0.1, ack_timeout)
+        local_deadline = time.monotonic() + max(0.1, ack_timeout)
         if deadline is not None:
             local_deadline = min(local_deadline, deadline)
 
@@ -387,7 +388,7 @@ class CodexAdapter(BaseProviderAdapter):
             if task.cancel_event and task.cancel_event.is_set():
                 break
 
-            remaining = local_deadline - time.time()
+            remaining = local_deadline - time.monotonic()
             if remaining <= 0:
                 break
 
@@ -435,6 +436,7 @@ class CodexAdapter(BaseProviderAdapter):
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
         started_at = time.time()
+        started_monotonic = time.monotonic()
         req = task.request
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=codex req_id={task.req_id} work_dir={req.work_dir} caller={req.caller}")
@@ -558,7 +560,10 @@ class CodexAdapter(BaseProviderAdapter):
         state = reader.capture_state()
         backend.send_text(pane_id, prompt)
 
-        deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
+        deadline = None if float(req.timeout_s) < 0.0 else (time.monotonic() + float(req.timeout_s))
+        progress_mode = not req.timeout_explicit and not req.delivery_only
+        progress_max_wait = positive_timeout_s(req.max_wait_s, codex_max_wait_s()) if progress_mode else None
+        max_wait_deadline = started_monotonic + progress_max_wait if progress_mode else None
         if req.delivery_only:
             result = self._wait_for_delivery(task, session_key, started_ms, reader, state, deadline)
             _write_log(
@@ -582,13 +587,20 @@ class CodexAdapter(BaseProviderAdapter):
         # and is set unconditionally on every exit path, anchored or not).
         codex_log_path_at_anchor: Optional[str] = None
         codex_session_id_at_anchor: Optional[str] = None
+        anchor_bound_log: Optional[str] = None
+        last_transcript_growth_at: Optional[float] = None
+        last_transcript_size: Optional[int] = None
+        timeout_reason: Optional[str] = None
 
         # Idle timeout detection for degraded completion
         idle_timeout = float(os.environ.get("CCB_CASKD_IDLE_TIMEOUT", "8.0"))
+        transcript_idle_timeout = positive_timeout_s(req.idle_timeout_s, codex_idle_timeout_s()) if progress_mode else None
         _last_reply_snapshot = ""
         _last_reply_changed_at = time.time()
 
-        anchor_collect_grace = min(deadline, time.time() + 2.0) if deadline else (time.time() + 2.0)
+        anchor_collect_grace = (
+            min(deadline, time.monotonic() + 2.0) if deadline else (time.monotonic() + 2.0)
+        )
         last_pane_check = time.time()
         pane_death_tracker = PaneDeathTracker()
         default_interval = "5.0" if is_windows() else "2.0"
@@ -598,19 +610,84 @@ class CodexAdapter(BaseProviderAdapter):
         stale_threshold_s = float(os.environ.get("CCB_CODEX_STALE_LOG_SECONDS", "10.0"))
         last_stale_check = time.time()
 
+        def drain_bound_transcript() -> tuple[bool, bool]:
+            nonlocal state, last_transcript_growth_at, last_transcript_size
+            nonlocal terminal_reply, latest_final, done_seen, done_ms
+            grew = False
+            completed = False
+            if anchor_bound_log:
+                try:
+                    current_size = Path(anchor_bound_log).stat().st_size
+                except OSError:
+                    current_size = last_transcript_size
+                if current_size is not None and (
+                    last_transcript_size is None or current_size > last_transcript_size
+                ):
+                    last_transcript_size = current_size
+                    last_transcript_growth_at = time.monotonic()
+                    grew = True
+
+            try_get_event = getattr(reader, "try_get_event", None)
+            if not callable(try_get_event):
+                return grew, completed
+            while True:
+                event, state = try_get_event(state)
+                if event is None:
+                    break
+                event_log = state.get("log_path") if isinstance(state, dict) else None
+                if not anchor_bound_log or not event_log or str(event_log) != anchor_bound_log:
+                    continue
+                grew = True
+                last_transcript_growth_at = time.monotonic()
+                role, text, phase = event
+                if role != "assistant":
+                    continue
+                chunks.append(text)
+                if phase == "final_answer":
+                    latest_final = text
+                if is_done_text(text, task.req_id, turn_ended=(phase == "final_answer")):
+                    terminal_reply = text
+                    done_seen = True
+                    done_ms = _now_ms() - started_ms
+                    completed = True
+                    break
+            return grew, completed
+
         while True:
             # Check for cancellation
             if task.cancel_event and task.cancel_event.is_set():
                 _write_log(f"[INFO] Task cancelled during wait loop: req_id={task.req_id}")
                 break
 
-            if deadline is not None:
-                remaining = deadline - time.time()
+            now = time.monotonic()
+            active_deadline = max_wait_deadline if (progress_mode and anchor_seen) else deadline
+            if active_deadline is not None:
+                remaining = active_deadline - now
                 if remaining <= 0:
+                    if progress_mode and anchor_seen:
+                        timeout_reason = "cap"
+                        _grew, completed = drain_bound_transcript()
+                        if completed:
+                            timeout_reason = None
+                            break
                     break
                 wait_step = min(remaining, 0.5)
             else:
                 wait_step = 0.5
+
+            if progress_mode and anchor_seen and last_transcript_growth_at is not None:
+                idle_remaining = transcript_idle_timeout - (now - last_transcript_growth_at)
+                if idle_remaining <= 0:
+                    timeout_reason = "idle"
+                    grew, completed = drain_bound_transcript()
+                    if completed:
+                        timeout_reason = None
+                        break
+                    if grew:
+                        timeout_reason = None
+                        continue
+                    break
+                wait_step = min(wait_step, idle_remaining)
 
             if time.time() - last_pane_check >= pane_check_interval:
                 liveness = probe_pane_liveness(backend, pane_id)
@@ -650,6 +727,19 @@ class CodexAdapter(BaseProviderAdapter):
                 last_pane_check = time.time()
 
             event, state = reader.wait_for_event(state, wait_step)
+
+            if progress_mode and anchor_seen and anchor_bound_log:
+                state_log = state.get("log_path") if isinstance(state, dict) else None
+                if state_log and str(state_log) == anchor_bound_log:
+                    try:
+                        transcript_size = Path(anchor_bound_log).stat().st_size
+                    except OSError:
+                        transcript_size = last_transcript_size
+                    if transcript_size is not None and (
+                        last_transcript_size is None or transcript_size > last_transcript_size
+                    ):
+                        last_transcript_size = transcript_size
+                        last_transcript_growth_at = time.monotonic()
 
             if event is None:
                 # Stale log detection: if no anchor and no chunks yet,
@@ -697,6 +787,14 @@ class CodexAdapter(BaseProviderAdapter):
                 continue
 
             role, text, phase = event
+            event_log = state.get("log_path") if isinstance(state, dict) else None
+            event_log = str(event_log) if event_log else None
+            if progress_mode and anchor_seen and anchor_bound_log and event_log != anchor_bound_log:
+                # Once the anchor binds this request to a transcript, later
+                # activity from any other rollout cannot extend its lifetime.
+                continue
+            if progress_mode and anchor_seen and anchor_bound_log and event_log == anchor_bound_log:
+                last_transcript_growth_at = time.monotonic()
             if role == "user":
                 if f"{REQ_ID_PREFIX} {task.req_id}" in text:
                     anchor_log = state.get("log_path") if isinstance(state, dict) else None
@@ -705,6 +803,17 @@ class CodexAdapter(BaseProviderAdapter):
                         # not just the stale-binding candidate scanner.
                         continue
                     anchor_seen = True
+                    if progress_mode:
+                        anchor_bound_log = str(anchor_log) if anchor_log else None
+                        if anchor_bound_log:
+                            pin_to_log = getattr(reader, "pin_to_log", None)
+                            if callable(pin_to_log):
+                                pin_to_log(Path(anchor_bound_log))
+                            last_transcript_growth_at = time.monotonic()
+                            try:
+                                last_transcript_size = Path(anchor_bound_log).stat().st_size
+                            except OSError:
+                                last_transcript_size = None
                     if anchor_ms is None:
                         anchor_ms = _now_ms() - started_ms
                     if codex_log_path_at_anchor is None:
@@ -720,7 +829,7 @@ class CodexAdapter(BaseProviderAdapter):
                 continue
 
             # Never collect assistant text before this request's anchor.
-            if (not anchor_seen) and (require_anchor_before_collect or time.time() < anchor_collect_grace):
+            if (not anchor_seen) and (require_anchor_before_collect or time.monotonic() < anchor_collect_grace):
                 continue
 
             chunks.append(text)
@@ -743,7 +852,7 @@ class CodexAdapter(BaseProviderAdapter):
             if combined != _last_reply_snapshot:
                 _last_reply_snapshot = combined
                 _last_reply_changed_at = time.time()
-            elif combined and (time.time() - _last_reply_changed_at >= idle_timeout):
+            elif not progress_mode and combined and (time.time() - _last_reply_changed_at >= idle_timeout):
                 _write_log(
                     f"[WARN] Codex reply idle for {idle_timeout}s without CCB_DONE, "
                     f"accepting as complete req_id={task.req_id}"
@@ -754,6 +863,13 @@ class CodexAdapter(BaseProviderAdapter):
 
         combined = "\n".join(chunks)
         reply = _assemble_reply(terminal_reply, latest_final, combined, task.req_id)
+        if timeout_reason:
+            timeout_note = (
+                "Codex transcript idle timeout expired without CCB_DONE."
+                if timeout_reason == "idle"
+                else "Codex maximum wait cap reached without CCB_DONE."
+            )
+            reply = f"{reply.rstrip()}\n\n[Incomplete: {timeout_note}]" if reply.strip() else timeout_note
         status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
         if task.cancelled:
             status = COMPLETION_STATUS_CANCELLED

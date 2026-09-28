@@ -253,6 +253,10 @@ class ProviderRequest:
     # see `PeerDestination`. Defaults empty, so every existing
     # construction site (including every non-peer request) is unaffected.
     peer_destination: PeerDestination = field(default_factory=PeerDestination)
+    # Missing on older daemon clients, which retain explicit wall-clock semantics.
+    timeout_explicit: bool = True
+    idle_timeout_s: Optional[float] = None
+    max_wait_s: Optional[float] = None
 
 
 @dataclass

@@ -216,6 +216,7 @@ def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None
         "suppress_completion_hook": True,
         "daemon_context": context,
         "route": ask.ResolvedRoute(),
+        "timeout_explicit": False,
     }
 
 
@@ -1767,6 +1768,8 @@ def test_ask_local_live_id_without_inventory_refuses(monkeypatch, capsys) -> Non
     with no live-session inventory has nothing to name, and the request
     must refuse rather than fall through to the provider default."""
     ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
     _refuse_dispatch(ask, monkeypatch)
 
     rc = ask.main(["ask", "codex", "--live-id", "live-b", "hello"])

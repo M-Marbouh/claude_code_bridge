@@ -33,7 +33,7 @@ from ccb_protocol import make_req_id
 from completion_hook import COMPLETION_STATUS_FAILED
 from pane_registry import validate_route
 from project_id import compute_ccb_project_id
-from providers import ProviderDaemonSpec
+from providers import PROGRESS_MODE_PROVIDERS, ProviderDaemonSpec
 from worker_pool import BaseSessionWorker, PerSessionWorkerPool
 
 
@@ -350,12 +350,12 @@ class UnifiedAskDaemon:
                 timeout_explicit=_request_bool(msg.get("timeout_explicit", True)),
                 idle_timeout_s=(
                     positive_timeout_s(msg.get("idle_timeout_s"), codex_idle_timeout_s())
-                    if provider == "codex"
+                    if provider in PROGRESS_MODE_PROVIDERS
                     else None
                 ),
                 max_wait_s=(
                     positive_timeout_s(msg.get("max_wait_s"), codex_max_wait_s())
-                    if provider == "codex"
+                    if provider in PROGRESS_MODE_PROVIDERS
                     else None
                 ),
                 output_path=str(msg.get("output_path")) if msg.get("output_path") else None,
@@ -403,7 +403,7 @@ class UnifiedAskDaemon:
                 "accepted": True,
             }
 
-        if provider == "codex" and not request.timeout_explicit and not request.delivery_only:
+        if provider in PROGRESS_MODE_PROVIDERS and not request.timeout_explicit and not request.delivery_only:
             wait_timeout = positive_timeout_s(request.max_wait_s, codex_max_wait_s()) + 5.0
         else:
             wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)

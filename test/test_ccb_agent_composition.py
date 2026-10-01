@@ -102,6 +102,39 @@ def test_launch_args_and_opaque_opencode_command_remain_byte_exact(monkeypatch, 
     )
 
 
+def test_hermes_launch_is_pinned_and_session_records_effective_home(monkeypatch, tmp_path: Path) -> None:
+    ccb = _load_ccb_module()
+    launcher = _launcher(
+        ccb, monkeypatch, tmp_path, launch_args={"hermes": "--provider not-allowed --model not-allowed"},
+    )
+    command = launcher._get_start_cmd("hermes")
+    assert command.agent_command == "hermes --cli --no-restore-cwd"
+    assert launcher._compose_agent_shell("hermes", command) == "hermes --cli --no-restore-cwd"
+
+    from ccb_start_config import DEFAULT_PROVIDERS
+
+    assert "hermes" not in DEFAULT_PROVIDERS
+    session_file = tmp_path / ".hermes-session"
+    hermes_home = tmp_path / "user-hermes-home"
+    launcher.session_id = "ai-test"
+    launcher.project_root = tmp_path
+    launcher.invocation_dir = tmp_path
+    launcher.terminal_type = "tmux"
+    launcher._live_slots = []
+    launcher._project_session_file = lambda _name: session_file
+    launcher._provider_env_overrides = lambda _provider: {"HERMES_HOME": str(hermes_home)}
+    launcher._maybe_start_provider_daemon = lambda _provider: None
+    launcher._auto_prune_session_records = lambda: None
+    monkeypatch.setattr(ccb, "upsert_registry", lambda _record: True)
+
+    assert launcher._write_hermes_session(tmp_path / "runtime", None, pane_id="%1", start_cmd=command.agent_command)
+    import json
+
+    recorded = json.loads(session_file.read_text())
+    assert recorded["hermes_home"] == str(hermes_home.resolve())
+    assert recorded["state_db_path"] == str((hermes_home / "state.db").resolve())
+
+
 def test_every_agent_launcher_routes_through_the_typed_seam() -> None:
     tree = ast.parse(CCB_PATH.read_text(encoding="utf-8"), filename=str(CCB_PATH))
     launcher = next(

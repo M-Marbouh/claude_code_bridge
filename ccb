@@ -52,7 +52,7 @@ from session_utils import (
 )
 from pane_registry import upsert_registry, load_registry_by_project_id, load_registry_by_session_id, read_inventory_for_record
 from project_id import compute_ccb_project_id
-from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC
+from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, HASK_CLIENT_SPEC
 from process_lock import ProviderLock
 from askd_rpc import shutdown_daemon, read_state
 from askd_runtime import state_file_path
@@ -672,7 +672,7 @@ class AILauncher:
         """Managed env + explicit caller marker for the pane/provider process."""
         env = self._managed_env_overrides()
         prov = (provider or "").strip().lower()
-        if prov in {"claude", "codex", "gemini", "opencode", "email", "manual"}:
+        if prov in {"claude", "codex", "gemini", "opencode", "hermes", "email", "manual"}:
             env["CCB_CALLER"] = prov
         # Merge per-provider launch_env from config.
         extra = self.launch_env.get(prov)
@@ -758,7 +758,7 @@ class AILauncher:
         if not cfg.is_dir():
             return
 
-        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session"):
+        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".hermes-session"):
             legacy = self.project_root / name
             if not legacy.exists():
                 continue
@@ -927,7 +927,7 @@ class AILauncher:
     def _maybe_start_unified_askd(self, *, quiet: bool = False) -> None:
         """Start unified askd daemon (provider-agnostic)."""
         # Try to start for any enabled provider that uses askd (including claude)
-        for provider in ["codex", "gemini", "opencode", "claude"]:
+        for provider in ["codex", "gemini", "opencode", "claude", "hermes"]:
             if provider in [p.lower() for p in self.providers]:
                 # Try to start and check if successful
                 self._maybe_start_provider_daemon(provider, quiet=quiet)
@@ -965,6 +965,7 @@ class AILauncher:
             "gemini": GASK_CLIENT_SPEC,
             "opencode": OASK_CLIENT_SPEC,
             "claude": LASK_CLIENT_SPEC,
+            "hermes": HASK_CLIENT_SPEC,
         }
         spec = specs.get(provider)
         if not spec:
@@ -1420,6 +1421,8 @@ class AILauncher:
             return self._start_gemini_tmux(parent_pane=parent_pane, direction=direction)
         elif provider == "opencode":
             return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction)
+        elif provider == "hermes":
+            return self._start_hermes_tmux(parent_pane=parent_pane, direction=direction)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -1472,6 +1475,8 @@ class AILauncher:
             self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         elif provider == "opencode":
             self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+        elif provider == "hermes":
+            self._write_hermes_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -2104,10 +2109,12 @@ class AILauncher:
             command = self._build_gemini_start_cmd()
         elif provider == "opencode":
             command = ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd())
+        elif provider == "hermes":
+            command = ShellAgentCommand(prelude="", agent_command="hermes --cli --no-restore-cwd")
         else:
             command = ShellAgentCommand(prelude="", agent_command="")
         # Append per-provider launch_args from config.
-        extra = self.launch_args.get(provider)
+        extra = self.launch_args.get(provider) if provider != "hermes" else None
         if isinstance(extra, str) and extra.strip():
             agent_command = (
                 f"{command.agent_command} {extra.strip()}"
@@ -2496,6 +2503,135 @@ class AILauncher:
         print(f"✅ {t('started_backend', provider='OpenCode', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
+    def _start_hermes_tmux(
+        self,
+        *,
+        parent_pane: str | None = None,
+        direction: str | None = None,
+    ) -> str | None:
+        runtime = self._provider_runtime("hermes")
+        runtime.mkdir(parents=True, exist_ok=True)
+        env_overrides = self._provider_env_overrides("hermes")
+        agent_cmd = self._compose_agent_shell("hermes", self._get_start_cmd("hermes"))
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
+        pane_title_marker = self._provider_marker("hermes")
+        backend = TmuxBackend()
+        use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
+        use_parent = parent_pane
+        if not use_parent:
+            try:
+                use_parent = backend.get_current_pane_id()
+            except Exception:
+                use_parent = None
+        if not use_parent and use_direction == "bottom":
+            try:
+                use_parent = next(reversed(self.tmux_panes.values()))
+            except StopIteration:
+                use_parent = None
+        try:
+            if use_parent and str(use_parent).startswith("%") and not backend.pane_exists(str(use_parent)):
+                use_parent = backend.get_current_pane_id()
+        except Exception:
+            use_parent = None
+        pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
+        backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
+        backend.set_pane_title(pane_id, pane_title_marker)
+        backend.set_pane_user_option(pane_id, "@ccb_agent", "Hermes")
+        self.tmux_panes["hermes"] = pane_id
+        if not self._write_hermes_session(
+            runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd,
+        ):
+            return None
+        print(f"✅ {t('started_backend', provider='Hermes', terminal='tmux pane', pane_id=pane_id)}")
+        return pane_id
+
+    def _start_hermes_current_pane(self) -> int:
+        runtime = self._provider_runtime("hermes")
+        runtime.mkdir(parents=True, exist_ok=True)
+        pane_id = self._current_pane_id()
+        if not pane_id:
+            print("❌ Unable to determine current pane id for Hermes", file=sys.stderr)
+            return 1
+        pane_title_marker = self._provider_marker("hermes")
+        if self.terminal_type == "tmux":
+            try:
+                backend = TmuxBackend()
+                backend.set_pane_title(pane_id, pane_title_marker)
+                backend.set_pane_user_option(pane_id, "@ccb_agent", "Hermes")
+            except Exception:
+                pass
+        title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
+        agent_cmd = self._compose_agent_shell("hermes", self._get_start_cmd("hermes"))
+        start_cmd = (
+            title_cmd
+            + self._build_env_prefix(self._provider_env_overrides("hermes"))
+            + _build_export_path_cmd(self.script_dir / "bin")
+            + agent_cmd
+        )
+        if not self._write_hermes_session(
+            runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd,
+        ):
+            return 1
+        return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
+
+    def _write_hermes_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
+        from hermes_comm import hermes_home_from_env
+
+        session_file = self._project_session_file(".hermes-session")
+        writable, reason, fix = check_session_writable(session_file)
+        if not writable:
+            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
+            print(f"💡 Fix: {fix}", file=sys.stderr)
+            return False
+        provider_env = {**os.environ, **self._provider_env_overrides("hermes")}
+        hermes_home = hermes_home_from_env(provider_env).expanduser().resolve()
+        work_dir = self.project_root
+        data = {
+            "session_id": self.session_id,
+            "ccb_project_id": compute_ccb_project_id(work_dir),
+            "runtime_dir": str(runtime),
+            "terminal": self.terminal_type,
+            "tmux_session": tmux_session,
+            "pane_id": pane_id,
+            "pane_title_marker": pane_title_marker,
+            "work_dir": str(work_dir),
+            "work_dir_norm": _normalize_path_for_match(str(work_dir)),
+            "start_dir": str(self.invocation_dir),
+            "active": True,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_cmd": str(start_cmd) if start_cmd else "hermes --cli --no-restore-cwd",
+            "hermes_home": str(hermes_home),
+            "state_db_path": str(hermes_home / "state.db"),
+            "ccb_managed_launch": True,
+            "ccb_launch_caller": "hermes",
+            "ccb_launch_provider": "hermes",
+        }
+        if self._live_slots:
+            data["live_id"] = self._live_slots[self._launch_slot]
+        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+        if not ok:
+            print(err, file=sys.stderr)
+            return False
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(work_dir),
+                "work_dir": str(work_dir),
+                "terminal": self.terminal_type,
+                "providers": {
+                    "hermes": {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(session_file),
+                    }
+                },
+            })
+        except Exception:
+            pass
+        self._maybe_start_provider_daemon("hermes")
+        self._auto_prune_session_records()
+        return True
+
     def _start_cmd_pane(
         self,
         *,
@@ -2765,6 +2901,8 @@ class AILauncher:
             return self._start_gemini_current_pane()
         if provider == "opencode":
             return self._start_opencode_current_pane()
+        if provider == "hermes":
+            return self._start_hermes_current_pane()
         print(f"❌ {t('unknown_provider', provider=provider)}")
         return 1
 
@@ -3317,6 +3455,7 @@ class AILauncher:
                 self._project_session_file(".gemini-session"),
                 self._project_session_file(".opencode-session"),
                 self._project_session_file(".claude-session"),
+                self._project_session_file(".hermes-session"),
             ]
             if self._live_slots:
                 session_files = [
@@ -3816,7 +3955,7 @@ def cmd_start(args):
 def _find_all_zombie_sessions() -> list[dict]:
     """Find all zombie tmux sessions (CCB sessions whose parent process is dead)."""
     import re
-    pattern = re.compile(r"^(codex|gemini|opencode|claude)-(\d+)-")
+    pattern = re.compile(r"^(codex|gemini|opencode|claude|hermes)-(\d+)-")
     zombies = []
 
     if os.name == "nt" or not shutil.which("tmux"):
@@ -4194,7 +4333,7 @@ def cmd_kill(args):
         return _kill_global_zombies(yes=yes)
 
     # Project-level cleanup (original behavior)
-    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude"], allow_unknown=True)
+    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude", "hermes"], allow_unknown=True)
     if not providers:
         return 2
 
@@ -4367,7 +4506,7 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     Preserves order and provider occurrences.
     """
-    allowed = {"codex", "gemini", "opencode", "claude"}
+    allowed = {"codex", "gemini", "opencode", "claude", "hermes"}
     raw_parts = _split_provider_tokens(values)
 
     if not raw_parts:
@@ -4383,8 +4522,8 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     if unknown and not allow_unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude  (spaces)  or  ccb codex,gemini,opencode,claude  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude hermes  (spaces)  or  ccb codex,gemini,opencode,claude,hermes  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, hermes", file=sys.stderr)
         return []
 
     error = provider_pairing_error(parsed)
@@ -4399,7 +4538,7 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
     Parse providers from argv and treat "cmd" as a separate flag.
     Returns (providers, cmd_enabled, valid).
     """
-    allowed = {"codex", "gemini", "opencode", "claude"}
+    allowed = {"codex", "gemini", "opencode", "claude", "hermes"}
     raw_parts = _split_provider_tokens(values)
     if not raw_parts:
         return [], False, True
@@ -4419,8 +4558,8 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
 
     if unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude cmd  (spaces)  or  ccb codex,gemini,opencode,claude,cmd  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, cmd", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude hermes cmd  (spaces)  or  ccb codex,gemini,opencode,claude,hermes,cmd  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, hermes, cmd", file=sys.stderr)
         return [], cmd_enabled, False
 
     error = provider_pairing_error(parsed)
@@ -5157,7 +5296,7 @@ def main():
         subparsers = parser.add_subparsers(dest="command", help="Subcommands")
 
         kill_parser = subparsers.add_parser("kill", help="Terminate session or clean up zombies")
-        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude)")
+        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude/hermes)")
         kill_parser.add_argument("--daemon", action="store_true", help="Also stop the shared askd daemon when ownership checks allow it")
         kill_parser.add_argument("-f", "--force", action="store_true", help="Clean up all zombie tmux sessions globally")
         kill_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt (with -f)")
@@ -5207,7 +5346,7 @@ def main():
     start_parser.add_argument(
         "providers",
         nargs="*",
-        help="Backends to start (space or comma separated): codex, gemini, opencode, claude (codex may appear twice; add cmd for a shell pane)",
+        help="Backends to start (space or comma separated): codex, gemini, opencode, claude, hermes (codex may appear twice; add cmd for a shell pane)",
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context (unique-provider launches only)")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")

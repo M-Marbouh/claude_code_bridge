@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, claude
+    gemini, codex, opencode, claude, hermes
 
 Modes:
     Default (async):  Background task with hook callback
@@ -34,6 +34,7 @@ from typing import NamedTuple
 
 PROVIDER_DISPLAY = {
     "opencode": "OpenCode",
+    "hermes": "Hermes",
 }
 
 
@@ -74,6 +75,8 @@ PROVIDER_DAEMONS = {
     "codex": "cask",
     "opencode": "oask",
     "claude": "lask",
+    # Hermes runs through the unified askd adapter and has no provider daemon.
+    "hermes": "",
 }
 
 PEER_PROVIDERS = {"claude", "codex"}
@@ -83,6 +86,7 @@ CALLER_SESSION_FILES = {
     "codex": ".codex-session",
     "gemini": ".gemini-session",
     "opencode": ".opencode-session",
+    "hermes": ".hermes-session",
 }
 
 CALLER_PANE_ENV_HINTS = {
@@ -101,6 +105,7 @@ _REMOVED_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGN
 _PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
+UNIFIED_NOTIFY_PROVIDERS = PEER_PROVIDERS | {"hermes"}
 
 
 class _UnifiedDaemonContext(NamedTuple):
@@ -626,7 +631,8 @@ def _send_via_unified_daemon(
         "suppress_completion_hook": suppress_completion_hook,
         "async_submit": async_submit,
     }
-    progress_mode = provider == "codex" and not timeout_explicit and not delivery_only
+    from providers import PROGRESS_MODE_PROVIDERS
+    progress_mode = provider in PROGRESS_MODE_PROVIDERS and not timeout_explicit and not delivery_only
     progress_max_wait = codex_max_wait_s() if progress_mode else None
     if progress_mode:
         req["idle_timeout_s"] = codex_idle_timeout_s()
@@ -764,7 +770,7 @@ def _usage() -> None:
     print("       ask --peer <target> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, claude, hermes", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)
@@ -1471,6 +1477,9 @@ def main(argv: list[str]) -> int:
 
     daemon_cmd = PROVIDER_DAEMONS[raw_provider]
     provider = raw_provider
+    if provider == "hermes" and not _use_unified_daemon():
+        print("[ERROR] Hermes requires the unified askd daemon", file=sys.stderr)
+        return EXIT_ERROR
 
     # Parse remaining arguments
     timeout: float = 3600.0
@@ -1572,7 +1581,7 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
 
     if peer_live_id and not peer_target and (
-        not _use_unified_daemon() or (notify_mode and provider not in PEER_PROVIDERS)
+        not _use_unified_daemon() or (notify_mode and provider not in UNIFIED_NOTIFY_PROVIDERS)
     ):
         print("[ERROR] --live-id needs the unified askd daemon for this provider", file=sys.stderr)
         return EXIT_ERROR
@@ -1654,7 +1663,7 @@ def main(argv: list[str]) -> int:
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:
         caller = _require_caller()
-        if _use_unified_daemon() and provider in PEER_PROVIDERS:
+        if _use_unified_daemon() and provider in UNIFIED_NOTIFY_PROVIDERS:
             daemon_context = _resolve_unified_daemon_context()
             if daemon_context is None:
                 print("[ERROR] Unified askd daemon not running", file=sys.stderr)

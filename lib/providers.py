@@ -54,6 +54,20 @@ OASKD_SPEC = ProviderDaemonSpec(
     lock_name="oaskd",
 )
 
+HASKD_SPEC = ProviderDaemonSpec(
+    daemon_key="askd",
+    protocol_prefix="ask",
+    state_file_name="askd.json",
+    log_file_name="askd.log",
+    idle_timeout_env="CCB_ASKD_IDLE_TIMEOUT_S",
+    lock_name="askd",
+)
+
+# These providers expose transcript progress when the caller leaves the wait
+# budget implicit. Keep the capability separate from provider identity and
+# preserve Codex's established timeout defaults.
+PROGRESS_MODE_PROVIDERS = frozenset({"codex", "hermes"})
+
 
 LASKD_SPEC = ProviderDaemonSpec(
     daemon_key="laskd",
@@ -108,6 +122,17 @@ LASK_CLIENT_SPEC = ProviderClientSpec(
     autostart_env_legacy="CCB_AUTO_LASKD",
     state_file_env="CCB_LASKD_STATE_FILE",
     session_filename=".claude-session",
+    daemon_bin_name="askd",
+    daemon_module="askd.daemon",
+)
+
+HASK_CLIENT_SPEC = ProviderClientSpec(
+    protocol_prefix="ask",
+    enabled_env="CCB_ASKD",
+    autostart_env_primary="CCB_ASKD_AUTOSTART",
+    autostart_env_legacy="CCB_AUTO_ASKD",
+    state_file_env="CCB_ASKD_STATE_FILE",
+    session_filename=".hermes-session",
     daemon_bin_name="askd",
     daemon_module="askd.daemon",
 )

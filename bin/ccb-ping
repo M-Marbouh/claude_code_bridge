@@ -6,7 +6,7 @@ Usage:
     ccb-ping <provider> [--session-file FILE] [--autostart]
 
 Providers:
-    gemini, codex, opencode, claude
+    gemini, codex, opencode, claude, hermes
 """
 
 import sys
@@ -35,13 +35,14 @@ PROVIDER_COMMS = {
     "codex": ("codex_comm", "CodexCommunicator"),
     "opencode": ("opencode_comm", "OpenCodeCommunicator"),
     "claude": ("claude_comm", "ClaudeCommunicator"),
+    "hermes": ("hermes_comm", "HermesCommunicator"),
 }
 
 def _usage():
     print("Usage: ccb-ping <provider> [--session-file FILE] [--autostart]", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, claude, hermes", file=sys.stderr)
 
 
 def _resolve_work_dir(session_file: str | None) -> Path:
@@ -144,6 +145,7 @@ def main():
                     GASK_CLIENT_SPEC,
                     LASK_CLIENT_SPEC,
                     OASK_CLIENT_SPEC,
+                    HASK_CLIENT_SPEC,
                 )
 
                 specs = {
@@ -151,6 +153,7 @@ def main():
                     "gemini": GASK_CLIENT_SPEC,
                     "opencode": OASK_CLIENT_SPEC,
                     "claude": LASK_CLIENT_SPEC,
+                    "hermes": HASK_CLIENT_SPEC,
                 }
 
                 spec = specs.get(provider)

@@ -17,6 +17,7 @@ CCB_SESSION_FILENAMES = (
     ".codex-session",
     ".gemini-session",
     ".opencode-session",
+    ".hermes-session",
 )
 
 

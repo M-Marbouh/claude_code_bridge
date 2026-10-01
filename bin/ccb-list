@@ -33,7 +33,7 @@ from session_utils import find_project_session_file
 
 setup_windows_encoding()
 
-SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode")
+SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode", "hermes")
 PEER_PROVIDERS = ("claude", "codex")
 SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
 

@@ -212,6 +212,22 @@ def test_load_registry_by_project_id_infers_missing_project_id(tmp_path: Path, m
     assert rec.get("ccb_session_id") == "legacy"
 
 
+def test_legacy_codex_record_does_not_infer_hermes_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = {
+        "codex_pane_id": "%1",
+        "pane_title_marker": "CCB-Codex-old",
+        "terminal": "tmux",
+        "work_dir": "/tmp/project",
+    }
+    monkeypatch.setattr(
+        pane_registry, "get_backend_for_session",
+        lambda _record: _FakeBackend(alive={"%1"}, marker_map={"CCB-Codex-old": "%1"}),
+    )
+
+    assert pane_registry._provider_entry_from_legacy(record, "hermes") == {}
+    assert pane_registry._provider_pane_alive(record, "hermes") is False
+
+
 def test_load_registry_by_project_id_rejects_reused_tmux_pane_id_with_wrong_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -22,6 +22,7 @@ from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
 from claude_comm import ClaudeLogReader, _extract_message
 from codex_comm import CodexLogReader
+from hermes_comm import HermesStateError
 from live_sessions import INVENTORY_INVALID, find_caller
 from live_roles import roles_for_record
 from pane_registry import (
@@ -48,6 +49,7 @@ PROVIDER_PENDS = {
     "codex": "cpend",
     "opencode": "opend",
     "claude": "lpend",
+    "hermes": "",
 }
 TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-\d{3}-\d+(?:-\d+)?$")
 PEER_PROVIDERS = {
@@ -89,6 +91,9 @@ class OverlayItem:
 
 
 def _legacy_pend(provider: str, extra: list[str]) -> int:
+    if provider == "hermes":
+        print("[ERROR] Hermes legacy overlay is unavailable; use an exact task ID or normal pend routing.", file=sys.stderr)
+        return EXIT_ERROR
     pend_path = script_dir / PROVIDER_PENDS[provider]
     if not pend_path.exists():
         print(f"[ERROR] Command not found: {pend_path}", file=sys.stderr)
@@ -594,6 +599,25 @@ def _recover_from_recorded_conversation(receipt: dict, provider: str) -> str | N
     receipt -- see `_recover_provider_reply`.
     """
     task_id = str(receipt.get("task_id") or "").strip()
+    if provider == "hermes":
+        database_path = str(receipt.get("destination_database_path") or "").strip()
+        conversation_id = str(receipt.get("destination_conversation_id") or "").strip()
+        work_dir_raw = str(receipt.get("work_dir") or "").strip()
+        if not task_id or not database_path or not conversation_id or not work_dir_raw:
+            return None
+        try:
+            from hermes_comm import read_exchange
+
+            exchange = read_exchange(
+                Path(database_path).expanduser(), Path(work_dir_raw).expanduser(), task_id,
+                session_id=conversation_id,
+            )
+            return exchange.reply(task_id) if exchange is not None else None
+        except HermesStateError:
+            raise
+        except Exception:
+            return None
+
     transcript_path = str(receipt.get("destination_transcript_path") or "").strip()
     if not task_id or not transcript_path:
         return None
@@ -686,12 +710,14 @@ def _recover_provider_reply(receipt: dict) -> str | None:
     wide marker scan, exactly as it always has.
     """
     provider = str(receipt.get("provider") or "").strip().lower()
-    if provider not in {"codex", "claude"}:
+    if provider not in {"codex", "claude", "hermes"}:
         return None
     if _is_routed_receipt(receipt):
         return _recover_from_recorded_conversation(receipt, provider)
     if provider == "codex":
         return _recover_codex_reply(receipt)
+    if provider == "hermes":
+        return _recover_from_recorded_conversation(receipt, provider)
     return None
 
 
@@ -778,7 +804,11 @@ def _show_receipt(receipt: dict, *, provenance: bool = False) -> int:
     recovered = ""
     finished, exit_code, _finished_at = _status_finished(status_path)
     if not peer_reply and server_status != "completed" and (not finished or exit_code != 0 or server_status == "incomplete"):
-        recovered = _recover_provider_reply(receipt)
+        try:
+            recovered = _recover_provider_reply(receipt)
+        except HermesStateError as exc:
+            print(f"[ERROR] Hermes state DB {exc.kind}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
     pend_status = _saved_pend_status(receipt, recovered=recovered)
     if provenance:
         provider = str(receipt.get("provider") or "")
@@ -839,7 +869,11 @@ def _show_receipt(receipt: dict, *, provenance: bool = False) -> int:
     if output:
         print(prepare_agent_visible_reply(output, task_id))
     elif exit_code == 0:
-        recovered = _recover_provider_reply(receipt)
+        try:
+            recovered = _recover_provider_reply(receipt)
+        except HermesStateError as exc:
+            print(f"[ERROR] Hermes state DB {exc.kind}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
         if recovered:
             print(prepare_agent_visible_reply(recovered, task_id))
             return EXIT_OK
@@ -1101,7 +1135,11 @@ def _show_ambiguous_tasks(records: list[tuple[Path, dict]]) -> int:
         provider = str(receipt.get("provider") or "")
         status = _saved_pend_status(receipt)
         if status in {RECEIPT_INCOMPLETE, RECEIPT_INCOMPLETE_RUNNING}:
-            recovered = _recover_provider_reply(receipt)
+            try:
+                recovered = _recover_provider_reply(receipt)
+            except HermesStateError as exc:
+                print(f"[ERROR] Hermes state DB {exc.kind}: {exc}", file=sys.stderr)
+                return EXIT_ERROR
             status = _saved_pend_status(receipt, recovered=recovered or "")
         role = _current_role_for_receipt(receipt)
         print(f"{task_id}\t{provider}\t{role}\t{status}\t{_age_label(receipt, now)}")

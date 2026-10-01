@@ -385,6 +385,7 @@ def persist_proven_result(
     status: str = "",
     transcript_path: str = "",
     conversation_id: str = "",
+    database_path: str = "",
     root: Path | None = None,
 ) -> str:
     """Called by a provider adapter, inside the daemon, BEFORE any
@@ -449,6 +450,9 @@ def persist_proven_result(
         changed = True
     if conversation_id and str(receipt.get("destination_conversation_id") or "") != conversation_id:
         updated["destination_conversation_id"] = conversation_id
+        changed = True
+    if database_path and str(receipt.get("destination_database_path") or "") != database_path:
+        updated["destination_database_path"] = database_path
         changed = True
     if changed:
         try:

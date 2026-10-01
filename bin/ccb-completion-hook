@@ -12,7 +12,7 @@ Usage:
 Environment:
     CCB_COMPLETION_HOOK_ENABLED: Set to "0" to disable (default: "1")
     CCB_COMPLETION_HOOK_TIMEOUT: Timeout in seconds (default: 5)
-    CCB_CALLER: Who initiated the request (claude/codex/gemini/opencode/email)
+    CCB_CALLER: Who initiated the request (claude/codex/gemini/opencode/hermes/email)
     CCB_EMAIL_REQ_ID: Request ID for email replies
     CCB_EMAIL_MSG_ID: Original email Message-ID for threading
     CCB_EMAIL_FROM: Original sender email address
@@ -537,6 +537,7 @@ def main() -> int:
         "codex": "Codex",
         "gemini": "Gemini",
         "opencode": "OpenCode",
+        "hermes": "Hermes",
         "peer-claude": "Peer Claude",
         "peer-codex": "Peer Codex",
     }
@@ -622,6 +623,7 @@ def main() -> int:
             "codex": ".codex-session",
             "gemini": ".gemini-session",
             "opencode": ".opencode-session",
+            "hermes": ".hermes-session",
         }
         session_filename = session_files.get(caller, ".claude-session")
 

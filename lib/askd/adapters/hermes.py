@@ -158,8 +158,13 @@ class HermesAdapter(BaseProviderAdapter):
                     status=COMPLETION_STATUS_FAILED,
                 ), database_path=str(db_path), conversation_id=existing.session_id)
         except HermesStateError as exc:
-            status = COMPLETION_STATUS_INCOMPLETE if exc.kind == "ambiguous" else COMPLETION_STATUS_FAILED
-            message = f"Hermes ambiguous anchor: {exc}" if exc.kind == "ambiguous" else f"Hermes state DB {exc.kind}: {exc}"
+            status = COMPLETION_STATUS_INCOMPLETE if exc.kind in {"ambiguous", "rotated"} else COMPLETION_STATUS_FAILED
+            if exc.kind == "ambiguous":
+                message = f"Hermes ambiguous anchor: {exc}"
+            elif exc.kind == "rotated":
+                message = f"Hermes session rotated: {exc}"
+            else:
+                message = f"Hermes state DB {exc.kind}: {exc}"
             return self._finish(task, ProviderResult(
                 exit_code=1, reply=message, req_id=task.req_id,
                 session_key=session_key, done_seen=False, status=status,
@@ -218,6 +223,9 @@ class HermesAdapter(BaseProviderAdapter):
             except HermesStateError as exc:
                 if exc.kind == "ambiguous":
                     reply = f"Hermes ambiguous anchor: {exc}"
+                    result_status = COMPLETION_STATUS_INCOMPLETE
+                elif exc.kind == "rotated":
+                    reply = f"Hermes session rotated: {exc}"
                     result_status = COMPLETION_STATUS_INCOMPLETE
                 else:
                     reply = f"Hermes state DB {exc.kind}: {exc}"

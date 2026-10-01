@@ -15,7 +15,8 @@ from ccb_protocol import append_trailing_notice, find_done_line, split_done_text
 from session_utils import find_project_session_file
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
+SUPPORTED_SCHEMA_VERSIONS = {30, SCHEMA_VERSION}
 BUSY_RETRIES = 3
 BUSY_RETRY_DELAY_S = 0.05
 READ_TIMEOUT_S = 0.1
@@ -24,7 +25,7 @@ _CONTENT_JSON_PREFIX = "\x00json:"
 _SUMMARY_END_MARKER = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
 _MERGED_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
-# Ported from ~/.hermes/hermes-agent/agent/context_compressor.py at Hermes commit 9b02a977bd.
+# Ported from ~/.hermes/hermes-agent/agent/context_compressor.py at Hermes commit 62c42e9db9.
 _SUMMARY_PREFIX = (
     '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. This '
     'is a handoff from a previous context window — treat it as background reference, NOT as active in'
@@ -141,6 +142,9 @@ REQUIRED_COLUMNS = {
         "timestamp", "finish_reason", "active", "compacted", "display_kind", "display_metadata", "display_order",
     },
 }
+SCHEMA_31_REQUIRED_COLUMNS = {
+    "messages": {"message_uid", "absorbed_message_uids"},
+}
 
 
 class HermesStateError(RuntimeError):
@@ -173,17 +177,17 @@ class HermesExchange:
 
     @property
     def terminal_row(self) -> dict[str, Any] | None:
-        if not self.rows:
-            return None
-        row = self.rows[-1]
-        finish = str(row.get("finish_reason") or "").strip().lower()
-        if row.get("role") != "assistant" or _has_tool_calls(row.get("tool_calls")):
-            return None
-        if finish not in TERMINAL_FINISH_REASONS:
-            return None
-        if find_done_line(_content_text(row.get("content")), row["req_id"]) is None:
-            return None
-        return row
+        for row in self.rows:
+            finish = str(row.get("finish_reason") or "").strip().lower()
+            if row.get("role") != "assistant" or _has_tool_calls(row.get("tool_calls")) or _model_only(row):
+                continue
+            if not (int(row.get("active") or 0) or int(row.get("compacted") or 0)):
+                continue
+            if finish not in TERMINAL_FINISH_REASONS:
+                continue
+            if find_done_line(_content_text(row.get("content")), row["req_id"]) is not None:
+                return row
+        return None
 
     def reply(self, req_id: str) -> str | None:
         row = self.terminal_row
@@ -261,9 +265,15 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
                 missing = sorted(columns - tables.get(table, set()))
                 raise HermesStateError("incompatible", f"Hermes state DB lacks {table} columns: {', '.join(missing)}")
         row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-        if row is None or int(row[0]) not in {SCHEMA_VERSION}:
+        if row is None or int(row[0]) not in SUPPORTED_SCHEMA_VERSIONS:
             found = "missing" if row is None else str(row[0])
-            raise HermesStateError("incompatible", f"Hermes state DB schema version {found}; supported: {SCHEMA_VERSION}")
+            supported = ", ".join(str(version) for version in sorted(SUPPORTED_SCHEMA_VERSIONS))
+            raise HermesStateError("incompatible", f"Hermes state DB schema version {found}; supported: {supported}")
+        if int(row[0]) == SCHEMA_VERSION:
+            for table, columns in SCHEMA_31_REQUIRED_COLUMNS.items():
+                if not columns.issubset(tables.get(table, set())):
+                    missing = sorted(columns - tables.get(table, set()))
+                    raise HermesStateError("incompatible", f"Hermes state DB lacks {table} columns: {', '.join(missing)}")
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
         if "locked" in message or "busy" in message or "i/o error" in message:
@@ -314,38 +324,6 @@ def _model_only(row: dict[str, Any]) -> bool:
 
 def _is_compressed_summary(row: dict[str, Any]) -> bool:
     return bool(row.get("_compressed_summary") or _metadata(row).get("_compressed_summary"))
-
-
-def _normalized_identity_content(row: dict[str, Any]) -> str:
-    content = row.get("content")
-    if isinstance(content, str) and content.startswith(_CONTENT_JSON_PREFIX):
-        try:
-            content = json.loads(content[len(_CONTENT_JSON_PREFIX):])
-        except (TypeError, ValueError):
-            pass
-    if row.get("role") != "user":
-        return str(content or "")
-
-    top = content if isinstance(content, dict) else {}
-    user_content = top.get("content") if isinstance(top, dict) and "content" in top else content
-    projected = _live_user_projection(
-        user_content,
-        is_summary=bool(top.get("_compressed_summary") or _is_compressed_summary(row)),
-    )
-    if projected is not None:
-        user_content = projected
-    else:
-        # Standalone synthetic handoffs have no live view; preserve their raw identity.
-        user_content = content
-    if isinstance(content, dict):
-        durable_metadata = {
-            key: value for key, value in content.items()
-            if key in {"display_metadata"} and isinstance(value, dict) and value.get("reactions")
-        }
-        normalized = {"content": user_content, **durable_metadata}
-    else:
-        normalized = user_content
-    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if isinstance(normalized, (dict, list)) else str(normalized or "")
 
 
 def _content_part_text(part: Any) -> str | None:
@@ -448,13 +426,6 @@ def _live_user_projection(content: Any, *, is_summary: bool = False) -> Any | No
     projected = _strip_context_summary_handoff_message(message)
     return projected.get("content") if projected is not None else None
 
-def _identity(row: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        row.get("role"), _normalized_identity_content(row), row.get("timestamp"), row.get("tool_call_id"),
-        row.get("tool_calls"), row.get("tool_name"),
-    )
-
-
 def _has_tool_calls(value: Any) -> bool:
     if value in (None, "", "[]", "{}"):
         return False
@@ -464,22 +435,6 @@ def _has_tool_calls(value: Any) -> bool:
         except (TypeError, ValueError):
             return True
     return bool(value)
-
-
-def _visible_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Match Hermes display generations: model-only rows never participate, and repeated copies
-    # collapse only when the upstream display identity fields prove they are the same message.
-    by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for row in rows:
-        if not (int(row.get("active") or 0) or int(row.get("compacted") or 0)) or _model_only(row):
-            continue
-        key = _identity(row)
-        current = by_key.get(key)
-        if current is None or (int(row.get("active") or 0), int(row["id"])) > (
-            int(current.get("active") or 0), int(current["id"])
-        ):
-            by_key[key] = row
-    return sorted(by_key.values(), key=lambda row: (int(row.get("display_order") or row["id"]), int(row["id"])))
 
 
 def _has_anchor(row: dict[str, Any], req_id: str) -> bool:
@@ -493,16 +448,6 @@ def _has_anchor(row: dict[str, Any], req_id: str) -> bool:
     return wanted in _content_text(content).splitlines()
 
 
-def _genuine_user_boundary(row: dict[str, Any]) -> bool:
-    if row.get("role") != "user" or _model_only(row):
-        return False
-    display_kind = str(row.get("display_kind") or "")
-    if display_kind and display_kind not in {"steer", "hidden"}:
-        return False
-    content = _live_user_projection(row.get("content"), is_summary=_is_compressed_summary(row))
-    return bool(_content_text(content).strip())
-
-
 def _read_exchange_once(
     db_path: Path,
     work_dir: Path,
@@ -512,8 +457,8 @@ def _read_exchange_once(
 ) -> HermesExchange | None:
     """Read an anchored exchange from one read-only, consistent DB snapshot.
 
-    ``session_id`` is supplied for exact pend recovery. Otherwise anchors are resolved only
-    among Hermes sessions whose recorded cwd is this project.
+    ``session_id`` is supplied for exact pend recovery. Anchors are always checked across all
+    project sessions first, so exact recovery cannot switch sessions or hide another anchor.
     """
     db_path = Path(db_path)
     work_dir = Path(work_dir).expanduser().resolve()
@@ -522,15 +467,10 @@ def _read_exchange_once(
     try:
         _verify_schema(conn)
         conn.execute("BEGIN")
-        if session_id:
-            session_rows = conn.execute(
-                "SELECT id, cwd, ended_at, end_reason, parent_session_id FROM sessions WHERE id=?",
-                (session_id,),
-            ).fetchall()
-        else:
-            session_rows = conn.execute(
-                "SELECT id, cwd, ended_at, end_reason, parent_session_id FROM sessions WHERE cwd IS NOT NULL AND cwd != ''"
-            ).fetchall()
+        session_rows = conn.execute(
+            "SELECT id, cwd, ended_at, end_reason, parent_session_id FROM sessions "
+            "WHERE cwd IS NOT NULL AND cwd != ''"
+        ).fetchall()
         session_by_id = {
             str(row["id"]): dict(row) for row in session_rows
             if os.path.realpath(str(row["cwd"] or "")) == work_dir_real
@@ -549,30 +489,17 @@ def _read_exchange_once(
         if not anchors:
             conn.execute("ROLLBACK")
             return None
-        # First collapse display generations only within their owning session. A child session is
-        # never a reply source for an anchor already present in a compressed parent session.
         anchors_by_session: dict[str, list[dict[str, Any]]] = {}
         for row in anchors:
             owner = str(row["session_id"])
-            session_anchors = anchors_by_session.setdefault(owner, [])
-            for index, existing in enumerate(session_anchors):
-                if _identity(existing) == _identity(row):
-                    if (int(row.get("active") or 0), int(row["id"])) > (
-                        int(existing.get("active") or 0), int(existing["id"])
-                    ):
-                        session_anchors[index] = row
-                    break
-            else:
-                session_anchors.append(row)
+            anchors_by_session.setdefault(owner, []).append(row)
 
+        anchors_by_session = {owner: min(rows, key=lambda row: int(row["id"])) for owner, rows in anchors_by_session.items()}
         session_anchor_groups = list(anchors_by_session.items())
-        if len(session_anchor_groups) == 1 and len(session_anchor_groups[0][1]) == 1:
-            selected_session, (anchor,) = session_anchor_groups[0]
-        elif len(session_anchor_groups) == 2 and all(len(group) == 1 for _sid, group in session_anchor_groups):
-            (first_id, first_group), (second_id, second_group) = session_anchor_groups
-            first, second = first_group[0], second_group[0]
-            if _identity(first) != _identity(second):
-                raise HermesStateError("ambiguous", f"Ambiguous Hermes anchor for request {req_id}")
+        if len(session_anchor_groups) == 1:
+            selected_session, anchor = session_anchor_groups[0]
+        elif len(session_anchor_groups) == 2:
+            (first_id, first), (second_id, second) = session_anchor_groups
             first_meta = session_by_id[first_id]
             second_meta = session_by_id[second_id]
             if second_meta.get("parent_session_id") == first_id and first_meta.get("end_reason") == "compression":
@@ -587,25 +514,17 @@ def _read_exchange_once(
         selected_meta = session_by_id.get(selected_session)
         if selected_meta is None:
             raise HermesStateError("unavailable", "Hermes anchor session disappeared from snapshot")
+        parent_meta = session_by_id.get(str(selected_meta.get("parent_session_id") or ""))
+        if parent_meta and parent_meta.get("end_reason") == "compression":
+            raise HermesStateError("rotated", "Hermes request anchor is in a compression child session")
         if session_id and selected_session != session_id:
-            raise HermesStateError("incompatible", "Recorded Hermes session does not own the request anchor")
+            conn.execute("ROLLBACK")
+            return None
 
         raw_session_rows = conn.execute(
-            "SELECT * FROM messages WHERE session_id=? ORDER BY id", (selected_session,)
+            "SELECT * FROM messages WHERE session_id=? AND id>? ORDER BY id", (selected_session, int(anchor["id"]))
         ).fetchall()
-        session_rows = [dict(row) for row in raw_session_rows]
-        visible = _visible_rows(session_rows)
-        anchor_index = next((i for i, row in enumerate(visible) if _identity(row) == _identity(anchor)), None)
-        if anchor_index is None:
-            raise HermesStateError("unavailable", "Hermes request anchor is not display-visible")
-        end = len(visible)
-        for i in range(anchor_index + 1, len(visible)):
-            row = visible[i]
-            if _genuine_user_boundary(row):
-                end = i
-                break
-        exchange_rows = visible[anchor_index:end]
-        exchange_rows = [dict(row, req_id=req_id) for row in exchange_rows]
+        exchange_rows = [dict(row, req_id=req_id) for row in raw_session_rows]
         result = HermesExchange(
             session_id=selected_session,
             anchor_id=int(anchor["id"]),

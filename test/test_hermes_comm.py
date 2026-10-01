@@ -24,17 +24,25 @@ _check_pane = hermes_adapter_module._check_pane
 
 def _db(path: Path, *, version: int = 30) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
+    schema_31 = """
+        , auto_archived INTEGER DEFAULT 0
+    """ if version >= 31 else ""
+    message_identity_columns = """
+            , message_uid TEXT, absorbed_message_uids TEXT, tool_call_uids TEXT, tool_call_uid TEXT
+    """ if version >= 31 else ""
     conn.executescript(
-        """
+        f"""
         CREATE TABLE schema_version(version INTEGER NOT NULL);
         CREATE TABLE sessions(
             id TEXT PRIMARY KEY, cwd TEXT, ended_at TEXT, end_reason TEXT, parent_session_id TEXT
+            {schema_31}
         );
         CREATE TABLE messages(
             id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
             tool_calls TEXT, tool_name TEXT, timestamp TEXT, finish_reason TEXT, active INTEGER,
             compacted INTEGER, display_kind TEXT, display_metadata TEXT, display_order INTEGER,
             _compressed_summary INTEGER DEFAULT 0
+            {message_identity_columns}
         );
         """
     )
@@ -60,7 +68,8 @@ def _message(
             session_id,role,content,tool_call_id,tool_calls,tool_name,timestamp,finish_reason,
             active,compacted,display_kind,display_metadata,display_order,_compressed_summary
         ) VALUES (?,?,?,NULL,?,'',?,?,?,?,?,?,?,?)""",
-        (session_id, role, content, tool_calls, timestamp, finish, active, compacted, display_kind, metadata, order, int(compressed_summary)),
+        (session_id, role, content, tool_calls, timestamp, finish, active, compacted,
+         display_kind, metadata, order, int(compressed_summary)),
     )
     return int(cur.lastrowid)
 
@@ -72,10 +81,14 @@ def _anchor(conn, session_id: str, req_id: str, *, timestamp: str = "t1", order:
     )
 
 
-def _done(conn, session_id: str, req_id: str, *, text: str | None = None, finish: str = "stop", tool_calls: str = "", order: int = 2) -> int:
+def _done(
+    conn, session_id: str, req_id: str, *, text: str | None = None, finish: str = "stop",
+    tool_calls: str = "", order: int = 2, active: int = 1, compacted: int = 0, metadata: str = "",
+) -> int:
     return _message(
         conn, session_id, "assistant", text or f"Answer\nCCB_DONE: {req_id}",
         timestamp=f"t{order}", order=order, finish=finish, tool_calls=tool_calls,
+        active=active, compacted=compacted, metadata=metadata,
     )
 
 
@@ -106,10 +119,11 @@ def test_read_exchange_requires_exact_whole_line_anchor_and_done_id(tmp_path: Pa
         ("Interim\nCCB_DONE: req", "", ""),
         ("Partial\nCCB_DONE: req", "length", ""),
         ("Tool result\nCCB_DONE: req", "stop", '[{"id":"call"}]'),
+        ("Wrong request\nCCB_DONE: other", "stop", ""),
         ("No marker", "stop", ""),
     ],
 )
-def test_intermediate_partial_or_tool_call_rows_never_complete(tmp_path: Path, reply_text, finish, tool_calls) -> None:
+def test_nonterminal_partial_tool_and_wrong_id_rows_never_complete(tmp_path: Path, reply_text, finish, tool_calls) -> None:
     conn = _db(tmp_path / "state.db")
     _session(conn, "s1", tmp_path)
     _anchor(conn, "s1", "req")
@@ -121,50 +135,7 @@ def test_intermediate_partial_or_tool_call_rows_never_complete(tmp_path: Path, r
     assert exchange.reply("req") is None  # negative: each non-terminal shape fails its completion check
 
 
-def test_compaction_clones_collapse_but_distinct_identical_prompts_are_ambiguous(tmp_path: Path) -> None:
-    db = tmp_path / "state.db"
-    conn = _db(db)
-    _session(conn, "parent", tmp_path, end_reason="compression")
-    _session(conn, "child", tmp_path, parent="parent")
-    _anchor(conn, "parent", "clone", timestamp="same", order=1)
-    _anchor(conn, "child", "clone", timestamp="same", order=1)
-    _done(conn, "parent", "clone")
-    _done(conn, "child", "clone")
-    conn.commit()
-    conn.close()
-
-    exchange = read_exchange(db, tmp_path, "clone")
-    assert exchange is not None and exchange.session_id == "parent"
-    assert exchange.end_reason == "compression"
-    assert all(row["session_id"] == "parent" for row in exchange.rows)  # negative: child reply is never read
-
-    conn = sqlite3.connect(db)
-    _session(conn, "unrelated", tmp_path)
-    _anchor(conn, "unrelated", "clone", timestamp="later", order=1)
-    conn.commit()
-    conn.close()
-    with pytest.raises(HermesStateError, match="Ambiguous"):
-        read_exchange(db, tmp_path, "clone")  # negative: different timestamp/session remains a distinct anchor
-
-
-def test_composite_handoff_identity_uses_normalized_live_user_content(tmp_path: Path) -> None:
-    db = tmp_path / "state.db"
-    conn = _db(db)
-    _session(conn, "parent", tmp_path, end_reason="compression")
-    _session(conn, "child", tmp_path, parent="parent")
-    live = f"{_SUMMARY_END_MARKER}\nCCB_REQ_ID: handoff\nDo this"
-    _anchor(conn, "parent", "handoff", timestamp="same", order=1, content=f"[CONTEXT SUMMARY]: summary-one\n{live}")
-    _anchor(conn, "child", "handoff", timestamp="same", order=1, content=f"[CONTEXT SUMMARY]: summary-two\n{live}")
-    conn.commit()
-    conn.close()
-
-    # Negative: without Hermes' live-view handoff normalization these differently summarized
-    # carriers would look like two distinct logical anchors and fail closed as ambiguous.
-    exchange = read_exchange(db, tmp_path, "handoff")
-    assert exchange is not None and exchange.session_id == "parent"
-
-
-def test_exchange_ends_at_next_user_and_ignores_unrelated_session_activity(tmp_path: Path) -> None:
+def test_request_id_completion_crosses_later_user_rows(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     conn = _db(db)
     _session(conn, "target", tmp_path)
@@ -172,17 +143,31 @@ def test_exchange_ends_at_next_user_and_ignores_unrelated_session_activity(tmp_p
     _anchor(conn, "target", "req")
     _message(conn, "target", "assistant", "working", timestamp="t2", order=2, finish="")
     _message(conn, "target", "user", "later real user turn", timestamp="t3", order=3)
-    _done(conn, "other", "elsewhere", order=2)
+    _done(conn, "target", "req", text="Correlated answer\nCCB_DONE: req", order=4)
+    _done(conn, "other", "elsewhere", text="Wrong session\nCCB_DONE: req", order=2)
     conn.commit()
     conn.close()
 
     exchange = read_exchange(db, tmp_path, "req")
     assert exchange is not None
-    assert [row["role"] for row in exchange.rows] == ["user", "assistant"]
-    assert exchange.reply("req") is None  # negative: unrelated session completion cannot leak into exchange
+    assert exchange.reply("req") == "Correlated answer"
 
 
-def test_hidden_compaction_carrier_live_user_turn_ends_exchange(tmp_path: Path) -> None:
+def test_same_request_anchor_in_unrelated_sessions_is_ambiguous(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db)
+    _session(conn, "first", tmp_path)
+    _session(conn, "second", tmp_path)
+    _anchor(conn, "first", "duplicate")
+    _anchor(conn, "second", "duplicate")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(HermesStateError, match="Ambiguous"):
+        read_exchange(db, tmp_path, "duplicate")
+
+
+def test_summary_only_carrier_does_not_hide_request_id_completion(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     conn = _db(db)
     _session(conn, "s1", tmp_path)
@@ -199,8 +184,8 @@ def test_hidden_compaction_carrier_live_user_turn_ends_exchange(tmp_path: Path) 
 
     exchange = read_exchange(db, tmp_path, "old")
     assert exchange is not None
-    assert [row["role"] for row in exchange.rows] == ["user", "assistant", "user", "assistant"]
-    assert exchange.reply("old") == "The old request answer"  # negative: summary-only row cannot truncate the exchange
+    assert [row["role"] for row in exchange.rows] == ["assistant", "user", "assistant"]
+    assert exchange.reply("old") == "The old request answer"
 
 
 def test_hidden_compaction_summary_request_id_is_not_an_anchor(tmp_path: Path) -> None:
@@ -310,12 +295,56 @@ def test_compacted_archived_anchor_remains_retrievable(tmp_path: Path) -> None:
     conn = _db(db)
     _session(conn, "s1", tmp_path)
     _message(conn, "s1", "user", "CCB_REQ_ID: archived\nOld task", timestamp="old", order=1, active=0, compacted=1)
-    _done(conn, "s1", "archived")
+    _done(conn, "s1", "archived", active=0, compacted=1)
     conn.commit()
     conn.close()
 
     exchange = read_exchange(db, tmp_path, "archived")
     assert exchange is not None and exchange.reply("archived") == "Answer"
+
+
+def test_withdrawn_terminal_row_does_not_complete(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db)
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "withdrawn")
+    _done(conn, "s1", "withdrawn", active=0, compacted=0)
+    conn.commit()
+    conn.close()
+
+    exchange = read_exchange(db, tmp_path, "withdrawn")
+    assert exchange is not None and exchange.reply("withdrawn") is None
+
+
+def test_model_only_terminal_row_does_not_complete(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db)
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "model-only")
+    _done(conn, "s1", "model-only", metadata='{"model_only":true}')
+    conn.commit()
+    conn.close()
+
+    exchange = read_exchange(db, tmp_path, "model-only")
+    assert exchange is not None and exchange.reply("model-only") is None
+
+
+def test_schema_31_uidless_compaction_replay_completes(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=31)
+    _session(conn, "s1", tmp_path)
+    earliest = _message(
+        conn, "s1", "user", "CCB_REQ_ID: replay\nDo the small task", timestamp="t1", order=1,
+        active=0, compacted=1,
+    )
+    _anchor(conn, "s1", "replay", timestamp="t2", order=2)
+    _done(conn, "s1", "replay", text="Replay answer\nCCB_DONE: replay", order=3)
+    conn.commit()
+    conn.close()
+
+    exchange = read_exchange(db, tmp_path, "replay")
+    assert exchange is not None and exchange.anchor_id == earliest
+    assert exchange.reply("replay") == "Replay answer"
 
 
 def test_json_content_anchor_and_synthetic_user_rows(tmp_path: Path) -> None:
@@ -359,12 +388,38 @@ def test_wrong_workdir_anchor_and_unsupported_schema_fail_closed(tmp_path: Path)
         read_exchange(bad_db, tmp_path, "req")  # negative: unsupported schema is an error, not no-reply
 
     newer_db = tmp_path / "newer.db"
-    conn = _db(newer_db, version=31)
+    conn = _db(newer_db, version=32)
     conn.commit()
     conn.close()
-    with pytest.raises(HermesStateError, match="schema version 31") as error:
+    with pytest.raises(HermesStateError, match="schema version 32") as error:
         read_exchange(newer_db, tmp_path, "req")
     assert error.value.kind == "incompatible"
+
+
+def test_queued_prompt_anchor_survives_accept_and_drain_replacement(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=31)
+    _session(conn, "s1", tmp_path)
+    early_id = _message(
+        conn, "s1", "user", "CCB_REQ_ID: queued\nDo this", timestamp="t2", order=2,
+        active=0, compacted=0, metadata=json.dumps({"_queued_prompt": True}),
+    )
+    _done(conn, "s1", "previous", text="Previous answer\nCCB_DONE: previous", order=3)
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(db)
+    replacement_id = _message(
+        conn, "s1", "user", "CCB_REQ_ID: queued\nDo this", timestamp="t4", order=4,
+    )
+    _done(conn, "s1", "queued", text="Queued answer\nCCB_DONE: queued", order=5)
+    conn.commit()
+    conn.close()
+
+    drained = read_exchange(db, tmp_path, "queued")
+    assert drained is not None and drained.anchor_id == early_id
+    assert replacement_id in [row["id"] for row in drained.rows]
+    assert drained.reply("queued") == "Queued answer"
 
 
 def test_session_cwd_filter_compares_realpaths(tmp_path: Path) -> None:
@@ -468,11 +523,17 @@ def _configure_adapter(monkeypatch, work_dir: Path, db: Path, backend) -> None:
     monkeypatch.setattr(hermes_adapter_module.HermesAdapter, "_finish", lambda self, task, result, **_kw: result)
 
 
-def test_duplicate_stale_anchor_is_refused_before_send(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(("active", "compacted", "has_done"), [(0, 0, False), (0, 1, True)])
+def test_duplicate_stale_anchor_is_refused_before_send(tmp_path: Path, monkeypatch, active, compacted, has_done) -> None:
     db = tmp_path / "state.db"
     conn = _db(db)
     _session(conn, "old", tmp_path)
-    _anchor(conn, "old", "stale")
+    _message(
+        conn, "old", "user", "CCB_REQ_ID: stale\nOld task", timestamp="t1", order=1,
+        active=active, compacted=compacted,
+    )
+    if has_done:
+        _done(conn, "old", "stale", order=2, active=0, compacted=1)
     conn.commit()
     conn.close()
     backend = SimpleNamespace(send_text=lambda *_args: pytest.fail("stale request was sent"))
@@ -507,6 +568,21 @@ def test_rotation_during_request_is_incomplete_and_never_reads_child_reply(tmp_p
     assert result.status == "incomplete"
     assert "session rotated" in result.reply
     assert not result.done_seen  # negative: child session DONE is outside the anchor session
+
+
+def test_compression_child_anchor_never_reads_child_done(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db)
+    _session(conn, "parent", tmp_path, end_reason="compression")
+    _session(conn, "child", tmp_path, parent="parent")
+    _anchor(conn, "child", "child-only")
+    _done(conn, "child", "child-only")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(HermesStateError, match="compression child") as error:
+        read_exchange(db, tmp_path, "child-only")
+    assert error.value.kind == "rotated"
 
 
 def test_pane_death_and_replacement_are_negative_controls(tmp_path: Path, monkeypatch) -> None:
@@ -628,3 +704,18 @@ def test_reply_stops_at_done_line_and_drops_following_prose(tmp_path: Path) -> N
     assert exchange is not None
     answer, trailing = split_done_text("The answer\nCCB_DONE: trailing\npost-marker prose", "trailing")
     assert exchange.reply("trailing") == append_trailing_notice(answer, trailing)
+
+
+def test_done_before_rotation_still_completes_from_parent(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db)
+    _session(conn, "parent", tmp_path, end_reason="compression")
+    _session(conn, "child", tmp_path, parent="parent")
+    _anchor(conn, "parent", "answered")
+    _done(conn, "parent", "answered")
+    conn.commit()
+    conn.close()
+
+    exchange = read_exchange(db, tmp_path, "answered")
+    assert exchange is not None and exchange.session_id == "parent"
+    assert exchange.reply("answered") == "Answer"

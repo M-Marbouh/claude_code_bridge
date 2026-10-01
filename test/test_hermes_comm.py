@@ -606,7 +606,7 @@ def test_pane_death_and_replacement_are_negative_controls(tmp_path: Path, monkey
     assert dead.status == "incomplete" and "pane died" in dead.reply
 
     class ReplacedBackend:
-        def pane_exists(self, _pane):
+        def is_alive(self, _pane):
             return True
 
         def find_pane_by_title_marker(self, *_args):
@@ -719,3 +719,17 @@ def test_done_before_rotation_still_completes_from_parent(tmp_path: Path) -> Non
     exchange = read_exchange(db, tmp_path, "answered")
     assert exchange is not None and exchange.session_id == "parent"
     assert exchange.reply("answered") == "Answer"
+
+
+def test_check_pane_uses_the_real_wezterm_backend(tmp_path: Path, monkeypatch) -> None:
+    from terminal import WeztermBackend
+
+    panes = [{"pane_id": 11, "title": "CCB-Hermes-test", "cwd": f"file://{tmp_path}"}]
+    monkeypatch.setattr(WeztermBackend, "_list_panes", lambda self: panes)
+    monkeypatch.setitem(_check_pane.__globals__, "get_backend_for_session", lambda _session: WeztermBackend())
+    session = {"pane_id": "11", "pane_title_marker": "CCB-Hermes-test", "terminal": "wezterm"}
+
+    backend, error = _check_pane(session, tmp_path)
+    assert error == "" and isinstance(backend, WeztermBackend)
+    _backend, error = _check_pane(dict(session, pane_id="12"), tmp_path)
+    assert error == "Hermes pane is not available."  # negative: a pane that is not listed fails

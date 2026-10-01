@@ -83,12 +83,12 @@ def _check_pane(data: dict[str, Any], work_dir: Path) -> tuple[Any | None, str]:
     if backend is None:
         return None, "Terminal backend not available."
     try:
-        if not backend.pane_exists(pane_id):
+        if not backend.is_alive(pane_id):
             return None, "Hermes pane is not available."
         finder = getattr(backend, "find_pane_by_title_marker", None)
         resolved = str(finder(marker, str(work_dir)) or "").strip() if callable(finder) else ""
-    except Exception:
-        return None, "Hermes pane could not be verified."
+    except Exception as exc:
+        return None, f"Hermes pane could not be verified: {type(exc).__name__}: {exc}"
     if resolved != pane_id:
         return None, "Hermes pane identity changed or could not be verified."
     return backend, ""

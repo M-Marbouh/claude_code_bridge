@@ -591,7 +591,7 @@ class HermesCommunicator:
         pane_id = str(data.get("pane_id") or "").strip()
         terminal = str(data.get("terminal") or "").strip().lower()
         backend = WeztermBackend() if terminal == "wezterm" else TmuxBackend() if terminal == "tmux" else None
-        if not data.get("active") or not pane_id or backend is None or not backend.pane_exists(pane_id):
+        if not data.get("active") or not pane_id or backend is None or not backend.is_alive(pane_id):
             return False, "Hermes pane is not active"
         try:
             db_path = session_db_path(data)

@@ -840,7 +840,7 @@ function Uninstall-Native {
 
   # 3. Remove Claude skills
   $claudeSkillsDir = Join-Path $env:USERPROFILE ".claude\skills"
-  $ccbSkills = @("ask", "cping", "ping", "pend", "autonew", "delegate", "mounted", "all-plan", "docs", "tp", "tr", "file-op", "review")
+  $ccbSkills = @("ask", "cping", "ping", "pend", "autonew", "delegate", "mounted", "all-plan", "docs", "tp", "tr", "file-op", "review", "ccb-lead", "ccb-implementer", "ccb-ratifier")
   if (Test-Path $claudeSkillsDir) {
     Write-Host "Removing CCB Claude skills..."
     foreach ($skill in $ccbSkills) {

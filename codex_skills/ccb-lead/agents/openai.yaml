@@ -1,0 +1,7 @@
+interface:
+  display_name: "CCB Lead"
+  short_description: "Assign this session as the CCB technical lead"
+  default_prompt: "Use $ccb-lead to assign this session as the architect and technical lead."
+
+policy:
+  allow_implicit_invocation: false

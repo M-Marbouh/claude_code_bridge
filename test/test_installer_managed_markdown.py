@@ -22,6 +22,7 @@ CLAUDE_START = "<!-- CCB_CONFIG_START -->"
 CLAUDE_END = "<!-- CCB_CONFIG_END -->"
 RATIFICATION_START = "<!-- MUTUAL_RATIFICATION_START -->"
 RATIFICATION_END = "<!-- MUTUAL_RATIFICATION_END -->"
+CCB_ROLE_SKILLS = ("ccb-lead", "ccb-implementer", "ccb-ratifier")
 
 
 def _prepare_install_prefix(tmp_path: Path) -> Path:
@@ -58,6 +59,69 @@ def _run_install_functions(
         capture_output=True,
         text=True,
     )
+
+
+def _assert_role_skills_present(skills_root: Path) -> None:
+    missing = [name for name in CCB_ROLE_SKILLS if not (skills_root / name).is_dir()]
+    assert not missing, f"missing CCB role skill directories: {', '.join(missing)}"
+
+
+def _assert_skill_trees_equal(source: Path, destination: Path) -> None:
+    source_files = {
+        path.relative_to(source): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    destination_files = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
+    assert destination_files == source_files
+
+
+def test_ccb_role_skills_are_required_for_both_providers_and_install_verbatim(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_claude_skills", "install_codex_skills"),
+    )
+
+    provider_roots = (
+        (REPO_ROOT / "claude_skills", home / ".claude" / "skills"),
+        (REPO_ROOT / "codex_skills", home / ".codex" / "skills"),
+    )
+    for source_root, installed_root in provider_roots:
+        _assert_role_skills_present(source_root)
+        _assert_role_skills_present(installed_root)
+        for name in CCB_ROLE_SKILLS:
+            _assert_skill_trees_equal(source_root / name, installed_root / name)
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_claude_skills", "uninstall_codex_skills"),
+    )
+    for _, installed_root in provider_roots:
+        for name in CCB_ROLE_SKILLS:
+            assert not (installed_root / name).exists()
+
+
+def test_ccb_role_skill_inventory_fails_when_one_directory_is_missing(
+    tmp_path: Path,
+) -> None:
+    skills_root = tmp_path / "skills"
+    for name in CCB_ROLE_SKILLS[:-1]:
+        (skills_root / name).mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(AssertionError, match="ccb-ratifier"):
+        _assert_role_skills_present(skills_root)
 
 
 def test_managed_blocks_preserve_hand_authored_content_and_are_idempotent(

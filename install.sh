@@ -1673,7 +1673,7 @@ except Exception:
 
 uninstall_claude_skills() {
   local skills_dst="$HOME/.claude/skills"
-  local ccb_skills="ask cping ping pend autonew mounted all-plan docs tp tr file-op review"
+  local ccb_skills="ask cping ping pend autonew mounted all-plan docs tp tr file-op review ccb-lead ccb-implementer ccb-ratifier"
 
   if [[ ! -d "$skills_dst" ]]; then
     return
@@ -1690,7 +1690,7 @@ uninstall_claude_skills() {
 
 uninstall_codex_skills() {
   local skills_dst="${CODEX_HOME:-$HOME/.codex}/skills"
-  local ccb_skills="ask ping pend autonew mounted all-plan file-op"
+  local ccb_skills="ask ping pend autonew mounted all-plan file-op ccb-lead ccb-implementer ccb-ratifier"
 
   if [[ ! -d "$skills_dst" ]]; then
     return

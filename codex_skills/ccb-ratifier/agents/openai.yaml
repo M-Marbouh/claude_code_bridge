@@ -1,0 +1,7 @@
+interface:
+  display_name: "CCB Ratifier"
+  short_description: "Assign this session as an on-demand independent ratifier"
+  default_prompt: "Use $ccb-ratifier to assign this session as the on-demand independent ratifier."
+
+policy:
+  allow_implicit_invocation: false

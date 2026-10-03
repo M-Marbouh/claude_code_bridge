@@ -1,0 +1,7 @@
+interface:
+  display_name: "CCB Implementer"
+  short_description: "Assign this session as implementation and review peer"
+  default_prompt: "Use $ccb-implementer to assign this session as the implementation and review peer."
+
+policy:
+  allow_implicit_invocation: false

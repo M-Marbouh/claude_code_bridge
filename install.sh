@@ -819,6 +819,140 @@ install_codex_skills() {
   echo "Updated Codex skills directory: $skills_dst"
 }
 
+overlay_path_is_inside() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+entry = os.path.realpath(sys.argv[2])
+try:
+    safe = os.path.commonpath((root, entry)) == root
+except ValueError:
+    safe = False
+sys.exit(0 if safe else 1)
+PY
+}
+
+overlay_skill_is_safe() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+entry = os.path.realpath(sys.argv[2])
+
+def inside(path):
+    try:
+        return os.path.commonpath((root, path)) == root
+    except ValueError:
+        return False
+
+if not inside(entry):
+    sys.exit(1)
+
+for current, directories, files in os.walk(entry, followlinks=False):
+    for name in directories + files:
+        path = os.path.join(current, name)
+        if os.path.islink(path) and not inside(os.path.realpath(path)):
+            sys.exit(1)
+PY
+}
+
+record_overlay_only_skill() {
+  local provider="$1"
+  local skill_name="$2"
+  local manifest="$HOME/.local/share/ccb/overlay-skills.manifest"
+  local record="$provider"$'\t'"$skill_name"
+
+  mkdir -p "$(dirname "$manifest")"
+  if [[ ! -f "$manifest" ]] || ! grep -Fqx -- "$record" "$manifest"; then
+    printf '%s\t%s\n' "$provider" "$skill_name" >> "$manifest"
+  fi
+}
+
+install_personal_skill_overlay() {
+  local overlay_dir="${CCB_OVERLAY_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ccb/overlay}"
+  [[ -d "$overlay_dir" ]] || return 0
+
+  local overlay_root
+  overlay_root="$(cd "$overlay_dir" && pwd -P)"
+
+  local provider
+  for provider in claude codex; do
+    local provider_root="$overlay_root/${provider}_skills"
+    [[ -d "$provider_root" ]] || continue
+    if ! overlay_path_is_inside "$overlay_root" "$provider_root"; then
+      echo "WARN: Skipping unsafe overlay directory: ${provider}_skills" >&2
+      continue
+    fi
+
+    local skills_dst
+    if [[ "$provider" == "claude" ]]; then
+      skills_dst="$HOME/.claude/skills"
+    else
+      skills_dst="${CODEX_HOME:-$HOME/.codex}/skills"
+    fi
+
+    local skill_path skill_name public_skill
+    for skill_path in "$provider_root"/* "$provider_root"/.[!.]* "$provider_root"/..?*; do
+      [[ -e "$skill_path" || -L "$skill_path" ]] || continue
+      skill_name="${skill_path##*/}"
+      if [[ ! "$skill_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ ! -d "$skill_path" ]]; then
+        echo "WARN: Skipping invalid overlay entry: ${provider}_skills/$skill_name" >&2
+        continue
+      fi
+      if ! overlay_skill_is_safe "$overlay_root" "$skill_path"; then
+        echo "WARN: Skipping unsafe overlay entry: ${provider}_skills/$skill_name" >&2
+        continue
+      fi
+
+      mkdir -p "$skills_dst"
+      rm -rf "$skills_dst/$skill_name"
+      mkdir -p "$skills_dst/$skill_name"
+      cp -R "$skill_path/." "$skills_dst/$skill_name/"
+
+      if [[ "$provider" == "claude" ]]; then
+        public_skill="$REPO_ROOT/claude_skills/$skill_name"
+      else
+        public_skill="$REPO_ROOT/codex_skills/$skill_name"
+      fi
+      if [[ ! -f "$public_skill/SKILL.md" && ! -f "$public_skill/SKILL.md.bash" ]]; then
+        record_overlay_only_skill "$provider" "$skill_name"
+      fi
+      echo "  Applied personal overlay: ${provider}_skills/$skill_name"
+    done
+  done
+}
+
+uninstall_overlay_only_skills() {
+  local provider="$1"
+  local skills_dst="$2"
+  local manifest="$HOME/.local/share/ccb/overlay-skills.manifest"
+  [[ -f "$manifest" ]] || return 0
+
+  local temporary_manifest="${manifest}.tmp.$$"
+  : > "$temporary_manifest"
+  local entry_provider skill_name skill_path
+  while IFS=$'\t' read -r entry_provider skill_name; do
+    if [[ "$entry_provider" == "$provider" && "$skill_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      skill_path="$skills_dst/$skill_name"
+      if [[ -e "$skill_path" || -L "$skill_path" ]]; then
+        rm -rf "$skill_path"
+        echo "  Removed overlay-only skill: $skill_name"
+      fi
+    else
+      printf '%s\t%s\n' "$entry_provider" "$skill_name" >> "$temporary_manifest"
+    fi
+  done < "$manifest"
+
+  if [[ -s "$temporary_manifest" ]]; then
+    mv "$temporary_manifest" "$manifest"
+  else
+    rm -f "$temporary_manifest" "$manifest"
+  fi
+}
+
 
 
 CCB_START_MARKER="<!-- CCB_CONFIG_START -->"
@@ -1485,6 +1619,7 @@ install_all() {
   install_agents_md_config
   install_settings_permissions
   install_tmux_config
+  install_personal_skill_overlay
   echo "OK: Installation complete"
   echo "   Project dir    : $INSTALL_PREFIX"
   echo "   Executable dir : $BIN_DIR"
@@ -1677,6 +1812,7 @@ uninstall_claude_skills() {
   local skills_dst="$HOME/.claude/skills"
   local ccb_skills="ask cping ping pend autonew mounted all-plan docs tp tr file-op review ccb-lead ccb-implementer ccb-ratifier"
 
+  uninstall_overlay_only_skills claude "$skills_dst"
   if [[ ! -d "$skills_dst" ]]; then
     return
   fi
@@ -1694,6 +1830,7 @@ uninstall_codex_skills() {
   local skills_dst="${CODEX_HOME:-$HOME/.codex}/skills"
   local ccb_skills="ask ping pend autonew mounted all-plan file-op ccb-lead ccb-implementer ccb-ratifier"
 
+  uninstall_overlay_only_skills codex "$skills_dst"
   if [[ ! -d "$skills_dst" ]]; then
     return
   fi

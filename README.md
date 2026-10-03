@@ -184,6 +184,10 @@ Each duplicate launch receives fresh internal live identities and separate bindi
 
 ## Configuration
 
+### Personal overlay
+
+An optional private skill overlay lives at `${CCB_OVERLAY_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ccb/overlay}`. Mirror the installer source layout with `claude_skills/<name>/` and `codex_skills/<name>/` directories. The shell installer applies overlay skills after public skills: a matching name fully replaces the public skill, while a new name is added.
+
 The project configuration lives at `.ccb/ccb.config`:
 
 ```text

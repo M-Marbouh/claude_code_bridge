@@ -40,15 +40,21 @@ def _run_install_functions(
     install_prefix: Path,
     codex_home: Path | None,
     functions: tuple[str, ...],
+    overlay_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["CODEX_INSTALL_PREFIX"] = str(install_prefix)
     env["CODEX_BIN_DIR"] = str(home / ".local" / "bin")
     if codex_home is None:
         env.pop("CODEX_HOME", None)
     else:
         env["CODEX_HOME"] = str(codex_home)
+    if overlay_dir is not None:
+        env["CCB_OVERLAY_DIR"] = str(overlay_dir)
+    else:
+        env.pop("CCB_OVERLAY_DIR", None)
 
     commands = "; ".join(functions)
     return subprocess.run(
@@ -131,6 +137,123 @@ def test_ccb_role_skills_are_required_for_both_providers_and_install_verbatim(
     for _, installed_root in provider_roots:
         for name in CCB_ROLE_SKILLS:
             assert not (installed_root / name).exists()
+
+
+def test_personal_overlay_replaces_adds_skips_escape_reinstalls_and_uninstalls(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    overlay = tmp_path / "overlay"
+    claude_replacement = overlay / "claude_skills" / "ask"
+    codex_addition = overlay / "codex_skills" / "private-added"
+    claude_replacement.mkdir(parents=True)
+    codex_addition.mkdir(parents=True)
+    (claude_replacement / "SKILL.md").write_text("private ask replacement\n", encoding="utf-8")
+    (codex_addition / "SKILL.md").write_text("private new skill\n", encoding="utf-8")
+    (codex_addition / "references").mkdir()
+    (codex_addition / "references" / "guide.md").write_text("nested content\n", encoding="utf-8")
+    invalid_name = overlay / "codex_skills" / "not a plain name"
+    invalid_name.mkdir()
+    (invalid_name / "SKILL.md").write_text("must be skipped\n", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("outside data\n", encoding="utf-8")
+    (overlay / "claude_skills" / "unsafe").symlink_to(outside, target_is_directory=True)
+    codex_destination = home / ".codex" / "skills" / "private-added"
+    codex_destination.parent.mkdir(parents=True)
+    codex_destination.symlink_to(outside, target_is_directory=True)
+
+    install_result = _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        overlay_dir=overlay,
+        functions=(
+            "install_claude_skills",
+            "install_codex_skills",
+            "install_personal_skill_overlay",
+            "install_claude_skills",
+            "install_codex_skills",
+            "install_personal_skill_overlay",
+        ),
+    )
+
+    claude_skills = home / ".claude" / "skills"
+    codex_skills = home / ".codex" / "skills"
+    assert (claude_skills / "ask" / "SKILL.md").read_text(encoding="utf-8") == "private ask replacement\n"
+    assert not (claude_skills / "ask" / "SKILL.md.bash").exists()
+    assert (codex_skills / "private-added" / "SKILL.md").read_text(encoding="utf-8") == "private new skill\n"
+    assert (codex_skills / "private-added" / "references" / "guide.md").read_text(encoding="utf-8") == "nested content\n"
+    assert not (claude_skills / "unsafe").exists()
+    assert "Skipping unsafe overlay entry: claude_skills/unsafe" in install_result.stderr
+    assert not (codex_skills / "not a plain name").exists()
+    assert "Skipping invalid overlay entry: codex_skills/not a plain name" in install_result.stderr
+    assert install_result.stdout.count("Applied personal overlay:") == 4
+    assert not codex_destination.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "outside data\n"
+    assert not _self_nested_skill_directories(claude_skills)
+    assert not _self_nested_skill_directories(codex_skills)
+
+    manifest = home / ".local" / "share" / "ccb" / "overlay-skills.manifest"
+    assert manifest.read_text(encoding="utf-8").splitlines() == ["codex\tprivate-added"]
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_claude_skills", "uninstall_codex_skills"),
+    )
+    assert not (codex_skills / "private-added").exists()
+    assert marker.read_text(encoding="utf-8") == "outside data\n"
+
+
+@pytest.mark.parametrize("overlay_exists", [False, True])
+def test_missing_or_empty_personal_overlay_adds_no_output_or_changes(
+    tmp_path: Path, overlay_exists: bool
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    overlay = tmp_path / "empty-overlay"
+    if overlay_exists:
+        overlay.mkdir()
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_claude_skills", "install_codex_skills"),
+    )
+    before = {
+        provider: {
+            path.relative_to(root): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+        for provider, root in (
+            ("claude", home / ".claude" / "skills"),
+            ("codex", home / ".codex" / "skills"),
+        )
+    }
+    overlay_result = _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        overlay_dir=overlay if overlay_exists else None,
+        functions=("install_personal_skill_overlay",),
+    )
+    assert "overlay" not in overlay_result.stdout.lower()
+    assert "overlay" not in overlay_result.stderr.lower()
+    for provider, root in (
+        ("claude", home / ".claude" / "skills"),
+        ("codex", home / ".codex" / "skills"),
+    ):
+        after = {
+            path.relative_to(root): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+        assert after == before[provider]
 
 
 def test_ccb_role_skill_inventory_fails_when_one_directory_is_missing(

@@ -80,6 +80,19 @@ def _assert_skill_trees_equal(source: Path, destination: Path) -> None:
     assert destination_files == source_files
 
 
+def _self_nested_skill_directories(skills_root: Path) -> list[Path]:
+    nested = []
+    for skill_dir in skills_root.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        nested.extend(
+            path.relative_to(skills_root)
+            for path in skill_dir.rglob("*")
+            if path.is_dir() and (path / path.name).is_dir()
+        )
+    return nested
+
+
 def test_ccb_role_skills_are_required_for_both_providers_and_install_verbatim(
     tmp_path: Path,
 ) -> None:
@@ -89,7 +102,12 @@ def test_ccb_role_skills_are_required_for_both_providers_and_install_verbatim(
         home=home,
         install_prefix=install_prefix,
         codex_home=None,
-        functions=("install_claude_skills", "install_codex_skills"),
+        functions=(
+            "install_claude_skills",
+            "install_codex_skills",
+            "install_claude_skills",
+            "install_codex_skills",
+        ),
     )
 
     provider_roots = (
@@ -99,6 +117,8 @@ def test_ccb_role_skills_are_required_for_both_providers_and_install_verbatim(
     for source_root, installed_root in provider_roots:
         _assert_role_skills_present(source_root)
         _assert_role_skills_present(installed_root)
+        nested = _self_nested_skill_directories(installed_root)
+        assert not nested, f"self-nested skill directories found: {nested}"
         for name in CCB_ROLE_SKILLS:
             _assert_skill_trees_equal(source_root / name, installed_root / name)
 

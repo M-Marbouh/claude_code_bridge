@@ -747,7 +747,8 @@ install_claude_skills() {
       if [[ -d "$subdir" ]]; then
         local subdir_name
         subdir_name=$(basename "$subdir")
-        cp -rf "$subdir" "$dst_dir/$subdir_name"
+        mkdir -p "$dst_dir/$subdir_name"
+        cp -rf "${subdir%/}/." "$dst_dir/$subdir_name/"
       fi
     done
 
@@ -808,7 +809,8 @@ install_codex_skills() {
       if [[ -d "$subdir" ]]; then
         local subdir_name
         subdir_name=$(basename "$subdir")
-        cp -rf "$subdir" "$dst_dir/$subdir_name"
+        mkdir -p "$dst_dir/$subdir_name"
+        cp -rf "${subdir%/}/." "$dst_dir/$subdir_name/"
       fi
     done
 

@@ -421,6 +421,23 @@ function Cleanup-LegacyFiles {
   }
 }
 
+function Copy-SkillDirectoryContents {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceDirectory,
+    [Parameter(Mandatory = $true)][string]$DestinationDirectory
+  )
+
+  New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
+  Get-ChildItem -LiteralPath $SourceDirectory -Force | ForEach-Object {
+    $destinationItem = Join-Path $DestinationDirectory $_.Name
+    if ($_.PSIsContainer) {
+      Copy-SkillDirectoryContents -SourceDirectory $_.FullName -DestinationDirectory $destinationItem
+    } else {
+      Copy-Item -LiteralPath $_.FullName -Destination $destinationItem -Force
+    }
+  }
+}
+
 function Install-CodexSkills {
   $skillsSrc = Join-Path $repoRoot "codex_skills"
   $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
@@ -464,7 +481,7 @@ function Install-CodexSkills {
       $subDirName = $_.Name
       $srcSubDir = $_.FullName
       $dstSubDir = Join-Path $dstDir $subDirName
-      Copy-Item -Recurse -Force $srcSubDir $dstSubDir
+      Copy-SkillDirectoryContents -SourceDirectory $srcSubDir -DestinationDirectory $dstSubDir
     }
 
     Write-Host "  Updated Codex skill: $skillName"
@@ -622,7 +639,7 @@ function Install-ClaudeConfig {
         $subDirName = $_.Name
         $srcSubDir = $_.FullName
         $dstSubDir = Join-Path $dstDir $subDirName
-        Copy-Item -Recurse -Force $srcSubDir $dstSubDir
+        Copy-SkillDirectoryContents -SourceDirectory $srcSubDir -DestinationDirectory $dstSubDir
       }
 
       Write-Host "  Updated skill: $skillName"

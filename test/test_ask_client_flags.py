@@ -1882,3 +1882,245 @@ def test_ask_local_live_id_refuses_without_unified_daemon(monkeypatch, capsys) -
 
     assert rc == 1
     assert "--live-id needs the unified askd daemon" in capsys.readouterr().err
+
+
+_RESEND_TASK_ID = "20261003-184536-844-1738289"
+
+
+def _resend_args(task_id: str, *extra: str) -> list[str]:
+    return ["ask", "codex", "--peer", "/tmp/peer", "--live-id", "live-target", "--resend", task_id, *extra]
+
+
+def _capture_resend_dispatch(ask, monkeypatch) -> dict:
+    captured: dict = {}
+    monkeypatch.setattr(
+        ask,
+        "_run_peer_bridge",
+        lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs) or 0,
+    )
+    return captured
+
+
+def test_ask_resend_refuses_missing_message_file(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+
+    rc = ask.main(_resend_args(_RESEND_TASK_ID))
+
+    assert rc == ask.EXIT_ERROR
+    assert not captured
+    assert "[ERROR]" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    ["../bad", "20261003-184536-844-1738289/extra", "20269999-184536-844-1738289"],
+)
+def test_ask_resend_refuses_malformed_task_id(monkeypatch, tmp_path: Path, capsys, task_id: str) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+
+    rc = ask.main(_resend_args(task_id))
+
+    assert rc == ask.EXIT_ERROR
+    assert not captured
+    assert "[ERROR]" in capsys.readouterr().err
+
+
+def test_ask_resend_refuses_ambiguous_message_files(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    (task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg").write_text("local body", encoding="utf-8")
+    (task_dir / f"ask-peer-codex-{_RESEND_TASK_ID}.msg").write_text("peer body", encoding="utf-8")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+
+    rc = ask.main(_resend_args(_RESEND_TASK_ID))
+
+    assert rc == ask.EXIT_ERROR
+    assert not captured
+    assert "[ERROR]" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("body, unreadable", [("", False), ("stored body", True)])
+def test_ask_resend_refuses_empty_or_unreadable_message_file(
+    monkeypatch, tmp_path: Path, capsys, body: str, unreadable: bool
+) -> None:
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    msg_file = task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg"
+    msg_file.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+    if unreadable:
+        original_read_bytes = Path.read_bytes
+
+        def refuse_read(path, *args, **kwargs):
+            if path == msg_file:
+                raise PermissionError("test unreadable source")
+            return original_read_bytes(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_bytes", refuse_read)
+
+    rc = ask.main(_resend_args(_RESEND_TASK_ID))
+
+    assert rc == ask.EXIT_ERROR
+    assert not captured
+    assert "[ERROR]" in capsys.readouterr().err
+
+
+def test_ask_resend_requires_live_id(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    (task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg").write_text("stored body", encoding="utf-8")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+
+    rc = ask.main(["ask", "codex", "--peer", "/tmp/peer", "--resend", _RESEND_TASK_ID])
+
+    assert rc == ask.EXIT_ERROR
+    assert not captured
+    assert "--resend requires --live-id" in capsys.readouterr().err
+
+
+def test_ask_resend_refuses_inline_message(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    (task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg").write_text("stored body", encoding="utf-8")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+
+    rc = ask.main(_resend_args(_RESEND_TASK_ID, "inline body"))
+
+    assert rc == ask.EXIT_ERROR
+    assert not captured
+    assert "cannot be combined with a message" in capsys.readouterr().err
+
+
+def test_ask_resend_forwards_raw_body_and_live_id_through_peer_mode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    body = "stored body\nwith exact spacing  \n"
+    (task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    captured = _capture_resend_dispatch(ask, monkeypatch)
+
+    rc = ask.main(
+        ["ask", "codex", "--peer", "/tmp/peer", "--live-id", "live-target", "--resend", _RESEND_TASK_ID]
+    )
+
+    assert rc == ask.EXIT_OK
+    assert captured["args"][3] == body
+    assert captured["kwargs"] == {
+        "live_id": "live-target",
+        "preserve_task_id": _RESEND_TASK_ID,
+    }
+
+
+def test_ask_resend_reuses_live_id_validation_for_vanished_destination(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    from live_sessions import Resolution
+
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    msg_file = task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg"
+    msg_file.write_text("stored body", encoding="utf-8")
+    original_read_bytes = Path.read_bytes
+    read_files: list[Path] = []
+
+    def tracked_read_bytes(path, *args, **kwargs):
+        if path == msg_file:
+            read_files.append(path)
+        return original_read_bytes(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", tracked_read_bytes)
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    context = ask._UnifiedDaemonContext(tmp_path / "askd.json", {"token": "tok"}, tmp_path)
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "provider_status_for_target", lambda *_a, **_k: _provider_status(mounted=True))
+    monkeypatch.setattr(
+        ask,
+        "resolve_live_route",
+        lambda *_a, **_k: (Resolution(error="unavailable", detail="that live session is gone"), None),
+    )
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("dispatched to vanished session")),
+    )
+
+    rc = ask.main(["ask", "codex", "--live-id", "gone-live", "--resend", _RESEND_TASK_ID])
+
+    assert rc == ask.EXIT_ERROR
+    assert read_files == [msg_file]
+    assert "that live session is gone" in capsys.readouterr().err
+
+
+def test_ask_resend_creates_new_async_request_for_exact_live_id(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ask = _load_ask_module()
+    task_dir = tmp_path / "ccb-tasks"
+    task_dir.mkdir()
+    original_files = {
+        task_dir / f"ask-codex-{_RESEND_TASK_ID}.msg": b"stored body\nwith exact spacing  \n",
+        task_dir / f"ask-codex-{_RESEND_TASK_ID}.log": b"original log\n",
+        task_dir / f"ask-codex-{_RESEND_TASK_ID}.status": b"original status\n",
+        task_dir / f"ask-codex-{_RESEND_TASK_ID}.json": b"original receipt\n",
+    }
+    for path, contents in original_files.items():
+        path.write_bytes(contents)
+    for index in range(100):
+        (task_dir / f"ask-codex-retention-{index}.log").write_bytes(b"retained log\n")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("CCB_CALLER", "manual")
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_default_foreground", lambda: True)
+    monkeypatch.setattr(ask, "inside_managed_codex_sandbox", lambda: False)
+    context = ask._UnifiedDaemonContext(tmp_path / "askd.json", {"token": "tok"}, tmp_path)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    seen: dict = {}
+
+    def preflight(_provider, *, route_out, target_live_id, **_kwargs):
+        seen["target_live_id"] = target_live_id
+        route_out.update(
+            live_id=target_live_id,
+            launch_id="launch-1",
+            pane_id="%9",
+            terminal="tmux",
+            session_file="/tmp/target-session.json",
+            ccb_project_id="project-1",
+        )
+        return True
+
+    monkeypatch.setattr(ask, "_preflight_target", preflight)
+    new_task_id = "20261003-184537-000-1738289"
+    monkeypatch.setattr(ask, "make_task_id", lambda: new_task_id)
+    monkeypatch.setattr(ask.subprocess, "Popen", lambda *_a, **_k: type("Proc", (), {"pid": 321})())
+
+    rc = ask.main(["ask", "codex", "--live-id", "target-live", "--resend", _RESEND_TASK_ID])
+
+    captured_output = capsys.readouterr()
+    output = captured_output.out
+    new_message_file = task_dir / f"ask-codex-{new_task_id}.msg"
+    new_script_file = task_dir / f"ask-codex-{new_task_id}.sh"
+    assert rc == ask.EXIT_OK, captured_output.err
+    assert seen["target_live_id"] == "target-live"
+    assert f"task: {new_task_id}" in output
+    assert new_task_id != _RESEND_TASK_ID
+    assert new_message_file.read_bytes() == original_files[next(iter(original_files))]
+    assert "CCB_ROUTE_LIVE_ID=target-live" in new_script_file.read_text(encoding="utf-8")
+    assert 'export CCB_REQ_ID="20261003-184537-000-1738289"' in new_script_file.read_text(encoding="utf-8")
+    assert {path: path.read_bytes() for path in original_files} == original_files

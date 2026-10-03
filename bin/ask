@@ -103,6 +103,7 @@ CALLER_ENV_HINTS = {
 
 _REMOVED_ROUTE_TAG_RE = re.compile(r"^\s*\[(WORKER|ARCHITECT)\](?=\s|$)", re.IGNORECASE)
 _PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-\d{3}-[1-9]\d*$")
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
 UNIFIED_NOTIFY_PROVIDERS = PEER_PROVIDERS | {"hermes"}
@@ -241,7 +242,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _cleanup_task_logs(log_dir: Path) -> None:
+def _cleanup_task_logs(log_dir: Path, *, preserve_task_id: str = "") -> None:
     """Keep latest task logs under log_dir."""
     max_files = _env_int("CCB_TASK_LOG_MAX_FILES", 100)
     if max_files <= 0:
@@ -257,6 +258,8 @@ def _cleanup_task_logs(log_dir: Path) -> None:
     except Exception:
         logs.sort(key=lambda p: p.name, reverse=True)
     for path in logs[max_files:]:
+        if preserve_task_id and path.stem.endswith(f"-{preserve_task_id}"):
+            continue
         prefix = path.name[:-4]  # strip .log
         for ext in (".log", ".sh", ".ps1", ".msg", ".status", ".json", ".reply"):
             try:
@@ -765,6 +768,37 @@ def make_task_id() -> str:
     return f"{now.strftime('%Y%m%d-%H%M%S')}-{ms:03d}-{os.getpid()}"
 
 
+def _read_resend_message(task_id: str) -> tuple[str | None, str]:
+    if not _TASK_ID_RE.fullmatch(task_id):
+        return None, "[ERROR] Invalid --resend task ID"
+    try:
+        datetime.strptime(task_id[:15], "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None, "[ERROR] Invalid --resend task ID"
+
+    log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
+    candidates = [
+        log_dir / f"ask-{source_provider}-{task_id}.msg"
+        for source_provider in PROVIDER_DAEMONS
+    ] + [
+        log_dir / f"ask-peer-{source_provider}-{task_id}.msg"
+        for source_provider in PROVIDER_DAEMONS
+    ]
+    matches = [path for path in candidates if path.exists()]
+    if not matches:
+        return None, f"[ERROR] No retained message file for task ID {task_id}"
+    if len(matches) > 1:
+        return None, f"[ERROR] Multiple retained message files match task ID {task_id}"
+
+    try:
+        message = matches[0].read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        return None, f"[ERROR] Cannot read retained message file for task ID {task_id}: {exc}"
+    if not message:
+        return None, f"[ERROR] Retained message file is empty for task ID {task_id}"
+    return message, ""
+
+
 def _usage() -> None:
     print("Usage: ask <provider> [options] <message>", file=sys.stderr)
     print("       ask --peer <target> [options] <message>", file=sys.stderr)
@@ -783,6 +817,10 @@ def _usage() -> None:
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
     print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
     print("  --live-id ID            Deliver to this exact live session (this launch, or --peer's)", file=sys.stderr)
+    print("  --resend TASK_ID        Re-send a retained .msg body as a new request; requires --live-id", file=sys.stderr)
+    print("                          The original task is untouched; no deduplication or exactly-once delivery is promised.", file=sys.stderr)
+    print("                          Cleanup keeps the newest 100 logs and removes each .msg with its log; /tmp has no reboot guarantee.", file=sys.stderr)
+    print("                          Only detached local and peer tasks retain .msg files.", file=sys.stderr)
     print("", file=sys.stderr)
     print("Local pair: in ccb codex codex, ask codex addresses the verified sibling.", file=sys.stderr)
     print("Peer targets must be unique in the remote project; ambiguity is an error.", file=sys.stderr)
@@ -1053,6 +1091,7 @@ def _run_peer_bridge_foreground(
     sender_work_dir: Path,
     *,
     live_id: str = "",
+    preserve_task_id: str = "",
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir_str = str(sender_work_dir)
@@ -1067,6 +1106,7 @@ def _run_peer_bridge_foreground(
             timeout,
             caller_pane_id,
             caller_terminal,
+            preserve_task_id=preserve_task_id,
         )
         if task is None:
             return EXIT_ERROR
@@ -1117,8 +1157,13 @@ def _prepare_peer_task(
     timeout: float,
     caller_pane_id: str,
     caller_terminal: str,
+    *,
+    preserve_task_id: str = "",
 ) -> _PeerTaskFiles | None:
     task_id = make_task_id()
+    if preserve_task_id and task_id == preserve_task_id:
+        print("[ERROR] Could not create a fresh task ID for --resend", file=sys.stderr)
+        return None
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     log_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.log"
     status_file = log_dir / f"ask-peer-{peer_provider}-{task_id}.status"
@@ -1149,7 +1194,11 @@ def _prepare_peer_task(
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file.touch(exist_ok=True)
         status_file.touch(exist_ok=True)
-        msg_file.write_text(message, encoding="utf-8")
+        if preserve_task_id:
+            with msg_file.open("w", encoding="utf-8", newline="") as msg_handle:
+                msg_handle.write(message)
+        else:
+            msg_file.write_text(message, encoding="utf-8")
         reply_file.touch(exist_ok=True)
         write_receipt(
             receipt_file,
@@ -1173,7 +1222,10 @@ def _prepare_peer_task(
     except Exception as e:
         print(f"[ERROR] Failed to create peer task receipt: {e}", file=sys.stderr)
         return None
-    _cleanup_task_logs(log_dir)
+    if preserve_task_id:
+        _cleanup_task_logs(log_dir, preserve_task_id=preserve_task_id)
+    else:
+        _cleanup_task_logs(log_dir)
     return _PeerTaskFiles(task_id, log_file, status_file, msg_file, reply_file)
 
 
@@ -1209,6 +1261,7 @@ def _run_peer_bridge_background(
     sender_work_dir: Path,
     *,
     live_id: str = "",
+    preserve_task_id: str = "",
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     task = _prepare_peer_task(
@@ -1220,6 +1273,7 @@ def _run_peer_bridge_background(
         timeout,
         caller_pane_id,
         caller_terminal,
+        preserve_task_id=preserve_task_id,
     )
     if task is None:
         return EXIT_ERROR
@@ -1304,6 +1358,7 @@ def _run_peer_bridge(
     reply_to: str = "",
     *,
     live_id: str = "",
+    preserve_task_id: str = "",
 ) -> int:
     if peer_provider not in PEER_PROVIDERS:
         print(
@@ -1335,6 +1390,7 @@ def _run_peer_bridge(
             reply_to,
             sender_work_dir,
             live_id=live_id,
+            preserve_task_id=preserve_task_id,
         )
     return _run_peer_bridge_background(
         peer_target,
@@ -1346,6 +1402,7 @@ def _run_peer_bridge(
         reply_to,
         sender_work_dir,
         live_id=live_id,
+        preserve_task_id=preserve_task_id,
     )
 
 
@@ -1492,6 +1549,8 @@ def main(argv: list[str]) -> int:
     peer_reply_to = ""
     peer_live_id = ""
     peer_live_id_seen = False
+    resend_task_id = ""
+    resend_seen = False
     peer_foreground_explicit = False
     parts: list[str] = []
 
@@ -1538,6 +1597,20 @@ def main(argv: list[str]) -> int:
             peer_live_id = peer_live_id.strip()
             peer_live_id_seen = True
             continue
+        if token == "--resend":
+            if resend_seen:
+                print("[ERROR] --resend may only be given once", file=sys.stderr)
+                return EXIT_ERROR
+            resend_seen = True
+            try:
+                resend_task_id = next(it)
+            except StopIteration:
+                print("[ERROR] --resend requires a task ID", file=sys.stderr)
+                return EXIT_ERROR
+            if resend_task_id.startswith("--"):
+                print("[ERROR] --resend requires a task ID", file=sys.stderr)
+                return EXIT_ERROR
+            continue
         if token == "--notify":
             notify_mode = True
             peer_intent = "notify"
@@ -1566,12 +1639,25 @@ def main(argv: list[str]) -> int:
             continue
         parts.append(token)
 
-    message = " ".join(parts).strip()
-    if not message and not sys.stdin.isatty():
-        message = read_stdin_text().strip()
-    if not message:
-        print("[ERROR] Message cannot be empty", file=sys.stderr)
-        return EXIT_ERROR
+    if resend_seen:
+        if not peer_live_id_seen:
+            print("[ERROR] --resend requires --live-id", file=sys.stderr)
+            return EXIT_ERROR
+        if parts:
+            print("[ERROR] --resend cannot be combined with a message", file=sys.stderr)
+            return EXIT_ERROR
+        message, resend_error = _read_resend_message(resend_task_id)
+        if resend_error:
+            print(resend_error, file=sys.stderr)
+            return EXIT_ERROR
+        assert message is not None
+    else:
+        message = " ".join(parts).strip()
+        if not message and not sys.stdin.isatty():
+            message = read_stdin_text().strip()
+        if not message:
+            print("[ERROR] Message cannot be empty", file=sys.stderr)
+            return EXIT_ERROR
     if not _valid_peer_correlation_id(peer_reply_to):
         print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
         return EXIT_ERROR
@@ -1579,6 +1665,12 @@ def main(argv: list[str]) -> int:
     if live_id_error:
         print(live_id_error, file=sys.stderr)
         return EXIT_ERROR
+
+    if resend_seen and (notify_mode or peer_foreground_explicit):
+        print("[ERROR] --resend cannot be combined with --notify or --foreground", file=sys.stderr)
+        return EXIT_ERROR
+    if resend_seen:
+        foreground_mode = False
 
     if peer_live_id and not peer_target and (
         not _use_unified_daemon() or (notify_mode and provider not in UNIFIED_NOTIFY_PROVIDERS)
@@ -1597,6 +1689,7 @@ def main(argv: list[str]) -> int:
             if _notify_requests_reply(message):
                 print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
                 return EXIT_ERROR
+        resend_options = {"preserve_task_id": resend_task_id} if resend_seen else {}
         return _run_peer_bridge(
             peer_target,
             provider,
@@ -1606,6 +1699,7 @@ def main(argv: list[str]) -> int:
             peer_intent,
             peer_reply_to,
             live_id=peer_live_id,
+            **resend_options,
         )
 
     daemon_context: _UnifiedDaemonContext | None = None
@@ -1765,6 +1859,9 @@ def main(argv: list[str]) -> int:
 
     # Default async mode: background task
     task_id = make_task_id()
+    if resend_seen and task_id == resend_task_id:
+        print("[ERROR] Could not create a fresh task ID for --resend", file=sys.stderr)
+        return EXIT_ERROR
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"ask-{provider}-{task_id}.log"
@@ -1777,7 +1874,10 @@ def main(argv: list[str]) -> int:
         status_file.touch(exist_ok=True)
     except Exception:
         pass
-    _cleanup_task_logs(log_dir)
+    if resend_seen:
+        _cleanup_task_logs(log_dir, preserve_task_id=resend_task_id)
+    else:
+        _cleanup_task_logs(log_dir)
 
     # Detect caller from environment or default to "claude"
     caller = _require_caller()
@@ -1839,7 +1939,11 @@ def main(argv: list[str]) -> int:
     # Use a message file on every platform. Embedding arbitrary prompt text in a
     # generated shell heredoc lets a line matching the delimiter alter the script.
     msg_file = log_dir / f"ask-{provider}-{task_id}.msg"
-    msg_file.write_text(message, encoding="utf-8")
+    if resend_seen:
+        with msg_file.open("w", encoding="utf-8", newline="") as msg_handle:
+            msg_handle.write(message)
+    else:
+        msg_file.write_text(message, encoding="utf-8")
 
     if os.name == "nt":
         # Windows: use PowerShell script

@@ -35,7 +35,7 @@ cd ~/dev/my-project
 ccb codex claude
 ```
 
-Available providers are `claude`, `codex`, `gemini`, and `opencode`. Gemini CLI is retired and will be removed; existing Gemini requests currently continue with a warning. A project may run any subset:
+Available providers are `claude`, `codex`, `gemini`, and `opencode`. Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work. A project may run any subset:
 
 ```bash
 ccb codex claude gemini opencode

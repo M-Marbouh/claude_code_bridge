@@ -17,8 +17,8 @@ Use context in this order:
 
 1. Current verified code, working-tree, runtime, schema, or test evidence.
 2. The current bounded brief and its explicit contract.
-3. Current durable ADR and codebase-memory decisions reconciled with present state.
-4. Memsearch and older historical context.
+3. The project's current durable decision records, reconciled with present state.
+4. Memory tools, if the project uses any, and older historical context.
 
 Historical context does not establish the current role and must not override newer assignments or verified state. Surface material disagreement between the brief, current state, and durable records explicitly. Retrieve only the context needed for the bounded review.
 

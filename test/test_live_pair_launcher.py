@@ -125,7 +125,7 @@ def test_cmd_start_warns_only_when_gemini_is_requested(
     result = ccb.cmd_start(type("Args", (), {"providers": cli_providers, "resume": False, "auto": False})())
 
     assert result == 0
-    warning = "Gemini CLI is retired and will be removed"
+    warning = "Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work."
     warning_count = capsys.readouterr().err.count(warning)
     assert warning_count == (1 if expect_warning else 0)
 

@@ -3927,7 +3927,7 @@ def cmd_start(args):
         print(f"❌ {pairing_error}", file=sys.stderr)
         return 2
     if gemini_requested:
-        print("⚠️ Gemini CLI is retired and will be removed; continuing with the requested provider.", file=sys.stderr)
+        print("⚠️ Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work.", file=sys.stderr)
     auto = bool(args.auto or flags.get("auto") or flags.get("auto_mode"))
     cmd_config = config_data.get("cmd") if isinstance(config_data, dict) else None
     if cmd_enabled:

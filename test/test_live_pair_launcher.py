@@ -81,6 +81,55 @@ def test_launch_parser_preserves_occurrences_and_order(tokens):
     assert normalize_start_config_data({"providers": expected})["providers"] == expected
 
 
+@pytest.mark.parametrize(
+    ("cli_providers", "config_text", "expect_warning"),
+    [
+        (["gemini"], None, True),
+        ([], "codex,gemini", True),
+        (["codex"], None, False),
+        ([], None, False),
+    ],
+)
+def test_cmd_start_warns_only_when_gemini_is_requested(
+    monkeypatch, tmp_path, capsys, cli_providers, config_text, expect_warning
+):
+    ccb = _load_ccb_module()
+    project_config = tmp_path / ".ccb"
+    project_config.mkdir()
+    if config_text is not None:
+        (project_config / "ccb.config").write_text(config_text, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ccb, "detect_terminal", lambda: "tmux")
+    monkeypatch.setattr(ccb, "remediate_ccb_permissions", lambda *_: (True, []))
+
+    class _Lock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def try_acquire(self):
+            return True
+
+        def release(self):
+            pass
+
+    class _Launcher:
+        def __init__(self, *, providers, **_kwargs):
+            self.providers = providers
+
+        def run_up(self):
+            return 0
+
+    monkeypatch.setattr(ccb, "ProviderLock", _Lock)
+    monkeypatch.setattr(ccb, "AILauncher", _Launcher)
+
+    result = ccb.cmd_start(type("Args", (), {"providers": cli_providers, "resume": False, "auto": False})())
+
+    assert result == 0
+    warning = "Gemini CLI is retired and will be removed"
+    warning_count = capsys.readouterr().err.count(warning)
+    assert warning_count == (1 if expect_warning else 0)
+
+
 @pytest.mark.parametrize("providers", [["codex"] * 3, ["claude"] * 2,
                                        ["gemini"] * 2, ["opencode"] * 2])
 def test_unsupported_duplicates_refuse_before_launcher_mutation(monkeypatch, providers):

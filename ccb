@@ -3896,6 +3896,7 @@ def cmd_start(args):
     atexit.register(ccb_lock.release)
 
     providers, cmd_enabled = requested_providers, _requested_cmd_enabled
+    gemini_requested = "gemini" in requested_providers
     config = load_start_config(work_dir)
     config_data = config.data if isinstance(config.data, dict) else {}
 
@@ -3905,6 +3906,7 @@ def cmd_start(args):
             raw_providers = [raw_providers]
         if not isinstance(raw_providers, list):
             raw_providers = []
+        configured_providers = bool(raw_providers)
         if not raw_providers:
             raw_providers = list(DEFAULT_PROVIDERS)
             if not config.path:
@@ -3912,6 +3914,7 @@ def cmd_start(args):
                 if created and created_path:
                     print(f"✅ Created default config: {created_path}", file=sys.stderr)
         providers = _parse_providers([str(p) for p in raw_providers])
+        gemini_requested = configured_providers and "gemini" in providers
 
     if not providers:
         print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
@@ -3923,6 +3926,8 @@ def cmd_start(args):
     if pairing_error:
         print(f"❌ {pairing_error}", file=sys.stderr)
         return 2
+    if gemini_requested:
+        print("⚠️ Gemini CLI is retired and will be removed; continuing with the requested provider.", file=sys.stderr)
     auto = bool(args.auto or flags.get("auto") or flags.get("auto_mode"))
     cmd_config = config_data.get("cmd") if isinstance(config_data, dict) else None
     if cmd_enabled:

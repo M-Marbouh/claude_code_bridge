@@ -4,6 +4,7 @@
 
 ### Added
 
+- Warn when a launch config or command line requests the retired Gemini CLI; existing Gemini behavior continues for now.
 - Added duplicate Codex pairing, including coexistence with other unique providers, with contextual sibling routing from either Codex pane.
 - Added exact live-session identity through queueing, receipts, completion delivery, task retrieval, status, cleanup, and provider kill operations.
 

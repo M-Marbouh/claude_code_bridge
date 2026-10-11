@@ -17,7 +17,7 @@ When `ask` outputs `[CCB_ASYNC_SUBMITTED`:
 3. Do not poll, sleep, call `pend`, inspect logs, or submit a duplicate request in the same turn.
 4. Wait for the user or completion hook to deliver the result.
 
-`[CCB_BACKGROUND_SUBMITTED]` is non-blocking: retain the task ID and continue useful work. A peer `--notify` delivery is one-way and requires no reply.
+Use `--background` only when there is independent work to do. `[CCB_BACKGROUND_SUBMITTED]` confirms a successful submission: retain the exact task ID and continue only with independent work. Never claim, act on, or build on its result until a complete reply matching that task ID has arrived. If the result is needed and has not arrived, retrieve it with `pend <exact-task-id>`; never use implicit or provider-based `pend` for that outstanding task. A peer `--notify` delivery is one-way and requires no reply.
 
 ### Mutual ratification
 

@@ -1924,11 +1924,16 @@ def main(argv: list[str]) -> int:
             _append_task_status_line(status_file, f"failed exit_code={rc}")
             return rc
         _append_task_status_line(status_file, "queued by host daemon (not yet delivered)")
-        print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
+        if peer_intent == "background":
+            print(f"[CCB_BACKGROUND_SUBMITTED provider={provider} intent=background]")
+        else:
+            print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
         print(f"{display_name(provider)} processing (task: {task_id})")
         print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
         print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
         print(f"[CCB_ASYNC_RECEIPT_FILE task={task_id}] {receipt_file}")
+        if peer_intent == "background":
+            print(f"Retain task ID {task_id}; use 'pend {task_id}' when you need the result.")
         return EXIT_OK
 
     # Get the path to this script for recursive call with --foreground
@@ -2080,14 +2085,19 @@ exit "$rc"
     else:
         _append_task_status_line(status_file, "spawned pid=unknown")
 
-    print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
+    if peer_intent == "background":
+        print(f"[CCB_BACKGROUND_SUBMITTED provider={provider} intent=background]")
+    else:
+        print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
     print(f"{display_name(provider)} processing (task: {task_id})")
     if bg_pid is not None:
         print(f"[CCB_ASYNC_PID task={task_id} pid={bg_pid}]")
     print(f"[CCB_ASYNC_STATUS_FILE task={task_id}] {status_file}")
     print(f"[CCB_ASYNC_LOG_FILE task={task_id}] {log_file}")
     print(f"[CCB_ASYNC_RECEIPT_FILE task={task_id}] {receipt_file}")
-    if _should_emit_async_guardrail(caller):
+    if peer_intent == "background":
+        print(f"Retain task ID {task_id}; use 'pend {task_id}' when you need the result.")
+    elif _should_emit_async_guardrail(caller):
         print(
             f"MANDATORY: END YOUR TURN NOW. Reply ONLY '{display_name(provider)} processing...', then stop. See 'Async Guardrail' in CLAUDE.md."
         )

@@ -22,10 +22,14 @@ The first argument must be the provider name, followed by the message:
 Start-Process -NoNewWindow -FilePath "ask" -ArgumentList "$PROVIDER" -RedirectStandardInput (New-TemporaryFile | ForEach-Object { $MESSAGE | Set-Content $_; $_.FullName })
 ```
 
+When there is independent work to do, pass `--background` after the provider in the arguments.
+
 ## Rules
 
-- After running the command, say "[Provider] processing..." and immediately end your turn.
-- Do not wait for results or check status in the same turn.
+- Use `--background` only when there is independent work to do.
+- Treat `[CCB_ASYNC_SUBMITTED` and `[CCB_BACKGROUND_SUBMITTED` as successful submission markers. If neither appears, the request was not submitted.
+- For `--background`, retain the exact task ID. Continue only with independent work; never claim, act on, or build on the result until a complete reply matching that task ID arrives. If the result is needed and has not arrived, run `pend <exact-task-id>`; do not use implicit or provider-based `pend` for this task.
+- For an async submission without `--background`, say "[Provider] processing..." and immediately end your turn. Do not wait for results or check status in the same turn.
 - The task ID and log file path will be displayed for tracking.
 
 ## Examples

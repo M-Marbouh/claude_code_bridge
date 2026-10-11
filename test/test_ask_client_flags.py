@@ -1450,6 +1450,133 @@ def test_managed_codex_background_submits_to_host_daemon_without_detached_child(
     assert captured["request_id"] == "task-fixed"
 
 
+def _prepare_local_async_submission(monkeypatch, tmp_path: Path, *, managed: bool):
+    ask = _load_ask_module()
+    context = ask._UnifiedDaemonContext(tmp_path / "askd.json", {"token": "tok"}, tmp_path)
+
+    def _preflight(_provider, **kwargs):
+        kwargs["route_out"].update(
+            live_id="s2", launch_id="ai-1", caller_live_id="s1",
+            caller_token="secret", caller_pane_id="%1", caller_terminal="tmux",
+            pane_id="%2", terminal="tmux", session_file=str(tmp_path / "s2.json"),
+            ccb_project_id="project-1",
+        )
+        return True
+
+    monkeypatch.setenv("CCB_CALLER", "claude")
+    monkeypatch.setattr(ask.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(ask, "make_task_id", lambda: "task-fixed")
+    monkeypatch.setattr(ask, "_cleanup_task_logs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ask, "inside_managed_codex_sandbox", lambda: managed)
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "_preflight_target", _preflight)
+    monkeypatch.setattr(ask, "_send_via_unified_daemon", lambda *_args, **_kwargs: ask.EXIT_OK)
+    monkeypatch.setattr(
+        ask.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: type("Proc", (), {"pid": 4321})(),
+    )
+    return ask
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["detached", "host-daemon"])
+def test_local_background_submission_is_non_blocking(
+    monkeypatch, tmp_path: Path, capsys, managed: bool
+) -> None:
+    ask = _prepare_local_async_submission(monkeypatch, tmp_path, managed=managed)
+
+    assert ask.main(["ask", "codex", "--background", "hello"]) == ask.EXIT_OK
+
+    task_dir = tmp_path / "ccb-tasks"
+    output = capsys.readouterr().out
+    assert output.splitlines() == [
+        "[CCB_BACKGROUND_SUBMITTED provider=codex intent=background]",
+        "Codex processing (task: task-fixed)",
+        *(["[CCB_ASYNC_PID task=task-fixed pid=4321]"] if not managed else []),
+        f"[CCB_ASYNC_STATUS_FILE task=task-fixed] {task_dir / 'ask-codex-task-fixed.status'}",
+        f"[CCB_ASYNC_LOG_FILE task=task-fixed] {task_dir / 'ask-codex-task-fixed.log'}",
+        f"[CCB_ASYNC_RECEIPT_FILE task=task-fixed] {task_dir / 'ask-codex-task-fixed.json'}",
+        "Retain task ID task-fixed; use 'pend task-fixed' when you need the result.",
+    ]
+    assert "[CCB_ASYNC_SUBMITTED" not in output
+    assert "MANDATORY: END YOUR TURN NOW" not in output
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["detached", "host-daemon"])
+def test_local_default_submission_output_is_unchanged(
+    monkeypatch, tmp_path: Path, capsys, managed: bool
+) -> None:
+    ask = _prepare_local_async_submission(monkeypatch, tmp_path, managed=managed)
+
+    assert ask.main(["ask", "codex", "hello"]) == ask.EXIT_OK
+
+    task_dir = tmp_path / "ccb-tasks"
+    output = capsys.readouterr().out
+    assert output.splitlines() == [
+        "[CCB_ASYNC_SUBMITTED provider=codex]",
+        "Codex processing (task: task-fixed)",
+        *(["[CCB_ASYNC_PID task=task-fixed pid=4321]"] if not managed else []),
+        f"[CCB_ASYNC_STATUS_FILE task=task-fixed] {task_dir / 'ask-codex-task-fixed.status'}",
+        f"[CCB_ASYNC_LOG_FILE task=task-fixed] {task_dir / 'ask-codex-task-fixed.log'}",
+        f"[CCB_ASYNC_RECEIPT_FILE task=task-fixed] {task_dir / 'ask-codex-task-fixed.json'}",
+        *(
+            ["MANDATORY: END YOUR TURN NOW. Reply ONLY 'Codex processing...', then stop. See 'Async Guardrail' in CLAUDE.md."]
+            if not managed
+            else []
+        ),
+    ]
+    if not managed:
+        production_task = "20261011-134616-996-388112"
+        production_tail = "\n".join(
+            [
+                f"[CCB_ASYNC_LOG_FILE task={production_task}] /tmp/ccb-tasks/ask-codex-{production_task}.log",
+                f"[CCB_ASYNC_RECEIPT_FILE task={production_task}] /tmp/ccb-tasks/ask-codex-{production_task}.json",
+                "MANDATORY: END YOUR TURN NOW. Reply ONLY 'Codex processing...', then stop. See 'Async Guardrail' in CLAUDE.md.",
+            ]
+        )
+        normalized_output = output.replace("task-fixed", production_task).replace(
+            str(task_dir), "/tmp/ccb-tasks"
+        )
+        assert normalized_output.rstrip("\n").endswith(production_tail)
+
+
+def test_codex_default_local_ask_stays_foreground(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask = _prepare_local_async_submission(monkeypatch, tmp_path, managed=False)
+    captured: dict = {}
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    monkeypatch.setattr(
+        ask,
+        "_send_via_unified_daemon",
+        lambda *_args, **kwargs: captured.update(kwargs) or ask.EXIT_OK,
+    )
+
+    assert ask.main(["ask", "codex", "hello"]) == ask.EXIT_OK
+
+    assert "async_submit" not in captured
+    assert capsys.readouterr().out == ""
+    assert not (tmp_path / "ccb-tasks").exists()
+
+
+@pytest.mark.parametrize("flags", [["--background", "--notify"], ["--notify", "--background"]])
+def test_local_background_notify_orders_remain_one_way(
+    monkeypatch, tmp_path: Path, capsys, flags: list[str]
+) -> None:
+    ask = _prepare_local_async_submission(monkeypatch, tmp_path, managed=False)
+    captured: dict = {}
+
+    def _send(*_args, **kwargs):
+        captured.update(kwargs)
+        return ask.EXIT_OK
+
+    monkeypatch.setattr(ask, "_send_via_unified_daemon", _send)
+
+    assert ask.main(["ask", "codex", *flags, "FYI"]) == ask.EXIT_OK
+    assert capsys.readouterr().out == ""
+    assert captured["delivery_only"] is True
+    assert captured["suppress_completion_hook"] is True
+
+
 def test_pair_credential_ignores_unrelated_ambient_terminal_pane(monkeypatch, tmp_path: Path) -> None:
     ask = _load_ask_module()
     context = ask._UnifiedDaemonContext(Path("/tmp/askd.json"), {"token": "tok"}, Path.cwd())

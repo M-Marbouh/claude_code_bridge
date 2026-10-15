@@ -11,13 +11,15 @@ Session role assignments are operational context, not architectural decisions. A
 
 ### Async guardrail
 
+Before calling `ask`, you may write up to three sentences explaining what you are sending and why. Do not predict or state the provider's result.
+
 When `ask` outputs `[CCB_ASYNC_SUBMITTED`:
 1. Reply with exactly one line: `<Provider> processing...`.
 2. End the turn immediately.
 3. Do not poll, sleep, call `pend`, inspect logs, or submit a duplicate request in the same turn.
 4. Wait for the user or completion hook to deliver the result.
 
-Use `--background` only when there is independent work to do. `[CCB_BACKGROUND_SUBMITTED]` confirms a successful submission: retain the exact task ID and continue only with independent work. Never claim, act on, or build on its result until a complete reply matching that task ID has arrived. If the result is needed and has not arrived, retrieve it with `pend <exact-task-id>`; never use implicit or provider-based `pend` for that outstanding task. A peer `--notify` delivery is one-way and requires no reply.
+If anything answer-independent remains at send time — work, or an explanation to the user that does not need the provider's reply — submit with `--background` and finish it. Use the default wait only when nothing answer-independent remains; an explanation that needs the provider's reply does not qualify. `[CCB_BACKGROUND_SUBMITTED]` confirms a successful submission: retain the exact task ID and continue only with independent work. Never claim, act on, or build on its result until a complete reply matching that task ID has arrived. If the result is needed and has not arrived, retrieve it with `pend <exact-task-id>`; never use implicit or provider-based `pend` for that outstanding task. A peer `--notify` delivery is one-way and requires no reply.
 
 ### Mutual ratification
 

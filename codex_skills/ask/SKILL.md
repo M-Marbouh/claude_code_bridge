@@ -20,17 +20,19 @@ The first argument must be the provider name. The message MUST be provided via s
 
 ## Execution (MANDATORY)
 
+Before calling `ask`, you may write up to three sentences explaining what you are sending and why. Do not predict or state the provider's result.
+
 ```bash
 CCB_CALLER=codex ask $PROVIDER <<'EOF'
 $MESSAGE
 EOF
 ```
 
-When there is independent work to do, add `--background` after `$PROVIDER` in the command.
+If anything answer-independent remains at send time, add `--background` after `$PROVIDER` in the command.
 
 ## Rules
 
-- Use `--background` only when there is independent work to do. Codex-managed sessions otherwise default to foreground; `--background` explicitly submits an async task.
+- If anything answer-independent remains at send time — work, or an explanation to the user that does not need the provider's reply — submit with `--background` and finish it. Use the default wait only when nothing answer-independent remains; an explanation that needs the provider's reply does not qualify. Codex-managed sessions otherwise default to foreground; `--background` explicitly submits an async task.
 - Treat `[CCB_ASYNC_SUBMITTED` and `[CCB_BACKGROUND_SUBMITTED` as successful submission markers. If neither appears, the request was not submitted.
 - For `--background`, retain the exact task ID. Continue only with independent work; never claim, act on, or build on the result until a complete reply matching that task ID arrives. If the result is needed and has not arrived, run `pend <exact-task-id>`; do not use implicit or provider-based `pend` for this task.
 - For an async submission without `--background`, say "[Provider] processing..." and immediately end your turn. Do not wait for results or check status in the same turn.

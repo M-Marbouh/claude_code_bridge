@@ -28,6 +28,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -48,13 +49,19 @@ sys.path.insert(0, str(lib_dir))
 from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
-from askd.adapters.base import MalformedRouteError, ResolvedRoute, parse_route_mapping
+from askd.adapters.base import (
+    MalformedRouteError,
+    ResolvedRoute,
+    parse_route_mapping,
+    route_session_key,
+)
 from askd_timeout import codex_idle_timeout_s, codex_max_wait_s
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import (
     ProviderRuntimeStatus,
     RegistryProviderRecord,
     daemon_work_dir_from_state,
+    daemon_queue_status,
     inside_managed_codex_sandbox,
     iter_registry_provider_records,
     provider_status_for_target,
@@ -67,6 +74,51 @@ from project_id import compute_ccb_project_id
 from reply_artifacts import prepare_agent_visible_reply
 from session_utils import find_project_session_file
 from task_receipts import new_peer_receipt, new_receipt, receipt_path, write_receipt
+
+
+def _queued_notice(provider: str, route: ResolvedRoute, work_dir: Path) -> str:
+    """Describe the exact destination queue without holding up submission."""
+    result: list[str] = []
+
+    def probe() -> None:
+        try:
+            result.append(_query_queued_notice(provider, route, work_dir))
+        except Exception:
+            return
+
+    thread = threading.Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(timeout=0.25)
+    return result[0] if result else ""
+
+
+def _query_queued_notice(provider: str, route: ResolvedRoute, work_dir: Path) -> str:
+    """Describe a busy exact destination queue when askd status is available."""
+    if not route.present:
+        return ""
+    expected_key = route_session_key(provider, route)
+    try:
+        queues = daemon_queue_status(
+            work_dir,
+            provider,
+            expected_key,
+            timeout_s=0.25,
+        )
+    except Exception:
+        return ""
+    try:
+        queue = next((item for item in queues if item.get("session_key") == expected_key), None)
+        if queue is None or not queue.get("in_flight"):
+            return ""
+        task = queue["in_flight"]
+        req_id = str(task.get("req_id") or "")
+        running_s = task.get("running_s")
+        waiting = int(queue.get("waiting") or 0)
+        if not req_id or running_s is None:
+            return ""
+        return f"[CCB_QUEUED waiting={waiting} busy_with={req_id} running={running_s}s]"
+    except Exception:
+        return ""
 
 
 # Provider to daemon command mapping
@@ -1904,6 +1956,12 @@ def main(argv: list[str]) -> int:
         f"submitted task={task_id} provider={provider} caller={caller} work_dir={os.getcwd()}",
     )
 
+    queue_notice = _queued_notice(
+        provider,
+        local_route,
+        daemon_context.work_dir if daemon_context is not None else Path.cwd(),
+    )
+
     # A managed Codex tool shell may terminate detached child processes as
     # soon as the tool call returns. Hand explicit background work to the
     # already-running host daemon instead, which owns the worker lifetime.
@@ -1924,6 +1982,8 @@ def main(argv: list[str]) -> int:
             _append_task_status_line(status_file, f"failed exit_code={rc}")
             return rc
         _append_task_status_line(status_file, "queued by host daemon (not yet delivered)")
+        if queue_notice:
+            print(queue_notice)
         if peer_intent == "background":
             print(f"[CCB_BACKGROUND_SUBMITTED provider={provider} intent=background]")
         else:
@@ -2086,8 +2146,12 @@ exit "$rc"
         _append_task_status_line(status_file, "spawned pid=unknown")
 
     if peer_intent == "background":
+        if queue_notice:
+            print(queue_notice)
         print(f"[CCB_BACKGROUND_SUBMITTED provider={provider} intent=background]")
     else:
+        if queue_notice:
+            print(queue_notice)
         print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
     print(f"{display_name(provider)} processing (task: {task_id})")
     if bg_pid is not None:

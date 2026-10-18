@@ -220,13 +220,18 @@ def _daemon_project_runtime_status(
         raise RuntimeError(f"askd returned an invalid runtime status: {exc}") from exc
 
 
-def daemon_queue_status(work_dir: Path, provider: str = "") -> list[dict]:
-    """Ask the running askd for each provider queue's depth and in-flight task."""
+def daemon_queue_status(
+    work_dir: Path,
+    provider: str = "",
+    session_key: str = "",
+    timeout_s: float = 8.0,
+) -> list[dict]:
+    """Ask the running askd for queue depth and in-flight task details."""
     state_file = find_running_state_file(
         "askd.json",
         protocol_prefix="ask",
         work_dir=work_dir,
-        timeout_s=0.5,
+        timeout_s=min(0.5, timeout_s),
     )
     state = askd_rpc.read_state(state_file) if state_file is not None else None
     if not state or not str(state.get("token") or ""):
@@ -238,8 +243,14 @@ def daemon_queue_status(work_dir: Path, provider: str = "") -> list[dict]:
         "token": str(state.get("token")),
         "operation": "queue_status",
         "provider": provider,
+        "session_key": session_key,
     }
-    response = askd_rpc.request_daemon(state, request, connect_timeout_s=2.0, response_timeout_s=8.0)
+    response = askd_rpc.request_daemon(
+        state,
+        request,
+        connect_timeout_s=min(2.0, timeout_s),
+        response_timeout_s=timeout_s,
+    )
     if response.get("type") != "ask.response" or int(response.get("exit_code", 1)) != 0:
         raise RuntimeError(str(response.get("reply") or "askd rejected queue status"))
     queues = response.get("queues")

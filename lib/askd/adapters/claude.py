@@ -957,7 +957,7 @@ class ClaudeAdapter(BaseProviderAdapter):
                 if role == TURN_END_EVENT:
                     combined = "\n".join(chunks)
                     progress["last_activity_at"] = time.time()
-                    if is_done_text(combined, task.req_id, turn_ended=True):
+                    if is_done_text(combined, task.req_id, turn_ended=True, allow_inline=True):
                         done_seen = True
                         done_ms = _now_ms() - started_ms
                         break
@@ -990,7 +990,7 @@ class ClaudeAdapter(BaseProviderAdapter):
                 break
 
         combined = "\n".join(chunks)
-        final_reply = extract_reply_for_req(combined, task.req_id)
+        final_reply = extract_reply_for_req(combined, task.req_id, allow_inline=done_seen)
         if done_seen:
             final_reply = append_trailing_notice(final_reply, extract_trailing_for_req(combined, task.req_id))
         elif unmarked_reply:

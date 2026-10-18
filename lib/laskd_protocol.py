@@ -111,7 +111,7 @@ def _trim_blank_edges(segment: list[str]) -> str:
     return "\n".join(segment).rstrip()
 
 
-def extract_reply_for_req(text: str, req_id: str) -> str:
+def extract_reply_for_req(text: str, req_id: str, *, allow_inline: bool = False) -> str:
     """
     Extract the reply segment for req_id from Claude's assistant text.
 
@@ -122,10 +122,22 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     if not lines:
         return ""
+    if allow_inline:
+        for index in range(len(lines) - 1, -1, -1):
+            if lines[index].strip() and not re.match(
+                r"^\s*(?!CCB_DONE\s*:)[A-Z][A-Z0-9_]*_DONE(?:\s*:.*)?\s*$",
+                lines[index],
+            ):
+                marker_pattern = re.compile(rf"\s+CCB_DONE:\s*{re.escape(req_id)}\s*$")
+                marker = marker_pattern.search(lines[index])
+                if marker is not None:
+                    lines[index] = lines[index][: marker.start()].rstrip()
+                    lines.insert(index + 1, f"{DONE_PREFIX} {req_id}")
+                break
     bounds = _reply_bounds(lines, req_id)
     if bounds is None:
         # No markers for this request at all: keep the legacy strip behavior.
-        return strip_done_text(text, req_id)
+        return strip_done_text(text, req_id, allow_inline=allow_inline)
     start, done_i = bounds
     return _trim_blank_edges(lines[start : done_i if done_i is not None else len(lines)])
 

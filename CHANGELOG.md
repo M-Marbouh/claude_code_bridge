@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Codex and Claude replies whose final line ends with the request's `CCB_DONE` marker inline now complete once the provider's turn has ended, instead of waiting out the idle timeout and failing as incomplete. The marker is stripped from the delivered reply.
+- `ask` now prints a `[CCB_QUEUED ...]` line before the submit marker when the destination session is busy, and `pend` shows whether a pending task is running or how many tasks are ahead of it. The probe is capped at 0.25s and stays silent on any error.
 - Prevented descendant Codex rollout logs with copied request anchors from winning destination reply selection.
 - Kept WezTerm peer delivery valid when Claude or Codex replaces CCB's launch-time pane title.
 

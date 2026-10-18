@@ -645,7 +645,12 @@ class CodexAdapter(BaseProviderAdapter):
                 chunks.append(text)
                 if phase == "final_answer":
                     latest_final = text
-                if is_done_text(text, task.req_id, turn_ended=(phase == "final_answer")):
+                if is_done_text(
+                    text,
+                    task.req_id,
+                    turn_ended=(phase == "final_answer"),
+                    allow_inline=(phase == "final_answer"),
+                ):
                     terminal_reply = text
                     done_seen = True
                     done_ms = _now_ms() - started_ms
@@ -836,7 +841,12 @@ class CodexAdapter(BaseProviderAdapter):
             combined = "\n".join(chunks)
             # A final_answer record is Codex's complete last message of the
             # turn, so a whole-line marker in it counts even if prose follows.
-            done_now = is_done_text(text, task.req_id, turn_ended=(phase == "final_answer"))
+            done_now = is_done_text(
+                text,
+                task.req_id,
+                turn_ended=(phase == "final_answer"),
+                allow_inline=(phase == "final_answer"),
+            )
             # Keep only the latest canonical final for degraded idle completion.
             # The event_msg twin carrying CCB_DONE arrives before its canonical
             # final_answer record, so the DONE-bearing event is authoritative.

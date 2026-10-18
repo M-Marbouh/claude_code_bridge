@@ -1626,7 +1626,7 @@ def test_recover_reads_the_exact_recorded_codex_conversation_not_the_replacement
     assert pend._recover_provider_reply(receipt) == "Original reply."
 
 
-def test_routed_recovery_requires_exact_transcript_done_marker(tmp_path: Path, monkeypatch) -> None:
+def test_routed_recovery_renders_inline_final_without_marker(tmp_path: Path, monkeypatch, capsys) -> None:
     pend = _load_pend_module()
     req_id = "20260928-200214-383-2702627"
     transcript = tmp_path / "rollout.jsonl"
@@ -1647,29 +1647,38 @@ def test_routed_recovery_requires_exact_transcript_done_marker(tmp_path: Path, m
     anchor = {"type": "event_msg", "payload": {"type": "user_message", "message": f"CCB_REQ_ID: {req_id}\nquestion"}}
     final = {"type": "response_item", "payload": {
         "type": "message", "role": "assistant", "phase": "final_answer",
-        "content": [{"type": "output_text", "text": "Final answer without marker."}],
+        "content": [{"type": "output_text", "text": f"Final answer.\nCCB_DONE: {req_id}"}],
     }}
     transcript.write_text(
         "\n".join(json.dumps(item) for item in [
-            {"type": "session_meta", "payload": {"cwd": str(tmp_path)}}, anchor, final,
+            {"type": "session_meta", "payload": {"cwd": str(tmp_path), "id": "exact-session"}}, anchor, final,
         ]) + "\n",
         encoding="utf-8",
     )
 
-    recovered = pend._recover_from_recorded_conversation(receipt, "codex")
-    assert recovered is None
-    assert pend._saved_pend_status(receipt, recovered=recovered or "") == "incomplete"
-
+    # Whole-line completion remains the control case for pend's final output.
+    monkeypatch.setattr(pend, "read_server_result_status", lambda _r: "incomplete")
+    monkeypatch.setattr(pend, "read_peer_reply", lambda _r: "")
+    monkeypatch.setattr(pend, "read_server_result", lambda _r: "partial output")
     final["payload"]["content"][0]["text"] = f"Final answer.\nCCB_DONE: {req_id}"
     transcript.write_text(
         "\n".join(json.dumps(item) for item in [
-            {"type": "session_meta", "payload": {"cwd": str(tmp_path)}}, anchor, final,
+            {"type": "session_meta", "payload": {"cwd": str(tmp_path), "id": "exact-session"}}, anchor, final,
         ]) + "\n",
         encoding="utf-8",
     )
-    recovered = pend._recover_from_recorded_conversation(receipt, "codex")
-    assert recovered == "Final answer."
-    assert pend._saved_pend_status(receipt, recovered=recovered) == "recovered-late"
+    assert pend._show_receipt(receipt) == pend.EXIT_OK
+    assert capsys.readouterr().out.strip() == "Final answer."
+
+    final["payload"]["content"][0]["text"] = f"Final answer. completed checks. CCB_DONE: {req_id}"
+    transcript.write_text(
+        "\n".join(json.dumps(item) for item in [
+            {"type": "session_meta", "payload": {"cwd": str(tmp_path), "id": "exact-session"}}, anchor, final,
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    assert pend._show_receipt(receipt) == pend.EXIT_OK
+    assert capsys.readouterr().out.strip() == "Final answer. completed checks."
 
 
 def test_recover_reads_the_exact_recorded_claude_conversation(tmp_path: Path) -> None:

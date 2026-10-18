@@ -34,7 +34,7 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
         self._stop_event.set()
 
     def queue_snapshot(self) -> dict:
-        """What this worker is doing now: the in-flight task and how many wait behind it."""
+        """What this worker is doing now, including the identities waiting behind it."""
         current = self._current
         started = self._current_started_at
         in_flight = None
@@ -45,7 +45,14 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
                 "running_s": round(time.time() - started, 1) if started else None,
                 "progress": dict(progress) if isinstance(progress, dict) else {},
             }
-        return {"session_key": self.session_key, "waiting": self._q.qsize(), "in_flight": in_flight}
+        with self._q.mutex:
+            waiting_req_ids = [getattr(task, "req_id", "") for task in self._q.queue]
+        return {
+            "session_key": self.session_key,
+            "waiting": len(waiting_req_ids),
+            "waiting_req_ids": waiting_req_ids,
+            "in_flight": in_flight,
+        }
 
     def run(self) -> None:
         while not self._stop_event.is_set():

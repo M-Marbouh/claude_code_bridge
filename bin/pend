@@ -19,7 +19,9 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
+from askd.adapters.base import ResolvedRoute, route_session_key
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
+from ccb_runtime_status import daemon_queue_status
 from claude_comm import ClaudeLogReader, _extract_message
 from codex_comm import CodexLogReader
 from hermes_comm import HermesStateError
@@ -553,7 +555,12 @@ def _recover_codex_reply(receipt: dict) -> str | None:
                         continue
                     chunks.append(text)
                     combined = "\n".join(chunks)
-                    done_now = is_done_text(text, task_id, turn_ended=(phase == "final_answer"))
+                    done_now = is_done_text(
+                        text,
+                        task_id,
+                        turn_ended=(phase == "final_answer"),
+                        allow_inline=(phase == "final_answer"),
+                    )
                     if phase == "final_answer":
                         latest_final = text
                     if done_now:
@@ -635,7 +642,7 @@ def _recover_from_recorded_conversation(receipt: dict, provider: str) -> str | N
 
     # A clean-looking exchange is not proof of completion: provider readers
     # may expose a partial assistant turn as a fallback. Require this exact
-    # transcript to show both this task's anchor and its whole-line marker.
+    # transcript to show both this task's anchor and its completion marker.
     anchored = False
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -655,7 +662,10 @@ def _recover_from_recorded_conversation(receipt: dict, provider: str) -> str | N
                         anchored = CodexLogReader._exchange_req_id(text) == task_id
                         continue
                     if anchored and role == "assistant" and is_done_text(
-                        text, task_id, turn_ended=(phase == "final_answer")
+                        text,
+                        task_id,
+                        turn_ended=(phase == "final_answer"),
+                        allow_inline=(phase == "final_answer"),
                     ):
                         break
                 else:
@@ -784,6 +794,43 @@ def _saved_pend_status(receipt: dict, *, recovered: str = "") -> str:
     return RECEIPT_FAILED if exit_code != 0 else RECEIPT_INCOMPLETE
 
 
+def _pending_queue_notice(receipt: dict, task_id: str) -> str:
+    """Return queue state only when the task maps to an exact routed session."""
+    provider = str(receipt.get("provider") or "").strip().lower()
+    live_id = str(receipt.get("destination_live_id") or "").strip()
+    launch_id = str(receipt.get("route_launch_id") or "").strip()
+    work_dir = str(receipt.get("work_dir") or "").strip()
+    if not provider or not live_id or not launch_id or not work_dir:
+        return ""
+    route = ResolvedRoute(live_id=live_id, launch_id=launch_id)
+    expected_key = route_session_key(provider, route)
+    try:
+        queues = daemon_queue_status(
+            Path(work_dir),
+            provider,
+            expected_key,
+            timeout_s=0.5,
+        )
+    except Exception:
+        return ""
+    try:
+        queue = next((item for item in queues if item.get("session_key") == expected_key), None)
+        if queue is None:
+            return ""
+        current = queue.get("in_flight") or {}
+        if str(current.get("req_id") or "") == task_id:
+            running_s = current.get("running_s")
+            suffix = f" running={running_s}s" if running_s is not None else ""
+            return f"[CCB_QUEUE state=running task={task_id}{suffix}]"
+        waiting_req_ids = queue.get("waiting_req_ids")
+        if isinstance(waiting_req_ids, list) and task_id in waiting_req_ids:
+            ahead = waiting_req_ids.index(task_id) + (1 if current else 0)
+            return f"[CCB_QUEUE state=queued task={task_id} ahead={ahead}]"
+    except Exception:
+        return ""
+    return ""
+
+
 def _current_role_for_receipt(receipt: dict) -> str:
     live_id = str(receipt.get("destination_live_id") or "").strip()
     project_id = str(receipt.get("destination_ccb_project_id") or receipt.get("ccb_project_id") or "").strip()
@@ -847,6 +894,9 @@ def _show_receipt(receipt: dict, *, provenance: bool = False) -> int:
             )
             return EXIT_ERROR
         print(f"[PENDING] task={task_id} provider={receipt.get('provider', '')}", file=sys.stderr)
+        queue_notice = _pending_queue_notice(receipt, task_id)
+        if queue_notice:
+            print(queue_notice, file=sys.stderr)
         return EXIT_NO_REPLY
     if (
         exit_code == 0

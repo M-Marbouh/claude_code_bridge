@@ -104,18 +104,47 @@ def find_done_line(text: str, req_id: str) -> int | None:
     return None
 
 
-def is_done_text(text: str, req_id: str, *, turn_ended: bool = False) -> bool:
+def _inline_done_suffix(line: str, req_id: str) -> re.Match[str] | None:
+    """Match an exact request marker appended after whitespace on a line."""
+    pattern = re.compile(rf"\s+CCB_DONE:\s*{re.escape(req_id)}\s*$")
+    return pattern.search(line or "")
+
+
+def _last_non_noise_line(lines: list[str]) -> int | None:
+    for index in range(len(lines) - 1, -1, -1):
+        if not _is_trailing_noise_line(lines[index]):
+            return index
+    return None
+
+
+def is_done_text(
+    text: str,
+    req_id: str,
+    *,
+    turn_ended: bool = False,
+    allow_inline: bool = False,
+) -> bool:
     """Whether `text` completes `req_id`.
 
     While the provider may still be writing, the marker must be the last
     meaningful line: an earlier marker could be followed by more reply, and
     accepting it would cut the reply short. Once the caller has seen the
-    provider's turn end (`turn_ended=True`), nothing more is coming, so a
-    whole-line marker anywhere in the text completes the request and any text
-    after it is ignored for the verdict.
+    provider's turn end (`turn_ended=True`), a whole-line marker anywhere in
+    the text completes the request. Callers may separately opt into accepting
+    an exact marker appended to the last meaningful line with `allow_inline`,
+    but only after setting `turn_ended=True`.
+    Text after a whole-line marker is ignored for the verdict.
     """
     if turn_ended:
-        return find_done_line(text, req_id) is not None
+        if find_done_line(text, req_id) is not None:
+            return True
+        lines = (text or "").splitlines()
+        last = _last_non_noise_line(lines)
+        return (
+            allow_inline
+            and last is not None
+            and _inline_done_suffix(lines[last], req_id) is not None
+        )
     lines = [ln.rstrip() for ln in (text or "").splitlines()]
     for i in range(len(lines) - 1, -1, -1):
         if _is_trailing_noise_line(lines[i]):
@@ -124,20 +153,32 @@ def is_done_text(text: str, req_id: str, *, turn_ended: bool = False) -> bool:
     return False
 
 
-def split_done_text(text: str, req_id: str) -> tuple[str, str]:
-    """Split `text` at its last whole-line done marker for `req_id`.
+def split_done_text(
+    text: str,
+    req_id: str,
+    *,
+    allow_inline: bool = False,
+) -> tuple[str, str]:
+    """Split `text` at its last whole-line marker, or opted-in inline suffix.
 
     Returns (reply before the marker, text after it). Harness `*_DONE`
     trailers and blank lines after the marker are not reported as trailing
     text. Without a marker, returns (strip_done_text(text), "").
     """
-    idx = find_done_line(text, req_id)
-    if idx is None:
-        return strip_done_text(text, req_id), ""
     lines = (text or "").splitlines()
-    body = "\n".join(lines[:idx]).rstrip()
-    trailing = [ln for ln in lines[idx + 1 :] if not _is_trailing_noise_line(ln)]
-    return body, "\n".join(trailing).strip()
+    idx = find_done_line(text, req_id)
+    if idx is not None:
+        body = "\n".join(lines[:idx]).rstrip()
+        trailing = [ln for ln in lines[idx + 1 :] if not _is_trailing_noise_line(ln)]
+        return body, "\n".join(trailing).strip()
+
+    last = _last_non_noise_line(lines) if allow_inline else None
+    if last is not None:
+        match = _inline_done_suffix(lines[last], req_id)
+        if match is not None:
+            lines[last] = lines[last][: match.start()].rstrip()
+            return "\n".join(lines[: last + 1]).rstrip(), ""
+    return strip_done_text(text, req_id), ""
 
 
 def append_trailing_notice(reply: str, trailing: str) -> str:
@@ -152,13 +193,18 @@ def append_trailing_notice(reply: str, trailing: str) -> str:
     return f"{(reply or '').rstrip()}\n\n{notice}\n{trailing}".strip()
 
 
-def strip_done_text(text: str, req_id: str) -> str:
+def strip_done_text(text: str, req_id: str, *, allow_inline: bool = False) -> str:
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     if not lines:
         return ""
 
     while lines and _is_trailing_noise_line(lines[-1]):
         lines.pop()
+
+    if lines and allow_inline:
+        match = _inline_done_suffix(lines[-1], req_id)
+        if match is not None:
+            lines[-1] = lines[-1][: match.start()].rstrip()
 
     if lines and done_line_re(req_id).match(lines[-1] or ""):
         lines.pop()
@@ -169,13 +215,14 @@ def strip_done_text(text: str, req_id: str) -> str:
     return "\n".join(lines).rstrip()
 
 
-def extract_reply_for_req(text: str, req_id: str) -> str:
+def extract_reply_for_req(text: str, req_id: str, *, allow_inline: bool = False) -> str:
     """
     Extract the reply segment for req_id from a message.
 
     When multiple replies are present (each ending with CCB_DONE: <req_id>),
     extract only the segment between the previous done line and the done line
     for our req_id. This prevents mixing old/stale content into the current reply.
+    `allow_inline` is for callers that already established turn completion.
     """
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     if not lines:
@@ -187,13 +234,26 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
 
     if not target_idxs:
+        last_non_noise = _last_non_noise_line(lines) if allow_inline else None
+        inline_target = (
+            _inline_done_suffix(lines[last_non_noise], req_id)
+            if last_non_noise is not None
+            else None
+        )
+        if inline_target is not None:
+            prev_done_i = max((i for i in done_idxs if i < last_non_noise), default=-1)
+            segment = lines[prev_done_i + 1 : last_non_noise + 1]
+            segment[-1] = segment[-1][: inline_target.start()].rstrip()
+            while segment and segment[0].strip() == "":
+                segment = segment[1:]
+            return "\n".join(segment).rstrip()
         # No CCB_DONE for our req_id found
         # If there are other CCB_DONE markers, this is likely old content - return empty
         # to avoid mixing old replies into current request
         if done_idxs:
             return ""  # Prevent returning old content
         # No CCB_DONE markers at all - fallback to strip behavior
-        return strip_done_text(text, req_id)
+        return strip_done_text(text, req_id, allow_inline=allow_inline)
 
     # Find the last occurrence of our req_id's done line
     target_i = target_idxs[-1]
@@ -225,13 +285,13 @@ def select_codex_reply(
 ) -> str:
     """Select the single Codex reply that belongs to a completed request."""
     if terminal_reply:
-        selected, trailing = split_done_text(terminal_reply, req_id)
+        selected, trailing = split_done_text(terminal_reply, req_id, allow_inline=True)
         if selected:
             return append_trailing_notice(selected, trailing)
     if latest_final:
-        selected, trailing = split_done_text(latest_final, req_id)
+        selected, trailing = split_done_text(latest_final, req_id, allow_inline=True)
         return append_trailing_notice(selected, trailing)
-    return extract_reply_for_req(combined, req_id)
+    return extract_reply_for_req(combined, req_id, allow_inline=True)
 
 
 @dataclass(frozen=True)

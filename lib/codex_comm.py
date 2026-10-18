@@ -847,7 +847,7 @@ class CodexLogReader:
     def _clean_exchange_reply(reply: str, req_id: Optional[str]) -> str:
         cleaned = strip_trailing_markers(reply or "")
         if req_id:
-            cleaned = strip_done_text(cleaned, req_id)
+            cleaned = strip_done_text(cleaned, req_id, allow_inline=True)
         return cleaned.strip()
 
     def latest_exchanges(self, n: int = 1) -> List[Dict[str, Optional[str]]]:

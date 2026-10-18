@@ -17,6 +17,7 @@ from ccb_protocol import (
     BEGIN_PREFIX,
     DONE_PREFIX,
     REQ_ID_PREFIX,
+    extract_reply_for_req as extract_ccb_reply_for_req,
     is_done_text,
     select_codex_reply,
     split_done_text,
@@ -56,6 +57,52 @@ def test_marker_followed_by_prose_completes_only_after_turn_end() -> None:
 def test_marker_for_another_request_never_completes() -> None:
     text = f"answer\n{DONE_PREFIX} {NEXT}\nmore"
     assert is_done_text(text, REQ, turn_ended=True) is False
+
+
+def test_inline_done_suffix_completes_only_when_turn_ended() -> None:
+    text = f"Earlier answer text. Final checks passed. {DONE}"
+    assert is_done_text(text, REQ) is False
+    assert is_done_text(text, REQ, allow_inline=True) is False
+    assert is_done_text(text, REQ, turn_ended=True) is False
+    assert is_done_text(text, REQ, turn_ended=True, allow_inline=True) is True
+
+
+def test_opencode_silence_completion_does_not_accept_inline_done() -> None:
+    # OpenCode's silence timer calls with turn_ended=True as a settle signal,
+    # but it has not observed a provider turn boundary.
+    text = f"Interim answer text. {DONE}"
+    assert is_done_text(text, REQ, turn_ended=True) is False
+    assert is_done_text(text, REQ) is False
+
+
+def test_inline_done_suffix_requires_exact_final_marker() -> None:
+    for text in (
+        f"Answer. {DONE_PREFIX} {NEXT}",
+        f"Answer. {DONE} more prose",
+        f"Answer. `{DONE}`",
+    ):
+        assert is_done_text(text, REQ, turn_ended=True) is False
+
+
+def test_inline_done_suffix_is_removed_without_truncating_reply() -> None:
+    text = f"A complete answer. Final checks passed. {DONE}\n\nHARNESS_DONE\n"
+    expected = "A complete answer. Final checks passed."
+    body, trailing = split_done_text(text, REQ, allow_inline=True)
+    assert body == expected
+    assert trailing == ""
+    assert extract_ccb_reply_for_req(text, REQ, allow_inline=True) == expected
+    assert extract_reply_for_req(text, REQ, allow_inline=True) == expected
+    assert select_codex_reply(text, text, text, REQ) == expected
+    assert extract_ccb_reply_for_req(text, REQ) == f"{expected} {DONE}"
+
+
+def test_claude_turn_end_accepts_and_strips_inline_done_suffix(tmp_path: Path) -> None:
+    text = f"A complete answer. Final checks passed. {DONE}"
+    _task, result = _run(tmp_path, [ANCHOR, ("assistant", text), TURN_END])
+
+    assert result.done_seen is True
+    assert result.exit_code == 0
+    assert result.reply == "A complete answer. Final checks passed."
 
 
 def test_split_done_text_separates_trailing_prose() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import time
 from pathlib import Path
 
 import askd_rpc
@@ -232,7 +233,7 @@ def test_unified_state_discovery_uses_cwd_project_when_run_dir_missing(monkeypat
     seen: list[Path] = []
 
     def _ping(*, timeout_s: float, state_file: Path) -> bool:
-        assert timeout_s == 0.5
+        assert 0 < timeout_s <= 0.5
         seen.append(state_file)
         return state_file == expected
 
@@ -1472,6 +1473,7 @@ def _prepare_local_async_submission(monkeypatch, tmp_path: Path, *, managed: boo
     monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
     monkeypatch.setattr(ask, "_preflight_target", _preflight)
     monkeypatch.setattr(ask, "_send_via_unified_daemon", lambda *_args, **_kwargs: ask.EXIT_OK)
+    monkeypatch.setattr(ask, "daemon_queue_status", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ask.subprocess,
         "Popen",
@@ -1539,6 +1541,61 @@ def test_local_default_submission_output_is_unchanged(
             str(task_dir), "/tmp/ccb-tasks"
         )
         assert normalized_output.rstrip("\n").endswith(production_tail)
+
+
+def test_local_submission_prints_exact_destination_queue_before_submitted_marker(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ask = _prepare_local_async_submission(monkeypatch, tmp_path, managed=True)
+    calls: list[tuple] = []
+
+    def _queue_status(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [
+            {
+                "session_key": "codex:launch:ai-1:live:s2",
+                "waiting": 3,
+                "in_flight": {"req_id": "busy-task", "running_s": 41.0},
+            }
+        ]
+
+    monkeypatch.setattr(ask, "daemon_queue_status", _queue_status)
+
+    assert ask.main(["ask", "codex", "hello"]) == ask.EXIT_OK
+
+    output = capsys.readouterr().out.splitlines()
+    assert output[0] == "[CCB_QUEUED waiting=3 busy_with=busy-task running=41.0s]"
+    assert output[1] == "[CCB_ASYNC_SUBMITTED provider=codex]"
+    (args, kwargs), = calls
+    assert args[1:] == ("codex", "codex:launch:ai-1:live:s2")
+    assert kwargs == {"timeout_s": 0.25}
+
+
+def test_slow_queue_advisory_does_not_delay_or_print_on_local_submission(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ask = _prepare_local_async_submission(monkeypatch, tmp_path, managed=True)
+
+    def _slow_queue_status(*_args, **_kwargs):
+        time.sleep(1)
+        return [
+            {
+                "session_key": "codex:launch:ai-1:live:s2",
+                "waiting": 2,
+                "in_flight": {"req_id": "busy-task", "running_s": 41.0},
+            }
+        ]
+
+    monkeypatch.setattr(ask, "daemon_queue_status", _slow_queue_status)
+
+    started = time.monotonic()
+    assert ask.main(["ask", "codex", "hello"]) == ask.EXIT_OK
+    elapsed = time.monotonic() - started
+
+    output = capsys.readouterr().out.splitlines()
+    assert elapsed < 0.4
+    assert not any(line.startswith("[CCB_QUEUED ") for line in output)
+    assert output[0] == "[CCB_ASYNC_SUBMITTED provider=codex]"
 
 
 def test_codex_default_local_ask_stays_foreground(monkeypatch, tmp_path: Path, capsys) -> None:

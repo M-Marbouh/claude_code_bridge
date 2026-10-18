@@ -219,7 +219,11 @@ class _UnifiedWorkerPool:
         return task
 
 
-def _queue_entries(pools: Dict[str, PerSessionWorkerPool[_SessionWorker]], provider: str = "") -> list[dict]:
+def _queue_entries(
+    pools: Dict[str, PerSessionWorkerPool[_SessionWorker]],
+    provider: str = "",
+    session_key: str = "",
+) -> list[dict]:
     entries: list[dict] = []
     for key, pool in sorted(pools.items()):
         if provider and key != provider:
@@ -230,6 +234,8 @@ def _queue_entries(pools: Dict[str, PerSessionWorkerPool[_SessionWorker]], provi
             except Exception:
                 continue
             snapshot["provider"] = key
+            if session_key and snapshot.get("session_key") != session_key:
+                continue
             entries.append(snapshot)
     return entries
 
@@ -530,8 +536,9 @@ class UnifiedAskDaemon:
         }
 
     def _handle_queue_status(self, msg: dict) -> dict:
-        """Per-provider queue depth and the in-flight task, so a stuck queue is visible."""
+        """Per-session queue depth and the in-flight task, so a stuck queue is visible."""
         provider = str(msg.get("provider") or "").strip().lower()
+        session_key = str(msg.get("session_key") or "").strip()
         with self.pool._lock:
             pools = dict(self.pool._pools)
         return {
@@ -540,7 +547,7 @@ class UnifiedAskDaemon:
             "id": msg.get("id"),
             "exit_code": 0,
             "reply": "",
-            "queues": _queue_entries(pools, provider),
+            "queues": _queue_entries(pools, provider, session_key),
         }
 
     def _handle_runtime_status(self, msg: dict) -> dict:

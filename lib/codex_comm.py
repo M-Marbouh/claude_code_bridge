@@ -21,6 +21,7 @@ from terminal import get_backend_for_session, get_pane_id_from_session
 from ccb_config import apply_backend_env
 from ccb_protocol import REQ_ID_PREFIX, strip_done_text, strip_trailing_markers
 from i18n import t
+import pane_registry
 from pane_registry import upsert_registry, registry_path_for_session, load_registry_by_session_id
 from session_utils import find_project_session_file
 from session_file_watcher import SessionFileWatcher, HAS_WATCHDOG
@@ -95,6 +96,11 @@ def _handle_codex_log_event(path: Path) -> None:
     if not session_file or not session_file.exists():
         return
     try:
+        if _codex_binding_contradicted_by_live_registry(session_file):
+            return
+    except Exception:
+        return
+    try:
         from caskd_session import load_project_session
     except Exception:
         return
@@ -106,6 +112,68 @@ def _handle_codex_log_event(path: Path) -> None:
         session.update_codex_log_binding(log_path=str(path), session_id=session_id)
     except Exception:
         return
+
+
+def _codex_binding_contradicted_by_live_registry(session_file: Path) -> bool:
+    """Refuse project-log binding when a fresh launch owns other Codex files."""
+    destination = Path(session_file).expanduser().resolve()
+    containing_dir = destination.parent
+    destination_root = (
+        containing_dir.parent
+        if containing_dir.name in {".ccb", ".ccb_config"}
+        else containing_dir
+    )
+    destination_project_id = compute_ccb_project_id(destination_root)
+
+    for registry_path in pane_registry._iter_registry_files():
+        record = pane_registry._load_registry_file(registry_path)
+        if not record:
+            continue
+        updated_at = pane_registry._coerce_updated_at(record.get("updated_at"), registry_path)
+        if pane_registry._is_stale(updated_at):
+            continue
+
+        matches_destination = record.get("ccb_project_id") == destination_project_id
+        if not matches_destination:
+            work_dir = str(record.get("work_dir") or "").strip()
+            if work_dir:
+                record_destination = find_project_session_file(
+                    Path(work_dir).expanduser(), ".codex-session"
+                )
+                matches_destination = bool(
+                    record_destination
+                    and Path(record_destination).expanduser().resolve() == destination
+                )
+        if not matches_destination:
+            continue
+
+        inventory = pane_registry.read_inventory_for_record(record)
+        if inventory.status == pane_registry.INVENTORY_INVALID:
+            return True
+        if inventory.status != pane_registry.INVENTORY_VALID:
+            continue
+        raw_entries = record.get("live_sessions")
+        raw_by_live_id = {
+            entry.get("live_id"): entry
+            for entry in raw_entries
+            if isinstance(entry, dict)
+        } if isinstance(raw_entries, list) else {}
+        for member in inventory.sessions:
+            if member.provider != "codex":
+                continue
+            raw_entry = raw_by_live_id.get(member.live_id)
+            raw_active = raw_entry.get("active", True) if raw_entry else True
+            explicitly_inactive = raw_active is False or (
+                isinstance(raw_active, str)
+                and raw_active.strip().lower() in {"false", "0", "no"}
+            )
+            if explicitly_inactive:
+                continue
+            if not member.session_file:
+                return True
+            if Path(member.session_file).expanduser().resolve() != destination:
+                return True
+    return False
 
 
 def _codex_log_is_descendant(log_path: Path) -> bool:

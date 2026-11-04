@@ -1022,6 +1022,25 @@ class CodexCommunicator:
         return find_project_session_file(Path.cwd(), ".codex-session")
 
     def _load_session_info(self):
+        explicit_session = (os.environ.get("CCB_SESSION_FILE") or "").strip()
+        if explicit_session:
+            try:
+                explicit_path = Path(os.path.expanduser(explicit_session))
+                if explicit_path.name != ".codex-session":
+                    raise RuntimeError("Explicit Codex session file must be named .codex-session")
+                with explicit_path.open("r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict) or not data.get("runtime_dir"):
+                    raise RuntimeError("Explicit Codex session file has no runtime_dir")
+                active = data.get("active", False)
+                if isinstance(active, str):
+                    active = active.strip().lower() in {"true", "1", "yes"}
+                if not active:
+                    raise RuntimeError("Explicit Codex session is inactive")
+                data["_session_file"] = str(explicit_path)
+                return data
+            except Exception as exc:
+                raise RuntimeError(f"Unable to use explicit Codex session file {explicit_session}: {exc}") from exc
         if "CODEX_SESSION_ID" in os.environ:
             terminal = os.environ.get("CODEX_TERMINAL", "tmux")
             # Get pane_id based on terminal type

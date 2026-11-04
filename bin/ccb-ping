@@ -110,14 +110,35 @@ def main():
     # Parse remaining arguments
     parser = argparse.ArgumentParser(prog=f"ccb-ping {provider}", add_help=False)
     parser.add_argument("--session-file", dest="session_file", default=None)
+    parser.add_argument("--live-id", dest="live_id", default=None)
     parser.add_argument("--autostart", action="store_true", help="Start daemon if needed")
     args, _ = parser.parse_known_args(sys.argv[2:])
+
+    if args.live_id and args.session_file:
+        print("[ERROR] --live-id cannot be combined with --session-file", file=sys.stderr)
+        return 1
 
     if args.session_file:
         os.environ["CCB_SESSION_FILE"] = str(args.session_file)
     work_dir = _resolve_work_dir(args.session_file)
 
     if inside_managed_codex_sandbox():
+        if provider == "codex" and args.live_id:
+            from live_sessions import read_inventory
+            from pane_registry import load_registry_by_session_id
+
+            launch_id = (os.environ.get("CODEX_SESSION_ID") or "").strip()
+            record = load_registry_by_session_id(launch_id) if launch_id else None
+            inventory = read_inventory(record or {})
+            known = inventory.valid and any(
+                session.provider == "codex" and session.live_id == args.live_id
+                for session in inventory.sessions
+            )
+            if not known:
+                print(f"[ERROR] Unknown Codex live id: {args.live_id}", file=sys.stderr)
+            else:
+                print("[ERROR] Cannot verify a per-live-id Codex session inside the managed sandbox", file=sys.stderr)
+            return 1
         try:
             status_work_dir = work_dir if args.session_file else resolve_daemon_work_dir(work_dir)
             status = provider_status_for_target(provider, work_dir=status_work_dir)
@@ -164,6 +185,9 @@ def main():
             except Exception as e:
                 print(f"[WARN] Autostart pre-check failed: {e}", file=sys.stderr)
 
+        if provider == "codex" and (args.live_id or (not args.session_file and _paired_codex_sessions())):
+            return _ping_paired_codex(args.live_id, work_dir, args.session_file)
+
         comm = comm_class()
         healthy, message = comm.ping(display=False)
         print(message)
@@ -180,6 +204,70 @@ def main():
     except Exception as e:
         print(f"[ERROR] {provider.capitalize()} connectivity test failed: {e}", file=sys.stderr)
         return 1
+
+
+def _paired_codex_sessions():
+    """Return the current launch's Codex panes when it is a paired launch."""
+    from live_sessions import read_inventory
+    from pane_registry import load_registry_by_session_id
+
+    launch_id = (os.environ.get("CODEX_SESSION_ID") or "").strip()
+    if not launch_id:
+        return []
+    record = load_registry_by_session_id(launch_id)
+    inventory = read_inventory(record or {})
+    if not inventory.valid:
+        return []
+    sessions = [s for s in inventory.sessions if s.provider == "codex" and s.active]
+    return sessions if len(sessions) > 1 else []
+
+
+def _ping_paired_codex(live_id, work_dir, explicit_session_file=None):
+    from live_sessions import read_inventory
+    from pane_registry import load_registry_by_session_id
+
+    launch_id = (os.environ.get("CODEX_SESSION_ID") or "").strip()
+    record = load_registry_by_session_id(launch_id) if launch_id else None
+    inventory = read_inventory(record or {})
+    sessions = [s for s in inventory.sessions if s.provider == "codex"] if inventory.valid else []
+    if live_id:
+        sessions = [s for s in sessions if s.live_id == live_id]
+        if not sessions:
+            print(f"[ERROR] Unknown Codex live id: {live_id}", file=sys.stderr)
+            return 1
+    elif len([s for s in sessions if s.active]) < 2:
+        print("[ERROR] Paired Codex session registry unavailable", file=sys.stderr)
+        return 1
+    from live_roles import roles_for_record
+    roles = roles_for_record(record or {})
+    healthy_all = True
+    for session in sessions:
+        if not session.active:
+            healthy, message = False, "session inactive"
+        else:
+            try:
+                session_file = Path(explicit_session_file or session.session_file).expanduser()
+                old_session_file = os.environ.get("CCB_SESSION_FILE")
+                try:
+                    os.environ["CCB_SESSION_FILE"] = str(session_file)
+                    from codex_comm import CodexCommunicator
+                    healthy, message = CodexCommunicator().ping(display=False)
+                finally:
+                    if old_session_file is None:
+                        os.environ.pop("CCB_SESSION_FILE", None)
+                    else:
+                        os.environ["CCB_SESSION_FILE"] = old_session_file
+            except Exception as exc:
+                healthy, message = False, f"❌ Codex connectivity test failed: {exc}"
+        role = roles.get(session.live_id, "")
+        role_label = f", {role}" if role else ""
+        print(f"{session.live_id} ({session.pane_id or 'no pane'}{role_label}): {message}")
+        healthy_all = healthy_all and healthy
+    try:
+        queue_work_dir = work_dir if explicit_session_file else resolve_daemon_work_dir(work_dir)
+    except Exception:
+        queue_work_dir = work_dir
+    return _finish("codex", queue_work_dir, healthy_all)
 
 
 if __name__ == "__main__":

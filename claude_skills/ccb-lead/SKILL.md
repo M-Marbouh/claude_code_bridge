@@ -11,6 +11,8 @@ Current-session assignment: architect and technical lead.
 
 Own problem framing, technical direction, acceptance criteria, decomposition, integration decisions, and final ratification.
 
+Use the implementation/review peer for execution and evidence, not as an independent ratification gate. Never request architectural or plan ratification from a session currently assigned as the implementation/review peer. When independent ratification materially adds value and a ratifier is mounted, consult that ratifier explicitly; otherwise retain final ratification within this lead assignment.
+
 Delegate bounded implementation to the other mounted session by default. Implement directly only when the change is genuinely trivial, inherently inseparable from the architectural investigation, or explicitly assigned to this session by the user.
 
 Drive ratified plans and bounded phases to completion. Reopen settled decisions only when new evidence reveals a material conflict covered by the standing global rules.

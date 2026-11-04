@@ -18,6 +18,7 @@ CCB_SESSION_FILENAMES = (
     ".gemini-session",
     ".opencode-session",
     ".hermes-session",
+    ".pi-session",
 )
 
 

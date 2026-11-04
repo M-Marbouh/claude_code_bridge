@@ -1626,6 +1626,67 @@ def test_recover_reads_the_exact_recorded_codex_conversation_not_the_replacement
     assert pend._recover_provider_reply(receipt) == "Original reply."
 
 
+def test_pi_routed_recovery_reads_only_the_recorded_session(tmp_path: Path) -> None:
+    pend = _load_pend_module()
+    fixture = ROOT / "test" / "fixtures" / "pi" / "s8_pair_b.jsonl"
+    header = json.loads(fixture.read_text(encoding="utf-8").splitlines()[0])
+    session_id = header["id"]
+    transcript = tmp_path / f"2026-11-04T00-00-00.000Z_{session_id}.jsonl"
+    transcript.write_bytes(fixture.read_bytes())
+    receipt = {
+        "task_id": "s8-b",
+        "provider": "pi",
+        "work_dir": str(tmp_path),
+        "route_launch_id": "launch-pi",
+        "destination_transcript_path": str(transcript),
+        "destination_conversation_id": session_id,
+    }
+    reply = pend._recover_provider_reply(receipt)
+    assert reply is not None
+    assert reply.strip() == "PANEB"
+
+
+def test_pi_recovery_works_without_a_route_launch_id(tmp_path: Path) -> None:
+    pend = _load_pend_module()
+    fixture = ROOT / "test" / "fixtures" / "pi" / "s8_pair_b.jsonl"
+    session_id = json.loads(fixture.read_text(encoding="utf-8").splitlines()[0])["id"]
+    transcript = tmp_path / f"2026-11-04T00-00-00.000Z_{session_id}.jsonl"
+    transcript.write_bytes(fixture.read_bytes())
+    receipt = {
+        "task_id": "s8-b", "provider": "pi", "work_dir": str(tmp_path),
+        "destination_transcript_path": str(transcript),
+        "destination_conversation_id": session_id,
+    }
+    assert pend._is_routed_receipt(receipt) is False
+    assert pend._recover_provider_reply(receipt) == "PANEB"
+
+
+def test_pi_recovery_uses_completed_request_branch_after_tree_navigation(tmp_path: Path) -> None:
+    pend = _load_pend_module()
+    fixture = ROOT / "test" / "fixtures" / "pi" / "s5b_tree_branch.jsonl"
+    session_id = json.loads(fixture.read_text(encoding="utf-8").splitlines()[0])["id"]
+    transcript = tmp_path / f"2026-11-04T00-00-00.000Z_{session_id}.jsonl"
+    receipt = {
+        "task_id": "s5b-1", "provider": "pi", "work_dir": str(tmp_path),
+        "route_launch_id": "launch-pi",
+        "destination_transcript_path": str(transcript),
+        "destination_conversation_id": session_id,
+    }
+    rows = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]
+    completion_index = next(
+        index for index, row in enumerate(rows)
+        if row.get("type") == "message"
+        and row.get("message", {}).get("role") == "assistant"
+        and "CCB_DONE: s5b-1" in " ".join(
+            part.get("text", "") for part in row["message"].get("content", []) if isinstance(part, dict)
+        )
+    )
+    transcript.write_text("".join(json.dumps(row) + "\n" for row in rows[:completion_index + 1]))
+    assert pend._recover_from_recorded_conversation(receipt, "pi") == "BETA"
+    transcript.write_bytes(fixture.read_bytes())
+    assert pend._recover_from_recorded_conversation(receipt, "pi") == "BETA"
+
+
 def test_routed_recovery_renders_inline_final_without_marker(tmp_path: Path, monkeypatch, capsys) -> None:
     pend = _load_pend_module()
     req_id = "20260928-200214-383-2702627"

@@ -20,7 +20,7 @@ sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
 from askd.adapters.base import ResolvedRoute, route_session_key
-from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply
+from ccb_protocol import REQ_ID_PREFIX, is_done_text, select_codex_reply, strip_done_text
 from ccb_runtime_status import daemon_queue_status
 from claude_comm import ClaudeLogReader, _extract_message
 from codex_comm import CodexLogReader
@@ -52,6 +52,7 @@ PROVIDER_PENDS = {
     "opencode": "opend",
     "claude": "lpend",
     "hermes": "",
+    "pi": "",
 }
 TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-\d{3}-\d+(?:-\d+)?$")
 PEER_PROVIDERS = {
@@ -93,8 +94,8 @@ class OverlayItem:
 
 
 def _legacy_pend(provider: str, extra: list[str]) -> int:
-    if provider == "hermes":
-        print("[ERROR] Hermes legacy overlay is unavailable; use an exact task ID or normal pend routing.", file=sys.stderr)
+    if provider in {"hermes", "pi"}:
+        print(f"[ERROR] {provider.capitalize()} legacy overlay is unavailable; use an exact task ID or normal pend routing.", file=sys.stderr)
         return EXIT_ERROR
     pend_path = script_dir / PROVIDER_PENDS[provider]
     if not pend_path.exists():
@@ -606,6 +607,22 @@ def _recover_from_recorded_conversation(receipt: dict, provider: str) -> str | N
     receipt -- see `_recover_provider_reply`.
     """
     task_id = str(receipt.get("task_id") or "").strip()
+    if provider == "pi":
+        transcript_path = str(receipt.get("destination_transcript_path") or "").strip()
+        conversation_id = str(receipt.get("destination_conversation_id") or "").strip()
+        if not task_id or not transcript_path or not conversation_id:
+            return None
+        try:
+            from pi_comm import load_session
+
+            path = Path(transcript_path).expanduser()
+            session = load_session(path.parent, conversation_id)
+            if session.path.resolve() != path.resolve():
+                return None
+            exchange = session.completed_exchange(task_id)
+            return strip_done_text(exchange.reply, task_id) if exchange.state == "completed" else None
+        except Exception:
+            return None
     if provider == "hermes":
         database_path = str(receipt.get("destination_database_path") or "").strip()
         conversation_id = str(receipt.get("destination_conversation_id") or "").strip()
@@ -720,13 +737,15 @@ def _recover_provider_reply(receipt: dict) -> str | None:
     wide marker scan, exactly as it always has.
     """
     provider = str(receipt.get("provider") or "").strip().lower()
-    if provider not in {"codex", "claude", "hermes"}:
+    if provider not in {"codex", "claude", "hermes", "pi"}:
         return None
     if _is_routed_receipt(receipt):
         return _recover_from_recorded_conversation(receipt, provider)
     if provider == "codex":
         return _recover_codex_reply(receipt)
     if provider == "hermes":
+        return _recover_from_recorded_conversation(receipt, provider)
+    if provider == "pi":
         return _recover_from_recorded_conversation(receipt, provider)
     return None
 

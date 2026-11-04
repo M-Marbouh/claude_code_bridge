@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, claude, hermes
+    gemini, codex, opencode, claude, hermes, pi
 
 Modes:
     Default (async):  Background task with hook callback
@@ -36,6 +36,7 @@ from typing import NamedTuple
 PROVIDER_DISPLAY = {
     "opencode": "OpenCode",
     "hermes": "Hermes",
+    "pi": "Pi",
 }
 
 
@@ -129,6 +130,7 @@ PROVIDER_DAEMONS = {
     "claude": "lask",
     # Hermes runs through the unified askd adapter and has no provider daemon.
     "hermes": "",
+    "pi": "",
 }
 
 PEER_PROVIDERS = {"claude", "codex"}
@@ -158,7 +160,7 @@ _PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-\d{3}-[1-9]\d*$")
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual"}
-UNIFIED_NOTIFY_PROVIDERS = PEER_PROVIDERS | {"hermes"}
+UNIFIED_NOTIFY_PROVIDERS = PEER_PROVIDERS | {"hermes", "pi"}
 
 
 class _UnifiedDaemonContext(NamedTuple):
@@ -856,7 +858,7 @@ def _usage() -> None:
     print("       ask --peer <target> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, claude, hermes", file=sys.stderr)
+    print("  gemini, codex, opencode, claude, hermes, pi", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)
@@ -1586,8 +1588,8 @@ def main(argv: list[str]) -> int:
 
     daemon_cmd = PROVIDER_DAEMONS[raw_provider]
     provider = raw_provider
-    if provider == "hermes" and not _use_unified_daemon():
-        print("[ERROR] Hermes requires the unified askd daemon", file=sys.stderr)
+    if provider in {"hermes", "pi"} and not _use_unified_daemon():
+        print(f"[ERROR] {display_name(provider)} requires the unified askd daemon", file=sys.stderr)
         return EXIT_ERROR
 
     # Parse remaining arguments

@@ -13,4 +13,5 @@ __all__ = [
     "OpenCodeAdapter",
     "ClaudeAdapter",
     "HermesAdapter",
+    "PiAdapter",
 ]

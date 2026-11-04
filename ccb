@@ -52,7 +52,7 @@ from session_utils import (
 )
 from pane_registry import upsert_registry, load_registry_by_project_id, load_registry_by_session_id, read_inventory_for_record
 from project_id import compute_ccb_project_id
-from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, HASK_CLIENT_SPEC
+from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, HASK_CLIENT_SPEC, PI_CLIENT_SPEC
 from process_lock import ProviderLock
 from askd_rpc import shutdown_daemon, read_state
 from askd_runtime import state_file_path
@@ -768,7 +768,7 @@ class AILauncher:
         if not cfg.is_dir():
             return
 
-        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".hermes-session"):
+        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".hermes-session", ".pi-session"):
             legacy = self.project_root / name
             if not legacy.exists():
                 continue
@@ -937,7 +937,7 @@ class AILauncher:
     def _maybe_start_unified_askd(self, *, quiet: bool = False) -> None:
         """Start unified askd daemon (provider-agnostic)."""
         # Try to start for any enabled provider that uses askd (including claude)
-        for provider in ["codex", "gemini", "opencode", "claude", "hermes"]:
+        for provider in ["codex", "gemini", "opencode", "claude", "hermes", "pi"]:
             if provider in [p.lower() for p in self.providers]:
                 # Try to start and check if successful
                 self._maybe_start_provider_daemon(provider, quiet=quiet)
@@ -976,6 +976,7 @@ class AILauncher:
             "opencode": OASK_CLIENT_SPEC,
             "claude": LASK_CLIENT_SPEC,
             "hermes": HASK_CLIENT_SPEC,
+            "pi": PI_CLIENT_SPEC,
         }
         spec = specs.get(provider)
         if not spec:
@@ -1433,6 +1434,8 @@ class AILauncher:
             return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction)
         elif provider == "hermes":
             return self._start_hermes_tmux(parent_pane=parent_pane, direction=direction)
+        elif provider == "pi":
+            return self._start_pi_tmux(parent_pane=parent_pane, direction=direction)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -1487,6 +1490,8 @@ class AILauncher:
             self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         elif provider == "hermes":
             self._write_hermes_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+        elif provider == "pi":
+            self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -2126,6 +2131,15 @@ class AILauncher:
             command = ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd())
         elif provider == "hermes":
             command = ShellAgentCommand(prelude="", agent_command="hermes --cli --no-restore-cwd")
+        elif provider == "pi":
+            session_id, session_dir = self._pi_binding()
+            command = ShellAgentCommand(
+                prelude="",
+                agent_command=(
+                    f"pi --no-approve --session-id {shlex.quote(session_id)} "
+                    f"--session-dir {shlex.quote(str(session_dir))}"
+                ),
+            )
         else:
             command = ShellAgentCommand(prelude="", agent_command="")
         # Append per-provider launch_args from config.
@@ -2647,6 +2661,99 @@ class AILauncher:
         self._auto_prune_session_records()
         return True
 
+    def _pi_binding(self) -> tuple[str, Path]:
+        session_id = getattr(self, "_pi_session_id", "")
+        session_dir = getattr(self, "_pi_session_dir", None)
+        if session_id and session_dir:
+            return session_id, Path(session_dir)
+        session_id = str(uuid.uuid4())
+        agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR") or (Path.home() / ".pi" / "agent")).expanduser()
+        project_id = compute_ccb_project_id(self.project_root)
+        session_dir = agent_dir / "sessions" / f"ccb-{project_id}"
+        self._pi_session_id = session_id
+        self._pi_session_dir = session_dir
+        return session_id, session_dir
+
+    def _write_pi_session(self, runtime, pane_id=None, pane_title_marker=None, start_cmd=None):
+        session_file = self._project_session_file(".pi-session")
+        writable, reason, fix = check_session_writable(session_file)
+        if not writable:
+            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
+            print(f"💡 Fix: {fix}", file=sys.stderr)
+            return False
+        pi_session_id, pi_session_dir = self._pi_binding()
+        work_dir = self.project_root
+        data = {
+            "session_id": self.session_id,
+            "ccb_project_id": compute_ccb_project_id(work_dir),
+            "runtime_dir": str(runtime),
+            "terminal": self.terminal_type,
+            "tmux_session": None,
+            "pane_id": pane_id,
+            "pane_title_marker": pane_title_marker,
+            "work_dir": str(work_dir),
+            "start_dir": str(self.invocation_dir),
+            "active": True,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_cmd": str(start_cmd) if start_cmd else "pi --no-approve",
+            "pi_session_id": pi_session_id,
+            "pi_session_dir": str(pi_session_dir),
+            "ccb_managed_launch": True,
+            "ccb_launch_caller": "pi",
+            "ccb_launch_provider": "pi",
+        }
+        if self._live_slots:
+            data["live_id"] = self._live_slots[self._launch_slot]
+        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+        if not ok:
+            print(err, file=sys.stderr)
+            return False
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(work_dir),
+                "work_dir": str(work_dir),
+                "terminal": self.terminal_type,
+                "providers": {"pi": {"pane_id": pane_id, "pane_title_marker": pane_title_marker, "session_file": str(session_file)}},
+            })
+        except Exception:
+            pass
+        self._maybe_start_provider_daemon("pi")
+        self._auto_prune_session_records()
+        return True
+
+    def _start_pi_tmux(self, *, parent_pane=None, direction=None):
+        runtime = self._provider_runtime("pi")
+        runtime.mkdir(parents=True, exist_ok=True)
+        start_cmd = self._build_env_prefix(self._provider_env_overrides("pi")) + _build_export_path_cmd(self.script_dir / "bin") + self._compose_agent_shell("pi", self._get_start_cmd("pi"))
+        pane_title_marker = self._provider_marker("pi")
+        backend = TmuxBackend()
+        use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
+        use_parent = parent_pane or backend.get_current_pane_id()
+        pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
+        backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
+        backend.set_pane_title(pane_id, pane_title_marker)
+        backend.set_pane_user_option(pane_id, "@ccb_agent", "Pi")
+        self.tmux_panes["pi"] = pane_id
+        if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd):
+            return None
+        print(f"✅ {t('started_backend', provider='Pi', terminal='tmux pane', pane_id=pane_id)}")
+        return pane_id
+
+    def _start_pi_current_pane(self):
+        runtime = self._provider_runtime("pi")
+        runtime.mkdir(parents=True, exist_ok=True)
+        pane_id = self._current_pane_id()
+        marker = self._provider_marker("pi")
+        if self.terminal_type == "tmux" and pane_id:
+            backend = TmuxBackend()
+            backend.set_pane_title(pane_id, marker)
+            backend.set_pane_user_option(pane_id, "@ccb_agent", "Pi")
+        start_cmd = self._build_env_prefix(self._provider_env_overrides("pi")) + _build_export_path_cmd(self.script_dir / "bin") + self._compose_agent_shell("pi", self._get_start_cmd("pi"))
+        if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=marker, start_cmd=start_cmd):
+            return 1
+        return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
+
     def _start_cmd_pane(
         self,
         *,
@@ -2918,6 +3025,8 @@ class AILauncher:
             return self._start_opencode_current_pane()
         if provider == "hermes":
             return self._start_hermes_current_pane()
+        if provider == "pi":
+            return self._start_pi_current_pane()
         print(f"❌ {t('unknown_provider', provider=provider)}")
         return 1
 
@@ -3977,7 +4086,7 @@ def cmd_start(args):
 def _find_all_zombie_sessions() -> list[dict]:
     """Find all zombie tmux sessions (CCB sessions whose parent process is dead)."""
     import re
-    pattern = re.compile(r"^(codex|gemini|opencode|claude|hermes)-(\d+)-")
+    pattern = re.compile(r"^(codex|gemini|opencode|claude|hermes|pi)-(\d+)-")
     zombies = []
 
     if os.name == "nt" or not shutil.which("tmux"):
@@ -4528,7 +4637,7 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     Preserves order and provider occurrences.
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "hermes"}
+    allowed = {"codex", "gemini", "opencode", "claude", "hermes", "pi"}
     raw_parts = _split_provider_tokens(values)
 
     if not raw_parts:
@@ -4544,8 +4653,8 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     if unknown and not allow_unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude hermes  (spaces)  or  ccb codex,gemini,opencode,claude,hermes  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, hermes", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude hermes pi  (spaces)  or  ccb codex,gemini,opencode,claude,hermes,pi  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, hermes, pi", file=sys.stderr)
         return []
 
     error = provider_pairing_error(parsed)
@@ -4560,7 +4669,7 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
     Parse providers from argv and treat "cmd" as a separate flag.
     Returns (providers, cmd_enabled, valid).
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "hermes"}
+    allowed = {"codex", "gemini", "opencode", "claude", "hermes", "pi"}
     raw_parts = _split_provider_tokens(values)
     if not raw_parts:
         return [], False, True
@@ -4580,8 +4689,8 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool, bool]
 
     if unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude hermes cmd  (spaces)  or  ccb codex,gemini,opencode,claude,hermes,cmd  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, hermes, cmd", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude hermes pi cmd  (spaces)  or  ccb codex,gemini,opencode,claude,hermes,pi,cmd  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, hermes, pi, cmd", file=sys.stderr)
         return [], cmd_enabled, False
 
     error = provider_pairing_error(parsed)
@@ -5318,7 +5427,7 @@ def main():
         subparsers = parser.add_subparsers(dest="command", help="Subcommands")
 
         kill_parser = subparsers.add_parser("kill", help="Terminate session or clean up zombies")
-        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude/hermes)")
+        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude/hermes/pi)")
         kill_parser.add_argument("--daemon", action="store_true", help="Also stop the shared askd daemon when ownership checks allow it")
         kill_parser.add_argument("-f", "--force", action="store_true", help="Clean up all zombie tmux sessions globally")
         kill_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt (with -f)")
@@ -5368,7 +5477,7 @@ def main():
     start_parser.add_argument(
         "providers",
         nargs="*",
-        help="Backends to start (space or comma separated): codex, gemini, opencode, claude, hermes (codex may appear twice; add cmd for a shell pane)",
+        help="Backends to start (space or comma separated): codex, gemini, opencode, claude, hermes, pi (codex may appear twice; add cmd for a shell pane)",
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context (unique-provider launches only)")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")

@@ -35,11 +35,13 @@ cd ~/dev/my-project
 ccb codex claude
 ```
 
-Available providers are `claude`, `codex`, `gemini`, and `opencode`. Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work. A project may run any subset:
+Available providers are `claude`, `codex`, `gemini`, `opencode`, `hermes`, and `pi`. Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work. A project may run any subset:
 
 ```bash
 ccb codex claude gemini opencode
 ```
+
+Pi is opt-in and is not added to the default provider list. Pi runs tools without approval; this is Pi behavior and is not enabled by `--no-approve`. CCB passes `--no-approve` to make Pi skip protected project resources; it does not provide a sandbox. CCB does not support in-pane `/tree`, `/new`, or `/resume` navigation while it manages the pane, because those actions can change the active branch or session and invalidate exact-request recovery.
 
 Starting another CCB session for the same directory reuses the existing provider pane when possible and otherwise fails clearly. Qualified names such as `codex:worker` are rejected.
 
@@ -227,6 +229,7 @@ ccb version
 ## Fork changes
 
 - `Unreleased` — added independent `ccb codex codex` pairing with contextual sibling routing, exact live-session receipts and completion delivery, preserved cross-project peer behavior, provider-neutral role guidance, and explicit ambiguity failures.
+- `Unreleased` — added opt-in Pi pane launch and request/reply support through Pi's versioned session transcript.
 
 - `0.13.1` — hardened peer routing and failure reporting, restored exact `pend` overlays, bounded agent-visible replies, persisted delivery evidence, and added explicit reply-artifact cleanup.
 - `0.13.0` — replaced relay-style review roles with symmetric mutual ratification and moved managed Codex guidance to the real global `${CODEX_HOME:-~/.codex}/AGENTS.md` target.

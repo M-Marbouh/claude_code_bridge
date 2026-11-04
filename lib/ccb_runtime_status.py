@@ -36,7 +36,7 @@ from project_id import compute_ccb_project_id
 from session_utils import find_project_session_file
 
 
-SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode", "hermes")
+SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode", "hermes", "pi")
 SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
 
 

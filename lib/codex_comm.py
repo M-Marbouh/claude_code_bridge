@@ -82,6 +82,8 @@ def _extract_cwd_from_log_file(log_path: Path) -> Optional[str]:
 def _handle_codex_log_event(path: Path) -> None:
     if not path or not path.exists() or path.suffix != ".jsonl":
         return
+    if _codex_log_is_descendant(path):
+        return
     cwd = _extract_cwd_from_log_file(path)
     if not cwd:
         return
@@ -104,6 +106,34 @@ def _handle_codex_log_event(path: Path) -> None:
         session.update_codex_log_binding(log_path=str(path), session_id=session_id)
     except Exception:
         return
+
+
+def _codex_log_is_descendant(log_path: Path) -> bool:
+    """Reject descendant transcripts when choosing or binding a conversation.
+
+    Native subagent rollouts share their parent's cwd and may quote the parent's
+    request anchor, so they are not the conversation CCB addressed. Only
+    positive evidence rejects a candidate; older rollouts without these fields
+    remain eligible.
+    """
+    try:
+        with Path(log_path).open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(50):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+                    continue
+                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                source = payload.get("source")
+                return bool(payload.get("parent_thread_id") or (isinstance(source, dict) and "subagent" in source))
+    except Exception:
+        pass
+    return False
 
 
 def _ensure_codex_watchdog_started() -> None:
@@ -583,7 +613,7 @@ class CodexLogReader:
         """
         Like _read_since(), but returns structured (role, text, phase) events.
 
-        Role is one of: "user", "assistant". See _extract_event for phase values.
+        Role is one of: "user", "assistant", "turn". See _extract_event for phase values.
         """
         deadline = time.time() + timeout
         current_path = self._normalize_path(state.get("log_path"))
@@ -781,6 +811,18 @@ class CodexLogReader:
           - "" for user messages
         Callers that want only the final report should keep phase=="final_answer".
         """
+        if entry.get("type") == "event_msg" and isinstance(entry.get("payload"), dict):
+            payload = entry["payload"]
+            kind = payload.get("type")
+            if kind == "task_started":
+                attribution = payload.get("turn_attribution")
+                turn_id = payload.get("turn_id") or (attribution.get("turn_id") if isinstance(attribution, dict) else None)
+                if isinstance(turn_id, str) and turn_id:
+                    return "turn", turn_id, "task_started"
+            if kind in ("task_complete", "turn_aborted"):
+                turn_id = payload.get("turn_id")
+                if isinstance(turn_id, str) and turn_id:
+                    return "turn", turn_id, kind
         user_msg = cls._extract_user_message(entry)
         if isinstance(user_msg, str) and user_msg.strip():
             return "user", user_msg.strip(), ""

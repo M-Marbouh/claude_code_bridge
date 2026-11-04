@@ -8,7 +8,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Protocol, TypeVar
+from typing import Any, Callable, Optional, Protocol, TypeVar
 
 from providers import ProviderDaemonSpec
 
@@ -296,6 +296,7 @@ class QueuedTask:
     # Adapter-reported progress of the in-flight task (phase, timestamps),
     # read by the daemon's queue status so a stuck queue is visible.
     progress: dict = field(default_factory=dict)
+    has_actionable_waiting: Optional[Callable[[], bool]] = None
 
 
 class BaseProviderAdapter(ABC):

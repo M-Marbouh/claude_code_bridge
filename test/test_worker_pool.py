@@ -609,3 +609,57 @@ def test_submit_refuses_duplicate_pool_route_missing_caller_evidence_via_real_va
     assert "unknown_caller" in task.result.reply
     # NO TERMINAL SEND OCCURRED: never reached the adapter.
     assert adapter.started == []
+
+
+def test_session_worker_exposes_only_actionable_waiting_tasks():
+    from askd.daemon import _SessionWorker
+
+    class _QueuedAdapter(_RouteAwareAdapter):
+        def __init__(self):
+            super().__init__()
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.waiting_checks: list[bool] = []
+
+        def handle_task(self, task):
+            self.started.append(task.req_id)
+            if task.req_id == "first":
+                self.first_started.set()
+                while not self.release_first.is_set():
+                    self.waiting_checks.append(bool(task.has_actionable_waiting()))
+                    time.sleep(0.01)
+            self.finished.append(task.req_id)
+            return ProviderResult(exit_code=0, reply="ok", req_id=task.req_id,
+                                  session_key="codex:test", done_seen=True)
+
+    adapter = _QueuedAdapter()
+    worker = _SessionWorker("codex:test", adapter)
+    def make_task(req_id):
+        request = ProviderRequest(client_id=req_id, work_dir="/tmp/test-project", timeout_s=5,
+                                  quiet=True, message="message", caller="claude", req_id=req_id)
+        return QueuedTask(request=request, created_ms=0, req_id=req_id,
+                          done_event=threading.Event(), cancel_event=threading.Event())
+
+    first, cancelled, next_task = make_task("first"), make_task("cancelled"), make_task("next")
+    cancelled.cancelled = True
+    cancelled.cancel_event.set()
+    worker.start()
+    try:
+        worker.enqueue(first)
+        assert adapter.first_started.wait(1)
+        worker.enqueue(cancelled)
+        time.sleep(0.05)
+        assert adapter.waiting_checks and not any(adapter.waiting_checks)
+        worker.enqueue(next_task)
+        deadline = time.time() + 1
+        while not any(adapter.waiting_checks) and time.time() < deadline:
+            time.sleep(0.01)
+        assert any(adapter.waiting_checks)
+        adapter.release_first.set()
+        assert first.done_event.wait(1)
+        assert next_task.done_event.wait(1)
+        assert adapter.started == ["first", "next"]
+    finally:
+        adapter.release_first.set()
+        worker.stop()
+        worker.join(timeout=2)

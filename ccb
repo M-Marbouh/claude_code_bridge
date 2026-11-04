@@ -699,6 +699,16 @@ class AILauncher:
             marker += "-" + self._live_slots[self._launch_slot]
         return marker
 
+    def _claude_marker(self) -> str:
+        if self.terminal_type == "tmux" and self.anchor_provider == "claude" and self._live_slots:
+            return self._provider_marker("claude")
+        return f"CCB-Claude-{self.project_id[:8]}"
+
+    def _claude_live_id(self) -> str | None:
+        if self.terminal_type == "tmux" and self.anchor_provider == "claude" and self._live_slots:
+            return self._live_slots[self._launch_slot]
+        return None
+
     def _publish_live_inventory(self) -> bool:
         if not self._live_slots:
             return True
@@ -1603,6 +1613,7 @@ class AILauncher:
         pane_id: str | None = None,
         pane_title_marker: str | None = None,
         terminal: str | None = None,
+        live_id: str | None = None,
     ) -> None:
         path = self._claude_session_file()
         writable, reason, fix = check_session_writable(path)
@@ -1623,6 +1634,10 @@ class AILauncher:
             data["ccb_project_id"] = data.get("ccb_project_id")
         data["work_dir"] = str(work_dir)
         data["work_dir_norm"] = _normalize_path_for_match(str(work_dir))
+        if live_id:
+            data["live_id"] = live_id
+        else:
+            data.pop("live_id", None)
         data["start_dir"] = str(self.invocation_dir)
         data["terminal"] = terminal or self.terminal_type
         data["active"] = bool(active)
@@ -3360,7 +3375,7 @@ class AILauncher:
             ShellAgentCommand(prelude="", agent_command=" ".join(cmd_parts)),
         )
         full_cmd = (
-            _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
+            _build_pane_title_cmd(self._claude_marker())
             + self._build_env_prefix(env_overrides)
             + _build_export_path_cmd(self.script_dir / "bin")
             + start_cmd
@@ -3377,7 +3392,7 @@ class AILauncher:
             backend = TmuxBackend()
             pane_id = backend.create_pane("", run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
             backend.respawn_pane(pane_id, cmd=full_cmd, cwd=run_cwd, remain_on_exit=True)
-            backend.set_pane_title(pane_id, f"CCB-Claude-{self.project_id[:8]}")
+            backend.set_pane_title(pane_id, self._claude_marker())
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
             self.tmux_panes["claude"] = pane_id
 
@@ -3386,8 +3401,9 @@ class AILauncher:
                 session_id=self._read_local_claude_session_id(),
                 active=True,
                 pane_id=str(pane_id or ""),
-                pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
+                pane_title_marker=self._claude_marker(),
                 terminal=self.terminal_type,
+                live_id=self._claude_live_id(),
             )
         except Exception:
             pass
@@ -3630,8 +3646,9 @@ class AILauncher:
                     session_id=self._read_local_claude_session_id(),
                     active=True,
                     pane_id=str(self.anchor_pane_id or ""),
-                    pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
+                    pane_title_marker=self._claude_marker(),
                     terminal=self.terminal_type,
+                    live_id=self._claude_live_id(),
                 )
             except Exception:
                 pass

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from ccb_start_config import normalize_start_config_data, provider_pairing_error
 from live_sessions import read_inventory, resolve_local_target
+import pane_registry
 from pane_registry import load_registry_by_session_id
 from test_ccb_agent_composition import _load_ccb_module
 
@@ -69,7 +70,63 @@ def test_unique_provider_keeps_legacy_paths_and_marker(monkeypatch, tmp_path):
     assert launcher._provider_runtime("codex") == launcher.runtime_dir / "codex"
     assert launcher._project_session_file(".codex-session") == tmp_path / ".ccb" / ".codex-session"
     assert launcher._provider_marker("codex") == f"CCB-Codex-{launcher.project_id[:8]}"
+    assert launcher._provider_marker("claude") == f"CCB-Claude-{launcher.project_id[:8]}"
+    assert launcher._claude_marker() == f"CCB-Claude-{launcher.project_id[:8]}"
     assert "CCB_LIVE_ID" not in launcher._provider_env_overrides("codex")
+
+
+def test_claude_live_slot_uses_suffixed_marker_and_binding(monkeypatch, tmp_path):
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir()
+    launcher = ccb.AILauncher(providers=["codex", "codex", "claude"])
+    launcher._launch_slot = 2
+    launcher.anchor_provider = "claude"
+    marker = launcher._provider_marker("claude")
+    live_id = launcher._live_slots[2]
+    assert marker == f"CCB-Claude-{launcher.project_id[:8]}-{live_id}"
+
+    launcher._write_local_claude_session(
+        pane_id="%2", pane_title_marker=marker, terminal="tmux", live_id=live_id
+    )
+    binding = launcher._read_json_file(launcher._claude_session_file())
+    assert binding["pane_title_marker"] == marker
+    assert binding["live_id"] == live_id
+
+
+def test_wezterm_claude_anchor_keeps_short_marker_without_live_id(monkeypatch, tmp_path):
+    ccb = _load_ccb_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ccb").mkdir()
+    launcher = ccb.AILauncher(providers=["codex", "codex", "claude"])
+    launcher.anchor_provider = "claude"
+    launcher.terminal_type = "wezterm"
+    assert launcher._claude_marker() == f"CCB-Claude-{launcher.project_id[:8]}"
+    assert launcher._claude_live_id() is None
+
+
+def test_claude_route_requires_exact_suffixed_marker_after_title_overwrite(monkeypatch):
+    class _Backend:
+        def is_alive(self, pane_id):
+            return pane_id == "%2"
+
+        def find_pane_by_title_marker(self, marker, _work_dir):
+            # Simulates tmux matching its stable option after Claude changes
+            # the visible pane title.
+            return "%2" if marker == expected else None
+
+    expected = "CCB-Claude-project-live-slot"
+    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _data: _Backend())
+    base = {"terminal": "tmux", "work_dir": ".", "providers": {"claude": {
+        "pane_id": "%2", "pane_title_marker": expected}}}
+    assert pane_registry._provider_pane_alive(base, "claude")
+
+    for marker, pane_id in (("CCB-Claude-project", "%2"),
+                            ("CCB-Claude-project-wrong", "%2"),
+                            (expected, "%3")):
+        candidate = {"terminal": "tmux", "work_dir": ".", "providers": {"claude": {
+            "pane_id": pane_id, "pane_title_marker": marker}}}
+        assert not pane_registry._provider_pane_alive(candidate, "claude")
 
 
 @pytest.mark.parametrize("tokens", [["codex", "codex"], ["codex,codex"], ["codex", "claude"], ["claude", "codex"]])

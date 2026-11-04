@@ -100,7 +100,16 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
             # the send target, never an adapter's mutable provider default.
             from peer_routing import send_peer_message
             return send_peer_message(task, self.adapter.key, self.session_key)
+        task.has_actionable_waiting = self._has_actionable_waiting
         return self.adapter.handle_task(task)
+
+    def _has_actionable_waiting(self) -> bool:
+        with self._q.mutex:
+            return any(
+                not getattr(task, "cancelled", False)
+                and not (getattr(task, "cancel_event", None) and task.cancel_event.is_set())
+                for task in self._q.queue
+            )
 
     def _handle_exception(self, exc: Exception, task: QueuedTask) -> ProviderResult:
         _write_log(f"[ERROR] provider={self.adapter.key} session={self.session_key} req_id={task.req_id} {exc}")

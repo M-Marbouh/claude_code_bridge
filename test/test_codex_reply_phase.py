@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import caskd_session
+import codex_comm
 from askd.adapters import codex as codex_adapter
 from askd.adapters.base import ProviderRequest, QueuedTask, ResolvedRoute
 from ccb_protocol import DONE_PREFIX, REQ_ID_PREFIX, make_req_id
@@ -71,6 +72,20 @@ def test_extract_event_user_has_empty_phase() -> None:
     role, _, phase = CodexLogReader._extract_event(_user_message("a question"))
     assert role == "user"
     assert phase == ""
+
+
+def test_extracts_turn_lifecycle_events_without_changing_message_contract() -> None:
+    started = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-a",
+        "turn_attribution": {"turn_id": "turn-a", "turn_trigger": "user", "parent_turn_id": None}}}
+    complete = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-a",
+        "root_turn_id": "root-a"}}
+    aborted = {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": "turn-a",
+        "reason": "interrupted"}}
+    assert CodexLogReader._extract_event(started) == ("turn", "turn-a", "task_started")
+    assert CodexLogReader._extract_event(complete) == ("turn", "turn-a", "task_complete")
+    assert CodexLogReader._extract_event(aborted) == ("turn", "turn-a", "turn_aborted")
+    assert CodexLogReader._extract_event({"type": "event_msg", "payload": {
+        "type": "task_complete", "root_turn_id": "root-a"}}) is None
 
 
 # --------------------------------------------------------------------------
@@ -206,6 +221,7 @@ def _drive_handle_task(
     idle_timeout_s: float | None = None,
     max_wait_s: float | None = None,
     reader_factory=None,
+    has_actionable_waiting=None,
 ):
     # Prepend the user anchor so anchor_seen flips before assistant events.
     scripted = list(events)
@@ -237,9 +253,350 @@ def _drive_handle_task(
         caller_work_dir=caller_work_dir,
     )
     task = QueuedTask(request=req, created_ms=0, req_id=req_id, done_event=threading.Event())
+    task.has_actionable_waiting = has_actionable_waiting
 
     adapter = codex_adapter.CodexAdapter()
     return adapter.handle_task(task)
+
+
+def test_matching_task_complete_releases_unmarked_final_and_marker_wins(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    final = "Final report."
+    terminal = [("turn", "turn-own", "task_started"),
+                ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                ("assistant", final, "final_answer"),
+                ("turn", "turn-own", "task_complete")]
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, terminal, include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=5, max_wait_s=10)
+    assert result.exit_code == 2
+    assert result.done_seen is False
+    assert result.reply.startswith(final)
+    assert "turn ended without CCB_DONE" in result.reply
+
+    marked = [("turn", "turn-own", "task_started"),
+              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+              ("assistant", f"{final}\nCCB_DONE: {req_id}", "final_answer"),
+              ("turn", "turn-own", "task_complete")]
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, marked, include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=5, max_wait_s=10)
+    assert result.done_seen is True
+    assert result.exit_code == 0
+
+
+def test_stale_turn_complete_does_not_release_anchored_turn(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    events = [("turn", "turn-own", "task_started"),
+              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+              ("turn", "turn-stale", "task_complete"),
+              ("assistant", "Still working", "commentary")]
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, events, include_anchor=False, timeout_s=0.05,
+                                timeout_explicit=False, idle_timeout_s=5, max_wait_s=10)
+    assert result.exit_code == 2
+    assert "turn ended without CCB_DONE" not in result.reply
+
+
+def test_unknown_anchor_turn_id_uses_idle_fallback(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.06")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "1")
+    result = _drive_handle_task(
+        monkeypatch, tmp_path, req_id,
+        [("turn", "turn-own", "task_complete"),
+         ("turn", "turn-next", "task_started"),
+         ("assistant", "Later turn final.", "final_answer"),
+         ("turn", "turn-next", "task_complete")],
+        timeout_explicit=False, idle_timeout_s=0.06, max_wait_s=1,
+        log_path=transcript,
+    )
+    assert result.exit_code == 2
+    assert "idle timeout" in result.reply
+    assert "turn ended without CCB_DONE" not in result.reply
+
+
+def test_known_anchor_turn_id_releases_on_its_first_task_complete(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+    result = _drive_handle_task(
+        monkeypatch, tmp_path, req_id,
+        [("turn", "turn-own", "task_started"),
+         ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+         ("assistant", "First turn final.", "final_answer"),
+         ("turn", "turn-own", "task_complete")],
+        include_anchor=False, timeout_explicit=False, idle_timeout_s=1, max_wait_s=2,
+        log_path=transcript,
+    )
+    assert result.exit_code == 2
+    assert "First turn final." in result.reply
+    assert "turn ended without CCB_DONE" in result.reply
+
+
+def test_abort_releases_for_actionable_queued_work(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+    events = [("turn", "turn-own", "task_started"),
+              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+              ("assistant", "Partial text", "commentary"),
+              ("turn", "turn-own", "turn_aborted")]
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, events, include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=5, max_wait_s=10,
+                                log_path=transcript, has_actionable_waiting=lambda: True)
+    assert result.exit_code == 2
+    assert result.done_seen is False
+    assert "turn was interrupted" in result.reply
+
+
+def test_abort_continuation_with_marker_completes_once(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+    notifications: list[dict] = []
+    events = [("turn", "turn-own", "task_started"),
+              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+              ("assistant", "Partial text", "commentary"),
+              ("turn", "turn-own", "turn_aborted"),
+              ("turn", "turn-next", "task_started"),
+              ("assistant", f"Continued.\nCCB_DONE: {req_id}", "final_answer")]
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, events, include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=5, max_wait_s=10,
+                                notifications=notifications, log_path=transcript)
+    assert result.exit_code == 0
+    assert result.done_seen is True
+    assert len(notifications) == 1
+
+
+def test_abort_drain_consumes_continuation_and_marker_without_releasing_parked(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+    marker = f"Finished original\nCCB_DONE: {req_id}"
+
+    class _BatchReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("turn", "turn-own", "task_started"),
+                              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("assistant", "Partial", "commentary"),
+                              ("turn", "turn-own", "turn_aborted")], transcript)
+            self.batch = []
+
+        def wait_for_event(self, state, timeout):
+            event = self._events.pop(0) if self._events else None
+            if event and event[2] == "turn_aborted":
+                self.batch = [("turn", "turn-next", "task_started"),
+                              ("user", "Continue", ""),
+                              ("assistant", "Continued work", "commentary"),
+                              ("assistant", marker, "final_answer")]
+            return event, state
+
+        def try_get_event(self, state):
+            return (self.batch.pop(0), state) if self.batch else (None, state)
+
+    reader = _BatchReader()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=1, max_wait_s=2,
+                                log_path=transcript, reader_factory=lambda **kw: reader,
+                                has_actionable_waiting=lambda: True)
+    assert result.done_seen is True
+    assert result.reply == "Finished original"
+    assert reader.batch == []
+
+
+def test_abort_drain_clearing_parked_state_does_not_release_continuation(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+
+    class _BatchReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("turn", "turn-own", "task_started"),
+                              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("assistant", "Partial", "commentary"),
+                              ("turn", "turn-own", "turn_aborted")], transcript)
+            self.batch = []
+
+        def wait_for_event(self, state, timeout):
+            event = self._events.pop(0) if self._events else None
+            if event and event[2] == "turn_aborted":
+                self.batch = [("turn", "turn-next", "task_started"),
+                              ("user", "Continue", ""),
+                              ("assistant", "Continued work in progress", "commentary")]
+            return event, state
+
+        def try_get_event(self, state):
+            return (self.batch.pop(0), state) if self.batch else (None, state)
+
+    reader = _BatchReader()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=0.06, max_wait_s=1,
+                                log_path=transcript, reader_factory=lambda **kw: reader,
+                                has_actionable_waiting=lambda: True)
+    assert result.exit_code == 2
+    assert "interrupted; released for queued work" not in result.reply
+    assert "idle timeout" in result.reply
+
+
+def test_completion_drain_stops_before_followup_and_preserves_anchored_final(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+
+    class _BatchReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("turn", "turn-own", "task_started"),
+                              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("assistant", "ORIGINAL REPORT", "final_answer"),
+                              ("turn", "turn-own", "task_complete")], transcript)
+            self.batch = []
+
+        def wait_for_event(self, state, timeout):
+            event = self._events.pop(0) if self._events else None
+            if event and event[2] == "task_complete":
+                self.batch = [("turn", "turn-next", "task_started"),
+                              ("user", "Unrelated follow-up", ""),
+                              ("assistant", "UNRELATED ANSWER", "final_answer"),
+                              ("turn", "turn-next", "task_complete")]
+            return event, state
+
+        def try_get_event(self, state):
+            return (self.batch.pop(0), state) if self.batch else (None, state)
+
+    reader = _BatchReader()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=1, max_wait_s=2,
+                                log_path=transcript, reader_factory=lambda **kw: reader)
+    assert result.exit_code == 2
+    assert "ORIGINAL REPORT" in result.reply
+    assert "UNRELATED ANSWER" not in result.reply
+    assert len(reader.batch) == 4
+
+
+def test_completion_drain_stops_before_repair_marker(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+
+    class _BatchReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("turn", "turn-own", "task_started"),
+                              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("assistant", "ORIGINAL REPORT", "final_answer"),
+                              ("turn", "turn-own", "task_complete")], transcript)
+            self.batch = []
+
+        def wait_for_event(self, state, timeout):
+            event = self._events.pop(0) if self._events else None
+            if event and event[2] == "task_complete":
+                self.batch = [("turn", "turn-next", "task_started"),
+                              ("user", "Please add marker", ""),
+                              ("assistant", f"Repair\nCCB_DONE: {req_id}", "final_answer")]
+            return event, state
+
+        def try_get_event(self, state):
+            return (self.batch.pop(0), state) if self.batch else (None, state)
+
+    reader = _BatchReader()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=1, max_wait_s=2,
+                                log_path=transcript, reader_factory=lambda **kw: reader)
+    assert result.exit_code == 2
+    assert result.done_seen is False
+    assert "ORIGINAL REPORT" in result.reply
+    assert "Repair" not in result.reply
+    assert len(reader.batch) == 3
+
+
+def test_marker_before_batched_task_complete_finishes_without_incomplete_note(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+
+    class _BatchReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("turn", "turn-own", "task_started"),
+                              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("assistant", f"Finished\nCCB_DONE: {req_id}", "final_answer")], transcript)
+            self.batch = [("turn", "turn-own", "task_complete")]
+
+        def try_get_event(self, state):
+            return (self.batch.pop(0), state) if self.batch else (None, state)
+
+    reader = _BatchReader()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=1, max_wait_s=2,
+                                log_path=transcript, reader_factory=lambda **kw: reader)
+    assert result.exit_code == 0
+    assert result.done_seen is True
+    assert "turn ended without CCB_DONE" not in result.reply
+    assert len(reader.batch) == 1
+
+
+def test_stale_log_switch_clears_unanchored_pending_turn(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    old_log, new_log = tmp_path / "old.jsonl", tmp_path / "new.jsonl"
+    old_log.touch()
+    new_log.touch()
+
+    class _SwitchReader(_ScriptedReader):
+        def __init__(self, events, log):
+            super().__init__(events, log)
+
+    readers = [_SwitchReader([("turn", "stale-turn", "task_started"), None], old_log),
+               _SwitchReader([("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("turn", "stale-turn", "task_complete")], new_log)]
+
+    def factory(**kwargs):
+        return readers.pop(0)
+
+    monkeypatch.setenv("CCB_CASKD_STALE_LOG_GRACE_SECONDS", "0")
+    monkeypatch.setenv("CCB_CASKD_STALE_LOG_CHECK_INTERVAL", "0")
+    monkeypatch.setenv("CCB_CODEX_STALE_LOG_SECONDS", "0")
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.05")
+    monkeypatch.setattr(codex_adapter, "_scan_latest_candidate_log", lambda *_a, **_kw: new_log)
+    monkeypatch.setattr(codex_adapter, "_is_log_stale", lambda *_a, **_kw: True)
+    monkeypatch.setattr(codex_adapter, "_state_at_req_anchor", lambda path, _rid: {"log_path": path, "offset": 0})
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_explicit=False, idle_timeout_s=0.05, max_wait_s=1,
+                                reader_factory=factory)
+    assert result.exit_code == 2
+    assert "idle timeout" in result.reply
+    assert "turn ended without CCB_DONE" not in result.reply
+
+
+def test_abort_without_queue_waits_for_idle_timeout(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "bound.jsonl"
+    transcript.touch()
+    events = [("turn", "turn-own", "task_started"),
+              ("assistant", "Partial text", "commentary"),
+              ("turn", "turn-own", "turn_aborted")]
+    started = time.monotonic()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, events,
+                                timeout_explicit=False, idle_timeout_s=0.08, max_wait_s=2,
+                                log_path=transcript, has_actionable_waiting=lambda: False)
+    elapsed = time.monotonic() - started
+    assert result.exit_code == 2
+    assert elapsed >= 0.07
+    assert "transcript idle timeout" in result.reply
+
+
+def test_codex_log_binding_skips_descendant_rollout(monkeypatch, tmp_path: Path) -> None:
+    log = tmp_path / "rollout.jsonl"
+    session_meta = {"type": "session_meta", "payload": {"cwd": str(tmp_path),
+        "source": {"subagent": {"other": "guardian"}}}}
+    log.write_text(json.dumps(session_meta) + "\n", encoding="utf-8")
+    session = _FakeSession(tmp_path)
+    binding_path = tmp_path / ".codex-session"
+    binding_path.touch()
+    monkeypatch.setattr(codex_comm, "find_project_session_file", lambda *_: binding_path)
+    monkeypatch.setattr(caskd_session, "load_project_session", lambda *_: session)
+
+    codex_comm._handle_codex_log_event(log)
+    assert session.bindings == []
+
+    session_meta["payload"].pop("source")
+    log.write_text(json.dumps(session_meta) + "\n", encoding="utf-8")
+    codex_comm._handle_codex_log_event(log)
+    assert session.bindings == [{"log_path": str(log), "session_id": None}]
 
 
 def test_handle_task_persists_proven_result_before_any_notification(
@@ -1134,6 +1491,32 @@ def test_explicit_timeout_keeps_wall_clock_deadline_during_transcript_activity(
     assert result.done_seen is False
 
 
+def test_explicit_timeout_ignores_unmarked_task_complete_but_marker_completes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+    events = [("turn", "turn-own", "task_started"),
+              ("assistant", "Final without marker", "final_answer"),
+              ("turn", "turn-own", "task_complete")]
+    started = time.monotonic()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, events, timeout_s=0.12,
+                                timeout_explicit=True, log_path=transcript,
+                                event_log_paths=[transcript] * 4,
+                                reader_delays=[0, 0.01, 0.01, 0.01])
+    assert result.exit_code == 2
+    assert time.monotonic() - started >= 0.1
+
+    marked = [("turn", "turn-own", "task_started"),
+              ("assistant", f"Final.\nCCB_DONE: {req_id}", "final_answer")]
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, marked, timeout_s=0.3,
+                                timeout_explicit=True, log_path=transcript,
+                                event_log_paths=[transcript] * 3,
+                                reader_delays=[0, 0.01, 0.01])
+    assert result.done_seen is True
+    assert result.exit_code == 0
+
+
 def test_default_timeout_silence_expires_with_idle_notice(monkeypatch, tmp_path: Path) -> None:
     req_id = make_req_id()
     transcript = tmp_path / "rollout.jsonl"
@@ -1293,6 +1676,42 @@ def test_idle_expiry_drain_completes_when_final_marker_is_already_readable(monke
     assert result.done_seen is True
     assert result.exit_code == 0
     assert len(notifications) == 1
+
+
+def test_idle_drain_terminal_task_complete_does_not_wait_for_second_idle_period(monkeypatch, tmp_path: Path) -> None:
+    req_id = make_req_id()
+    transcript = tmp_path / "rollout.jsonl"
+
+    class _DrainReader(_ScriptedReader):
+        def __init__(self):
+            super().__init__([("turn", "turn-own", "task_started"),
+                              ("user", f"{REQ_ID_PREFIX} {req_id}", ""),
+                              ("assistant", "Final without marker", "final_answer")], transcript)
+            self.drained = False
+
+        def wait_for_event(self, state, timeout):
+            if self._events:
+                return self._events.pop(0), state
+            time.sleep(timeout)
+            return None, state
+
+        def try_get_event(self, state):
+            if not self.drained:
+                self.drained = True
+                return ("turn", "turn-own", "task_complete"), state
+            return None, state
+
+    monkeypatch.setenv("CCB_CODEX_IDLE_TIMEOUT_S", "0.03")
+    monkeypatch.setenv("CCB_CODEX_MAX_WAIT_S", "0.3")
+    started = time.monotonic()
+    result = _drive_handle_task(monkeypatch, tmp_path, req_id, [], include_anchor=False,
+                                timeout_s=0.2, timeout_explicit=False, log_path=transcript,
+                                reader_factory=lambda **kw: _DrainReader())
+    elapsed = time.monotonic() - started
+    assert result.exit_code == 2
+    assert "turn ended without CCB_DONE" in result.reply
+    assert "idle timeout" not in result.reply
+    assert elapsed < 0.1
 
 
 def _append_rollout_record(path: Path, value: dict) -> None:

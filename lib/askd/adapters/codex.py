@@ -31,7 +31,13 @@ from ccb_protocol import (
     wrap_codex_prompt,
 )
 from caskd_session import CodexProjectSession, compute_session_key, load_project_session
-from codex_comm import CodexCommunicator, CodexLogReader, CodexTurnContext, read_latest_turn_context
+from codex_comm import (
+    CodexCommunicator,
+    CodexLogReader,
+    CodexTurnContext,
+    _codex_log_is_descendant,
+    read_latest_turn_context,
+)
 from completion_hook import (
     COMPLETION_STATUS_CANCELLED,
     COMPLETION_STATUS_COMPLETED,
@@ -167,43 +173,6 @@ def _codex_log_work_dir_matches(log_path: Path, work_dir: Path) -> bool:
                     return normalize_work_dir(cwd) == expected
                 except Exception:
                     return cwd == str(work_dir)
-    except Exception:
-        return False
-    return False
-
-
-def _codex_log_is_descendant(log_path: Path) -> bool:
-    """True when the rollout is a descendant transcript rather than a top-level
-    conversation.
-
-    Codex writes native subagent runs to their own rollout files that share the
-    parent's cwd and can quote the parent's prompt, request anchor included. A
-    descendant is never the conversation CCB addressed, so it must not win
-    candidate selection just by being the most recently written file.
-
-    Only positive evidence rejects a candidate: rollouts from CLI versions that
-    predate these fields carry neither marker and stay eligible.
-    """
-    try:
-        with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
-            for _ in range(50):
-                line = handle.readline()
-                if not line:
-                    break
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(entry, dict) or entry.get("type") != "session_meta":
-                    continue
-                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-                parent = payload.get("parent_thread_id")
-                if isinstance(parent, str) and parent.strip():
-                    return True
-                source = payload.get("source")
-                if isinstance(source, dict) and "subagent" in source:
-                    return True
-                return False
     except Exception:
         return False
     return False
@@ -591,6 +560,10 @@ class CodexAdapter(BaseProviderAdapter):
         last_transcript_growth_at: Optional[float] = None
         last_transcript_size: Optional[int] = None
         timeout_reason: Optional[str] = None
+        terminal_note: Optional[str] = None
+        pending_turn_id: Optional[str] = None
+        anchored_turn_id: Optional[str] = None
+        aborted_turn_id: Optional[str] = None
 
         # Idle timeout detection for degraded completion
         idle_timeout = float(os.environ.get("CCB_CASKD_IDLE_TIMEOUT", "8.0"))
@@ -610,11 +583,106 @@ class CodexAdapter(BaseProviderAdapter):
         stale_threshold_s = float(os.environ.get("CCB_CODEX_STALE_LOG_SECONDS", "10.0"))
         last_stale_check = time.time()
 
-        def drain_bound_transcript() -> tuple[bool, bool]:
-            nonlocal state, last_transcript_growth_at, last_transcript_size
+        def apply_event(event: tuple[str, str, str], event_state: dict) -> Optional[str]:
+            nonlocal anchor_seen, anchor_ms, anchor_bound_log, last_transcript_growth_at
+            nonlocal last_transcript_size, codex_log_path_at_anchor, codex_session_id_at_anchor
+            nonlocal pending_turn_id, anchored_turn_id, aborted_turn_id, terminal_note
             nonlocal terminal_reply, latest_final, done_seen, done_ms
+            nonlocal _last_reply_snapshot, _last_reply_changed_at
+
+            role, text, phase = event
+            event_log = event_state.get("log_path") if isinstance(event_state, dict) else None
+            event_log = str(event_log) if event_log else None
+            if progress_mode and anchor_seen and anchor_bound_log and event_log != anchor_bound_log:
+                return None
+            if progress_mode and anchor_seen and anchor_bound_log and event_log == anchor_bound_log:
+                last_transcript_growth_at = time.monotonic()
+
+            if role == "turn":
+                if not progress_mode:
+                    return None
+                if phase == "task_started":
+                    pending_turn_id = text
+                    if anchor_seen and aborted_turn_id and text != aborted_turn_id:
+                        anchored_turn_id = text
+                        aborted_turn_id = None
+                        terminal_note = None
+                        latest_final = None
+                        task.progress.update({"phase": "replying", "last_activity_at": time.time()})
+                elif anchor_seen and anchored_turn_id and text == anchored_turn_id:
+                    if phase == "task_complete":
+                        terminal_note = "[Incomplete: Codex turn ended without CCB_DONE.]"
+                        return "incomplete"
+                    if phase == "turn_aborted":
+                        aborted_turn_id = text
+                        task.progress.update({"phase": "interrupted", "last_activity_at": time.time()})
+                return None
+
+            if role == "user":
+                if f"{REQ_ID_PREFIX} {task.req_id}" not in text:
+                    return None
+                anchor_log = event_state.get("log_path") if isinstance(event_state, dict) else None
+                if anchor_log and _codex_log_is_descendant(Path(anchor_log)):
+                    return None
+                anchor_seen = True
+                anchored_turn_id = pending_turn_id
+                if progress_mode:
+                    anchor_bound_log = str(anchor_log) if anchor_log else None
+                    if anchor_bound_log:
+                        pin_to_log = getattr(reader, "pin_to_log", None)
+                        if callable(pin_to_log):
+                            pin_to_log(Path(anchor_bound_log))
+                        last_transcript_growth_at = time.monotonic()
+                        try:
+                            last_transcript_size = Path(anchor_bound_log).stat().st_size
+                        except OSError:
+                            last_transcript_size = None
+                if anchor_ms is None:
+                    anchor_ms = _now_ms() - started_ms
+                if codex_log_path_at_anchor is None and anchor_log:
+                    codex_log_path_at_anchor = str(anchor_log)
+                    try:
+                        codex_session_id_at_anchor = _codex_log_session_id(Path(codex_log_path_at_anchor))
+                    except Exception:
+                        codex_session_id_at_anchor = None
+                return None
+
+            if role != "assistant":
+                return None
+            if (not anchor_seen) and (require_anchor_before_collect or time.monotonic() < anchor_collect_grace):
+                return None
+
+            chunks.append(text)
+            combined = "\n".join(chunks)
+            done_now = is_done_text(
+                text,
+                task.req_id,
+                turn_ended=(phase == "final_answer"),
+                allow_inline=(phase == "final_answer"),
+            )
+            if phase == "final_answer":
+                latest_final = text
+            if done_now:
+                terminal_reply = text
+                done_seen = True
+                done_ms = _now_ms() - started_ms
+                return "completed"
+            if combined != _last_reply_snapshot:
+                _last_reply_snapshot = combined
+                _last_reply_changed_at = time.time()
+            elif not progress_mode and combined and time.time() - _last_reply_changed_at >= idle_timeout:
+                _write_log(
+                    f"[WARN] Codex reply idle for {idle_timeout}s without CCB_DONE, "
+                    f"accepting as complete req_id={task.req_id}"
+                )
+                done_seen = True
+                done_ms = _now_ms() - started_ms
+                return "completed"
+            return None
+
+        def drain_bound_transcript() -> tuple[bool, Optional[str]]:
+            nonlocal state, last_transcript_growth_at, last_transcript_size
             grew = False
-            completed = False
             if anchor_bound_log:
                 try:
                     current_size = Path(anchor_bound_log).stat().st_size
@@ -626,42 +694,35 @@ class CodexAdapter(BaseProviderAdapter):
                     last_transcript_size = current_size
                     last_transcript_growth_at = time.monotonic()
                     grew = True
-
             try_get_event = getattr(reader, "try_get_event", None)
             if not callable(try_get_event):
-                return grew, completed
+                return grew, None
             while True:
                 event, state = try_get_event(state)
                 if event is None:
-                    break
+                    return grew, None
                 event_log = state.get("log_path") if isinstance(state, dict) else None
                 if not anchor_bound_log or not event_log or str(event_log) != anchor_bound_log:
                     continue
                 grew = True
                 last_transcript_growth_at = time.monotonic()
-                role, text, phase = event
-                if role != "assistant":
-                    continue
-                chunks.append(text)
-                if phase == "final_answer":
-                    latest_final = text
-                if is_done_text(
-                    text,
-                    task.req_id,
-                    turn_ended=(phase == "final_answer"),
-                    allow_inline=(phase == "final_answer"),
-                ):
-                    terminal_reply = text
-                    done_seen = True
-                    done_ms = _now_ms() - started_ms
-                    completed = True
-                    break
-            return grew, completed
+                decision = apply_event(event, state)
+                if decision:
+                    return grew, decision
 
         while True:
             # Check for cancellation
             if task.cancel_event and task.cancel_event.is_set():
                 _write_log(f"[INFO] Task cancelled during wait loop: req_id={task.req_id}")
+                break
+
+            if progress_mode and aborted_turn_id and task.has_actionable_waiting and task.has_actionable_waiting():
+                _grew, decision = drain_bound_transcript()
+                if decision:
+                    break
+                if not aborted_turn_id:
+                    continue
+                terminal_note = "[Incomplete: Codex turn was interrupted; released for queued work.]"
                 break
 
             now = time.monotonic()
@@ -671,8 +732,8 @@ class CodexAdapter(BaseProviderAdapter):
                 if remaining <= 0:
                     if progress_mode and anchor_seen:
                         timeout_reason = "cap"
-                        _grew, completed = drain_bound_transcript()
-                        if completed:
+                        _grew, decision = drain_bound_transcript()
+                        if decision:
                             timeout_reason = None
                             break
                     break
@@ -684,8 +745,8 @@ class CodexAdapter(BaseProviderAdapter):
                 idle_remaining = transcript_idle_timeout - (now - last_transcript_growth_at)
                 if idle_remaining <= 0:
                     timeout_reason = "idle"
-                    grew, completed = drain_bound_transcript()
-                    if completed:
+                    grew, decision = drain_bound_transcript()
+                    if decision:
                         timeout_reason = None
                         break
                     if grew:
@@ -774,6 +835,7 @@ class CodexAdapter(BaseProviderAdapter):
                             # stale-log discovery runs. Starting at EOF would skip
                             # that anchor forever and reject the later CCB_DONE.
                             state = _state_at_req_anchor(latest_log, task.req_id)
+                            pending_turn_id = None
                             fallback_scan = True
                             try:
                                 new_session_id = CodexCommunicator._extract_session_id(latest_log)
@@ -791,88 +853,14 @@ class CodexAdapter(BaseProviderAdapter):
                             _write_log(f"[WARN] stale codex log detected; switching to {latest_log}")
                 continue
 
-            role, text, phase = event
-            event_log = state.get("log_path") if isinstance(state, dict) else None
-            event_log = str(event_log) if event_log else None
-            if progress_mode and anchor_seen and anchor_bound_log and event_log != anchor_bound_log:
-                # Once the anchor binds this request to a transcript, later
-                # activity from any other rollout cannot extend its lifetime.
-                continue
-            if progress_mode and anchor_seen and anchor_bound_log and event_log == anchor_bound_log:
-                last_transcript_growth_at = time.monotonic()
-            if role == "user":
-                if f"{REQ_ID_PREFIX} {task.req_id}" in text:
-                    anchor_log = state.get("log_path") if isinstance(state, dict) else None
-                    if anchor_log and _codex_log_is_descendant(Path(anchor_log)):
-                        # Eligibility applies to the initial reader too,
-                        # not just the stale-binding candidate scanner.
-                        continue
-                    anchor_seen = True
-                    if progress_mode:
-                        anchor_bound_log = str(anchor_log) if anchor_log else None
-                        if anchor_bound_log:
-                            pin_to_log = getattr(reader, "pin_to_log", None)
-                            if callable(pin_to_log):
-                                pin_to_log(Path(anchor_bound_log))
-                            last_transcript_growth_at = time.monotonic()
-                            try:
-                                last_transcript_size = Path(anchor_bound_log).stat().st_size
-                            except OSError:
-                                last_transcript_size = None
-                    if anchor_ms is None:
-                        anchor_ms = _now_ms() - started_ms
-                    if codex_log_path_at_anchor is None:
-                        if anchor_log:
-                            codex_log_path_at_anchor = str(anchor_log)
-                            try:
-                                codex_session_id_at_anchor = _codex_log_session_id(Path(codex_log_path_at_anchor))
-                            except Exception:
-                                codex_session_id_at_anchor = None
-                continue
-
-            if role != "assistant":
-                continue
-
-            # Never collect assistant text before this request's anchor.
-            if (not anchor_seen) and (require_anchor_before_collect or time.monotonic() < anchor_collect_grace):
-                continue
-
-            chunks.append(text)
-            combined = "\n".join(chunks)
-            # A final_answer record is Codex's complete last message of the
-            # turn, so a whole-line marker in it counts even if prose follows.
-            done_now = is_done_text(
-                text,
-                task.req_id,
-                turn_ended=(phase == "final_answer"),
-                allow_inline=(phase == "final_answer"),
-            )
-            # Keep only the latest canonical final for degraded idle completion.
-            # The event_msg twin carrying CCB_DONE arrives before its canonical
-            # final_answer record, so the DONE-bearing event is authoritative.
-            if phase == "final_answer":
-                latest_final = text
-            if done_now:
-                terminal_reply = text
-                done_seen = True
-                done_ms = _now_ms() - started_ms
-                break
-
-            # Idle-timeout: detect when Codex finished but forgot CCB_DONE
-            if combined != _last_reply_snapshot:
-                _last_reply_snapshot = combined
-                _last_reply_changed_at = time.time()
-            elif not progress_mode and combined and (time.time() - _last_reply_changed_at >= idle_timeout):
-                _write_log(
-                    f"[WARN] Codex reply idle for {idle_timeout}s without CCB_DONE, "
-                    f"accepting as complete req_id={task.req_id}"
-                )
-                done_seen = True
-                done_ms = _now_ms() - started_ms
+            decision = apply_event(event, state)
+            if decision:
                 break
 
         combined = "\n".join(chunks)
         reply = _assemble_reply(terminal_reply, latest_final, combined, task.req_id)
+        if terminal_note:
+            reply = f"{reply.rstrip()}\n\n{terminal_note}" if reply.strip() else terminal_note
         if timeout_reason:
             timeout_note = (
                 "Codex transcript idle timeout expired without CCB_DONE."

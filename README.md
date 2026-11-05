@@ -226,6 +226,16 @@ ccb version
 `ccb clean` also removes oversized-reply artifacts older than `--older-than`; `--dry-run`,
 `--project`, and `--all-projects` apply to both stale session records and reply artifacts.
 
+## tmux status-right extension
+
+Add a widget to the right side of the CCB tmux status bar from your own `tmux.conf`:
+
+```tmux
+set -g @ccb_status_right_extra ' #(your-widget) '
+```
+
+Native `#[...]` styles and `#()` commands work in the value. Escape literal percent signs as `%%`. The value renders after the clock, and config reloads apply without restarting the theme. The theme lasts for the lifetime of the launcher that owns it.
+
 ## Fork changes
 
 - `Unreleased` — added independent `ccb codex codex` pairing with contextual sibling routing, exact live-session receipts and completion delivery, preserved cross-project peer behavior, provider-neutral role guidance, and explicit ambiguity failures.

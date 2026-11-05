@@ -1346,19 +1346,48 @@ class AILauncher:
             return
         if not os.environ.get("TMUX"):
             return
-        script = Path.home() / ".local" / "bin" / ("ccb-tmux-on.sh" if active else "ccb-tmux-off.sh")
+        if active:
+            pane = (os.environ.get("TMUX_PANE") or "").strip()
+            if not pane:
+                return
+            try:
+                target = subprocess.run(
+                    ["tmux", "display-message", "-p", "-t", pane, "#{session_id} #{window_id}"],
+                    check=True, capture_output=True, text=True, timeout=3,
+                ).stdout.strip().split()
+            except Exception:
+                return
+            if len(target) != 2:
+                return
+            self._tmux_ui_target = target
+            if getattr(self, "_tmux_ui_owned", False):
+                return
+            script = Path.home() / ".local" / "bin" / "ccb-tmux-on.sh"
+            args = [str(script), "--session", target[0], "--window", target[1], "--owner", self.session_id]
+        else:
+            if not getattr(self, "_tmux_ui_owned", False):
+                return
+            target = getattr(self, "_tmux_ui_target", [])
+            if len(target) != 2:
+                return
+            script = Path.home() / ".local" / "bin" / "ccb-tmux-off.sh"
+            args = [str(script), "--session", target[0], "--window", target[1], "--owner", self.session_id]
         if not script.exists():
             return
         try:
             debug = os.environ.get("CCB_DEBUG") in ("1", "true", "yes")
             cp = subprocess.run(
-                [str(script)],
+                args,
                 check=False,
                 capture_output=debug,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
             )
+            if active and cp.returncode == 0:
+                self._tmux_ui_owned = True
+            elif not active and cp.returncode == 0:
+                self._tmux_ui_owned = False
             if cp.returncode != 0 and debug:
                 out = (cp.stdout or "").strip()
                 err = (cp.stderr or "").strip()

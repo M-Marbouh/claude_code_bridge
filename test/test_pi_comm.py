@@ -215,3 +215,70 @@ def test_screen_classifier_handles_observed_dialog_busy_and_footer() -> None:
     assert classify_pane_screen((FIXTURES / "screen-idle.txt").read_text()) == "idle"
     assert classify_pane_screen("/work (main)\ndeepseek-flash • high") == "unknown"
     assert classify_pane_screen("blank terminal") == "unknown"
+
+
+@pytest.mark.parametrize("reply", [
+    "see this working copy", "the editor was Working well", "the WORKING marker appeared",
+    "tests are Running now", "we are running tests",
+    "it is Retrying (after timeout) in the log", "compacting context appeared in the report",
+    "we enabled Auto-compacting yesterday", "the output was summarizing branch details",
+    "this working copy is clean",
+])
+def test_screen_reply_words_do_not_make_idle_pane_busy(reply: str) -> None:
+    screen = (FIXTURES / "screen-idle.txt").read_text().replace("Already at this point", f"{reply}\nwith another line")
+    assert classify_pane_screen(screen) == "idle"
+
+
+@pytest.mark.parametrize("border", [
+    "── ⠙ Reticulating splines ───",
+    "───⠙──────",
+    "── ⠋ Retrying (1/3) in 2s... (esc to cancel) ───",
+    "── * Working ───",
+])
+def test_screen_editor_border_activity_is_busy(border: str) -> None:
+    lines = (FIXTURES / "screen-idle.txt").read_text().splitlines()
+    width = len(lines[3].rstrip())
+    padded_border = border + "─" * (width - len(border))
+    screen = "\n".join([lines[0], padded_border, *lines[2:]])
+    assert classify_pane_screen(screen) == "busy"
+
+
+@pytest.mark.parametrize("loader", [
+    " X Working", " >>> Working", " [=====] Working", " Working", " >> >> Working", " ( o o ) Retrying (1/3)",
+])
+def test_non_embedded_loader_above_plain_editor_box_is_busy(loader: str) -> None:
+    screen = "\n".join([
+        "", loader, "────────────────────", "", "────────────────────",
+        "<CCB_CWD> (master)", "model • high",
+    ])
+    assert classify_pane_screen(screen) == "busy"
+
+
+def test_plain_working_paragraph_above_box_is_refuse_safe_busy() -> None:
+    screen = "\n".join([
+        "", "Working tree clean", "────────────────────", "", "────────────────────",
+        "<CCB_CWD> (master)", "model • high",
+    ])
+    assert classify_pane_screen(screen) == "busy"
+
+
+def test_editor_draft_is_unknown_even_with_overflow_label() -> None:
+    screen = (FIXTURES / "screen-idle.txt").read_text().replace("─" * 8, "─── ↑ 3 more ───", 1)
+    screen = screen.replace("\n\n────────────────", "\ndraft\n────────────────", 1)
+    assert classify_pane_screen(screen) == "unknown"
+
+
+def test_short_rule_and_multiline_draft_are_not_idle() -> None:
+    screen = "\n".join([
+        "reply", "──────", "draft", "", "────────────────────",
+        "<CCB_CWD> (master)", "model • high",
+    ])
+    assert classify_pane_screen(screen) == "unknown"
+
+
+def test_one_character_top_border_is_not_idle() -> None:
+    screen = "\n".join([
+        "reply", "─", "", "────────────────────",
+        "<CCB_CWD> (master)", "model • high",
+    ])
+    assert classify_pane_screen(screen) == "unknown"

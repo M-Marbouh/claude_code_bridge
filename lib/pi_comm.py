@@ -179,7 +179,10 @@ def load_session(session_dir: Path, session_id: str) -> PiSession:
     if len(matches) != 1:
         kind = "ambiguous" if matches else "not_created"
         raise PiSessionError(kind, f"Pi session file {'is ambiguous' if matches else 'has not been created'} for {session_id}.")
-    path = matches[0]
+    return _load_session_path(matches[0], session_id)
+
+
+def _load_session_path(path: Path, session_id: str) -> PiSession:
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -209,6 +212,83 @@ def load_session(session_dir: Path, session_id: str) -> PiSession:
     if len(ids) != len(set(ids)):
         raise PiSessionError("incompatible", "Pi session contains duplicate entry IDs.")
     return PiSession(path, session_id, header, tuple(entries[1:]))
+
+
+def _load_cached_session_path(
+    path: Path,
+    session_id: str,
+    cache: dict[tuple[Path, int, int], tuple[PiSession | None, PiSessionError | None]] | None,
+) -> PiSession:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise PiSessionError("unavailable", f"Cannot stat Pi session file: {exc}") from exc
+    key = (path, metadata.st_mtime_ns, metadata.st_size)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            session, error = cached
+            if error is not None:
+                raise error
+            if session is not None:
+                return session
+        for old_key in tuple(cache):
+            if old_key[0] == path and old_key != key:
+                del cache[old_key]
+    try:
+        session = _load_session_path(path, session_id)
+    except PiSessionError as exc:
+        if cache is not None:
+            cache[key] = (None, exc)
+        raise
+    if cache is not None:
+        cache[key] = (session, None)
+    return session
+
+
+def load_candidate_sessions(
+    session_dir: Path,
+    work_dir: Path,
+    *,
+    bound_session_id: str = "",
+    start_dir: str | Path | None = None,
+    cache: dict[tuple[Path, int, int], tuple[PiSession | None, PiSessionError | None]] | None = None,
+) -> tuple[PiSession, ...]:
+    """Load the bound session and valid same-workspace Pi sessions."""
+    session_dir = Path(session_dir)
+    bound_path: Path | None = None
+    candidates: list[PiSession] = []
+    if bound_session_id:
+        matches = matching_session_files(session_dir, bound_session_id)
+        if len(matches) > 1:
+            raise PiSessionError("ambiguous", f"Pi session file is ambiguous for {bound_session_id}.")
+        if matches:
+            bound_path = matches[0]
+            candidates.append(_load_cached_session_path(bound_path, bound_session_id, cache))
+
+    allowed_cwds = {Path(work_dir).expanduser().resolve()}
+    if start_dir:
+        try:
+            allowed_cwds.add(Path(start_dir).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            pass
+    for path in sorted(session_dir.glob("*.jsonl")):
+        if path == bound_path:
+            continue
+        session_id = path.stem.rsplit("_", 1)[-1]
+        if not session_id:
+            continue
+        try:
+            session = _load_cached_session_path(path, session_id, cache)
+            cwd_value = session.header.get("cwd")
+            if not isinstance(cwd_value, str) or not cwd_value.strip():
+                continue
+            cwd = Path(cwd_value).expanduser().resolve()
+            if cwd in allowed_cwds:
+                candidates.append(session)
+        except (OSError, PiSessionError, RuntimeError, ValueError):
+            continue
+    return tuple(candidates)
 
 
 def load_session_file(work_dir: Path, explicit_path: str | Path | None = None) -> tuple[Path, dict[str, Any]] | None:
@@ -273,18 +353,15 @@ _DIALOG_MARKERS = (
     "enter select  escape/ctrl+c cancel",
     "Select a session",
 )
-_BUSY_MARKERS = (
-    "Working",
-    "Running",
-    "Retrying (",
-    "Compacting context",
-    "Auto-compacting",
-    "Summarizing branch",
-)
 _MODEL_FOOTER = re.compile(r"^.*\S+\s+[•·]\s+(?:off|minimal|low|medium|high|max)\s*$", re.IGNORECASE | re.MULTILINE)
 _RULE_LINE = re.compile(r"^\s*─{8,}\s*$")
 _EDITOR_LINE = re.compile(r"^\s*(?:›\s*)?$")
 _CWD_LINE = re.compile(r"^\s*(?:/|~/|<CCB_CWD>).*\s*$")
+_OVERFLOW_LABEL = re.compile(r"↑\s*\d+\s+more")
+_LOADER_LINE = re.compile(
+    r"^\s*(?:.*\s)?(?:Working|Retrying \(|Compacting context|Auto-compacting|"
+    r"Context overflow detected|Summarizing branch)"
+)
 
 
 def classify_pane_screen(screen: str) -> str:
@@ -292,20 +369,28 @@ def classify_pane_screen(screen: str) -> str:
     text = screen or ""
     if any(marker.casefold() in text.casefold() for marker in _DIALOG_MARKERS):
         return "dialog"
-    tail = "\n".join(text.splitlines()[-12:])
-    if any(marker.casefold() in tail.casefold() for marker in _BUSY_MARKERS):
-        return "busy"
     lines = text.splitlines()
-    if lines and _MODEL_FOOTER.fullmatch(lines[-1]):
-        for index in range(max(0, len(lines) - 5), len(lines) - 4):
-            box = lines[index:index + 5]
-            if (
-                len(box) == 5
-                and _RULE_LINE.fullmatch(box[0])
-                and _EDITOR_LINE.fullmatch(box[1])
-                and _RULE_LINE.fullmatch(box[2])
-                and _CWD_LINE.fullmatch(box[3])
-                and _MODEL_FOOTER.fullmatch(box[4])
-            ):
-                return "idle"
+    if len(lines) < 5 or not _MODEL_FOOTER.fullmatch(lines[-1]):
+        return "unknown"
+    if not _CWD_LINE.fullmatch(lines[-2]) or not _RULE_LINE.fullmatch(lines[-3]):
+        return "unknown"
+    editor_end = len(lines) - 3
+    top_index = editor_end - 1
+    while top_index >= 0 and not lines[top_index].startswith("─"):
+        top_index -= 1
+    if top_index < 0:
+        return "unknown"
+    if len(lines[top_index].rstrip()) != len(lines[-3].rstrip()):
+        return "unknown"
+    border = _OVERFLOW_LABEL.sub("", lines[top_index])
+    if re.sub(r"[─\s]", "", border):
+        return "busy"
+    if not _RULE_LINE.fullmatch(border):
+        return "unknown"
+    # Built-in messages only: coverage is the embedded default editor (any frames/message) plus non-embedded loaders showing a built-in message. An extension editor with a custom message is detected only by the best-effort animation check above.
+    if top_index >= 2 and not lines[top_index - 2].strip() and _LOADER_LINE.match(lines[top_index - 1]):
+        return "busy"
+    editor = lines[top_index + 1:editor_end]
+    if len(editor) == 1 and _EDITOR_LINE.fullmatch(editor[0]):
+        return "idle"
     return "unknown"

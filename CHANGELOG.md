@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- `ask pi` no longer refuses to send when Pi's last reply mentions words such as "working" or "running". Pi is treated as busy only when its own activity indicator is shown (the spinner in the editor border, or a built-in status line above the editor), and the pane is checked twice before sending.
+- `ask pi` now delivers the reply after Pi is switched to an earlier session inside Pi (for example with `/resume` after a relaunch). The request is located in any valid session of the project's Pi session folder, and a request that has not yet appeared is no longer reported as "not accepted" while Pi shows activity.
 - Codex and Claude replies whose final line ends with the request's `CCB_DONE` marker inline now complete once the provider's turn has ended, instead of waiting out the idle timeout and failing as incomplete. The marker is stripped from the delivered reply.
 - `ask` now prints a `[CCB_QUEUED ...]` line before the submit marker when the destination session is busy, and `pend` shows whether a pending task is running or how many tasks are ahead of it. The probe is capped at 0.25s and stays silent on any error.
 - Prevented descendant Codex rollout logs with copied request anchors from winning destination reply selection.

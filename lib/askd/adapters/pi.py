@@ -1,7 +1,6 @@
 """Unified askd adapter for a Pi coding-agent pane."""
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,7 @@ from completion_hook import (
     notify_completion,
 )
 from pane_registry import validate_route
-from pi_comm import PiSessionError, classify_pane_screen, load_session
+from pi_comm import PiExchange, PiSessionError, classify_pane_screen, load_candidate_sessions
 from project_id import compute_ccb_project_id
 from providers import PI_SPEC
 from task_receipts import PersistOutcome, persist_proven_result
@@ -88,6 +87,75 @@ def _check_pane(data: dict[str, Any], work_dir: Path):
     return backend, ""
 
 
+def _capture_screen_state(backend: Any, pane_id: str) -> tuple[str, str | None]:
+    try:
+        screen = backend.get_pane_content(pane_id, lines=40)
+    except Exception:
+        return "unknown", None
+    if screen is None:
+        return "unknown", None
+    return classify_pane_screen(screen), screen
+
+
+def _screen_context(screen: str) -> tuple[str, ...] | None:
+    lines = screen.splitlines()
+    for index in range(len(lines) - 4, -1, -1):
+        if lines[index].startswith("─"):
+            return tuple(lines[max(0, index - 2):index])
+    return None
+
+
+def _capture_confirmed_state(backend: Any, pane_id: str) -> str:
+    first_state, first_screen = _capture_screen_state(backend, pane_id)
+    if first_screen is None or first_state != "idle":
+        return first_state
+    time.sleep(0.2)
+    second_state, second_screen = _capture_screen_state(backend, pane_id)
+    if second_screen is None:
+        return "unknown"
+    if _screen_context(first_screen) != _screen_context(second_screen):
+        return "busy"
+    return second_state
+
+
+def _anchor_landed(
+    session_dir: Path,
+    work_dir: Path,
+    req_id: str,
+    *,
+    bound_session_id: str,
+    start_dir: str | Path | None,
+    cache: dict,
+) -> bool:
+    try:
+        found, _exchange, lookup_error, _candidates = _find_request_session(
+            session_dir, work_dir, req_id, bound_session_id=bound_session_id, start_dir=start_dir, cache=cache,
+        )
+    except PiSessionError:
+        return True  # the main poll reports the session error
+    return found is not None or lookup_error == "ambiguous"
+
+
+def _find_request_session(
+    session_dir: Path,
+    work_dir: Path,
+    req_id: str,
+    *,
+    bound_session_id: str,
+    start_dir: str | Path | None,
+    cache: dict,
+):
+    candidates = load_candidate_sessions(
+        session_dir, work_dir, bound_session_id=bound_session_id, start_dir=start_dir, cache=cache,
+    )
+    matches = [candidate for candidate in candidates if candidate.anchors(req_id)]
+    if len(matches) > 1:
+        return None, None, "ambiguous", candidates
+    if not matches:
+        return None, None, "missing", candidates
+    return matches[0], matches[0].exchange(req_id), "", candidates
+
+
 class PiAdapter(BaseProviderAdapter):
     @property
     def key(self) -> str:
@@ -117,7 +185,7 @@ class PiAdapter(BaseProviderAdapter):
         req = task.request
         started = time.monotonic()
         work_dir = Path(req.work_dir).expanduser().resolve()
-        session_path, session, error = _load_destination(req)
+        _session_path, session, error = _load_destination(req)
         session_key = route_session_key(self.key, req.route) if req.route.present else self.compute_session_key(session)
         if error or session is None:
             return self._finish(task, ProviderResult(
@@ -132,24 +200,35 @@ class PiAdapter(BaseProviderAdapter):
             ))
 
         session_dir = Path(session["pi_session_dir"]).expanduser()
-        pi_session_id = str(session["pi_session_id"])
+        bound_session_id = str(session["pi_session_id"])
+        pi_session_id = bound_session_id
+        session_cache: dict = {}
         try:
-            existing = load_session(session_dir, pi_session_id)
-            if existing.anchors(task.req_id):
-                return self._finish(task, ProviderResult(
-                    exit_code=1, reply=f"Pi request anchor already exists for {task.req_id}.",
-                    req_id=task.req_id, session_key=session_key, done_seen=False,
-                    status=COMPLETION_STATUS_FAILED,
-                ), transcript_path=str(existing.path), conversation_id=pi_session_id)
+            candidates = load_candidate_sessions(
+                session_dir, work_dir, bound_session_id=bound_session_id,
+                start_dir=session.get("start_dir"), cache=session_cache,
+            )
         except PiSessionError as exc:
-            if exc.kind != "not_created":
-                return self._finish(task, ProviderResult(
-                    exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
-                    session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-                ))
+            return self._finish(task, ProviderResult(
+                exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
+                session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+            ))
+        existing_anchors = [
+            candidate for candidate in candidates
+            if candidate.anchors(task.req_id)
+        ]
+        if existing_anchors:
+            ambiguous = len(existing_anchors) > 1 or any(
+                len(candidate.anchors(task.req_id)) > 1 for candidate in existing_anchors
+            )
+            reason = f"Pi request anchor is ambiguous for {task.req_id}." if ambiguous else f"Pi request anchor already exists for {task.req_id}."
+            return self._finish(task, ProviderResult(
+                exit_code=2 if ambiguous else 1, reply=reason,
+                req_id=task.req_id, session_key=session_key, done_seen=False,
+                status=COMPLETION_STATUS_INCOMPLETE if ambiguous else COMPLETION_STATUS_FAILED,
+            ))
 
-        screen = backend.get_pane_content(str(session["pane_id"]), lines=40)
-        screen_state = classify_pane_screen(screen or "")
+        screen_state = _capture_confirmed_state(backend, str(session["pane_id"]))
         if screen_state != "idle":
             if screen_state == "dialog":
                 reason = "Pi is waiting for a project-trust or selector decision in its pane."
@@ -175,6 +254,7 @@ class PiAdapter(BaseProviderAdapter):
         parked_at: float | None = None
         anchor_seen = False
         anchor_ms: int | None = None
+        saw_busy = False
         transcript_path = ""
         result = None
         while True:
@@ -193,20 +273,28 @@ class PiAdapter(BaseProviderAdapter):
                     anchor_ms=anchor_ms, status=COMPLETION_STATUS_INCOMPLETE,
                 )
                 break
+            screen_state, _screen = _capture_screen_state(backend, str(session["pane_id"]))
+            saw_busy = saw_busy or screen_state == "busy"
             try:
-                native = load_session(session_dir, pi_session_id)
-                transcript_path = str(native.path)
-                exchange = native.exchange(task.req_id)
+                found, exchange, lookup_error, candidates = _find_request_session(
+                    session_dir, work_dir, task.req_id, bound_session_id=bound_session_id,
+                    start_dir=session.get("start_dir"), cache=session_cache,
+                )
             except PiSessionError as exc:
-                if exc.kind == "not_created":
-                    exchange = None
-                else:
-                    result = ProviderResult(
-                        exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
-                        session_key=session_key, done_seen=False, anchor_seen=anchor_seen,
-                        anchor_ms=anchor_ms, status=COMPLETION_STATUS_FAILED,
-                    )
-                    break
+                result = ProviderResult(
+                    exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
+                    session_key=session_key, done_seen=False, anchor_seen=anchor_seen,
+                    anchor_ms=anchor_ms, status=COMPLETION_STATUS_FAILED,
+                )
+                break
+            bound_session = next((candidate for candidate in candidates if candidate.session_id == pi_session_id), None)
+            if bound_session is not None:
+                transcript_path = str(bound_session.path)
+            if lookup_error == "ambiguous":
+                exchange = PiExchange("ambiguous", reason=f"Pi request anchor is ambiguous for {task.req_id}.")
+            elif found is not None:
+                pi_session_id = found.session_id
+                transcript_path = str(found.path)
             if exchange:
                 anchor_seen = exchange.state not in {"missing"}
                 if anchor_seen and anchor_ms is None:
@@ -253,13 +341,43 @@ class PiAdapter(BaseProviderAdapter):
                     )
                     break
             if not anchor_seen and now >= anchor_deadline:
-                result = ProviderResult(
-                    exit_code=1, reply="Pi did not accept the request (input not received).",
-                    req_id=task.req_id, session_key=session_key, done_seen=False,
-                    anchor_seen=False, status=COMPLETION_STATUS_FAILED,
-                    log_path=transcript_path or None,
-                )
-                break
+                deadline_state = screen_state
+                if deadline_state == "idle":
+                    deadline_state = _capture_confirmed_state(backend, str(session["pane_id"]))
+                if deadline_state in {"idle", "dialog"} and _anchor_landed(
+                    session_dir, work_dir, task.req_id, bound_session_id=bound_session_id,
+                    start_dir=session.get("start_dir"), cache=session_cache,
+                ):
+                    # The request reached Pi's transcript during confirmation; let the
+                    # next poll track it instead of reporting a lost request.
+                    continue
+                if deadline_state == "idle":
+                    if saw_busy:
+                        result = ProviderResult(
+                            exit_code=1,
+                            reply="Pi showed activity, but CCB could not locate this request in its session folder.",
+                            req_id=task.req_id, session_key=session_key, done_seen=False,
+                            anchor_seen=False, status=COMPLETION_STATUS_FAILED,
+                            log_path=transcript_path or None,
+                        )
+                    else:
+                        result = ProviderResult(
+                            exit_code=1, reply="Pi did not accept the request (input not received).",
+                            req_id=task.req_id, session_key=session_key, done_seen=False,
+                            anchor_seen=False, status=COMPLETION_STATUS_FAILED,
+                            log_path=transcript_path or None,
+                        )
+                    break
+                if deadline_state == "dialog":
+                    result = ProviderResult(
+                        exit_code=1, reply="Pi did not accept the request (Pi is showing a dialog).",
+                        req_id=task.req_id, session_key=session_key, done_seen=False,
+                        anchor_seen=False, status=COMPLETION_STATUS_FAILED,
+                        log_path=transcript_path or None,
+                    )
+                    break
+                if deadline_state == "busy":
+                    saw_busy = True
             if deadline is not None and now >= deadline:
                 result = ProviderResult(
                     exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",

@@ -33,9 +33,9 @@ class FakeBackend:
         self.sent.append((pane, text))
 
 
-def _task(work_dir: Path, req_id: str, *, has_actionable_waiting=None, cancel_event=None) -> QueuedTask:
+def _task(work_dir: Path, req_id: str, *, has_actionable_waiting=None, cancel_event=None, timeout_s: float = -1) -> QueuedTask:
     request = ProviderRequest(
-        client_id="test", work_dir=str(work_dir), timeout_s=-1, quiet=True,
+        client_id="test", work_dir=str(work_dir), timeout_s=timeout_s, quiet=True,
         message="do it", caller="claude",
     )
     return QueuedTask(
@@ -46,9 +46,42 @@ def _task(work_dir: Path, req_id: str, *, has_actionable_waiting=None, cancel_ev
 
 def _binding(tmp_path: Path, session_dir: Path, session_id: str) -> dict:
     return {
-        "active": True, "work_dir": str(tmp_path), "pi_session_id": session_id,
+        "active": True, "work_dir": str(tmp_path), "start_dir": str(tmp_path),
+        "session_id": "launch-1", "pi_session_id": session_id,
         "pi_session_dir": str(session_dir), "pane_id": "%12", "pane_title_marker": "Pi-marker",
     }
+
+
+def _write_anchor_session(session_dir: Path, work_dir: Path, session_id: str, req_id: str) -> Path:
+    path = session_dir / f"2026-11-05T00-04-35-019Z_{session_id}.jsonl"
+    rows = [
+        {"type": "session", "id": session_id, "cwd": str(work_dir), "version": 3},
+        {"type": "message", "id": "user", "parentId": None, "message": {"role": "user", "content": [{"type": "text", "text": f"CCB_REQ_ID: {req_id}\n\nrequest"}]}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def _write_completed_session(session_dir: Path, work_dir: Path, session_id: str, req_id: str) -> Path:
+    path = _write_anchor_session(session_dir, work_dir, session_id, req_id)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows.append({
+        "type": "message", "id": "assistant", "parentId": "user",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": f"Recovered reply\nCCB_DONE: {req_id}"}], "stopReason": "stop"},
+    })
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def _adapter_with_real_binding(monkeypatch, tmp_path: Path, session_dir: Path, binding: dict, backend: FakeBackend):
+    binding_path = tmp_path / ".pi-session"
+    binding_path.write_text(json.dumps(binding, indent=2) + "\n", encoding="utf-8")
+    binding_path.chmod(0o640)
+    monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (binding_path, binding, ""))
+    monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    adapter = PiAdapter()
+    monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
+    return adapter, binding_path
 
 
 def test_existing_anchor_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
@@ -57,7 +90,8 @@ def test_existing_anchor_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     target = session_dir / f"2026-11-04T00-00-00.000Z_{session_id}.jsonl"
-    target.write_bytes((FIXTURES / "s8_pair_b.jsonl").read_bytes())
+    content = (FIXTURES / "s8_pair_b.jsonl").read_text(encoding="utf-8").replace("<SCRATCH>/work", str(tmp_path), 1)
+    target.write_text(content, encoding="utf-8")
     binding = _binding(tmp_path, session_dir, session_id)
     backend = FakeBackend()
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
@@ -238,13 +272,21 @@ def test_completed_reply_strips_trailing_done_marker(monkeypatch, tmp_path: Path
 
     def accept(pane, text):
         backend.sent.append((pane, text))
-        target.write_text(source.read_text(encoding="utf-8").replace("s8-b", req_id), encoding="utf-8")
+        content = source.read_text(encoding="utf-8").replace("<SCRATCH>/work", str(tmp_path), 1).replace("s8-b", req_id)
+        target.write_text(content, encoding="utf-8")
 
     backend.send_text = accept
+    capture_calls = count()
+
+    def capture(_pane, lines=40):
+        if next(capture_calls) >= 2:
+            raise RuntimeError("terminal capture unavailable")
+        return (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+
+    backend.get_pane_content = capture
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
-    ticks = iter([0.0, 0.0, 0.1, 0.2])
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", ticks.__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
     adapter = PiAdapter()
     monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
@@ -253,3 +295,359 @@ def test_completed_reply_strips_trailing_done_marker(monkeypatch, tmp_path: Path
     assert result.exit_code == 0
     assert "CCB_DONE:" not in result.reply
     assert result.reply.strip() == "PANEB"
+
+
+def test_capture_failure_before_send_refuses_without_sending(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    backend.get_pane_content = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("capture failed"))
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+
+    result = adapter.handle_task(_task(tmp_path, "capture-failed-before-send"))
+    assert result.exit_code == 1 and "readiness could not be verified" in result.reply
+    assert backend.sent == []
+
+
+@pytest.mark.parametrize("second_capture", [
+    "busy", "dialog", "draft", "raises", "loader_change", "short_draft", "short_border",
+])
+def test_confirmed_pre_send_capture_refuses_unstable_or_uncertain_screen(monkeypatch, tmp_path: Path, second_capture: str):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    idle_screen = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    if second_capture == "busy":
+        next_screen = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    elif second_capture == "dialog":
+        next_screen = (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8")
+    elif second_capture == "draft":
+        lines = idle_screen.splitlines()
+        lines[2] = "draft text"
+        next_screen = "\n".join(lines)
+    elif second_capture == "short_draft":
+        lines = idle_screen.splitlines()
+        lines[2:3] = ["draft text", "──────", ""]
+        next_screen = "\n".join(lines)
+    elif second_capture == "short_border":
+        lines = idle_screen.splitlines()
+        lines[1] = "─"
+        next_screen = "\n".join(lines)
+    elif second_capture == "loader_change":
+        lines = idle_screen.splitlines()
+        lines[1:1] = ["", "Working"]
+        next_screen = "\n".join(lines)
+    else:
+        next_screen = ""
+    capture_calls = count()
+
+    def capture(_pane, lines=40):
+        if next(capture_calls) == 0:
+            return idle_screen
+        if second_capture == "raises":
+            raise RuntimeError("second capture failed")
+        return next_screen
+
+    backend.get_pane_content = capture
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, f"unstable-{second_capture}"))
+    assert result.exit_code == 1
+    assert backend.sent == []
+
+
+def test_resumed_session_anchor_is_tracked_without_rewriting_binding(monkeypatch, tmp_path: Path):
+    source = FIXTURES / "s11_resumed_session.jsonl"
+    rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+    session_id = rows[0]["id"]
+    req_id = "20261105-011341-925-1992986"
+    start_dir = tmp_path / "subdir"
+    start_dir.mkdir()
+    rows[0]["cwd"] = str(start_dir)
+    anchor_index = next(
+        index for index, row in enumerate(rows)
+        if row.get("type") == "message" and req_id in row.get("message", {}).get("content", [{}])[0].get("text", "")
+    )
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    target = session_dir / "2026-11-05T00-04-35-019Z_0483f4f5-72d3-476b-9bfa-25df0e3118be.jsonl"
+    target.write_text("".join(json.dumps(row) + "\n" for row in rows[:anchor_index]), encoding="utf-8")
+    fresh_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    binding = _binding(tmp_path, session_dir, fresh_id)
+    binding["start_dir"] = str(start_dir)
+    backend = FakeBackend()
+
+    def accept(pane, _text):
+        backend.sent.append((pane, _text))
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write("".join(json.dumps(row) + "\n" for row in rows[anchor_index:]))
+
+    backend.send_text = accept
+    adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    original_binding = binding_path.read_bytes()
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.1, 0.2]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0 and result.status == "completed"
+    assert "CCB_DONE:" not in result.reply
+    assert binding_path.read_bytes() == original_binding
+
+
+def test_bound_session_from_subdirectory_launch_is_still_a_candidate(monkeypatch, tmp_path: Path):
+    work_dir = tmp_path / "project"
+    start_dir = work_dir / "subdir"
+    session_dir = tmp_path / "sessions"
+    start_dir.mkdir(parents=True)
+    session_dir.mkdir()
+    session_id = "6d9e8a0e-3653-4f6f-9869-1e143d73134a"
+    req_id = "subdir-bound"
+    session_path = session_dir / f"2026-11-05T00-04-35-019Z_{session_id}.jsonl"
+    session_path.write_text(json.dumps({"type": "session", "id": session_id, "cwd": str(start_dir), "version": 3}) + "\n", encoding="utf-8")
+    binding = _binding(work_dir, session_dir, session_id)
+    binding["start_dir"] = str(start_dir)
+    backend = FakeBackend()
+
+    def accept(pane, text):
+        backend.sent.append((pane, text))
+        rows = [
+            {"type": "message", "id": "user", "parentId": None, "message": {"role": "user", "content": [{"type": "text", "text": f"CCB_REQ_ID: {req_id}\nrequest"}]}},
+            {"type": "message", "id": "assistant", "parentId": "user", "message": {"role": "assistant", "content": [{"type": "text", "text": f"Subdirectory reply\nCCB_DONE: {req_id}"}], "stopReason": "stop"}},
+        ]
+        with session_path.open("a", encoding="utf-8") as handle:
+            handle.write("".join(json.dumps(row) + "\n" for row in rows))
+
+    backend.send_text = accept
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, work_dir, session_dir, binding, backend)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(work_dir, req_id))
+    assert result.exit_code == 0 and result.reply.strip() == "Subdirectory reply"
+
+
+def test_unchanged_candidate_session_is_parsed_once_across_polls(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    candidate_path = _write_anchor_session(session_dir, tmp_path, "6d9e8a0e-3653-4f6f-9869-1e143d73134a", "other-request")
+    candidate_path.write_text(json.dumps({"type": "session", "id": "6d9e8a0e-3653-4f6f-9869-1e143d73134a", "cwd": str(tmp_path), "version": 3}) + "\n", encoding="utf-8")
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    import pi_comm
+
+    original_load = pi_comm._load_session_path
+    parses = []
+
+    def count_parse(path, session_id):
+        if path == candidate_path:
+            parses.append(path)
+        return original_load(path, session_id)
+
+    monkeypatch.setattr(pi_comm, "_load_session_path", count_parse)
+    screens = iter([
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        "blank terminal", "blank terminal",
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+    ])
+    backend.get_pane_content = lambda _pane, lines=40: next(screens)
+    monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02, 0.03, 0.04]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, "never-found"))
+    assert result.reply == "Pi did not accept the request (input not received)."
+    assert len(parses) == 1
+
+
+def test_dialog_after_anchor_deadline_fails_with_dialog_message(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    screens = iter([
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8"),
+    ])
+    backend.get_pane_content = lambda _pane, lines=40: next(screens)
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, "dialog-no-anchor"))
+    assert result.exit_code == 1 and not result.done_seen
+    assert result.reply == "Pi did not accept the request (Pi is showing a dialog)."
+
+
+def test_nonbound_existing_anchor_refuses_without_sending(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    bound_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    _write_anchor_session(session_dir, tmp_path, "6d9e8a0e-3653-4f6f-9869-1e143d73134a", "duplicate")
+    binding = _binding(tmp_path, session_dir, bound_id)
+    backend = FakeBackend()
+    adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+
+    result = adapter.handle_task(_task(tmp_path, "duplicate"))
+    assert result.exit_code == 1 and "anchor already exists" in result.reply
+    assert backend.sent == []
+
+
+def test_multiple_nonbound_anchors_are_ambiguous_without_rebinding(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    bound_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    _write_anchor_session(session_dir, tmp_path, "6d9e8a0e-3653-4f6f-9869-1e143d73134a", "duplicate")
+    _write_anchor_session(session_dir, tmp_path, "63f65251-7c83-4301-a171-c0c797927f83", "duplicate")
+    binding = _binding(tmp_path, session_dir, bound_id)
+    backend = FakeBackend()
+    adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+
+    result = adapter.handle_task(_task(tmp_path, "duplicate"))
+    assert result.exit_code == 2 and result.status == "incomplete" and "ambiguous" in result.reply
+    assert backend.sent == []
+    assert json.loads(binding_path.read_text(encoding="utf-8"))["pi_session_id"] == bound_id
+
+
+@pytest.mark.parametrize("invalid", ["foreign_cwd", "header_id"])
+def test_invalid_or_foreign_candidate_is_ignored(monkeypatch, tmp_path: Path, invalid: str):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    bound_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    candidate_id = "6d9e8a0e-3653-4f6f-9869-1e143d73134a"
+    candidate = _write_anchor_session(session_dir, tmp_path, candidate_id, "ignored")
+    if invalid == "foreign_cwd":
+        content = candidate.read_text(encoding="utf-8").replace(str(tmp_path), str(tmp_path / "elsewhere"), 1)
+        candidate.write_text(content, encoding="utf-8")
+    else:
+        content = candidate.read_text(encoding="utf-8").replace(candidate_id, bound_id, 1)
+        candidate.write_text(content, encoding="utf-8")
+    binding = _binding(tmp_path, session_dir, bound_id)
+    backend = FakeBackend()
+    adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.1]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, "ignored"))
+    assert result.reply == "Pi did not accept the request (input not received)."
+    assert json.loads(binding_path.read_text(encoding="utf-8"))["pi_session_id"] == bound_id
+
+
+def test_busy_then_idle_without_anchor_reports_unlocated_activity(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    screens = iter([
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+    ])
+    backend.get_pane_content = lambda _pane, lines=40: next(screens)
+    adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02, 0.03]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, "activity-without-anchor"))
+    assert result.exit_code == 1 and not result.done_seen
+    assert result.reply == "Pi showed activity, but CCB could not locate this request in its session folder."
+
+
+def test_unknown_screen_after_anchor_deadline_allows_late_completion(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    screens = iter([
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+        "blank terminal", "blank terminal",
+    ])
+    original_get = backend.get_pane_content
+
+    def get_screen(_pane, lines=40):
+        screen = next(screens)
+        if screen == "blank terminal":
+            return screen
+        return original_get(_pane, lines)
+
+    backend.get_pane_content = get_screen
+    adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    original_find = __import__("pi_comm").load_candidate_sessions
+    calls = count()
+
+    def late_candidate(directory, work_dir, **kwargs):
+        if next(calls) == 2:
+            _write_completed_session(directory, work_dir, "6d9e8a0e-3653-4f6f-9869-1e143d73134a", "late-anchor")
+        return original_find(directory, work_dir, **kwargs)
+
+    monkeypatch.setattr("askd.adapters.pi.load_candidate_sessions", late_candidate)
+    monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02, 0.03, 0.04]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    result = adapter.handle_task(_task(tmp_path, "late-anchor"))
+    assert result.exit_code == 0 and result.reply.strip() == "Recovered reply"
+
+
+def test_completion_landing_during_deadline_confirmation_is_delivered(monkeypatch, tmp_path: Path):
+    source = FIXTURES / "s8_pair_b.jsonl"
+    session_id = json.loads(source.read_text(encoding="utf-8").splitlines()[0])["id"]
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    target = session_dir / f"2026-11-04T00-00-00.000Z_{session_id}.jsonl"
+    req_id = "pi-late-confirm"
+    binding = _binding(tmp_path, session_dir, session_id)
+    backend = FakeBackend()
+
+    def sleep(seconds):
+        # The anchored completion is persisted while the deadline idle check confirms.
+        if backend.sent and seconds == pytest.approx(0.2) and not target.exists():
+            content = source.read_text(encoding="utf-8").replace("<SCRATCH>/work", str(tmp_path), 1).replace("s8-b", req_id)
+            target.write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
+    monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 1.0).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", sleep)
+    adapter = PiAdapter()
+    monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
+
+    result = adapter.handle_task(_task(tmp_path, req_id, timeout_s=60))
+    assert result.exit_code == 0
+    assert result.status == "completed"
+    assert len(backend.sent) == 1
+
+
+def test_spaced_custom_loader_frame_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    backend = FakeBackend()
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8").splitlines()
+    top = len(idle) - 5
+    screen = "\n".join(idle[:top - 1] + ["", " >> >> Working"] + idle[top:])
+    backend.get_pane_content = lambda _pane, lines=40: screen
+    monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
+    monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+    adapter = PiAdapter()
+    monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
+
+    result = adapter.handle_task(_task(tmp_path, "spaced-frame"))
+    assert result.exit_code == 1
+    assert "busy" in result.reply
+    assert backend.sent == []

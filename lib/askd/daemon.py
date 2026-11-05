@@ -47,6 +47,26 @@ ASKD_SPEC = ProviderDaemonSpec(
 )
 
 
+def _result_is_refusal(result: ProviderResult) -> bool:
+    """Did this already-recorded result refuse the request?
+
+    Only a nonzero exit or a failure status is a refusal. A completed success
+    that simply finished before the acknowledgement was built is not.
+    """
+    try:
+        if int(result.exit_code or 0) != 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+    status = str(result.status or "").strip().lower()
+    return status in {
+        COMPLETION_STATUS_FAILED.lower(),
+        "cancelled",
+        "canceled",
+        "refused",
+    }
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -98,7 +118,11 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
                 )
             # Peer messages are delivery-only. The validated endpoint is
             # the send target, never an adapter's mutable provider default.
+            # G6: the role-policy recheck lives INSIDE send_peer_message, as
+            # the last step before its own send_text, so it judges the
+            # endpoint that send actually resolved.
             from peer_routing import send_peer_message
+
             return send_peer_message(task, self.adapter.key, self.session_key)
         task.has_actionable_waiting = self._has_actionable_waiting
         return self.adapter.handle_task(task)
@@ -289,6 +313,8 @@ class UnifiedAskDaemon:
             return self._handle_resolve_route(msg)
         if operation == "peer_identify_sender":
             return self._handle_peer_identify_sender(msg)
+        if operation == "check_delivery":
+            return self._handle_check_delivery(msg)
 
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
@@ -354,6 +380,12 @@ class UnifiedAskDaemon:
                 "reply": f"Malformed peer_destination: {exc}",
             }
 
+        sender_member_id = str(msg.get("sender_member_id") or "")
+        sender_member_token = str(msg.get("sender_member_token") or "")
+        kind = str(msg.get("kind") or "").strip().lower()
+        to_role = str(msg.get("to_role") or "").strip().lower()
+        reply_to = str(msg.get("reply_to") or "").strip()
+
         try:
             request = ProviderRequest(
                 client_id=str(msg.get("id") or ""),
@@ -387,6 +419,11 @@ class UnifiedAskDaemon:
                 caller_work_dir=str(msg.get("caller_work_dir") or ""),
                 route=route,
                 peer_destination=peer_destination,
+                kind=kind,
+                to_role=to_role,
+                sender_member_id=sender_member_id,
+                sender_member_token=sender_member_token,
+                reply_to=reply_to,
             )
         except Exception as exc:
             return {
@@ -395,6 +432,36 @@ class UnifiedAskDaemon:
                 "id": msg.get("id"),
                 "exit_code": 1,
                 "reply": f"Bad request: {exc}",
+            }
+
+        # Role delivery policy (Phase 3): the accept gate. Evaluated BEFORE
+        # anything is enqueued, so a refusal never reaches a queue or a pane.
+        # With no role_policy on the destination launch this returns allow
+        # unless the caller explicitly asserted a target role.
+        from delivery_policy import evaluate_request
+
+        # G1: judge the destination the adapter will actually deliver to.
+        # For an unrouted request that is whatever `load_session` binds --
+        # a subdirectory request binds to its project's session, whose own
+        # project/launch scope decides the policy.
+        bound_session = None
+        if not request.route.present and not request.peer_destination.present:
+            try:
+                bound_session = adapter.load_session(Path(request.work_dir))
+            except Exception as exc:
+                _write_log(f"[WARN] policy could not load the destination session: {exc}")
+                bound_session = None
+        policy = evaluate_request(request, provider, session=bound_session)
+        if not policy.allowed:
+            _write_log(f"[INFO] policy refused provider={provider} req_id={request.req_id or '-'} reason={policy.reason}")
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": request.client_id,
+                "req_id": request.req_id or "",
+                "exit_code": 1,
+                "reply": policy.reason,
+                "accepted": False,
             }
 
         task = self.pool.submit(provider, request)
@@ -408,6 +475,29 @@ class UnifiedAskDaemon:
             }
 
         if _request_bool(msg.get("async_submit")):
+            # A7: submit() may already have refused this request (route, peer
+            # destination or policy) and recorded the result without ever
+            # enqueueing it. Reporting accepted:True there told the caller a
+            # rejected request had been accepted; report the actual outcome --
+            # but only a REFUSAL. A task that really completed must keep
+            # accepted:True and its own exit code.
+            preset = task.result
+            if preset is not None and _result_is_refusal(preset):
+                return {
+                    "type": "ask.response",
+                    "v": 1,
+                    "id": request.client_id,
+                    "req_id": preset.req_id or task.req_id,
+                    "exit_code": int(preset.exit_code),
+                    "reply": preset.reply,
+                    "accepted": False,
+                    "provider": provider,
+                    "meta": {
+                        "session_key": preset.session_key,
+                        "status": preset.status,
+                        "done_seen": preset.done_seen,
+                    },
+                }
             return {
                 "type": "ask.response",
                 "v": 1,
@@ -544,6 +634,112 @@ class UnifiedAskDaemon:
             "id": msg.get("id"),
             "exit_code": 0 if ok else 1,
             "reply": detail,
+        }
+
+    def _handle_check_delivery(self, msg: dict) -> dict:
+        """Read-only role-policy preflight for an async sender.
+
+        Advisory only: the accept gate in `_handle_request` stays
+        authoritative and re-evaluates the same request before anything is
+        enqueued. This exists so a refusal can be reported before a
+        background submission is announced.
+        """
+        from askd.adapters.base import (
+            PeerDestination,
+            ProviderRequest,
+            ResolvedRoute,
+            parse_peer_destination_mapping,
+            parse_route_mapping,
+        )
+        from delivery_policy import evaluate_request
+
+        # Deliberately NOT the `provider` field: an older daemon that does
+        # not know this operation would fall through to normal dispatch, and
+        # an empty `provider` makes it refuse instead of enqueueing anything.
+        provider = str(msg.get("target_provider") or "").strip().lower()
+        if not provider:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": "Delivery check requires a provider",
+            }
+        try:
+            route = parse_route_mapping(msg.get("route"))
+            peer_destination = parse_peer_destination_mapping(msg.get("peer_destination"))
+        except MalformedRouteError as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 1,
+                "reply": f"Malformed delivery check: {exc}",
+                "allowed": False,
+            }
+        request = ProviderRequest(
+            client_id=str(msg.get("id") or ""),
+            work_dir=str(msg.get("work_dir") or ""),
+            timeout_s=float(msg.get("timeout_s") or 300.0),
+            quiet=True,
+            message="",
+            caller=str(msg.get("caller") or ""),
+            delivery_only=bool(msg.get("delivery_only") or False),
+            route=route if isinstance(route, ResolvedRoute) else ResolvedRoute(),
+            peer_destination=(
+                peer_destination if isinstance(peer_destination, PeerDestination) else PeerDestination()
+            ),
+            kind=str(msg.get("kind") or "").strip().lower(),
+            to_role=str(msg.get("to_role") or "").strip().lower(),
+            sender_member_id=str(msg.get("sender_member_id") or ""),
+            sender_member_token=str(msg.get("sender_member_token") or ""),
+            reply_to=str(msg.get("reply_to") or "").strip(),
+        )
+        project_hint = str(msg.get("project_hint") or "").strip()
+        peer_transport = bool(msg.get("peer_transport") or project_hint)
+        try:
+            destination = None
+            if project_hint and not route.present and not peer_destination.present:
+                from delivery_policy import destination_from_project_hint
+
+                destination = destination_from_project_hint(
+                    provider, project_hint, member_id=str(msg.get("target_live_id") or "")
+                )
+            elif not route.present and not peer_destination.present:
+                from delivery_policy import destination_for_session
+
+                adapter = self.registry.get(provider)
+                if adapter is not None:
+                    try:
+                        bound = adapter.load_session(Path(request.work_dir))
+                    except Exception:
+                        bound = None
+                    if bound is not None:
+                        destination = destination_for_session(provider, bound)
+            decision = evaluate_request(
+                request,
+                provider,
+                destination=destination,
+                peer_transport=peer_transport,
+            )
+        except Exception as exc:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "exit_code": 0,
+                "reply": "",
+                "allowed": False,
+                "reason": f"role policy cannot be determined: {exc}",
+            }
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0,
+            "reply": "",
+            "allowed": bool(decision.allowed),
+            "reason": decision.reason,
         }
 
     def _handle_queue_status(self, msg: dict) -> dict:

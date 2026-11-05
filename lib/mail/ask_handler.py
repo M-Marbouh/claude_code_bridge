@@ -204,6 +204,27 @@ class AskHandler:
         # Prepare environment
         work_dir = self._get_work_dir()
         env = os.environ.copy()
+        # Email ingress is always an EXTERNAL sender for the role delivery
+        # policy: it must never inherit a launch credential or a carrying
+        # route from whatever shell the mail daemon happens to run under.
+        for leaked in (
+            "CCB_MEMBER_ID",
+            "CCB_MEMBER_TOKEN",
+            "CCB_LIVE_ID",
+            "CCB_LIVE_TOKEN",
+            "CCB_ROUTE_LIVE_ID",
+            "CCB_ROUTE_LAUNCH_ID",
+            "CCB_ROUTE_CALLER_LIVE_ID",
+            "CCB_ROUTE_CALLER_TOKEN",
+            "CCB_ROUTE_CALLER_PANE_ID",
+            "CCB_ROUTE_CALLER_TERMINAL",
+            "CCB_ROUTE_PANE_ID",
+            "CCB_ROUTE_TERMINAL",
+            "CCB_ROUTE_SESSION_FILE",
+            "CCB_ROUTE_PROJECT_ID",
+            "CCB_ROUTE_TASK_ID",
+        ):
+            env.pop(leaked, None)
         env["CCB_CALLER"] = "email"
         env["CCB_EMAIL_REQ_ID"] = request_id
         env["CCB_EMAIL_MSG_ID"] = msg.message_id or ""

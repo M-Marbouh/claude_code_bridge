@@ -1,0 +1,34 @@
+{
+  "ccb_session_id": "ai-1700000000-1000000",
+  "ccb_project_id": "9dad1e4e08b0b11cbcd860257e8bdfa6b8e5f01790e10a6a0b1f4870c13e686b",
+  "work_dir": "/home/user/project",
+  "terminal": "tmux",
+  "providers": {
+    "claude": {
+      "pane_id": "%8",
+      "pane_title_marker": "CCB-Claude-0f0f0f0f",
+      "session_file": "/home/user/project/.ccb/.claude-session",
+      "claude_session_id": "00000000-0000-4000-8000-000000000001",
+      "claude_session_path": "/home/user/.claude/projects/-home-user-project/00000000-0000-4000-8000-000000000001.jsonl",
+      "member_id": "11111111111111111111111111111111",
+      "member_token": "test-token-claude"
+    },
+    "pi": {
+      "pane_id": "%13",
+      "pane_title_marker": "CCB-Pi-0f0f0f0f",
+      "session_file": "/home/user/project/.ccb/.pi-session",
+      "member_id": "22222222222222222222222222222222",
+      "member_token": "test-token-pi"
+    },
+    "codex": {
+      "pane_id": "%14",
+      "pane_title_marker": "CCB-Codex-0f0f0f0f",
+      "session_file": "/home/user/project/.ccb/.codex-session",
+      "member_id": "33333333333333333333333333333333",
+      "member_token": "test-token-codex"
+    }
+  },
+  "updated_at": 1700000000,
+  "claude_pane_id": "%8",
+  "codex_pane_id": "%14"
+}

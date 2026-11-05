@@ -432,6 +432,7 @@ def send_peer_message(task, provider: str, session_key: str):
     """Send a queued delivery-only message to its exact saved endpoint."""
     from askd.adapters.base import ProviderResult
     from ccb_protocol import wrap_codex_delivery_prompt
+    from completion_hook import COMPLETION_STATUS_FAILED
     from laskd_protocol import wrap_claude_delivery_prompt
     from terminal import get_backend_for_session
 
@@ -449,6 +450,22 @@ def send_peer_message(task, provider: str, session_key: str):
     wrapper = wrap_codex_delivery_prompt if provider == "codex" else wrap_claude_delivery_prompt
     prompt = request.message if request.no_wrap else wrapper(request.message, task.req_id)
     backend = get_backend_for_session({"terminal": destination.terminal})
+    if backend is None:
+        return ProviderResult(exit_code=1, reply="Peer destination terminal backend is unavailable.",
+                              req_id=task.req_id, session_key=session_key, done_seen=False,
+                              status=COMPLETION_STATUS_FAILED)
+    # Phase 3 (E5/G6): the role-policy recheck runs here, immediately before
+    # injection, against the endpoint this send resolved -- never earlier, so
+    # a role or pane change during revalidation above cannot slip through.
+    from delivery_policy import refusal_for_request
+
+    refusal = refusal_for_request(
+        request, provider, expected_pane=destination.pane_id
+    )
+    if refusal:
+        return ProviderResult(exit_code=1, reply=refusal, req_id=task.req_id,
+                              session_key=session_key, done_seen=False,
+                              status=COMPLETION_STATUS_FAILED)
     backend.send_text(destination.pane_id, prompt)
     return ProviderResult(exit_code=0, reply="Peer message accepted.", req_id=task.req_id,
                           session_key=session_key, done_seen=False, status="completed",

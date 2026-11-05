@@ -232,6 +232,20 @@ class GeminiAdapter(BaseProviderAdapter):
         state = log_reader.capture_state()
 
         prompt = wrap_gemini_prompt(req.message, task.req_id)
+        # Phase 3 (E5): role-policy recheck as the LAST step before injection.
+        from delivery_policy import refusal_for_request
+
+        refusal = refusal_for_request(req, self.key, expected_pane=pane_id, session=session)
+        if refusal:
+            _write_log(f"[INFO] policy refused provider=gemini req_id={task.req_id} reason={refusal}")
+            return ProviderResult(
+                exit_code=1,
+                reply=refusal,
+                req_id=task.req_id,
+                session_key=session_key,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
         backend.send_text(pane_id, prompt)
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))

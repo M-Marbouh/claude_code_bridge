@@ -241,6 +241,16 @@ class PiAdapter(BaseProviderAdapter):
                 done_seen=False, status=COMPLETION_STATUS_FAILED,
             ))
 
+        # Phase 3 (E5): role-policy recheck as the LAST step before injection.
+        from delivery_policy import refusal_for_request
+
+        refusal = refusal_for_request(req, self.key, expected_pane=str(session["pane_id"]), session=session)
+        if refusal:
+            _write_log(f"[INFO] policy refused provider=pi req_id={task.req_id} reason={refusal}")
+            return self._finish(task, ProviderResult(
+                exit_code=1, reply=refusal, req_id=task.req_id, session_key=session_key,
+                done_seen=False, status=COMPLETION_STATUS_FAILED,
+            ))
         try:
             backend.send_text(str(session["pane_id"]), wrap_codex_prompt(req.message, task.req_id))
         except Exception as exc:

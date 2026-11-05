@@ -63,7 +63,7 @@ def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda *_args: (
+        lambda *_args, **_kwargs: (
             0,
             "",
             {
@@ -99,7 +99,7 @@ def test_bridge_persists_observed_delivery_confirmation(monkeypatch) -> None:
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda *_args: (
+        lambda *_args, **_kwargs: (
             0,
             "Peer message delivered.",
             {
@@ -272,7 +272,7 @@ def test_bridge_accepts_codex_only_project(monkeypatch) -> None:
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda *args: captured.update(provider=args[-3], caller=args[-2], foreground=args[-1])
+        lambda *args, **kwargs: captured.update(provider=args[-3], caller=args[-2], foreground=args[-1])
         or (0, "Codex result", {}),
     )
 
@@ -598,7 +598,7 @@ def test_reverse_reply_prefers_live_project_and_saves_correlated_result(
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda *args: sent.update(target=args[0], message=args[1]) or (0, "Peer message delivered.", {}),
+        lambda *args, **kwargs: sent.update(target=args[0], message=args[1]) or (0, "Peer message delivered.", {}),
     )
     monkeypatch.setattr(
         bridge,
@@ -851,7 +851,7 @@ def test_reverse_reply_continues_when_bridge_lock_filesystem_is_read_only(
     monkeypatch.setattr(
         bridge,
         "_send_to_daemon",
-        lambda _target, message, *_args: deliveries.append(message) or (1, "", {}),
+        lambda _target, message, *_args, **_kwargs: deliveries.append(message) or (1, "", {}),
     )
 
     rc = bridge.main(

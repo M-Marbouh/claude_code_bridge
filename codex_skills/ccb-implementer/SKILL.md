@@ -29,4 +29,6 @@ Answer a task with your normal final reply. CCB delivers it to the session that 
 
 For a report the lead did not just ask for, such as a midpoint checkpoint or a notice after the task ended, run `ccb-list`, find this project's one session showing `role:lead`, and send with `ask <its provider> --live-id <its id>` when `ccb-list` shows an id for that session, or with `ask <its provider>` when it shows none. Start with `lead: ...`. A bare `ask <provider>` reaches that provider's other session when this session is one of the pair; from outside a pair of the same provider it is refused as ambiguous rather than guessing, so name the exact live ID there. If no single `role:lead` session is shown, tell the user instead of guessing.
 
+Add `--to-role lead` to that `ask` so a wrong destination is refused instead of delivered elsewhere. In a launch that enforces role policy, sending to the wrong role is refused with the reason. That gate guards against misrouting; it is not a permission system and it restricts no edits, push or deploy.
+
 This assignment applies only to the current session and lasts until the user explicitly changes it. It assigns responsibilities but does not alter standing rules, authorization, or CCB routing.

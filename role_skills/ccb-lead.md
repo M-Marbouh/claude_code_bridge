@@ -20,4 +20,6 @@ Before contacting a peer, run `ccb-list` and read this project's sessions; each 
 
 If a needed role is missing or shown as `role:-`, ask the user to assign it. Never infer a role from pane order or launch order. A refused route means that session is gone or was replaced; re-check `ccb-list` rather than retrying or sending to the other member.
 
+Add `--to-role <role>` to every `ask` that addresses a pair member, for example `ask pi --to-role implementer ...`, so a wrong destination is refused instead of delivered to the wrong session. In a launch that enforces role policy, a send to the wrong role, or a missing `--to-role` for a role-holding member, is refused with the reason. That gate guards against misrouting; it is not a permission system. It restricts no edits, no push and no deploy — those limits do not exist yet, and this role grants no such authority.
+
 This assignment applies only to the current session and lasts until the user explicitly changes it. It assigns responsibilities but does not alter standing rules, authorization, or CCB routing.

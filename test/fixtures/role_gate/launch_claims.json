@@ -1,0 +1,26 @@
+{
+  "launch_id": "ai-1700000000-1000000",
+  "claims": {
+    "22222222222222222222222222222222": {
+      "role": "implementer",
+      "pane_id": "%13",
+      "provider": "pi",
+      "claimed_at": 1700000100,
+      "pane_pid": ""
+    },
+    "33333333333333333333333333333333": {
+      "role": "ratifier",
+      "pane_id": "%14",
+      "provider": "codex",
+      "claimed_at": 1700000100,
+      "pane_pid": ""
+    },
+    "11111111111111111111111111111111": {
+      "role": "lead",
+      "pane_id": "%8",
+      "provider": "claude",
+      "claimed_at": 1700000100,
+      "pane_pid": ""
+    }
+  }
+}

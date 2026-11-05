@@ -218,6 +218,8 @@ def test_claude_notify_uses_unified_delivery_only_transport(monkeypatch) -> None
         "daemon_context": context,
         "route": ask.ResolvedRoute(),
         "timeout_explicit": False,
+        "kind": "notify",
+        "to_role": "",
     }
 
 
@@ -411,6 +413,7 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
         reply_to: str,
         *,
         live_id: str = "",
+        to_role: str = "",
     ) -> int:
         captured.update(
             target=target,
@@ -420,6 +423,7 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
             foreground=foreground,
             intent=intent,
             reply_to=reply_to,
+            to_role=to_role,
         )
         return 0
 
@@ -436,6 +440,7 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
         "foreground": True,
         "intent": "notify",
         "reply_to": "",
+        "to_role": "",
     }
 
 
@@ -1921,7 +1926,7 @@ def test_ask_forwards_live_id_for_provider_peer_form(monkeypatch) -> None:
     )
 
     assert rc == 0
-    assert captured == {"live_id": "live-b"}
+    assert captured == {"live_id": "live-b", "to_role": ""}
 
 
 def test_peer_mode_parser_forwards_live_id(monkeypatch) -> None:
@@ -1936,7 +1941,7 @@ def test_peer_mode_parser_forwards_live_id(monkeypatch) -> None:
     rc = ask._handle_peer_mode(["--peer", "/tmp/peer", "--live-id", "live-b", "--notify", "FYI"])
 
     assert rc == 0
-    assert captured == {"live_id": "live-b"}
+    assert captured == {"live_id": "live-b", "to_role": ""}
 
 
 def _refuse_dispatch(ask, monkeypatch) -> None:
@@ -2207,6 +2212,7 @@ def test_ask_resend_forwards_raw_body_and_live_id_through_peer_mode(
     assert captured["kwargs"] == {
         "live_id": "live-target",
         "preserve_task_id": _RESEND_TASK_ID,
+        "to_role": "",
     }
 
 

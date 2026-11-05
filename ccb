@@ -606,6 +606,7 @@ class AILauncher:
         cmd_config: dict | None = None,
         launch_args: dict | None = None,
         launch_env: dict | None = None,
+        role_policy: str = "",
     ):
         self.providers = providers or ["codex"]
         pairing_error = provider_pairing_error(self.providers, resume=resume)
@@ -616,6 +617,10 @@ class AILauncher:
         self.cmd_config = self._normalize_cmd_config(cmd_config)
         self.launch_args = launch_args if isinstance(launch_args, dict) else {}
         self.launch_env = launch_env if isinstance(launch_env, dict) else {}
+        # Opt-in role delivery gate. Written by the launcher into the launch
+        # record; nothing a pane process does can change it for its own
+        # launch (A1). Absent/"" means off, which is today's behaviour.
+        self.role_policy = role_policy if role_policy in ("", "off", "enforce") else ""
         self.script_dir = Path(__file__).resolve().parent
         self.invocation_dir = Path.cwd()
         # Project root is strictly the current working directory.
@@ -745,6 +750,24 @@ class AILauncher:
         if self.terminal_type == "tmux" and self.anchor_provider == "claude" and self._live_slots:
             return self._live_slots[self._launch_slot]
         return None
+
+    def _publish_role_policy(self) -> bool:
+        """Record this launch's role policy before any pane exists.
+
+        The launch record is the single place the daemon reads the policy
+        from, and the launcher is its intended writer (evidence map §6). An
+        absent field means off, so an off launch needs no write.
+        """
+        if not self.role_policy:
+            return True
+        return upsert_registry({
+            "ccb_session_id": self.session_id,
+            "ccb_project_id": self.project_id,
+            "work_dir": str(self.project_root),
+            "terminal": self.terminal_type,
+            "ccb_pid": self.ccb_pid,
+            "role_policy": self.role_policy,
+        })
 
     def _publish_live_inventory(self) -> bool:
         if not self._live_slots:
@@ -3767,6 +3790,9 @@ class AILauncher:
         if not self._publish_live_inventory():
             print("❌ Cannot publish live session inventory.", file=sys.stderr)
             return 2
+        if not self._publish_role_policy():
+            print("❌ Cannot record the role policy for this launch.", file=sys.stderr)
+            return 2
 
         self.anchor_provider = self.providers[-1]
         self.anchor_pane_id = self._current_pane_id()
@@ -4163,6 +4189,16 @@ def cmd_start(args):
     raw_launch_env = config_data.get("launch_env")
     launch_env = raw_launch_env if isinstance(raw_launch_env, dict) else None
 
+    configured_role_policy = str(config_data.get("role_policy") or "").strip().lower()
+    if configured_role_policy not in ("", "off", "enforce"):
+        print(
+            "[ERROR] role_policy must be 'enforce' or 'off' in ccb.config",
+            file=sys.stderr,
+        )
+        return 2
+    flag_role_policy = str(getattr(args, "role_policy", "") or "").strip().lower()
+    role_policy = flag_role_policy or configured_role_policy
+
     launcher = AILauncher(
         providers=providers,
         resume=resume,
@@ -4170,6 +4206,7 @@ def cmd_start(args):
         cmd_config=cmd_config,
         launch_args=launch_args,
         launch_env=launch_env,
+        role_policy=role_policy,
     )
     try:
         return launcher.run_up()
@@ -5576,6 +5613,12 @@ def main():
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context (unique-provider launches only)")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")
+    start_parser.add_argument(
+        "--role-policy",
+        choices=("enforce", "off"),
+        default="",
+        help="Role delivery gate for this launch: 'enforce' refuses role-violating asks (default: off)",
+    )
     args = start_parser.parse_args(argv)
     return cmd_start(args)
 

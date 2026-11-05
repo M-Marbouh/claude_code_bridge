@@ -223,6 +223,30 @@ Each body says to take the role only when the user explicitly assigns it in the 
 
 Known limitation: peer-to-peer messaging (`ask --peer`) stays limited to Claude and Codex, as sender and as destination; a Pi session can start a local `ask` and receive the result, and can record a role, but a Pi request cannot be sent with `--peer`. Recording a role needs a CCB launch credential, which CCB exports into every managed pane; a session started outside CCB has none and cannot record a role.
 
+### Role policy
+
+A launch can enforce which roles may send new work to which roles. It is off unless the launch opts in:
+
+```bash
+ccb --role-policy enforce     # or: role_policy = "enforce" in .ccb/ccb.config
+```
+
+The flag wins over the config value. The launcher writes the choice into the launch record before any pane starts, and the policy of the **destination** launch governs: a launch without the setting behaves exactly as before.
+
+With enforcement on, the fixed matrix is:
+
+| Sender role | May address |
+| --- | --- |
+| `lead` | `implementer`, `ratifier` |
+| `implementer` | `lead` |
+| `ratifier` | `lead` |
+| a session with no role | nobody, and receives nothing ("assign a role first") |
+| external (manual, email, another launch, `--peer`, legacy sender, missing credential) | only a session holding `lead` |
+
+`ask --to-role <role>` asserts the destination's role and is always verified, even in a non-enforcing launch; under enforcement it is required for role-holding members. A refusal names the sender role, the target role and the allowed targets, and the request is refused before it is queued — never reported as submitted. Verified correlated peer replies still reach the original requester whatever role it now holds.
+
+**This guards against misrouting, not against permissions.** Every pane, daemon and the launcher run as one OS user, so any process can rewrite the files the gate reads or type into another pane directly. What enforcement does guarantee is that every CCB ingress path applies the same rule and fails closed: local `ask`, `--notify`, `--peer`, the bridge's direct reply path, background submissions and email ingress. **Action limits are not provided**: enforcement does not restrict edits, push, deploy or any other external effect, and a role grants no such authority.
+
 ## Troubleshooting
 
 - `ambiguous` means CCB cannot prove one destination. Run the request from a mounted member of the local pair, or choose a remote project with one session of that provider; CCB never guesses by launch order.

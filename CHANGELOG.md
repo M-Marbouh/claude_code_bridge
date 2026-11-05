@@ -4,6 +4,14 @@
 
 ### Added
 
+- Added an opt-in role delivery gate: `ccb --role-policy enforce` (or `role_policy = "enforce"` in `ccb.config`) refuses asks whose sender role may not address the destination role, using a fixed matrix (`lead` may address `implementer` and `ratifier`; both may address `lead`; the two may not address each other; a session with no role neither sends nor receives; external senders may only reach `lead`). The gate applies at the daemon accept step, again immediately before pane injection, and on the bridge direct-reply path; email ingress is always treated as external. Verified correlated peer replies still reach their original requester whatever role it now holds. Launches without the setting behave as before.
+- Added `ask --to-role <role>`, which asserts the destination session's role and is always verified, with or without enforcement.
+- Added the read-only `check_delivery` daemon operation so an async submission reports a policy refusal instead of announcing a submission that will not be delivered.
+
+### Fixed
+
+- A background (`async_submit`) ask no longer reports `accepted: true` when the request had already been refused before queueing; it now returns the refusal and a nonzero exit code.
+
 - Any CCB launch can now record a session role: non-pair launches export a member credential, `ccb-role` accepts it, and `ccb-list` shows the role beside the provider without printing the member ID. Pair launches keep their existing live ID and token as the same credential.
 - Role claims are serialized by a launch-scoped lock, so concurrent claims for one name produce exactly one holder, and a malformed live-session inventory never falls back to provider entries.
 - Pi is a local `ask` caller: its requests reach the lead and the result returns to the Pi pane through `.pi-session`, with Pi named in completion notifications.

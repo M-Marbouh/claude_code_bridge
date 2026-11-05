@@ -371,6 +371,68 @@ def _validated_direct_reply_target(
     return target, backend
 
 
+ROLE_NAMES = ("lead", "implementer", "ratifier")
+
+
+def _sender_credential() -> tuple[str, str]:
+    member_id = (os.environ.get("CCB_MEMBER_ID") or "").strip()
+    member_token = (os.environ.get("CCB_MEMBER_TOKEN") or "").strip()
+    if not member_id or not member_token:
+        member_id = member_id or (os.environ.get("CCB_LIVE_ID") or "").strip()
+        member_token = member_token or (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+    return member_id, member_token
+
+
+def _direct_reply_policy_refusal(
+    *,
+    provider: str,
+    pane_id: str,
+    work_dir: str,
+    ccb_project_id: str,
+    reply_receipt: dict[str, Any] | None,
+    to_role: str,
+) -> str:
+    """Phase 3 (A6.iv/E2): the direct reply path bypasses the daemon.
+
+    It may only deliver when the destination launch's policy allows it, and
+    under enforce only a verified correlated reply to the original requester
+    is allowed. Correlation is re-verified here from the receipt, never from
+    a client flag.
+    """
+    from delivery_policy import (
+        MODE_UNMANAGED,
+        destination_from_pane,
+        evaluate,
+        identify_sender,
+        verify_reply_correlation,
+    )
+
+    destination = destination_from_pane(
+        provider, pane_id, ccb_project_id=ccb_project_id, work_dir=work_dir
+    )
+    if destination.mode == MODE_UNMANAGED:
+        return ""
+    member_id, member_token = _sender_credential()
+    sender = identify_sender(destination, member_id, member_token)
+    kind = "reply" if reply_receipt is not None else "request"
+    reply_to = str((reply_receipt or {}).get("task_id") or "").strip()
+    if kind == "reply":
+        problem = verify_reply_correlation(destination, reply_to=reply_to, provider=provider)
+        if problem:
+            return f"role policy refused: {problem}"
+    decision = evaluate(
+        destination=destination,
+        sender=sender,
+        kind=kind,
+        to_role=to_role,
+        delivery_only=True,
+        has_peer=True,
+        reply_to=reply_to,
+        expected_pane=pane_id,
+    )
+    return "" if decision.allowed else decision.reason
+
+
 def _send_to_direct_reply_target(
     target: dict[str, Any],
     backend: Any,
@@ -449,6 +511,78 @@ def _acquire_lock(target_hash: str, provider: str):
     return lock_handle, fcntl
 
 
+DAEMON_CAPABILITY_REFUSAL = (
+    "cannot confirm the CCB daemon supports role policy; restart this CCB launch"
+)
+
+
+def _policy_destination(*, provider: str, pane_id: str, work_dir: str, ccb_project_id: str):
+    from delivery_policy import destination_from_pane
+
+    return destination_from_pane(
+        provider, pane_id, ccb_project_id=ccb_project_id, work_dir=work_dir
+    )
+
+
+def _bridge_gate_required(
+    *,
+    provider: str,
+    to_role: str,
+    pane_id: str,
+    work_dir: str,
+    ccb_project_id: str,
+) -> bool:
+    """Does this peer delivery need the host's gate? (H3b)
+
+    An explicit --to-role always does, and so does a destination launch whose
+    own policy is enforcing or unreadable.
+    """
+    from delivery_policy import MODE_ENFORCE, MODE_ERROR, destination_is_known
+
+    if (to_role or "").strip():
+        return True
+    destination = _policy_destination(
+        provider=provider,
+        pane_id=pane_id,
+        work_dir=work_dir,
+        ccb_project_id=ccb_project_id,
+    )
+    return destination_is_known(destination) and destination.mode in (MODE_ENFORCE, MODE_ERROR)
+
+
+def _capability_preflight(state: dict, request: dict[str, Any]) -> str:
+    """Ask the daemon to judge the REAL request. "" when it may proceed.
+
+    The probe carries this delivery's actual fields -- kind (including
+    `reply`), reply correlation, endpoint identity and sender credential --
+    because the answer must be the policy verdict for THIS message, not for a
+    synthetic request that a correlated reply would fail.
+
+    "Supported" is exactly "the answer carries an `allowed` key". A policy
+    refusal is returned verbatim, as a policy refusal; only a missing op, a
+    reply without `allowed`, a malformed answer or an exception is a
+    capability failure.
+    """
+    probe = dict(request)
+    probe["operation"] = "check_delivery"
+    probe["provider"] = ""
+    probe["target_provider"] = str(request.get("provider") or "")
+    probe.pop("message", None)
+    probe.pop("async_submit", None)
+    probe.pop("timeout_explicit", None)
+    try:
+        response = askd_rpc.request_daemon(
+            state, probe, connect_timeout_s=5.0, response_timeout_s=10.0
+        )
+    except Exception:
+        return DAEMON_CAPABILITY_REFUSAL
+    if not isinstance(response, dict) or "allowed" not in response:
+        return DAEMON_CAPABILITY_REFUSAL
+    if response.get("allowed") is False:
+        return str(response.get("reason") or "role policy refused this delivery")
+    return ""
+
+
 def _send_to_daemon(
     target: dict[str, Any],
     message: str,
@@ -462,6 +596,9 @@ def _send_to_daemon(
     provider: str = "claude",
     caller: str = "claude",
     foreground: bool = False,
+    to_role: str = "",
+    peer_pane_id: str = "",
+    peer_project_id: str = "",
 ) -> tuple[int, str, dict[str, Any]]:
     state_file = find_running_state_file(
         "askd.json",
@@ -506,7 +643,16 @@ def _send_to_daemon(
         "caller_pane_id": caller_pane_id,
         "caller_terminal": caller_terminal,
         "caller_work_dir": sender_work_dir,
+        # Phase 3 (E3): logical kind, independent of the peer transport's
+        # delivery_only, plus the caller's explicit target-role assertion.
+        "kind": "reply" if reply_to else ("notify" if intent == "notify" else "request"),
+        "to_role": to_role,
+        "reply_to": reply_to,
     }
+    sender_member_id, sender_member_token = _sender_credential()
+    if sender_member_id and sender_member_token:
+        req["sender_member_id"] = sender_member_id
+        req["sender_member_token"] = sender_member_token
     if peer_task_id:
         req["req_id"] = peer_task_id
     peer_destination = target.get("peer_destination") if isinstance(target, dict) else None
@@ -521,6 +667,23 @@ def _send_to_daemon(
         # so this function's own call signature -- and every existing
         # caller of it -- stays exactly as it is.
         req["peer_destination"] = dict(peer_destination)
+
+    # H3b/J2: the probe sends THESE fields, so its answer is this request's
+    # policy verdict. Run before submission; a required gate never proceeds
+    # on a daemon that cannot answer it.
+    if _bridge_gate_required(
+        provider=provider,
+        to_role=to_role,
+        # The endpoint identity the send will really use, whether the caller
+        # passed it explicitly or it came from the resolved target.
+        pane_id=peer_pane_id
+        or str(((target.get("providers") or {}).get(provider) or {}).get("pane_id") or ""),
+        work_dir=str(target.get("work_dir") or ""),
+        ccb_project_id=peer_project_id or str(target.get("ccb_project_id") or ""),
+    ):
+        refusal = _capability_preflight(state, req)
+        if refusal:
+            raise RuntimeError(refusal)
 
     try:
         resp = askd_rpc.request_daemon(
@@ -625,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Deliver to this exact live session of the target provider.",
     )
+    parser.add_argument("--to-role", default="", help=argparse.SUPPRESS)
     parser.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
@@ -637,6 +801,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.intent == "notify" and message.rstrip().endswith("?"):
         print("[ERROR] --notify cannot end with a direct question; use --background or --wait", file=sys.stderr)
+        return 1
+    to_role = str(args.to_role or "").strip().lower()
+    if to_role and to_role not in ROLE_NAMES:
+        print(f"[ERROR] --to-role must be one of: {', '.join(ROLE_NAMES)}", file=sys.stderr)
         return 1
     if args.reply_to and not PEER_CORRELATION_ID_RE.fullmatch(str(args.reply_to)):
         print("[ERROR] Invalid --reply-to task ID", file=sys.stderr)
@@ -762,6 +930,22 @@ def main(argv: list[str] | None = None) -> int:
                 # Revalidate after acquiring the transport lock, just as
                 # queued daemon delivery revalidates at its send boundary.
                 target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
+                direct_pane = str(
+                    ((target.get("providers") or {}).get(args.provider) or {}).get("pane_id") or ""
+                )
+                # Phase 3 (A6.iv/E2): this path reaches a pane without the
+                # daemon, so it applies the same policy module itself.
+                direct_refusal = _direct_reply_policy_refusal(
+                    provider=str(args.provider or "claude"),
+                    pane_id=direct_pane,
+                    work_dir=str(target.get("work_dir") or ""),
+                    ccb_project_id=str(target.get("ccb_project_id") or ""),
+                    reply_receipt=reply_receipt,
+                    to_role=to_role,
+                )
+                if direct_refusal:
+                    print(f"[ERROR] {direct_refusal}", file=sys.stderr)
+                    return 1
                 exit_code, reply, meta = _send_to_direct_reply_target(
                     target,
                     direct_backend,
@@ -787,6 +971,11 @@ def main(argv: list[str] | None = None) -> int:
                     str(args.provider or "claude"),
                     str(args.caller or "claude"),
                     bool(args.foreground),
+                    to_role=to_role,
+                    peer_pane_id=str(
+                        ((target.get("providers") or {}).get(args.provider) or {}).get("pane_id") or ""
+                    ),
+                    peer_project_id=str(target.get("ccb_project_id") or ""),
                 )
         finally:
             if lock_handle is not None:

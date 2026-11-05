@@ -257,6 +257,17 @@ class ProviderRequest:
     timeout_explicit: bool = True
     idle_timeout_s: Optional[float] = None
     max_wait_s: Optional[float] = None
+    # Role delivery policy (Phase 3). `kind` is the LOGICAL intent, independent
+    # of how the message is transported: request / notify / reply (empty keeps
+    # the pre-policy behaviour). `to_role` is the caller's explicit target-role
+    # assertion, always verified when supplied. The sender credential is the
+    # caller's own launch credential, verified host-side; it is what makes a
+    # sender a member of the destination launch rather than external.
+    kind: str = ""
+    to_role: str = ""
+    sender_member_id: str = ""
+    sender_member_token: str = ""
+    reply_to: str = ""
 
 
 @dataclass

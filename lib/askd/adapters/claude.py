@@ -647,6 +647,21 @@ class ClaudeAdapter(BaseProviderAdapter):
             prompt = wrap_claude_delivery_prompt(req.message, task.req_id)
         else:
             prompt = wrap_claude_prompt(req.message, task.req_id)
+        # Phase 3 (E5): role-policy recheck as the LAST step before injection.
+        # The role or the pane may have changed while this task sat queued.
+        from delivery_policy import refusal_for_request
+
+        refusal = refusal_for_request(req, self.key, expected_pane=pane_id, session=session)
+        if refusal:
+            _write_log(f"[INFO] policy refused provider=claude req_id={task.req_id} reason={refusal}")
+            return ProviderResult(
+                exit_code=1,
+                reply=refusal,
+                req_id=task.req_id,
+                session_key=session_key,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
         backend.send_text(pane_id, prompt)
 
         if req.delivery_only:

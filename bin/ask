@@ -648,7 +648,13 @@ def _send_via_unified_daemon(
     async_submit: bool = False,
     request_id: str = "",
     timeout_explicit: bool = True,
+    kind: str = "",
+    to_role: str = "",
+    reply_to: str = "",
+    preflight_done: bool = False,
 ) -> int:
+    # `reply_to` marks a correlated reply: it returns to its original
+    # requester, so the host judges it as kind=reply rather than as new work.
     """Send request via unified askd daemon with auto-start retry."""
     import askd_rpc
 
@@ -689,7 +695,18 @@ def _send_via_unified_daemon(
         "delivery_only": delivery_only,
         "suppress_completion_hook": suppress_completion_hook,
         "async_submit": async_submit,
+        "kind": kind,
+        "to_role": to_role,
     }
+    if reply_to:
+        req["reply_to"] = reply_to
+    sender_member_id, sender_member_token = _sender_credential()
+    if sender_member_id and sender_member_token:
+        # The sender's own launch credential: the daemon verifies it and
+        # derives the sender role host-side. It is never used to pick a
+        # destination.
+        req["sender_member_id"] = sender_member_id
+        req["sender_member_token"] = sender_member_token
     from providers import PROGRESS_MODE_PROVIDERS
     progress_mode = provider in PROGRESS_MODE_PROVIDERS and not timeout_explicit and not delivery_only
     progress_max_wait = codex_max_wait_s() if progress_mode else None
@@ -723,6 +740,22 @@ def _send_via_unified_daemon(
             "session_file": route.session_file,
             "ccb_project_id": route.ccb_project_id,
         }
+
+    if not preflight_done and (to_role or _local_policy_needs_gate(provider, route, daemon_work_dir)):
+        # G3a: a sync submit gates too, not only the announcing async paths.
+        allowed, refusal = _preflight_delivery(
+            provider,
+            daemon_context=context,
+            work_dir=daemon_work_dir,
+            route=route,
+            to_role=to_role,
+            kind=kind or "request",
+            delivery_only=delivery_only,
+            reply_to=reply_to,
+        )
+        if not allowed:
+            print(f"[ERROR] {refusal}", file=sys.stderr)
+            return EXIT_ERROR
 
     # Pass email-related env vars for email caller
     if caller == "email":
@@ -817,6 +850,260 @@ def _require_caller() -> str:
     return default_caller
 
 
+ROLE_NAMES = ("lead", "implementer", "ratifier")
+DAEMON_CAPABILITY_REFUSAL = (
+    "cannot confirm the CCB daemon supports role policy; restart this CCB launch"
+)
+
+
+def _sender_credential() -> tuple[str, str]:
+    """This session's own launch credential, as exported into its pane."""
+    member_id = (os.environ.get("CCB_MEMBER_ID") or "").strip()
+    member_token = (os.environ.get("CCB_MEMBER_TOKEN") or "").strip()
+    if not member_id or not member_token:
+        member_id = member_id or (os.environ.get("CCB_LIVE_ID") or "").strip()
+        member_token = member_token or (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+    return member_id, member_token
+
+
+def _normalized_role(value: str) -> str:
+    role = (value or "").strip().lower()
+    return role if role in ROLE_NAMES else ""
+
+
+def _policy_check(
+    destination,
+    *,
+    provider: str,
+    to_role: str,
+    kind: str,
+    delivery_only: bool,
+    reply_to: str = "",
+    has_peer: bool = False,
+) -> tuple[bool, str]:
+    """Client-side mirror of the host decision, for paths with no daemon."""
+    from delivery_policy import evaluate, identify_sender
+
+    member_id, member_token = _sender_credential()
+    sender = identify_sender(destination, member_id, member_token)
+    decision = evaluate(
+        destination=destination,
+        sender=sender,
+        kind=kind,
+        to_role=to_role,
+        delivery_only=delivery_only,
+        has_peer=has_peer,
+        reply_to=reply_to,
+    )
+    return decision.allowed, decision.reason
+
+
+def _client_destination(provider: str, *, route=None, peer_target: str = "", work_dir: str = ""):
+    """Best-effort destination for any client-side policy check.
+
+    Delegates entirely to `delivery_policy`, which resolves an unrouted
+    directory through the provider's OWN session loader -- the same upward
+    walk the adapter performs -- so a request from a subdirectory is judged
+    by the launch its binding names, not by a hash of that subdirectory.
+    """
+    from delivery_policy import (
+        destination_from_launch,
+        destination_from_project_hint,
+        destination_from_work_dir,
+    )
+
+    if route is not None and getattr(route, "present", False):
+        return destination_from_launch(provider, route.launch_id, route.live_id)
+    if peer_target:
+        return destination_from_project_hint(provider, peer_target)
+    return destination_from_work_dir(provider, work_dir or Path.cwd())
+
+
+def _legacy_policy_refusal(
+    provider: str,
+    *,
+    peer_target: str,
+    to_role: str,
+    kind: str,
+    delivery_only: bool,
+    route=None,
+    work_dir: str = "",
+    reply_to: str = "",
+) -> str:
+    """Refusal for ANY delivery path that would bypass the daemon gate.
+
+    Covers `CCB_UNIFIED_ASKD=0` and the per-provider legacy notify/foreground
+    branches that the unified daemon does not serve (G2). An enforcing
+    destination always refuses here, because this path cannot ask the host
+    to recheck before injection.
+    """
+    from delivery_policy import MODE_ENFORCE
+
+    destination = _client_destination(
+        provider, route=route, peer_target=peer_target, work_dir=work_dir
+    )
+    if destination.mode == MODE_ENFORCE:
+        return (
+            "role policy requires the unified daemon: this destination enforces roles and "
+            "legacy delivery would bypass the gate"
+        )
+    allowed, reason = _policy_check(
+        destination,
+        provider=provider,
+        to_role=to_role,
+        kind=kind,
+        delivery_only=delivery_only,
+        has_peer=bool(peer_target),
+        reply_to=reply_to,
+    )
+    return "" if allowed else reason
+
+
+def gate_required(
+    provider: str,
+    *,
+    to_role: str = "",
+    route=None,
+    peer_target: str = "",
+    work_dir: str = "",
+) -> bool:
+    """Does this delivery need the host's gate?
+
+    An explicit --to-role always does. So does a destination whose own
+    policy is enforcing (or unreadable), because the client cannot verify
+    the matrix on its own.
+    """
+    if (to_role or "").strip():
+        return True
+    from delivery_policy import MODE_ENFORCE, MODE_ERROR, destination_is_known
+
+    try:
+        destination = _client_destination(
+            provider, route=route, peer_target=peer_target, work_dir=work_dir
+        )
+    except Exception:
+        return True
+    return destination_is_known(destination) and destination.mode in (MODE_ENFORCE, MODE_ERROR)
+
+
+def _local_policy_needs_gate(provider: str, route, work_dir: str) -> bool:
+    """Does this destination require the host's gate (cheap client-side read)?"""
+    from delivery_policy import MODE_ENFORCE, MODE_ERROR
+
+    try:
+        destination = _client_destination(provider, route=route, work_dir=work_dir)
+    except Exception:
+        return True
+    return destination.mode in (MODE_ENFORCE, MODE_ERROR)
+
+
+def _peer_preflight_kind(intent: str, reply_to: str) -> str:
+    """Logical kind of a peer dispatch: replies are not new work."""
+    if (reply_to or "").strip():
+        return "reply"
+    return "notify" if intent == "notify" else "request"
+
+
+def _preflight_delivery(
+    provider: str,
+    *,
+    daemon_context: _UnifiedDaemonContext | None,
+    work_dir: str,
+    route: ResolvedRoute | None = None,
+    peer_target: str = "",
+    to_role: str = "",
+    kind: str = "request",
+    delivery_only: bool = False,
+    reply_to: str = "",
+    live_id: str = "",
+) -> tuple[bool, str]:
+    """Read-only host-side preflight, so a refusal is never announced as a submission.
+
+    Advisory: the daemon's accept gate remains authoritative for the real
+    request. When the op is unavailable this returns allow rather than
+    inventing a second policy engine in the client.
+    """
+    import askd_rpc
+
+    if daemon_context is None:
+        return True, ""
+    state = daemon_context.state
+    token = state.get("token") or ""
+    if not token:
+        return True, ""
+    member_id, member_token = _sender_credential()
+    req = {
+        "type": "ask.request",
+        "v": 1,
+        "id": make_task_id(),
+        "token": token,
+        "operation": "check_delivery",
+        "provider": "",
+        "target_provider": provider,
+        "work_dir": str(work_dir or ""),
+        "kind": kind,
+        "to_role": to_role,
+        "delivery_only": delivery_only,
+        "reply_to": reply_to,
+        "sender_member_id": member_id,
+        "sender_member_token": member_token,
+        "caller": _require_caller(),
+    }
+    if route is not None and route.present:
+        req["route"] = {
+            "live_id": route.live_id,
+            "launch_id": route.launch_id,
+            "caller_live_id": route.caller_live_id,
+            "caller_token": route.caller_token,
+            "caller_pane_id": route.caller_pane_id,
+            "caller_terminal": route.caller_terminal,
+            "pane_id": route.pane_id,
+            "terminal": route.terminal,
+            "session_file": route.session_file,
+            "ccb_project_id": route.ccb_project_id,
+        }
+    if peer_target:
+        req["project_hint"] = peer_target
+        # A peer target is always a delivery-only send, so the logical kind
+        # check must treat it as the peer transport it is.
+        req["peer_transport"] = True
+    if live_id:
+        req["target_live_id"] = live_id
+    try:
+        response = askd_rpc.request_daemon(
+            state, req, connect_timeout_s=5.0, response_timeout_s=10.0
+        )
+    except Exception:
+        # H3a: when the gate is required, an unreachable capability probe is
+        # a refusal, not a pass.
+        if gate_required(
+            provider, to_role=to_role, route=route,
+            peer_target=peer_target, work_dir=work_dir,
+        ):
+            return False, DAEMON_CAPABILITY_REFUSAL
+        return True, ""
+    if not isinstance(response, dict):
+        if gate_required(
+            provider, to_role=to_role, route=route,
+            peer_target=peer_target, work_dir=work_dir,
+        ):
+            return False, DAEMON_CAPABILITY_REFUSAL
+        return True, ""
+    if "allowed" not in response:
+        # Mixed versions (H3a). A daemon that does not answer this op cannot
+        # gate anything, so it may only be used where nothing needs gating:
+        # no explicit assertion and a destination that is not enforcing.
+        if gate_required(
+            provider, to_role=to_role, route=route,
+            peer_target=peer_target, work_dir=work_dir,
+        ):
+            return False, DAEMON_CAPABILITY_REFUSAL
+        return True, ""
+    if response.get("allowed") is False:
+        return False, str(response.get("reason") or "role policy refused this delivery")
+    return True, ""
+
+
 def make_task_id() -> str:
     """Generate task ID: YYYYMMDD-HHMMSS-mmm-PID"""
     now = datetime.now()
@@ -873,10 +1160,15 @@ def _usage() -> None:
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
     print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
     print("  --live-id ID            Deliver to this exact live session (this launch, or --peer's)", file=sys.stderr)
+    print("  --to-role ROLE          Require the destination session's role (lead/implementer/ratifier)", file=sys.stderr)
     print("  --resend TASK_ID        Re-send a retained .msg body as a new request; requires --live-id", file=sys.stderr)
     print("                          The original task is untouched; no deduplication or exactly-once delivery is promised.", file=sys.stderr)
     print("                          Cleanup keeps the newest 100 logs and removes each .msg with its log; /tmp has no reboot guarantee.", file=sys.stderr)
     print("                          Only detached local and peer tasks retain .msg files.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Role policy: a launch started with --role-policy enforce (or role_policy=enforce in", file=sys.stderr)
+    print("ccb.config) refuses role-violating asks. It guards against misrouting, not permissions:", file=sys.stderr)
+    print("it restricts edits, push or deploy to nothing.", file=sys.stderr)
     print("", file=sys.stderr)
     print("Local pair: in ccb codex codex, ask codex addresses the verified sibling.", file=sys.stderr)
     print("Peer targets must be unique in the remote project; ambiguity is an error.", file=sys.stderr)
@@ -1100,6 +1392,7 @@ def _peer_bridge_cmd(
     reply_to: str = "",
     foreground: bool = False,
     live_id: str = "",
+    to_role: str = "",
 ) -> list[str]:
     bridge_cmd = Path(__file__).resolve().parent / "ccb-bridge-ask"
     cmd = [
@@ -1131,6 +1424,8 @@ def _peer_bridge_cmd(
         # string or the message body, so the bridge resolves the project
         # and the session selector independently.
         cmd.extend(["--live-id", live_id])
+    if to_role:
+        cmd.extend(["--to-role", to_role])
     if foreground:
         cmd.append("--foreground")
     return cmd
@@ -1148,6 +1443,7 @@ def _run_peer_bridge_foreground(
     *,
     live_id: str = "",
     preserve_task_id: str = "",
+    to_role: str = "",
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
     sender_work_dir_str = str(sender_work_dir)
@@ -1179,6 +1475,7 @@ def _run_peer_bridge_foreground(
         reply_to=reply_to,
         foreground=True,
         live_id=live_id,
+        to_role=to_role,
     )
     env = os.environ.copy()
     env["CCB_CALLER"] = caller
@@ -1318,8 +1615,27 @@ def _run_peer_bridge_background(
     *,
     live_id: str = "",
     preserve_task_id: str = "",
+    to_role: str = "",
 ) -> int:
     caller_pane_id, caller_terminal = _peer_caller_pane_info()
+    # Phase 3 (E4/G5): the peer background path announces a submission, so
+    # the read-only preflight runs before anything is spawned. A correlated
+    # reply is kind=reply -- it returns to its original requester and must
+    # not be judged by the external/role matrix on the way out.
+    allowed, refusal = _preflight_delivery(
+        peer_provider,
+        daemon_context=_resolve_unified_daemon_context(),
+        work_dir=str(sender_work_dir),
+        peer_target=peer_target,
+        to_role=to_role,
+        kind=_peer_preflight_kind(intent, reply_to),
+        delivery_only=True,
+        reply_to=reply_to,
+        live_id=live_id,
+    )
+    if not allowed:
+        print(f"[ERROR] {refusal}", file=sys.stderr)
+        return EXIT_ERROR
     task = _prepare_peer_task(
         peer_provider,
         message,
@@ -1350,6 +1666,7 @@ def _run_peer_bridge_background(
         task_id,
         reply_to,
         live_id=live_id,
+        to_role=to_role,
     )
     env = os.environ.copy()
     env["CCB_REQ_ID"] = task_id
@@ -1415,6 +1732,7 @@ def _run_peer_bridge(
     *,
     live_id: str = "",
     preserve_task_id: str = "",
+    to_role: str = "",
 ) -> int:
     if peer_provider not in PEER_PROVIDERS:
         print(
@@ -1458,6 +1776,7 @@ def _run_peer_bridge(
             sender_work_dir,
             live_id=live_id,
             preserve_task_id=preserve_task_id,
+            to_role=to_role,
         )
     return _run_peer_bridge_background(
         peer_target,
@@ -1470,6 +1789,7 @@ def _run_peer_bridge(
         sender_work_dir,
         live_id=live_id,
         preserve_task_id=preserve_task_id,
+        to_role=to_role,
     )
 
 
@@ -1481,6 +1801,8 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
     peer_reply_to = ""
     peer_live_id = ""
     peer_live_id_seen = False
+    peer_to_role = ""
+    peer_to_role_seen = False
     parts: list[str] = []
 
     it = iter(argv)
@@ -1527,6 +1849,24 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
             peer_live_id = peer_live_id.strip()
             peer_live_id_seen = True
             continue
+        if token == "--to-role":
+            if peer_to_role_seen:
+                print("[ERROR] --to-role may only be given once", file=sys.stderr)
+                return EXIT_ERROR
+            try:
+                peer_to_role = next(it)
+            except StopIteration:
+                print("[ERROR] --to-role requires a role", file=sys.stderr)
+                return EXIT_ERROR
+            if not _normalized_role(peer_to_role):
+                print(
+                    f"[ERROR] --to-role must be one of: {', '.join(ROLE_NAMES)}",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            peer_to_role = _normalized_role(peer_to_role)
+            peer_to_role_seen = True
+            continue
         if token == "--foreground":
             foreground_mode = True
             continue
@@ -1572,6 +1912,7 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
         peer_intent,
         peer_reply_to,
         live_id=peer_live_id,
+        to_role=peer_to_role,
     )
 
 
@@ -1616,6 +1957,8 @@ def main(argv: list[str]) -> int:
     peer_reply_to = ""
     peer_live_id = ""
     peer_live_id_seen = False
+    peer_to_role = ""
+    peer_to_role_seen = False
     resend_task_id = ""
     resend_seen = False
     peer_foreground_explicit = False
@@ -1663,6 +2006,24 @@ def main(argv: list[str]) -> int:
                 return EXIT_ERROR
             peer_live_id = peer_live_id.strip()
             peer_live_id_seen = True
+            continue
+        if token == "--to-role":
+            if peer_to_role_seen:
+                print("[ERROR] --to-role may only be given once", file=sys.stderr)
+                return EXIT_ERROR
+            try:
+                peer_to_role = next(it)
+            except StopIteration:
+                print("[ERROR] --to-role requires a role", file=sys.stderr)
+                return EXIT_ERROR
+            if not _normalized_role(peer_to_role):
+                print(
+                    f"[ERROR] --to-role must be one of: {', '.join(ROLE_NAMES)}",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            peer_to_role = _normalized_role(peer_to_role)
+            peer_to_role_seen = True
             continue
         if token == "--resend":
             if resend_seen:
@@ -1749,6 +2110,21 @@ def main(argv: list[str]) -> int:
         print("[ERROR] [WORKER]/[ARCHITECT] routing tags are no longer supported", file=sys.stderr)
         return EXIT_ERROR
 
+    # Phase 3 (A6.v/E4): a legacy (CCB_UNIFIED_ASKD=0) local delivery bypasses
+    # the daemon gate entirely, so an enforcing launch refuses it here, and an
+    # explicitly passed --to-role is still verified rather than ignored.
+    if not peer_target and not _use_unified_daemon():
+        legacy_refusal = _legacy_policy_refusal(
+            provider,
+            peer_target="",
+            to_role=peer_to_role,
+            kind="notify" if notify_mode else "request",
+            delivery_only=bool(notify_mode),
+        )
+        if legacy_refusal:
+            print(f"[ERROR] {legacy_refusal}", file=sys.stderr)
+            return EXIT_ERROR
+
     if peer_target:
         if peer_intent == "notify":
             if not peer_foreground_explicit:
@@ -1766,6 +2142,7 @@ def main(argv: list[str]) -> int:
             peer_intent,
             peer_reply_to,
             live_id=peer_live_id,
+            to_role=peer_to_role,
             **resend_options,
         )
 
@@ -1874,9 +2251,25 @@ def main(argv: list[str]) -> int:
                 daemon_context=daemon_context,
                 route=notify_route,
                 timeout_explicit=timeout_explicit,
+                kind="notify",
+                to_role=peer_to_role,
             )
         if _use_unified_daemon():
             print("[WARN] Unified notify is unavailable for this provider; using legacy", file=sys.stderr)
+
+        # G2: this branch reaches a pane without the host gate. An enforcing
+        # destination refuses here rather than being delivered ungated.
+        legacy_refusal = _legacy_policy_refusal(
+            provider,
+            peer_target="",
+            to_role=peer_to_role,
+            kind="notify",
+            delivery_only=True,
+            work_dir=str(daemon_context.work_dir) if daemon_context is not None else "",
+        )
+        if legacy_refusal:
+            print(f"[ERROR] {legacy_refusal}", file=sys.stderr)
+            return EXIT_ERROR
 
         # Legacy daemon path for notify mode
         cmd = [daemon_cmd, "--sync"]
@@ -1910,8 +2303,21 @@ def main(argv: list[str]) -> int:
                 daemon_context=daemon_context,
                 route=local_route,
                 timeout_explicit=timeout_explicit,
+                kind="request",
+                to_role=peer_to_role,
             )
         else:
+            # G2: same gate for the per-provider legacy foreground path.
+            legacy_refusal = _legacy_policy_refusal(
+                provider,
+                peer_target="",
+                to_role=peer_to_role,
+                kind="request",
+                delivery_only=False,
+            )
+            if legacy_refusal:
+                print(f"[ERROR] {legacy_refusal}", file=sys.stderr)
+                return EXIT_ERROR
             cmd = [daemon_cmd, "--sync", "--timeout", str(timeout)]
             if no_wrap and provider == "claude":
                 cmd.append("--no-wrap")
@@ -1992,6 +2398,9 @@ def main(argv: list[str]) -> int:
             async_submit=True,
             request_id=task_id,
             timeout_explicit=timeout_explicit,
+            kind="request",
+            to_role=peer_to_role,
+            preflight_done=True,
         )
         if rc != EXIT_OK:
             _append_task_status_line(status_file, f"failed exit_code={rc}")
@@ -2011,8 +2420,25 @@ def main(argv: list[str]) -> int:
             print(f"Retain task ID {task_id}; use 'pend {task_id}' when you need the result.")
         return EXIT_OK
 
+    # Phase 3 (A6.iii/E4): the detached async path announces a submission, so
+    # ask the host for the policy decision first and report a refusal instead.
+    allowed, refusal = _preflight_delivery(
+        provider,
+        daemon_context=daemon_context,
+        work_dir=daemon_context.work_dir if daemon_context is not None else Path.cwd(),
+        route=local_route,
+        to_role=peer_to_role,
+        kind="request",
+    )
+    if not allowed:
+        _append_task_status_line(status_file, f"refused {refusal}")
+        print(f"[ERROR] {refusal}", file=sys.stderr)
+        return EXIT_ERROR
+
     # Get the path to this script for recursive call with --foreground
     ask_cmd = str(Path(__file__).resolve())
+    child_role_arg = f" --to-role {shlex.quote(peer_to_role)}" if peer_to_role else ""
+    _child_role_arg_ps1 = f" --to-role {_ps1_literal(peer_to_role)}" if peer_to_role else ""
     bg_pid: int | None = None
 
     # Platform-specific background execution
@@ -2072,7 +2498,7 @@ function Write-CcbStatus([string]$line) {{
   Add-Content -Path $statusFile -Value ("{{0}} {{1}}" -f (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"), $line) -Encoding UTF8
 }}
 Write-CcbStatus "running pid=$PID"
-Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --foreground --timeout {timeout}{' --ccb-default-timeout' if not timeout_explicit else ''}
+Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --foreground --timeout {timeout}{' --ccb-default-timeout' if not timeout_explicit else ''}{_child_role_arg_ps1}
 $rc = $LASTEXITCODE
 Write-CcbStatus "finished exit_code=$rc"
 if ($rc -ne 0) {{
@@ -2129,7 +2555,7 @@ echo "[CCB_TASK_START] task={task_id} provider={provider} caller={caller} pid=$$
 export CCB_REQ_ID="{task_id}"
 export CCB_CALLER="{caller}"
 export CCB_WORK_DIR="{os.getcwd()}"
-{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout}{' --ccb-default-timeout' if not timeout_explicit else ''} < {quoted_message}
+{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout}{' --ccb-default-timeout' if not timeout_explicit else ''}{child_role_arg} < {quoted_message}
 rc=$?
 echo "[CCB_TASK_END] task={task_id} provider={provider} exit_code=$rc"
 echo "$(_now) finished exit_code=$rc" >> {quoted_status}

@@ -1,0 +1,4 @@
+role	description
+ccb-lead	Assign the current session as the architect and technical lead in a user-directed CCB collaboration.
+ccb-implementer	Assign the current session as the implementation and review peer in a user-directed CCB collaboration.
+ccb-ratifier	Assign the current session as an on-demand independent ratifier in a user-directed CCB collaboration.

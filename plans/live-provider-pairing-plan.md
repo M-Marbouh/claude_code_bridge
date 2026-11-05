@@ -383,3 +383,16 @@ One interactive limitation was confirmed and documented rather than treated as a
 ## Artifact placement
 
 The repository uses ignored `plans/` for historical plans and ignores `docs/`. This plan deliberately makes only `plans/live-provider-pairing-plan.md` trackable through a narrow `.gitignore` exception. Other internal plans/docs stay ignored. The execution document is public and self-contained; maintainer-specific migration paths are clearly separated from public user requirements.
+
+## Amendment 2026-11-05 — opt-in role enforcement
+
+The owner reversed the Phase 7 exclusions "without a role engine" and "Do not restore: role-based routing tags, built-in role hierarchy". Roles may now enforce message boundaries, under an explicit opt-in per launch. Disabled by default; launches without it keep today's behaviour.
+
+Unchanged invariants: destinations are resolved by exact session identity, never selected by role; any provider may hold any role; a role is current-session operational state, cleared when its pane dies or is replaced, never a durable decision; a role grants no push, deploy or other external-effect authorization; request-bound replies return to their verified original requester.
+
+Phases, each gated separately:
+
+1. Distribution: the three role skills ship to every supported provider from one provider-neutral body, installed only where the provider's home exists or an explicit provider override is supplied (Claude and Codex keep their existing unconditional install).
+2. Session identity in every launch (not only Codex pairs), as a compatibility phase; repair Pi as a caller.
+3. Delivery policy: explicit opt-in that claims cannot disable; structured request kinds and required target role; sender role derived from verified launch credentials; host-side refusal before acceptance and recheck before delivery; accurate acknowledgement; atomic role claims; no bypass via missing metadata, direct RPC, cross-project, manual or email ingress.
+4. Action limits (edits, push, deploy) are not provided by the delivery gate and remain unimplemented until provider-specific permission evidence exists. Report this limitation plainly.

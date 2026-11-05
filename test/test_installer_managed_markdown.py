@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
 INSTALL_PS1 = REPO_ROOT / "install.ps1"
+BASH = shutil.which("bash") or "bash"
 POWERSHELL = (
     os.environ.get("CCB_TEST_POWERSHELL")
     or shutil.which("pwsh")
@@ -23,6 +25,42 @@ CLAUDE_END = "<!-- CCB_CONFIG_END -->"
 RATIFICATION_START = "<!-- MUTUAL_RATIFICATION_START -->"
 RATIFICATION_END = "<!-- MUTUAL_RATIFICATION_END -->"
 CCB_ROLE_SKILLS = ("ccb-lead", "ccb-implementer", "ccb-ratifier")
+NEUTRAL_ROLE_SKILLS_DIR = REPO_ROOT / "role_skills"
+
+
+def _role_skill_descriptions() -> dict[str, str]:
+    rows: dict[str, str] = {}
+    for line in (NEUTRAL_ROLE_SKILLS_DIR / "descriptions.tsv").read_text(
+        encoding="utf-8"
+    ).splitlines():
+        role, separator, description = line.partition("\t")
+        if separator:
+            rows[role] = description
+    return rows
+
+
+CCB_ROLE_DESCRIPTIONS = _role_skill_descriptions()
+
+# Copied verbatim from a real user skill that already lived in a Pi skills
+# directory when the role skills were added there.
+PI_TYPESCRIPT_SKILL = (
+    "---\n"
+    "name: pi-typescript\n"
+    "description: Write and verify TypeScript changes using the current "
+    "project's conventions.\n"
+    "---\n"
+    "Follow the project's stack and formatting; do not introduce another UI "
+    "framework.\n"
+    "Use precise types, avoid unjustified any, and verify external schemas at "
+    "boundaries.\n"
+    "Prefer existing utilities and installed dependencies over one-use "
+    "abstractions.\n"
+    "Use Context7 resolve-library-id then query-docs for uncertain library "
+    "behavior.\n"
+    "Test the affected contract and guard behavior; run the project's applicable "
+    "type check.\n"
+)
+
 
 
 def _prepare_install_prefix(tmp_path: Path) -> Path:
@@ -41,6 +79,7 @@ def _run_install_functions(
     codex_home: Path | None,
     functions: tuple[str, ...],
     overlay_dir: Path | None = None,
+    env_extra: dict[str, Path | str | None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
@@ -55,10 +94,24 @@ def _run_install_functions(
         env["CCB_OVERLAY_DIR"] = str(overlay_dir)
     else:
         env.pop("CCB_OVERLAY_DIR", None)
+    # Never let the developer's real provider homes leak into a test run.
+    for name in (
+        "PI_CODING_AGENT_DIR",
+        "OPENCODE_CONFIG_DIR",
+        "GEMINI_CLI_HOME",
+        "HERMES_HOME",
+        "HERMES_DATA_DIR_SUFFIX",
+    ):
+        env.pop(name, None)
+    for name, value in (env_extra or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = str(value)
 
     commands = "; ".join(functions)
     return subprocess.run(
-        ["bash", "-c", f"source {shlex.quote(str(INSTALL_SH))}; {commands}"],
+        [BASH, "-c", f"source {shlex.quote(str(INSTALL_SH))}; {commands}"],
         cwd=REPO_ROOT,
         env=env,
         check=True,
@@ -265,6 +318,521 @@ def test_ccb_role_skill_inventory_fails_when_one_directory_is_missing(
 
     with pytest.raises(AssertionError, match="ccb-ratifier"):
         _assert_role_skills_present(skills_root)
+
+
+def _skill_frontmatter_and_body(skill_md: Path) -> tuple[str, str]:
+    text = skill_md.read_text(encoding="utf-8")
+    assert text.startswith("---\n"), f"{skill_md} does not start with frontmatter"
+    end = text.index("\n---\n", 4)
+    frontmatter = text[len("---\n") : end + 1]
+    remainder = text[end + len("\n---\n") :]
+    assert remainder.startswith("\n"), f"{skill_md} has no blank line before its body"
+    return frontmatter, remainder[1:]
+
+
+def _assert_role_skill_bodies_match_neutral(copies: dict[str, list[Path]]) -> None:
+    mismatched = []
+    for role, paths in copies.items():
+        neutral_body = (NEUTRAL_ROLE_SKILLS_DIR / f"{role}.md").read_text(encoding="utf-8")
+        for path in paths:
+            assert path.is_file(), f"missing role skill copy: {path}"
+            _, body = _skill_frontmatter_and_body(path)
+            if body != neutral_body:
+                mismatched.append(str(path))
+    assert not mismatched, f"role skill bodies diverged from the neutral source: {mismatched}"
+
+
+def _provider_role_skill_paths(
+    home: Path, overrides: dict[str, Path]
+) -> dict[str, list[Path]]:
+    """Every installed role skill copy, using each provider's verified path."""
+    claude_root = home / ".claude" / "skills"
+    codex_root = home / ".codex" / "skills"
+    pi_root = overrides["PI_CODING_AGENT_DIR"] / "skills"
+    opencode_root = overrides["OPENCODE_CONFIG_DIR"] / "skills"
+    gemini_root = overrides["GEMINI_CLI_HOME"] / ".gemini" / "skills"
+    hermes_root = overrides["HERMES_HOME"] / "skills"
+    return {
+        role: [
+            REPO_ROOT / "claude_skills" / role / "SKILL.md",
+            REPO_ROOT / "codex_skills" / role / "SKILL.md",
+            claude_root / role / "SKILL.md",
+            codex_root / role / "SKILL.md",
+            pi_root / role / "SKILL.md",
+            opencode_root / role / "SKILL.md",
+            gemini_root / role / "SKILL.md",
+            hermes_root / role / "SKILL.md",
+        ]
+        for role in CCB_ROLE_SKILLS
+    }
+
+
+def test_ccb_role_skill_bodies_are_provider_neutral_and_identical_everywhere(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    overrides = {
+        "PI_CODING_AGENT_DIR": tmp_path / "pi-agent",
+        "OPENCODE_CONFIG_DIR": tmp_path / "opencode-config",
+        "GEMINI_CLI_HOME": tmp_path / "gemini-home",
+        "HERMES_HOME": tmp_path / "hermes-home",
+    }
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=(
+            "install_claude_skills",
+            "install_codex_skills",
+            "install_role_skills",
+        ),
+        env_extra=overrides,
+    )
+
+    _assert_role_skill_bodies_match_neutral(
+        _provider_role_skill_paths(home, overrides)
+    )
+
+    for role in CCB_ROLE_SKILLS:
+        neutral_body = (NEUTRAL_ROLE_SKILLS_DIR / f"{role}.md").read_text(encoding="utf-8")
+        for provider_name in ("Claude", "Codex", "Gemini", "OpenCode", "Hermes", "Pi"):
+            assert provider_name not in neutral_body, (
+                f"neutral {role} body names {provider_name}"
+            )
+        assert (
+            "Take this role only when the user explicitly assigns it in the current "
+            "conversation; the user invoking this skill counts as assigning it." in neutral_body
+        ), f"neutral {role} body lacks the explicit-assignment guard"
+
+    # Pi is the only one of these loaders that documents the field, so only the
+    # Pi copy may declare it; the other three rely on the body guard.
+    pi_frontmatter, _ = _skill_frontmatter_and_body(
+        overrides["PI_CODING_AGENT_DIR"] / "skills" / "ccb-lead" / "SKILL.md"
+    )
+    assert "disable-model-invocation: true" in pi_frontmatter
+    for root in (
+        overrides["OPENCODE_CONFIG_DIR"] / "skills",
+        overrides["GEMINI_CLI_HOME"] / ".gemini" / "skills",
+        overrides["HERMES_HOME"] / "skills",
+    ):
+        frontmatter, _ = _skill_frontmatter_and_body(root / "ccb-lead" / "SKILL.md")
+        assert "disable-model-invocation" not in frontmatter
+        assert "name: ccb-lead" in frontmatter
+
+
+def test_role_skill_drift_guard_fails_on_one_edited_copy(tmp_path: Path) -> None:
+    """Negative control: the body-equality guard is capable of failing."""
+    neutral_body = (NEUTRAL_ROLE_SKILLS_DIR / "ccb-lead.md").read_text(encoding="utf-8")
+
+    faithful = tmp_path / "faithful" / "ccb-lead" / "SKILL.md"
+    faithful.parent.mkdir(parents=True)
+    faithful.write_text(
+        "---\nname: ccb-lead\ndescription: Assign the lead.\n---\n\n" + neutral_body,
+        encoding="utf-8",
+    )
+    _assert_role_skill_bodies_match_neutral({"ccb-lead": [faithful]})
+
+    edited = tmp_path / "edited" / "ccb-lead" / "SKILL.md"
+    edited.parent.mkdir(parents=True)
+    edited.write_text(
+        "---\nname: ccb-lead\ndescription: Assign the lead.\n---\n\n"
+        + neutral_body
+        + "This line exists in only one copy.\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="diverged from the neutral source"):
+        _assert_role_skill_bodies_match_neutral({"ccb-lead": [faithful, edited]})
+
+
+ROLE_SKILL_FILES = tuple(
+    [NEUTRAL_ROLE_SKILLS_DIR / f"{role}.md" for role in CCB_ROLE_SKILLS]
+    + [
+        REPO_ROOT / provider / role / "SKILL.md"
+        for provider in ("claude_skills", "codex_skills")
+        for role in CCB_ROLE_SKILLS
+    ]
+)
+
+
+def test_role_skill_live_session_id_wording_is_updated_in_every_role_file() -> None:
+    assert len(ROLE_SKILL_FILES) == 9
+    for path in ROLE_SKILL_FILES:
+        text = path.read_text(encoding="utf-8")
+        assert "this launch has no live session IDs" in text, (
+            f"{path} does not carry the replacement wording"
+        )
+        assert "the launch has no paired session" not in text, (
+            f"{path} still carries the old wording"
+        )
+
+
+def test_role_skills_are_not_created_for_absent_provider_homes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+
+    result = _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+    )
+
+    assert "Installed pi role skill" not in result.stdout
+    assert not (home / ".pi").exists()
+    assert not (home / ".hermes").exists()
+    assert not (home / ".gemini").exists()
+    assert not (home / ".config" / "opencode").exists()
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_role_skills",),
+    )
+    assert not (home / ".pi").exists()
+    assert not (home / ".hermes").exists()
+    assert not (home / ".gemini").exists()
+
+
+def test_role_skills_install_under_overrides_and_reinstall_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    overrides = {
+        "PI_CODING_AGENT_DIR": tmp_path / "pi-agent",
+        "OPENCODE_CONFIG_DIR": tmp_path / "opencode-config",
+        "GEMINI_CLI_HOME": tmp_path / "gemini-home",
+        "HERMES_HOME": tmp_path / "hermes-home",
+    }
+    roots = (
+        overrides["PI_CODING_AGENT_DIR"] / "skills",
+        overrides["OPENCODE_CONFIG_DIR"] / "skills",
+        overrides["GEMINI_CLI_HOME"] / ".gemini" / "skills",
+        overrides["HERMES_HOME"] / "skills",
+    )
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra=overrides,
+    )
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path): path.read_bytes()
+            for root in roots
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    first = snapshot()
+    assert len(first) == len(roots) * len(CCB_ROLE_SKILLS)
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra=overrides,
+    )
+    assert snapshot() == first
+
+
+def test_hermes_role_skills_use_the_suffixed_home_when_hermes_home_is_unset(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    suffixed_home = home / ".hermes-review"
+    legacy_home = home / ".hermes"
+    suffixed_home.mkdir(parents=True)
+    legacy_home.mkdir()
+    env_extra = {"HERMES_DATA_DIR_SUFFIX": "-review"}
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra=env_extra,
+    )
+
+    for role in CCB_ROLE_SKILLS:
+        assert (suffixed_home / "skills" / role / "SKILL.md").is_file()
+        assert not (legacy_home / "skills" / role).exists()
+    assert not (home / ".pi").exists()
+    assert not (home / ".gemini").exists()
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_role_skills",),
+        env_extra=env_extra,
+    )
+    for role in CCB_ROLE_SKILLS:
+        assert not (suffixed_home / "skills" / role).exists()
+        assert not (legacy_home / "skills" / role).exists()
+
+
+def test_hermes_home_override_wins_over_the_suffix(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    suffixed_home = home / ".hermes-review"
+    override = tmp_path / "custom-hermes"
+    suffixed_home.mkdir(parents=True)
+    env_extra = {"HERMES_HOME": override, "HERMES_DATA_DIR_SUFFIX": "-review"}
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra=env_extra,
+    )
+
+    for role in CCB_ROLE_SKILLS:
+        assert (override / "skills" / role / "SKILL.md").is_file()
+    assert not (suffixed_home / "skills").exists()
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_role_skills",),
+        env_extra=env_extra,
+    )
+    for role in CCB_ROLE_SKILLS:
+        assert not (override / "skills" / role).exists()
+    assert not (suffixed_home / "skills").exists()
+
+
+def test_hermes_home_override_expands_home_references(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    home.mkdir(exist_ok=True)
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra={"HERMES_HOME": "$HOME/hermes-from-var"},
+    )
+
+    assert (home / "hermes-from-var" / "skills" / "ccb-lead" / "SKILL.md").is_file()
+    assert not (home / ".hermes").exists()
+
+
+def _restricted_bin_dir(tmp_path: Path, *, with_python: bool) -> Path:
+    """A PATH holding only what the role-skill functions need."""
+    bin_dir = tmp_path / "restricted-bin"
+    bin_dir.mkdir()
+    for name in ("cat", "chmod", "cp", "dirname", "mkdir", "rm"):
+        target = shutil.which(name)
+        assert target, f"{name} is required to build the restricted PATH"
+        (bin_dir / name).symlink_to(target)
+    if with_python:
+        interpreter = shutil.which("python3") or sys.executable
+        wrapper = bin_dir / "ccb-custom-python"
+        wrapper.write_text(
+            f'#!/bin/sh\nexec "{interpreter}" "$@"\n', encoding="utf-8"
+        )
+        wrapper.chmod(0o755)
+    return bin_dir
+
+
+def test_hermes_home_expansion_uses_the_selected_python_interpreter(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    home.mkdir(exist_ok=True)
+    # No python3 or python on PATH: only the interpreter named by CCB_PYTHON_BIN.
+    bin_dir = _restricted_bin_dir(tmp_path, with_python=True)
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra={
+            "PATH": bin_dir,
+            "CCB_PYTHON_BIN": bin_dir / "ccb-custom-python",
+            "HERMES_HOME": r"$HOME/custom-hermes",
+        },
+    )
+
+    assert (home / "custom-hermes" / "skills" / "ccb-lead" / "SKILL.md").is_file()
+    assert not (home / ".hermes").exists()
+    assert not (REPO_ROOT / "$HOME").exists()
+
+
+def test_unresolvable_hermes_home_is_skipped_without_failing_the_install(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    # A provider home that must still be handled with no interpreter available.
+    (home / ".pi" / "agent").mkdir(parents=True)
+    bin_dir = _restricted_bin_dir(tmp_path, with_python=False)
+    env_extra = {"PATH": bin_dir, "HERMES_HOME": r"$HOME/literal-hermes"}
+
+    install_result = _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra=env_extra,
+    )
+
+    assert "HERMES_HOME" in install_result.stderr
+    assert "skipping Hermes role skills" in install_result.stderr
+    assert (home / ".pi" / "agent" / "skills" / "ccb-lead" / "SKILL.md").is_file()
+    assert not (REPO_ROOT / "$HOME").exists()
+    assert not (tmp_path / "$HOME").exists()
+    assert not (home / "literal-hermes").exists()
+
+    uninstall_result = _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_role_skills",),
+        env_extra=env_extra,
+    )
+
+    assert "skipping Hermes role skills" in uninstall_result.stderr
+    assert not (home / ".pi" / "agent" / "skills" / "ccb-lead").exists()
+    assert not (REPO_ROOT / "$HOME").exists()
+    assert not (tmp_path / "$HOME").exists()
+
+
+def test_hermes_home_expansion_failure_skips_hermes_without_failing(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    (home / ".pi" / "agent").mkdir(parents=True)
+    bin_dir = _restricted_bin_dir(tmp_path, with_python=True)
+    # Passes the installer's interpreter probe, then fails the expansion itself.
+    interpreter = shutil.which("python3") or sys.executable
+    (bin_dir / "ccb-custom-python").write_text(
+        f'#!/bin/sh\nif [ "$1" = "-" ]; then exit 3; fi\nexec "{interpreter}" "$@"\n',
+        encoding="utf-8",
+    )
+
+    result = _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra={
+            "PATH": bin_dir,
+            "CCB_PYTHON_BIN": bin_dir / "ccb-custom-python",
+            "HERMES_HOME": r"$HOME/literal-hermes",
+        },
+    )
+
+    assert "Could not expand shell references in HERMES_HOME" in result.stderr
+    assert (home / ".pi" / "agent" / "skills" / "ccb-lead" / "SKILL.md").is_file()
+    assert not (REPO_ROOT / "$HOME").exists()
+    assert not (tmp_path / "$HOME").exists()
+
+
+def test_absent_suffixed_hermes_home_is_not_replaced_by_a_legacy_dot_hermes(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    legacy_skills = home / ".hermes" / "skills"
+    legacy_skills.mkdir(parents=True)
+    env_extra = {"HERMES_DATA_DIR_SUFFIX": "-review"}
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra=env_extra,
+    )
+
+    assert not (home / ".hermes-review").exists()
+    assert list(legacy_skills.iterdir()) == []
+
+    # A blank HERMES_HOME counts as unset, exactly as Hermes resolves it.
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+        env_extra={**env_extra, "HERMES_HOME": "   "},
+    )
+
+    assert not (home / ".hermes-review").exists()
+    assert list(legacy_skills.iterdir()) == []
+
+
+def test_role_skills_leave_foreign_skills_untouched_and_uninstall_only_ccb_dirs(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+
+    pi_skills = home / ".pi" / "agent" / "skills"
+    fixture = pi_skills / "pi-typescript" / "SKILL.md"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(PI_TYPESCRIPT_SKILL, encoding="utf-8")
+
+    foreign = {}
+    for skills_root, name in (
+        (home / ".hermes" / "skills", "notes"),
+        (home / ".config" / "opencode" / "skills", "local-helper"),
+        (home / ".gemini" / "skills", "local-review"),
+    ):
+        path = skills_root / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        content = f"---\nname: {name}\ndescription: Keep me.\n---\nkeep\n"
+        path.write_text(content, encoding="utf-8")
+        foreign[path] = content
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+    )
+
+    for name in CCB_ROLE_SKILLS:
+        assert (pi_skills / name / "SKILL.md").is_file()
+    assert sorted(p.name for p in pi_skills.iterdir()) == [
+        "ccb-implementer",
+        "ccb-lead",
+        "ccb-ratifier",
+        "pi-typescript",
+    ]
+    assert fixture.read_text(encoding="utf-8") == PI_TYPESCRIPT_SKILL
+    for path, content in foreign.items():
+        assert path.read_text(encoding="utf-8") == content
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_role_skills",),
+    )
+
+    for name in CCB_ROLE_SKILLS:
+        assert not (pi_skills / name).exists()
+        assert not (home / ".hermes" / "skills" / name).exists()
+        assert not (home / ".config" / "opencode" / "skills" / name).exists()
+        assert not (home / ".gemini" / "skills" / name).exists()
+    assert fixture.read_text(encoding="utf-8") == PI_TYPESCRIPT_SKILL
+    for path, content in foreign.items():
+        assert path.read_text(encoding="utf-8") == content
 
 
 def test_managed_blocks_preserve_hand_authored_content_and_are_idempotent(
@@ -564,6 +1132,212 @@ def test_windows_installer_functionally_copies_template_and_injects_block(
     assert "Malformed CCB marker structure" in (
         malformed_result.stdout + malformed_result.stderr
     )
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell is not installed")
+def test_windows_role_skills_render_the_shared_body_and_follow_resolved_homes(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    local_appdata = tmp_path / "localappdata"
+    overrides = {
+        "pi": tmp_path / "override-pi",
+        "opencode": tmp_path / "override-opencode",
+        "gemini": tmp_path / "override-gemini",
+        "hermes": tmp_path / "override-hermes",
+    }
+    home.mkdir(exist_ok=True)
+    local_appdata.mkdir()
+
+    def ps_quote(value: Path | str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    # A foreign skill living inside an active install target: uninstall must
+    # leave it alone and must not alter its content.
+    foreign_skill = "---\nname: local-notes\ndescription: Keep me.\n---\nkeep this content\n"
+    ps_foreign_skill = "\"---`nname: local-notes`ndescription: Keep me.`n---`nkeep this content`n\""
+
+    command = "\n".join(
+        (
+            "$ErrorActionPreference = 'Stop'",
+            f". {ps_quote(INSTALL_PS1)}",
+            f"$testRoot = {ps_quote(home)}",
+            f"$lap = {ps_quote(local_appdata)}",
+            "function Reset-RoleEnv {",
+            "  $env:PI_CODING_AGENT_DIR = $null",
+            "  $env:OPENCODE_CONFIG_DIR = $null",
+            "  $env:XDG_CONFIG_HOME = $null",
+            "  $env:GEMINI_CLI_HOME = $null",
+            "  $env:HERMES_HOME = $null",
+            "  $env:HERMES_DATA_DIR_SUFFIX = $null",
+            "}",
+            "function Get-TreeFingerprint([string]$Root) {",
+            "  if (-not (Test-Path -LiteralPath $Root)) { return '' }",
+            "  (Get-ChildItem -LiteralPath $Root -Recurse -File | Sort-Object FullName | ForEach-Object {",
+            "    $_.FullName + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash",
+            "  }) -join '|'",
+            "}",
+            "function Assert-NoCcbRole([string]$SkillsRoot) {",
+            "  foreach ($role in @('ccb-lead', 'ccb-implementer', 'ccb-ratifier')) {",
+            "    if (Test-Path -LiteralPath (Join-Path $SkillsRoot $role)) {",
+            "      throw \"unexpected role skill $role under $SkillsRoot\"",
+            "    }",
+            "  }",
+            "}",
+            "",
+            "# 1. No provider home and no override: nothing may be created.",
+            "Reset-RoleEnv",
+            "foreach ($target in Get-RoleSkillTargets) {",
+            "  if ($target.Present) { throw \"target $($target.Provider) should be absent\" }",
+            "}",
+            "Install-RoleSkills",
+            "foreach ($path in @((Join-Path $testRoot '.pi'), (Join-Path $testRoot '.hermes'), (Join-Path $testRoot '.gemini'), (Join-Path $testRoot '.config/opencode'))) {",
+            "  if (Test-Path -LiteralPath $path) { throw \"install created $path\" }",
+            "}",
+            "",
+            "# 2. A legacy ~/.hermes is not the Hermes home when the suffixed default is absent.",
+            "Reset-RoleEnv",
+            "$env:HERMES_DATA_DIR_SUFFIX = '-review'",
+            "$legacySkills = Join-Path $testRoot '.hermes/skills'",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $legacySkills 'notes') | Out-Null",
+            "[System.IO.File]::WriteAllText((Join-Path $legacySkills 'notes/SKILL.md'), \"---`nname: notes`ndescription: Keep me.`n---`nkeep`n\", [System.Text.Encoding]::UTF8)",
+            "$hermesTarget = Get-RoleSkillTargets | Where-Object { $_.Provider -eq 'hermes' }",
+            "if ($hermesTarget.Present) { throw 'a legacy .hermes must not count as the resolved Hermes home' }",
+            "if ($hermesTarget.Base -ne (Join-Path $lap 'hermes-review')) { throw \"unexpected Hermes base: $($hermesTarget.Base)\" }",
+            "Install-RoleSkills",
+            "if (Test-Path -LiteralPath (Join-Path $legacySkills 'ccb-lead')) { throw 'installed into a legacy .hermes' }",
+            "",
+            "# 3. Default homes present: the suffixed Hermes home is used.",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $testRoot '.pi/agent') | Out-Null",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $testRoot '.config/opencode') | Out-Null",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $testRoot '.gemini') | Out-Null",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $lap 'hermes-review') | Out-Null",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $testRoot '.pi/agent/skills/local-notes') | Out-Null",
+            f"[System.IO.File]::WriteAllText((Join-Path $testRoot '.pi/agent/skills/local-notes/SKILL.md'), {ps_foreign_skill}, $script:utf8NoBom)",
+            "Install-RoleSkills",
+            "$piSkills = Join-Path $testRoot '.pi/agent/skills'",
+            "$fingerprint = Get-TreeFingerprint $piSkills",
+            "Install-RoleSkills",
+            "if ((Get-TreeFingerprint $piSkills) -ne $fingerprint) { throw 'a repeat install changed the Pi skills tree' }",
+            "Uninstall-RoleSkills",
+            "foreach ($root in @($piSkills, (Join-Path $testRoot '.config/opencode/skills'), (Join-Path $testRoot '.gemini/skills'), (Join-Path $lap 'hermes-review/skills'))) {",
+            "  Assert-NoCcbRole $root",
+            "}",
+            "if (-not (Test-Path -LiteralPath (Join-Path $legacySkills 'notes/SKILL.md'))) { throw 'uninstall removed a foreign skill from the legacy home' }",
+            "if (-not (Test-Path -LiteralPath (Join-Path $testRoot '.pi/agent/skills/local-notes/SKILL.md'))) { throw 'uninstall removed a foreign skill from the Pi target' }",
+            f"if ([System.IO.File]::ReadAllText((Join-Path $testRoot '.pi/agent/skills/local-notes/SKILL.md'), [System.Text.Encoding]::UTF8) -ne {ps_foreign_skill}) {{ throw 'uninstall changed a foreign skill in the Pi target' }}",
+            "Install-RoleSkills",
+            "",
+            "# 4. Overrides win, including HERMES_HOME over HERMES_DATA_DIR_SUFFIX.",
+            "Reset-RoleEnv",
+            f"$env:PI_CODING_AGENT_DIR = {ps_quote(overrides['pi'])}",
+            f"$env:OPENCODE_CONFIG_DIR = {ps_quote(overrides['opencode'])}",
+            f"$env:GEMINI_CLI_HOME = {ps_quote(overrides['gemini'])}",
+            f"$env:HERMES_HOME = {ps_quote(overrides['hermes'])}",
+            "$env:HERMES_DATA_DIR_SUFFIX = '-ignored'",
+            "foreach ($target in Get-RoleSkillTargets) {",
+            "  if (-not $target.Present) { throw \"override target $($target.Provider) not present\" }",
+            "}",
+            "$hermesTarget = Get-RoleSkillTargets | Where-Object { $_.Provider -eq 'hermes' }",
+            f"if ($hermesTarget.Base -ne {ps_quote(overrides['hermes'])}) {{",
+            "  throw \"HERMES_HOME did not win: $($hermesTarget.Base)\"",
+            "}",
+            "New-Item -ItemType Directory -Force -Path (Join-Path $env:PI_CODING_AGENT_DIR 'skills/local-notes') | Out-Null",
+            f"[System.IO.File]::WriteAllText((Join-Path $env:PI_CODING_AGENT_DIR 'skills/local-notes/SKILL.md'), {ps_foreign_skill}, $script:utf8NoBom)",
+            "Install-RoleSkills",
+            "Uninstall-RoleSkills",
+            "foreach ($root in @((Join-Path $env:PI_CODING_AGENT_DIR 'skills'), (Join-Path $env:OPENCODE_CONFIG_DIR 'skills'), (Join-Path $env:GEMINI_CLI_HOME '.gemini/skills'), (Join-Path $env:HERMES_HOME 'skills'))) {",
+            "  Assert-NoCcbRole $root",
+            "}",
+            "if (-not (Test-Path -LiteralPath (Join-Path $env:PI_CODING_AGENT_DIR 'skills/local-notes/SKILL.md'))) { throw 'uninstall removed a foreign skill from an override target' }",
+            f"if ([System.IO.File]::ReadAllText((Join-Path $env:PI_CODING_AGENT_DIR 'skills/local-notes/SKILL.md'), [System.Text.Encoding]::UTF8) -ne {ps_foreign_skill}) {{ throw 'uninstall changed a foreign skill in an override target' }}",
+            "if (-not (Test-Path -LiteralPath (Join-Path $testRoot '.pi/agent/skills/ccb-lead/SKILL.md'))) { throw 'an override uninstall removed a default-target role skill' }",
+            "Install-RoleSkills",
+            "",
+            "# 5. ~ in HERMES_HOME expands through HOME first, then USERPROFILE.",
+            "Reset-RoleEnv",
+            f"$env:HOME = {ps_quote(tmp_path / 'posix-home')}",
+            f"$env:USERPROFILE = {ps_quote(tmp_path / 'windows-home')}",
+            "$env:HERMES_HOME = '~/hermes-tilde'",
+            "$hermesTarget = Get-RoleSkillTargets | Where-Object { $_.Provider -eq 'hermes' }",
+            f"if ($hermesTarget.Base -ne (Join-Path {ps_quote(tmp_path / 'posix-home')} 'hermes-tilde')) {{",
+            "  throw \"~ did not expand through HOME: $($hermesTarget.Base)\"",
+            "}",
+            "$env:HOME = $null",
+            "$hermesTarget = Get-RoleSkillTargets | Where-Object { $_.Provider -eq 'hermes' }",
+            f"if ($hermesTarget.Base -ne (Join-Path {ps_quote(tmp_path / 'windows-home')} 'hermes-tilde')) {{",
+            "  throw \"~ did not fall back to USERPROFILE: $($hermesTarget.Base)\"",
+            "}",
+            f"$env:HOME = {ps_quote(home)}",
+            f"$env:USERPROFILE = {ps_quote(home)}",
+            "Write-Host 'Windows role skills: cases complete'",
+        )
+    )
+
+    env = os.environ.copy()
+    env["USERPROFILE"] = str(home)
+    env["HOME"] = str(home)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    for name in (
+        "PI_CODING_AGENT_DIR",
+        "OPENCODE_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "GEMINI_CLI_HOME",
+        "HERMES_HOME",
+        "HERMES_DATA_DIR_SUFFIX",
+    ):
+        env.pop(name, None)
+
+    result = subprocess.run(
+        [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Windows role skills: cases complete" in result.stdout
+
+    neutral = {
+        role: (NEUTRAL_ROLE_SKILLS_DIR / f"{role}.md").read_text(encoding="utf-8")
+        for role in CCB_ROLE_SKILLS
+    }
+    roots = {
+        "default-pi": home / ".pi" / "agent" / "skills",
+        "default-opencode": home / ".config" / "opencode" / "skills",
+        "default-gemini": home / ".gemini" / "skills",
+        "default-hermes": local_appdata / "hermes-review" / "skills",
+        "override-pi": overrides["pi"] / "skills",
+        "override-opencode": overrides["opencode"] / "skills",
+        "override-gemini": overrides["gemini"] / ".gemini" / "skills",
+        "override-hermes": overrides["hermes"] / "skills",
+    }
+    for label, root in roots.items():
+        for role in CCB_ROLE_SKILLS:
+            skill_md = root / role / "SKILL.md"
+            assert skill_md.is_file(), f"{label} did not install {role}"
+            frontmatter, body = _skill_frontmatter_and_body(skill_md)
+            assert body == neutral[role], f"{label} {role} body diverged from the shared body"
+            assert f"name: {role}" in frontmatter
+            assert f"description: {CCB_ROLE_DESCRIPTIONS[role]}" in frontmatter
+            if label.endswith("-pi"):
+                assert "disable-model-invocation: true" in frontmatter
+            else:
+                assert "disable-model-invocation" not in frontmatter
+
+    legacy_skills = home / ".hermes" / "skills"
+    assert sorted(path.name for path in legacy_skills.iterdir()) == ["notes"]
+    assert not (local_appdata / "hermes").exists()
+
+    default_pi_foreign = home / ".pi" / "agent" / "skills" / "local-notes" / "SKILL.md"
+    assert default_pi_foreign.is_file()
+    assert default_pi_foreign.read_text(encoding="utf-8") == foreign_skill
+    override_pi_foreign = overrides["pi"] / "skills" / "local-notes" / "SKILL.md"
+    assert override_pi_foreign.is_file()
+    assert override_pi_foreign.read_text(encoding="utf-8") == foreign_skill
+    assert sorted(
+        path.name for path in (home / ".pi" / "agent" / "skills").iterdir()
+    ) == ["ccb-implementer", "ccb-lead", "ccb-ratifier", "local-notes"]
 
 
 def test_managed_templates_have_symmetric_authority_without_fixed_roles() -> None:

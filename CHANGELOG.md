@@ -5,6 +5,7 @@
 ### Added
 
 - Clarified that Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work.
+- Added the three CCB role skills (`ccb-lead`, `ccb-implementer`, `ccb-ratifier`) to Pi, OpenCode, Gemini and Hermes. Each provider copy is rendered from one provider-neutral body so the copies cannot drift; only the `ccb-*` role directories are written, and only for providers whose home already exists or whose override variable is set.
 - Added duplicate Codex pairing, including coexistence with other unique providers, with contextual sibling routing from either Codex pane.
 - Added exact live-session identity through queueing, receipts, completion delivery, task retrieval, status, cleanup, and provider kill operations.
 

@@ -819,6 +819,188 @@ install_codex_skills() {
   echo "Updated Codex skills directory: $skills_dst"
 }
 
+# The three CCB role skills ship to every supported provider from one
+# provider-neutral body (role_skills/<role>.md). Only the frontmatter differs.
+CCB_ROLE_SKILLS="ccb-lead ccb-implementer ccb-ratifier"
+
+role_skill_description() {
+  local role="$1"
+  local descriptions="$REPO_ROOT/role_skills/descriptions.tsv"
+  local name desc
+
+  [[ -f "$descriptions" ]] || return 1
+  while IFS=$'\t' read -r name desc; do
+    if [[ "$name" == "$role" ]]; then
+      printf '%s' "$desc"
+      return 0
+    fi
+  done < "$descriptions"
+  return 1
+}
+
+# Emit the frontmatter a provider's own skill loader understands. Pi documents
+# disable-model-invocation, which leaves the skill reachable only through
+# /skill:<name>. OpenCode, Gemini and Hermes have no such field, so the
+# explicit-assignment sentence in the body is their guard.
+write_role_skill_frontmatter() {
+  local role="$1"
+  local description="$2"
+  local provider="$3"
+
+  printf -- '---\nname: %s\ndescription: %s\n' "$role" "$description"
+  if [[ "$provider" == "pi" ]]; then
+    printf -- 'disable-model-invocation: true\n'
+  fi
+  printf -- '---\n\n'
+}
+
+install_role_skill_set() {
+  local provider="$1"
+  local skills_dst="$2"
+  local role body description dst_dir
+
+  for role in $CCB_ROLE_SKILLS; do
+    body="$REPO_ROOT/role_skills/$role.md"
+    [[ -f "$body" ]] || continue
+    if ! description="$(role_skill_description "$role")"; then
+      echo "WARN: No role skill description for $role; skipping" >&2
+      continue
+    fi
+    dst_dir="$skills_dst/$role"
+    mkdir -p "$dst_dir" || continue
+    {
+      write_role_skill_frontmatter "$role" "$description" "$provider"
+      cat "$body"
+    } > "$dst_dir/SKILL.md"
+    chmod 0644 "$dst_dir/SKILL.md" 2>/dev/null || true
+    echo "  Installed $provider role skill: $role"
+  done
+}
+
+# Hermes resolves its home in lib/hermes_comm.py:hermes_home_from_env:
+# HERMES_HOME when set and non-blank (after $VAR and ~ expansion), otherwise
+# the platform default with HERMES_DATA_DIR_SUFFIX appended. Role skills must
+# land where that resolver looks, so a stale ~/.hermes is not a fallback.
+hermes_home_override_is_set() {
+  local raw="${HERMES_HOME:-}"
+
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  [[ -n "$raw" ]]
+}
+
+hermes_home_expand_path() {
+  local path="$1"
+  local home="${HOME:-}"
+
+  if [[ "$path" == *'$'* ]]; then
+    local expanded=""
+    if ! pick_python_bin; then
+      echo "WARN: HERMES_HOME contains shell references and no usable Python interpreter was found; skipping Hermes role skills" >&2
+      return 1
+    fi
+    expanded="$(HERMES_PATH_TO_EXPAND="$path" HOME="$home" "$PYTHON_BIN" - <<'PY'
+import os
+import re
+import sys
+
+raw = os.environ.get("HERMES_PATH_TO_EXPAND", "")
+expanded = re.sub(
+    r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+    lambda match: str(os.environ.get(match.group(1) or match.group(2), match.group(0))),
+    raw,
+)
+home = str(os.environ.get("HOME") or os.path.expanduser("~"))
+if expanded == "~" or expanded.startswith(("~/", "~\\")):
+    expanded = home + expanded[1:]
+sys.stdout.write(expanded)
+PY
+)" || {
+      echo "WARN: Could not expand shell references in HERMES_HOME; skipping Hermes role skills" >&2
+      return 1
+    }
+    if [[ -z "$expanded" ]]; then
+      echo "WARN: Expanding HERMES_HOME produced an empty path; skipping Hermes role skills" >&2
+      return 1
+    fi
+    path="$expanded"
+  fi
+
+  if [[ "$path" == "~" || "$path" == "~/"* || "$path" == '~\'* ]]; then
+    path="$home${path:1}"
+  fi
+  printf '%s' "$path"
+}
+
+# Returns 1 when HERMES_HOME cannot be resolved; callers then skip Hermes
+# rather than writing to a literal "$HOME/..." directory.
+hermes_role_skills_base() {
+  if hermes_home_override_is_set; then
+    local raw="${HERMES_HOME:-}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    hermes_home_expand_path "$raw"
+    return $?
+  fi
+
+  printf '%s/.hermes%s' "${HOME:-}" "${HERMES_DATA_DIR_SUFFIX:-}"
+}
+
+install_role_skills() {
+  local roles_src="$REPO_ROOT/role_skills"
+
+  [[ -d "$roles_src" ]] || return 0
+
+  echo "Installing CCB role skills for Pi, OpenCode, Gemini and Hermes..."
+
+  # Install only where the provider already has a home, or where its own
+  # override variable says where that home is.
+  local pi_base="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  if [[ -n "${PI_CODING_AGENT_DIR:-}" || -d "$pi_base" ]]; then
+    install_role_skill_set pi "$pi_base/skills"
+  fi
+
+  local opencode_base="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+  if [[ -n "${OPENCODE_CONFIG_DIR:-}" || -d "$opencode_base" ]]; then
+    install_role_skill_set opencode "$opencode_base/skills"
+  fi
+
+  local gemini_base="${GEMINI_CLI_HOME:-$HOME}/.gemini"
+  if [[ -n "${GEMINI_CLI_HOME:-}" || -d "$gemini_base" ]]; then
+    install_role_skill_set gemini "$gemini_base/skills"
+  fi
+
+  local hermes_base=""
+  if hermes_base="$(hermes_role_skills_base)"; then
+    if hermes_home_override_is_set || [[ -d "$hermes_base" ]]; then
+      install_role_skill_set hermes "$hermes_base/skills"
+    fi
+  fi
+}
+
+uninstall_role_skills() {
+  local roots=(
+    "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/skills"
+    "${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/skills"
+    "${GEMINI_CLI_HOME:-$HOME}/.gemini/skills"
+  )
+  local hermes_base=""
+  if hermes_base="$(hermes_role_skills_base)"; then
+    roots+=("$hermes_base/skills")
+  fi
+  local root role
+
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    for role in $CCB_ROLE_SKILLS; do
+      if [[ -d "$root/$role" ]]; then
+        rm -rf "$root/$role"
+        echo "  Removed CCB role skill: $root/$role"
+      fi
+    done
+  done
+}
+
 overlay_path_is_inside() {
   python3 - "$1" "$2" <<'PY'
 import os
@@ -1615,6 +1797,7 @@ install_all() {
   install_claude_commands
   install_claude_skills
   install_codex_skills
+  install_role_skills
   install_claude_md_config
   install_agents_md_config
   install_settings_permissions
@@ -1901,6 +2084,9 @@ uninstall_all() {
 
   # 9. Remove Codex skills
   uninstall_codex_skills
+
+  # 9b. Remove CCB role skills (Pi, OpenCode, Gemini, Hermes)
+  uninstall_role_skills
 
   # 10. Remove Droid skills
 

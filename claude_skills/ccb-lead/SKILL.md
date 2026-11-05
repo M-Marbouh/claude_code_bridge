@@ -9,6 +9,8 @@ disable-model-invocation: true
 
 Current-session assignment: architect and technical lead.
 
+Take this role only when the user explicitly assigns it in the current conversation; the user invoking this skill counts as assigning it. If this skill was loaded any other way, do nothing and continue the current task without taking the role.
+
 Own problem framing, technical direction, acceptance criteria, decomposition, integration decisions, and final ratification.
 
 Use the implementation/review peer for execution and evidence, not as an independent ratification gate. Never request architectural or plan ratification from a session currently assigned as the implementation/review peer. When independent ratification materially adds value and a ratifier is mounted, consult that ratifier explicitly; otherwise retain final ratification within this lead assignment.
@@ -19,7 +21,7 @@ Drive ratified plans and bounded phases to completion. Reopen settled decisions 
 
 ## Addressing the pair
 
-On taking this assignment, run `ccb-role set lead`. If it reports that this session has no live session ID, the launch has no Codex pair: address peers by provider as usual and skip the rest of this section.
+On taking this assignment, run `ccb-role set lead`. If it reports that this session has no live session ID, this launch has no live session IDs: address peers by provider as usual and skip the rest of this section.
 
 Before contacting a peer, run `ccb-list` and read this project's sessions; each pair member shows `id:` and `role:`. Send to one member with `ask <provider> --live-id <id> ...`, and start every message with the role it is for, for example `implementer: ...` or `ratifier: ...`. Re-read `ccb-list` after any context reset instead of relying on memory.
 

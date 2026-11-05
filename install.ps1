@@ -26,6 +26,8 @@ $script:CCB_START_MARKER = "<!-- CCB_CONFIG_START -->"
 $script:CCB_END_MARKER = "<!-- CCB_CONFIG_END -->"
 $script:CCB_WEZTERM_START_MARKER = "-- CCB_WEZTERM_START"
 $script:CCB_WEZTERM_END_MARKER = "-- CCB_WEZTERM_END"
+# Role skills shipped to every supported provider from one neutral body.
+$script:CCB_ROLE_SKILLS = @("ccb-lead", "ccb-implementer", "ccb-ratifier")
 
 # i18n support
 function Get-CCBLang {
@@ -348,6 +350,7 @@ function Install-Native {
   }
   Install-CodexSkills
   Install-ClaudeConfig
+  Install-RoleSkills
   Cleanup-LegacyFiles -InstallPrefix $InstallPrefix
 
   try {
@@ -489,7 +492,157 @@ function Install-CodexSkills {
   Write-Host "Updated Codex skills directory: $skillsDst"
 }
 
+function Get-RoleSkillDescription {
+  param([Parameter(Mandatory = $true)][string]$Role)
 
+  $descriptions = Join-Path $repoRoot "role_skills\descriptions.tsv"
+  if (-not (Test-Path -LiteralPath $descriptions)) { return $null }
+
+  foreach ($line in [System.IO.File]::ReadAllLines($descriptions, [System.Text.Encoding]::UTF8)) {
+    if (-not $line) { continue }
+    $parts = $line -split "`t", 2
+    if ($parts.Count -eq 2 -and $parts[0] -eq $Role) { return $parts[1] }
+  }
+  return $null
+}
+
+function Test-HermesHomeOverride {
+  return -not [string]::IsNullOrWhiteSpace($env:HERMES_HOME)
+}
+
+function Resolve-HermesHome {
+  # Mirrors lib/hermes_comm.py:hermes_home_from_env so role skills land where
+  # Hermes itself looks: HERMES_HOME (after $VAR/~ expansion) when set and
+  # non-blank, otherwise the platform default plus HERMES_DATA_DIR_SUFFIX.
+  $raw = if ($null -ne $env:HERMES_HOME) { $env:HERMES_HOME.Trim() } else { "" }
+
+  if ($raw) {
+    $expanded = $raw
+    if ($expanded.Contains('$')) {
+      try {
+        $expanded = [regex]::Replace(
+          $expanded,
+          '\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)',
+          [System.Text.RegularExpressions.MatchEvaluator]{
+            param($match)
+            $name = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($null -eq $value) { $match.Value } else { $value }
+          }
+        )
+      } catch {
+        $expanded = $raw
+      }
+    }
+    # Hermes expands ~ through HOME first, then the platform home.
+    $homeDir = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    if ($expanded -eq "~") {
+      $expanded = $homeDir
+    } elseif ($expanded.StartsWith("~/") -or $expanded.StartsWith("~\")) {
+      $expanded = $homeDir + $expanded.Substring(1)
+    }
+    return $expanded
+  }
+
+  $suffix = if ($env:HERMES_DATA_DIR_SUFFIX) { $env:HERMES_DATA_DIR_SUFFIX } else { "" }
+  $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $env:USERPROFILE "AppData\Local" }
+  return Join-Path $base ("hermes" + $suffix)
+}
+
+function Get-RoleSkillTargets {
+  $targets = @()
+
+  $piBase = if ($env:PI_CODING_AGENT_DIR) { $env:PI_CODING_AGENT_DIR } else { Join-Path $env:USERPROFILE ".pi\agent" }
+  $targets += @{
+    Provider = "pi"
+    Base     = $piBase
+    Present  = [bool]$env:PI_CODING_AGENT_DIR -or (Test-Path -LiteralPath $piBase)
+  }
+
+  $configRoot = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $env:USERPROFILE ".config" }
+  $opencodeBase = if ($env:OPENCODE_CONFIG_DIR) { $env:OPENCODE_CONFIG_DIR } else { Join-Path $configRoot "opencode" }
+  $targets += @{
+    Provider = "opencode"
+    Base     = $opencodeBase
+    Present  = [bool]$env:OPENCODE_CONFIG_DIR -or (Test-Path -LiteralPath $opencodeBase)
+  }
+
+  $geminiHome = if ($env:GEMINI_CLI_HOME) { $env:GEMINI_CLI_HOME } else { $env:USERPROFILE }
+  $geminiBase = Join-Path $geminiHome ".gemini"
+  $targets += @{
+    Provider = "gemini"
+    Base     = $geminiBase
+    Present  = [bool]$env:GEMINI_CLI_HOME -or (Test-Path -LiteralPath $geminiBase)
+  }
+
+  # Hermes resolves its home from HERMES_HOME, then the platform default with
+  # HERMES_DATA_DIR_SUFFIX. A legacy ~/.hermes is not a fallback.
+  $hermesBase = Resolve-HermesHome
+  $targets += @{
+    Provider = "hermes"
+    Base     = $hermesBase
+    Present  = (Test-HermesHomeOverride) -or (Test-Path -LiteralPath $hermesBase)
+  }
+
+  return $targets
+}
+
+function Install-RoleSkills {
+  $rolesSrc = Join-Path $repoRoot "role_skills"
+  if (-not (Test-Path -LiteralPath $rolesSrc)) {
+    return
+  }
+
+  Write-Host "Installing CCB role skills for Pi, OpenCode, Gemini and Hermes..."
+  foreach ($target in Get-RoleSkillTargets) {
+    # Only touch a provider that already has a home, or whose override says where it is.
+    if (-not $target.Present) { continue }
+    $skillsDst = Join-Path $target.Base "skills"
+
+    foreach ($role in $script:CCB_ROLE_SKILLS) {
+      $bodyPath = Join-Path $rolesSrc "$role.md"
+      if (-not (Test-Path -LiteralPath $bodyPath)) { continue }
+
+      $description = Get-RoleSkillDescription -Role $role
+      if (-not $description) {
+        Write-Warning "No role skill description for $role; skipping"
+        continue
+      }
+
+      $dstDir = Join-Path $skillsDst $role
+      New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+
+      $builder = New-Object System.Text.StringBuilder
+      [void]$builder.Append("---`n")
+      [void]$builder.Append("name: $role`n")
+      [void]$builder.Append("description: $description`n")
+      if ($target.Provider -eq "pi") {
+        [void]$builder.Append("disable-model-invocation: true`n")
+      }
+      [void]$builder.Append("---`n`n")
+      [void]$builder.Append([System.IO.File]::ReadAllText($bodyPath, [System.Text.Encoding]::UTF8))
+
+      $dstSkillMd = Join-Path $dstDir "SKILL.md"
+      [System.IO.File]::WriteAllText($dstSkillMd, $builder.ToString(), $script:utf8NoBom)
+      Write-Host "  Installed $($target.Provider) role skill: $role"
+    }
+  }
+}
+
+function Uninstall-RoleSkills {
+  foreach ($target in Get-RoleSkillTargets) {
+    $skillsDir = Join-Path $target.Base "skills"
+    if (-not (Test-Path -LiteralPath $skillsDir)) { continue }
+
+    foreach ($role in $script:CCB_ROLE_SKILLS) {
+      $rolePath = Join-Path $skillsDir $role
+      if (Test-Path -LiteralPath $rolePath) {
+        Remove-Item -Recurse -Force $rolePath
+        Write-Host "  Removed CCB role skill: $rolePath"
+      }
+    }
+  }
+}
 
 function Install-AgentsMdConfig {
   param([Parameter(Mandatory = $true)][string]$InstallPrefix)
@@ -930,6 +1083,9 @@ function Uninstall-Native {
       }
     }
   }
+
+  # 7b. Remove CCB role skills (Pi, OpenCode, Gemini, Hermes)
+  Uninstall-RoleSkills
 
   # 8. Remove Droid skills
   $factoryHome = if ($env:FACTORY_HOME) { $env:FACTORY_HOME } else { Join-Path $env:USERPROFILE ".factory" }

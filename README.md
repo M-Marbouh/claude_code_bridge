@@ -204,6 +204,25 @@ The same-provider pair can also be declared as JSON:
 
 Provider instance names and `instances` overrides are not supported. Existing `provider_instances` and `instances` keys are ignored during configuration normalization, and stale worker session files are not loaded.
 
+### Role skills
+
+CCB ships three role skills — `ccb-lead`, `ccb-implementer` and `ccb-ratifier` — from one provider-neutral body per role (`role_skills/<role>.md`). Any supported provider can hold any role. The Pi, OpenCode, Gemini and Hermes installers render `SKILL.md` from that shared body at install time, adding only the frontmatter that provider's loader understands; Claude and Codex install their tracked `claude_skills/` and `codex_skills/` files byte for byte, and the tests keep those bodies equal to the shared one.
+
+| Provider | Installs to | Override | Invoke |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/skills/<role>/SKILL.md` | fixed path | `/ccb-lead` |
+| Codex | `${CODEX_HOME:-~/.codex}/skills/<role>/SKILL.md` | `CODEX_HOME` | `$ccb-lead` |
+| Pi | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/skills/<role>/SKILL.md` | `PI_CODING_AGENT_DIR` | `/skill:ccb-lead` |
+| OpenCode | `${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/opencode}/skills/<role>/SKILL.md` | `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME` | name the skill in your request; the agent loads it through its `skill` tool |
+| Gemini CLI | `${GEMINI_CLI_HOME:-~}/.gemini/skills/<role>/SKILL.md` | `GEMINI_CLI_HOME` | `/skills list` shows it; the agent activates it through `activate_skill` after a consent prompt |
+| Hermes | `${HERMES_HOME:-~/.hermes$HERMES_DATA_DIR_SUFFIX}/skills/<role>/SKILL.md` | `HERMES_HOME`, `HERMES_DATA_DIR_SUFFIX` | `hermes --skills ccb-lead` preloads it; the agent can also load it through its skill tool |
+
+The skip-unless-home-exists rule applies to those four providers only: each is skipped unless its home directory already exists or its override variable is set, so installing never creates a config directory for a tool you do not use. Claude and Codex install unconditionally as before. Only the three `ccb-*` directories are written in any provider; every other skill in the same directory is left untouched, and uninstall removes only the three role directories. Hermes is resolved the way Hermes itself resolves its home — `HERMES_HOME` when set and non-blank, otherwise the platform default with `HERMES_DATA_DIR_SUFFIX` appended — so a leftover `~/.hermes` is not used as a fallback when the resolved home is absent.
+
+Each body says to take the role only when the user explicitly assigns it in the current conversation, which includes the user invoking the skill, and to do nothing if the file was loaded any other way. Pi additionally sets `disable-model-invocation: true` in the generated frontmatter, so its copy is only reachable through `/skill:ccb-lead`. OpenCode, Gemini and Hermes have no equivalent frontmatter field, so their guard is that sentence together with the explicit user request.
+
+Known limitation: a Pi session can hold a role and answer requests, but it cannot yet start a message to the lead, so Pi midpoint reports do not work yet. Recording a role with `ccb-role set` also still needs a launch with live session IDs.
+
 ## Troubleshooting
 
 - `ambiguous` means CCB cannot prove one destination. Run the request from a mounted member of the local pair, or choose a remote project with one session of that provider; CCB never guesses by launch order.

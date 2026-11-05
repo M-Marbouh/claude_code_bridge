@@ -393,6 +393,6 @@ Unchanged invariants: destinations are resolved by exact session identity, never
 Phases, each gated separately:
 
 1. Distribution: the three role skills ship to every supported provider from one provider-neutral body, installed only where the provider's home exists or an explicit provider override is supplied (Claude and Codex keep their existing unconditional install).
-2. Session identity in every launch (not only Codex pairs), as a compatibility phase; repair Pi as a caller.
+2. A role-claim credential for every pane of every launch, kept separate from routing: launches other than Codex pairs get no live IDs and publish no routing inventory, so destination resolution is unchanged. Pair launches reuse their existing live ID and token as the credential. Role claims become atomic, and Pi is repaired as a local caller.
 3. Delivery policy: explicit opt-in that claims cannot disable; structured request kinds and required target role; sender role derived from verified launch credentials; host-side refusal before acceptance and recheck before delivery; accurate acknowledgement; atomic role claims; no bypass via missing metadata, direct RPC, cross-project, manual or email ingress.
 4. Action limits (edits, push, deploy) are not provided by the delivery gate and remain unimplemented until provider-specific permission evidence exists. Report this limitation plainly.

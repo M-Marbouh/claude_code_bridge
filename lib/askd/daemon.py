@@ -523,15 +523,17 @@ class UnifiedAskDaemon:
     def _handle_set_role(self, msg: dict) -> dict:
         """Record a session's own role for a sandboxed caller that cannot write the run dir.
 
-        The session's own live ID and credential are the authorization;
-        `set_own_role` refuses anything else.
+        The session's own launch credential is the authorization;
+        `set_own_role` refuses anything else. New clients send it as
+        `member_id`/`member_token`; the historical `live_id`/`live_token`
+        fields remain accepted so older panes keep working.
         """
         from live_roles import set_own_role
 
         try:
             ok, detail = set_own_role(
-                str(msg.get("live_id") or ""),
-                str(msg.get("live_token") or ""),
+                str(msg.get("member_id") or msg.get("live_id") or ""),
+                str(msg.get("member_token") or msg.get("live_token") or ""),
                 str(msg.get("role") or ""),
             )
         except Exception as exc:

@@ -108,6 +108,8 @@ class CodexProjectSession:
             return False, "Terminal backend not available"
 
         pane_id = self.pane_id
+        previous_pane = str(pane_id or "").strip()
+        launch_id = str(self.data.get("session_id") or "").strip()
         marker = self.pane_title_marker
         resolver = getattr(backend, "find_pane_by_title_marker", None)
 
@@ -121,6 +123,7 @@ class CodexProjectSession:
                     try:
                         resolved = resolver(marker, self.work_dir)
                         if resolved and str(resolved) != str(pane_id) and backend.is_alive(str(resolved)):
+                            _invalidate_role_claims(launch_id, previous_pane)
                             self.data["pane_id"] = str(resolved)
                             self.data["updated_at"] = _now_str()
                             self._write_back()
@@ -136,6 +139,7 @@ class CodexProjectSession:
         if marker and callable(resolver):
             resolved = resolver(marker, self.work_dir)
             if resolved and backend.is_alive(str(resolved)):
+                _invalidate_role_claims(launch_id, previous_pane)
                 self.data["pane_id"] = str(resolved)
                 self.data["updated_at"] = _now_str()
                 self._write_back()
@@ -183,7 +187,17 @@ class CodexProjectSession:
                                 saver(str(target), str(crash_log), lines=1000)
                             except Exception:
                                 pass
-                        respawn(str(target), cmd=start_cmd, cwd=self.work_dir, remain_on_exit=True, kill_live=False)
+                        _invalidate_role_claims(launch_id, str(target))
+                        credential_prefix = _role_credential_prefix(
+                            launch_id, str(target), str(self.session_file)
+                        )
+                        respawn(
+                            str(target),
+                            cmd=credential_prefix + start_cmd,
+                            cwd=self.work_dir,
+                            remain_on_exit=True,
+                            kill_live=False,
+                        )
                         if backend.is_alive(str(target)):
                             self.data["pane_id"] = str(target)
                             self.data["updated_at"] = _now_str()
@@ -302,3 +316,39 @@ def compute_session_key(session: CodexProjectSession) -> str:
         except Exception:
             pid = ""
     return f"codex:{pid}" if pid else "codex:unknown"
+
+
+def _role_credential_prefix(launch_id: str, pane_id: str, session_file: str) -> str:
+    """Credential env for a respawned pane, re-derived from the launch record.
+
+    The stored start command intentionally carries no token. If this lookup
+    fails the pane still respawns -- it just cannot claim a role.
+    """
+    try:
+        from live_roles import credential_env_prefix_for_pane
+
+        return credential_env_prefix_for_pane(launch_id, pane_id, session_file)
+    except Exception:
+        return ""
+
+
+def _invalidate_role_claims(launch_id: str, pane_id: str) -> None:
+    """Drop a role claim recorded for a pane that just died or was replaced.
+
+    Role assignments are per pane incarnation: a respawned or replacement
+    pane never inherits one. Best-effort -- recovery must not depend on it.
+    """
+    launch_id = str(launch_id or "").strip()
+    pane_id = str(pane_id or "").strip()
+    if not launch_id or not pane_id:
+        return
+    # Best-effort tidy-up only. Recovery proceeds whatever this returns: the
+    # stored pane process witness is what makes a respawned pane's old
+    # assignment invalid, so a lock timeout or a failed write here changes
+    # nothing about correctness.
+    try:
+        from live_roles import invalidate_pane_claims
+
+        invalidate_pane_claims(launch_id, pane_id)
+    except Exception:
+        pass

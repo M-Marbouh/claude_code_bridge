@@ -8,9 +8,12 @@ Usage:
 
 The role is shown by `ccb-list` so a lead can find who is who. It is a
 display name only: routing never reads it and it grants no permissions.
-Only the session itself can set its role, it lasts only for the current
-launch, and it disappears if the session's pane dies or is replaced.
-Roles exist only in launches with live session IDs (a Codex pair).
+Only the session itself can set its role, using the credential CCB exported
+into its pane (CCB_MEMBER_ID/CCB_MEMBER_TOKEN, or CCB_LIVE_ID/CCB_LIVE_TOKEN
+in a launch with live session IDs). The role lasts only for the current
+launch and disappears if the session's pane dies or is replaced. A session
+with no CCB launch credential is outside a CCB launch and cannot record a
+role.
 """
 from __future__ import annotations
 
@@ -46,21 +49,28 @@ def main(argv: list[str]) -> int:
         _usage()
         return 1
 
-    live_id = (os.environ.get("CCB_LIVE_ID") or "").strip()
-    live_token = (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
-    if not live_id or not live_token:
+    member_id = (os.environ.get("CCB_MEMBER_ID") or "").strip()
+    member_token = (os.environ.get("CCB_MEMBER_TOKEN") or "").strip()
+    if not member_id or not member_token:
+        # Older launches exported only the pair credential; it names the same
+        # member, so it stays accepted.
+        member_id = member_id or (os.environ.get("CCB_LIVE_ID") or "").strip()
+        member_token = member_token or (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+    if not member_id or not member_token:
         print(
-            "[ERROR] This session has no live session ID. Roles are only recorded in a "
-            "CCB launch with a Codex pair.",
+            "[ERROR] This session has no CCB launch credential. Roles are only recorded "
+            "from inside a CCB launch.",
             file=sys.stderr,
         )
         return 1
 
     try:
         if inside_managed_codex_sandbox():
-            ok, detail = daemon_set_role(resolve_daemon_work_dir(Path.cwd()), live_id, live_token, role)
+            ok, detail = daemon_set_role(
+                resolve_daemon_work_dir(Path.cwd()), member_id, member_token, role
+            )
         else:
-            ok, detail = set_own_role(live_id, live_token, role)
+            ok, detail = set_own_role(member_id, member_token, role)
     except Exception as exc:
         print(f"[ERROR] Role update failed: {exc}", file=sys.stderr)
         return 1

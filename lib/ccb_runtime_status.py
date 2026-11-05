@@ -259,8 +259,14 @@ def daemon_queue_status(
     return [q for q in queues if isinstance(q, dict)]
 
 
-def daemon_set_role(work_dir: Path, live_id: str, live_token: str, role: str) -> tuple[bool, str]:
-    """Ask the host daemon to record this session's own role (sandboxed callers)."""
+def daemon_set_role(work_dir: Path, member_id: str, member_token: str, role: str) -> tuple[bool, str]:
+    """Ask the host daemon to record this session's own role (sandboxed callers).
+
+    The wire fields keep their historical `live_id`/`live_token` names so a
+    daemon from the pair-only era still understands the request; the value is
+    whichever launch credential this session holds (member credential, or the
+    pair's live credential).
+    """
     state_file = find_running_state_file(
         "askd.json",
         protocol_prefix="ask",
@@ -276,8 +282,10 @@ def daemon_set_role(work_dir: Path, live_id: str, live_token: str, role: str) ->
         "id": f"set-role-{os.getpid()}",
         "token": str(state.get("token")),
         "operation": "set_role",
-        "live_id": live_id,
-        "live_token": live_token,
+        "live_id": member_id,
+        "live_token": member_token,
+        "member_id": member_id,
+        "member_token": member_token,
         "role": role,
     }
     response = askd_rpc.request_daemon(state, request, connect_timeout_s=2.0, response_timeout_s=8.0)

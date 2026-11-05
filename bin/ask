@@ -141,12 +141,14 @@ CALLER_SESSION_FILES = {
     "gemini": ".gemini-session",
     "opencode": ".opencode-session",
     "hermes": ".hermes-session",
+    "pi": ".pi-session",
 }
 
 CALLER_PANE_ENV_HINTS = {
     "codex": ("CODEX_TMUX_SESSION", "CODEX_WEZTERM_PANE"),
     "gemini": ("GEMINI_TMUX_SESSION", "GEMINI_WEZTERM_PANE"),
     "opencode": ("OPENCODE_TMUX_SESSION", "OPENCODE_WEZTERM_PANE"),
+    "pi": ("PI_TMUX_SESSION", "PI_WEZTERM_PANE"),
 }
 
 CALLER_ENV_HINTS = {
@@ -1421,6 +1423,17 @@ def _run_peer_bridge(
         )
         return EXIT_ERROR
     caller = _require_caller()
+    # Pi is now a local caller, but it has no peer identity: refuse it here, on
+    # the one path both peer syntaxes (`ask --peer T`, `ask P --peer T`) take,
+    # before any project lookup, task receipt or bridge dispatch. Every other
+    # caller keeps the behaviour it had before Pi could call at all.
+    if caller == "pi":
+        print(
+            "[ERROR] Peer messaging is not available from a Pi session; "
+            "start the request from a Claude or Codex pane.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
     if intent == "notify":
         sender_work_dir = (
             _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))

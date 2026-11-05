@@ -169,6 +169,8 @@ class ClaudeProjectSession:
             return False, "Terminal backend not available"
 
         pane_id = self.pane_id
+        previous_pane = str(pane_id or "").strip()
+        launch_id = str(self.data.get("session_id") or "").strip()
         marker = self.pane_title_marker
         resolver = getattr(backend, "find_pane_by_title_marker", None)
 
@@ -180,6 +182,7 @@ class ClaudeProjectSession:
                     try:
                         resolved = resolver(marker, self.work_dir)
                         if resolved and str(resolved) != str(pane_id) and backend.is_alive(str(resolved)):
+                            _invalidate_role_claims(launch_id, previous_pane)
                             self.data["pane_id"] = str(resolved)
                             self.data["updated_at"] = _now_str()
                             self._write_back()
@@ -194,6 +197,7 @@ class ClaudeProjectSession:
         if marker and callable(resolver):
             resolved = resolver(marker, self.work_dir)
             if resolved and backend.is_alive(str(resolved)):
+                _invalidate_role_claims(launch_id, previous_pane)
                 self.data["pane_id"] = str(resolved)
                 self.data["updated_at"] = _now_str()
                 self._write_back()
@@ -294,3 +298,25 @@ def compute_session_key(session: ClaudeProjectSession) -> str:
         except Exception:
             pid = ""
     return f"claude:{pid}" if pid else "claude:unknown"
+
+
+def _invalidate_role_claims(launch_id: str, pane_id: str) -> None:
+    """Drop a role claim recorded for a pane that just died or was replaced.
+
+    Role assignments are per pane incarnation: a respawned or replacement
+    pane never inherits one. Best-effort -- recovery must not depend on it.
+    """
+    launch_id = str(launch_id or "").strip()
+    pane_id = str(pane_id or "").strip()
+    if not launch_id or not pane_id:
+        return
+    # Best-effort tidy-up only. Recovery proceeds whatever this returns: the
+    # stored pane process witness is what makes a respawned pane's old
+    # assignment invalid, so a lock timeout or a failed write here changes
+    # nothing about correctness.
+    try:
+        from live_roles import invalidate_pane_claims
+
+        invalidate_pane_claims(launch_id, pane_id)
+    except Exception:
+        pass

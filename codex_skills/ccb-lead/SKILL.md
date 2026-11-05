@@ -19,9 +19,9 @@ Drive ratified plans and bounded phases to completion. Reopen settled decisions 
 
 ## Addressing the pair
 
-On taking this assignment, run `ccb-role set lead`. If it reports that this session has no live session ID, this launch has no live session IDs: address peers by provider as usual and skip the rest of this section.
+On taking this assignment, run `ccb-role set lead`. If it reports that this session has no CCB launch credential, this session is outside a CCB launch: address peers by provider as usual and skip the rest of this section.
 
-Before contacting a peer, run `ccb-list` and read this project's sessions; each pair member shows `id:` and `role:`. Send to one member with `ask <provider> --live-id <id> ...`, and start every message with the role it is for, for example `implementer: ...` or `ratifier: ...`. Re-read `ccb-list` after any context reset instead of relying on memory.
+Before contacting a peer, run `ccb-list` and read this project's sessions; each member shows its `role:` and, in a launch with live session IDs, an `id:`. Send to one member with `ask <provider> --live-id <id> ...` when `ccb-list` shows an id for that session, or with `ask <provider>` when it shows none, and start every message with the role it is for, for example `implementer: ...` or `ratifier: ...`. A bare `ask <provider>` reaches that provider's other session when this session is one of the pair; from outside a pair of the same provider it is refused as ambiguous rather than guessing, so name the exact live ID there. Re-read `ccb-list` after any context reset instead of relying on memory.
 
 If a needed role is missing or shown as `role:-`, ask the user to assign it. Never infer a role from pane order or launch order. A refused route means that session is gone or was replaced; re-check `ccb-list` rather than retrying or sending to the other member.
 

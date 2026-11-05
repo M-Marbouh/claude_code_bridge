@@ -2944,3 +2944,116 @@ def test_pend_legacy_still_runs_for_a_unique_provider_under_a_pair(monkeypatch) 
 
     assert rc == pend.EXIT_OK
     assert calls == [("claude", [])]
+
+
+# --- Pi caller completion delivery ------------------------------------------------
+
+def _pi_and_claude_session_files(project: Path) -> tuple[Path, Path]:
+    config = project / ".ccb"
+    config.mkdir(parents=True)
+    pi_file = config / ".pi-session"
+    claude_file = config / ".claude-session"
+    pi_file.write_text(
+        json.dumps({"pane_id": "%21", "terminal": "tmux", "work_dir": str(project)}),
+        encoding="utf-8",
+    )
+    claude_file.write_text(
+        json.dumps({"pane_id": "%11", "terminal": "tmux", "work_dir": str(project)}),
+        encoding="utf-8",
+    )
+    return pi_file, claude_file
+
+
+def test_completion_hook_delivers_a_pi_callers_result_to_the_pi_pane(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A Pi session that started the ask gets the completion, never Claude."""
+    hook = _load_completion_hook_module()
+    project = tmp_path / "project"
+    _pi_and_claude_session_files(project)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        hook, "send_via_tmux", lambda pane_id, message: sent.append((pane_id, message)) or True
+    )
+    monkeypatch.setattr(hook, "send_via_wezterm", lambda *a, **k: False)
+    monkeypatch.setattr(hook.sys.stdin, "isatty", lambda: True)
+    monkeypatch.delenv("CCB_CALLER_PANE_ID", raising=False)
+    monkeypatch.delenv("CCB_ROUTE_LAUNCH_ID", raising=False)
+    monkeypatch.setenv("CCB_WORK_DIR", str(project))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(
+        hook.sys,
+        "argv",
+        [
+            "ccb-completion-hook",
+            "--provider", "claude",
+            "--caller", "pi",
+            "--req-id", "task-pi",
+            "--reply", "Hello",
+        ],
+    )
+
+    assert hook.main() == 0
+
+    assert [pane for pane, _message in sent] == ["%21"]
+    assert "task-pi" in sent[0][1]
+
+
+def test_pi_completion_lookup_climbs_from_a_nested_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    hook = _load_completion_hook_module()
+    project = tmp_path / "project"
+    _pi_and_claude_session_files(project)
+    nested = project / "src" / "deep"
+    nested.mkdir(parents=True)
+    sent: list[str] = []
+    monkeypatch.setattr(hook, "send_via_tmux", lambda pane_id, message: sent.append(pane_id) or True)
+    monkeypatch.setattr(hook, "send_via_wezterm", lambda *a, **k: False)
+    monkeypatch.setattr(hook.sys.stdin, "isatty", lambda: True)
+    monkeypatch.delenv("CCB_CALLER_PANE_ID", raising=False)
+    monkeypatch.delenv("CCB_ROUTE_LAUNCH_ID", raising=False)
+    monkeypatch.delenv("CCB_WORK_DIR", raising=False)
+    monkeypatch.chdir(nested)
+    monkeypatch.setattr(
+        hook.sys,
+        "argv",
+        [
+            "ccb-completion-hook",
+            "--provider", "claude",
+            "--caller", "pi",
+            "--req-id", "task-pi-nested",
+            "--reply", "Hello",
+        ],
+    )
+
+    assert hook.main() == 0
+    assert sent == ["%21"]
+
+
+def test_pi_direct_pane_completion_uses_the_captured_pane(monkeypatch, tmp_path: Path) -> None:
+    hook = _load_completion_hook_module()
+    project = tmp_path / "project"
+    _pi_and_claude_session_files(project)
+    sent: list[str] = []
+    monkeypatch.setattr(hook, "send_via_tmux", lambda pane_id, message: sent.append(pane_id) or True)
+    monkeypatch.setattr(hook.sys.stdin, "isatty", lambda: True)
+    monkeypatch.delenv("CCB_ROUTE_LAUNCH_ID", raising=False)
+    monkeypatch.setenv("CCB_CALLER_PANE_ID", "%21")
+    monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")
+    monkeypatch.setenv("CCB_WORK_DIR", str(project))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(
+        hook.sys,
+        "argv",
+        [
+            "ccb-completion-hook",
+            "--provider", "claude",
+            "--caller", "pi",
+            "--req-id", "task-pi-direct",
+            "--reply", "Hello",
+        ],
+    )
+
+    assert hook.main() == 0
+    assert sent == ["%21"]

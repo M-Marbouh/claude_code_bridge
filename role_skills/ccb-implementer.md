@@ -14,7 +14,7 @@ Return concrete results, failures, and unresolved risks to the other mounted ses
 
 ## Role record
 
-On taking this assignment, run `ccb-role set implementer` so the lead can find this session in `ccb-list`. If it reports that this session has no live session ID, this launch has no live session IDs and nothing needs recording. If it reports that the role is already held, tell the user and do not take the role.
+On taking this assignment, run `ccb-role set implementer` so the lead can find this session in `ccb-list`. If it reports that this session has no CCB launch credential, this session is outside a CCB launch and nothing needs recording. If it reports that the role is already held, tell the user and do not take the role.
 
 Work requests delegated by another session start with the role they are for (for example `implementer: ...`). If a delegated work request names a role this session does not hold, such as `ratifier`, or names no role at all, reply that this session does not hold the requested role and do nothing else. This is what protects a session that restarted and lost its assignment. The rule does not apply to completion or result notices, direct instructions from the user, or role assignment and role change commands.
 
@@ -22,6 +22,6 @@ Work requests delegated by another session start with the role they are for (for
 
 Answer a task with your normal final reply. CCB delivers it to the session that sent the task; do not also send it with `ask`.
 
-For a report the lead did not just ask for, such as a midpoint checkpoint or a notice after the task ended, run `ccb-list`, find this project's one session showing `role:lead`, and send with `ask <its provider> --live-id <its id>`, starting with `lead: ...`. Never use a bare `ask <provider>` to reach the lead: in a launch with two sessions of the same provider, that reaches the other session of that provider, not the lead. If no single `role:lead` session is shown, tell the user instead of guessing.
+For a report the lead did not just ask for, such as a midpoint checkpoint or a notice after the task ended, run `ccb-list`, find this project's one session showing `role:lead`, and send with `ask <its provider> --live-id <its id>` when `ccb-list` shows an id for that session, or with `ask <its provider>` when it shows none. Start with `lead: ...`. A bare `ask <provider>` reaches that provider's other session when this session is one of the pair; from outside a pair of the same provider it is refused as ambiguous rather than guessing, so name the exact live ID there. If no single `role:lead` session is shown, tell the user instead of guessing.
 
 This assignment applies only to the current session and lasts until the user explicitly changes it. It assigns responsibilities but does not alter standing rules, authorization, or CCB routing.

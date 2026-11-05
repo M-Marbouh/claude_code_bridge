@@ -538,6 +538,7 @@ def main() -> int:
         "gemini": "Gemini",
         "opencode": "OpenCode",
         "hermes": "Hermes",
+        "pi": "Pi",
         "peer-claude": "Peer Claude",
         "peer-codex": "Peer Codex",
     }
@@ -624,6 +625,7 @@ def main() -> int:
             "gemini": ".gemini-session",
             "opencode": ".opencode-session",
             "hermes": ".hermes-session",
+            "pi": ".pi-session",
         }
         session_filename = session_files.get(caller, ".claude-session")
 

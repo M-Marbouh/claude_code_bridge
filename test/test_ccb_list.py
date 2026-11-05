@@ -47,6 +47,12 @@ def _write_fake_tmux(bin_dir: Path, panes: list[dict[str, str]]) -> None:
         f"  printf '%b\\n' {json.dumps(lines)}\n"
         "  exit 0\n"
         "fi\n"
+        "if [ \"$1\" = \"display-message\" ]; then\n"
+        "  case \"$*\" in\n"
+        "    *pane_dead*) printf '0\\n'; exit 0 ;;\n"
+        "    *pane_pid*) printf '4242\\n'; exit 0 ;;\n"
+        "  esac\n"
+        "fi\n"
         "exit 1\n",
         encoding="utf-8",
     )
@@ -893,3 +899,292 @@ def test_ccb_list_reports_daemon_discovery_failure_in_codex_sandbox(monkeypatch,
     assert rc == 1
     assert captured.out == ""
     assert "daemon discovery failed: socket unavailable" in captured.err
+
+
+# --- roles in a launch with no live-session inventory ------------------------------
+
+REAL_NON_PAIR_RECORD = {
+    "ccb_session_id": "ai-1793895837-1479705",
+    "ccb_project_id": "f8cc696c6fe8102f7f96e61fb986e6f989639baba0456d9919a111a164e1be2f",
+    "work_dir": "/home/user/dev/claude_code_bridge",
+    "terminal": "tmux",
+    "providers": {
+        "claude": {
+            "pane_id": "%8",
+            "pane_title_marker": "CCB-Claude-f8cc696c",
+            "session_file": "/home/user/dev/claude_code_bridge/.ccb/.claude-session",
+            "claude_session_id": "a971d925-d525-42a1-b186-be9695b99d04",
+            "claude_session_path": "/home/user/.claude/projects/-home-user-dev-claude-code-bridge/a971d925-d525-42a1-b186-be9695b99d04.jsonl",
+        },
+        "pi": {
+            "pane_id": "%11",
+            "pane_title_marker": "CCB-Pi-f8cc696c",
+            "session_file": "/home/user/dev/claude_code_bridge/.ccb/.pi-session",
+        },
+        "codex": {
+            "pane_id": "%12",
+            "pane_title_marker": "CCB-Codex-f8cc696c",
+            "session_file": "/home/user/dev/claude_code_bridge/.ccb/.codex-session",
+        },
+    },
+    "ccb_pid": 1479705,
+    "updated_at": 1793895839,
+    "claude_pane_id": "%8",
+    "codex_pane_id": "%12",
+}
+
+
+def _non_pair_role_launch(tmp_path: Path) -> tuple[Path, dict]:
+    """The real non-pair record, rewritten for this temp project, with claims."""
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "project"
+    config = work_dir / ".ccb"
+    config.mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [
+            {"pane_id": "%8", "title": "CCB-Claude-f8cc696c", "cwd": str(work_dir)},
+            {"pane_id": "%11", "title": "CCB-Pi-f8cc696c", "cwd": str(work_dir)},
+            {"pane_id": "%12", "title": "CCB-Codex-f8cc696c", "cwd": str(work_dir)},
+        ],
+    )
+    record = json.loads(json.dumps(REAL_NON_PAIR_RECORD))
+    record["work_dir"] = str(work_dir)
+    record["ccb_project_id"] = compute_ccb_project_id(work_dir)
+    record["ccb_pid"] = os.getpid()
+    record["updated_at"] = int(time.time())
+    for provider, entry in record["providers"].items():
+        session_file = config / f".{provider}-session"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "session_id": record["ccb_session_id"],
+                    "ccb_project_id": record["ccb_project_id"],
+                    "work_dir": str(work_dir),
+                    "pane_id": entry["pane_id"],
+                    "pane_title_marker": entry["pane_title_marker"],
+                    "terminal": "tmux",
+                    "active": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        entry["session_file"] = str(session_file)
+        entry["member_id"] = f"member-{provider}"
+        entry["member_token"] = f"static-token-{provider}"
+    (run_dir / f"ccb-session-{record['ccb_session_id']}.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+    claims = {
+        "member-claude": {
+            "role": "lead",
+            "pane_id": "%8",
+            "provider": "claude",
+            "pane_pid": "4242",
+            "claimed_at": 1,
+        },
+        "member-pi": {
+            "role": "implementer",
+            "pane_id": "%11",
+            "provider": "pi",
+            "pane_pid": "4242",
+            "claimed_at": 1,
+        },
+    }
+    (run_dir / f"ccb-roles-{record['ccb_session_id']}.json").write_text(
+        json.dumps({"launch_id": record["ccb_session_id"], "claims": claims}), encoding="utf-8"
+    )
+    return work_dir, record
+
+
+def test_ccb_list_shows_roles_without_printing_a_member_id_or_token(tmp_path: Path) -> None:
+    work_dir, record = _non_pair_role_launch(tmp_path)
+
+    entries = _run_ccb_list(tmp_path)
+
+    providers = entries[0]["providers"]
+    assert providers["claude"]["role"] == "lead"
+    assert providers["pi"]["role"] == "implementer"
+    assert providers["codex"]["role"] == ""
+    dumped = json.dumps(entries)
+    for entry in record["providers"].values():
+        assert entry["member_id"] not in dumped
+        assert entry["member_token"] not in dumped
+
+    env = os.environ.copy()
+    env.pop("CCB_RUN_DIR", None)
+    env["HOME"] = str(tmp_path)
+    env["USERPROFILE"] = str(tmp_path)
+    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    human = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "ccb-list")],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    ).stdout
+
+    assert f"role:lead" in human
+    assert "role:implementer" in human
+    assert "id:" not in human
+    for entry in record["providers"].values():
+        assert entry["member_id"] not in human
+        assert entry["member_token"] not in human
+
+
+def test_ccb_list_pair_role_output_keeps_id_then_role(tmp_path: Path, capsys) -> None:
+    ccb_list = _load_ccb_list_module()
+    entries = [
+        {
+            "index": 1,
+            "work_dir": "/project",
+            "ccb_project_id": "abcdef012345",
+            "peer_providers": ["codex"],
+            "sessions": [
+                {
+                    "session_id": "ai-1",
+                    "window_id": "%1",
+                    "terminal": "tmux",
+                    "providers": {
+                        "claude": {
+                            "pane_id": "%1",
+                            "mounted": True,
+                            "live_id": "live-lead",
+                            "role": "lead",
+                        },
+                        "codex": {"pane_id": "%2", "mounted": True, "live_id": "live-cx"},
+                    },
+                }
+            ],
+        }
+    ]
+
+    ccb_list._print_human(entries)
+    out = capsys.readouterr().out
+
+    assert "id:live-lead  role:lead" in out
+    assert "id:live-cx  role:-" in out
+
+
+def test_ccb_list_hides_a_role_whose_pane_changed(tmp_path: Path) -> None:
+    _, record = _non_pair_role_launch(tmp_path)
+    record["providers"]["pi"]["pane_id"] = "%99"
+    run_dir = tmp_path / ".ccb" / "run"
+    (run_dir / f"ccb-session-{record['ccb_session_id']}.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+
+    entries = _run_ccb_list(tmp_path)
+
+    # The stale claim is not rendered anywhere, and the untouched member keeps its role.
+    dumped = json.dumps(entries)
+    assert "implementer" not in dumped
+    assert entries[0]["providers"]["claude"]["role"] == "lead"
+
+
+# The real .claude-session that `laskd` leaves behind: no launch id, bound by
+# project + pane + marker + active.
+REAL_CLAUDE_SESSION_FIELDS = {
+    "ccb_project_id": "eb24f3aebfb7009a506fc2d21ece36916af4998559a804ecd76eaa400c0c552f",
+    "work_dir": "/home/user/proj",
+    "terminal": "tmux",
+    "pane_id": "%8",
+    "pane_title_marker": "CCB-Claude-eb24f3ae",
+    "work_dir_norm": "/home/user/proj",
+    "claude_session_path": "/home/user/.claude/projects/-home-user-proj/101ec639-5c70-46d2-8e7d-75d6c38d9f1b.jsonl",
+    "claude_session_id": "101ec639-5c70-46d2-8e7d-75d6c38d9f1b",
+    "updated_at": "2026-11-05 19:50:39",
+    "active": True,
+}
+
+
+def test_ccb_list_shows_a_role_for_a_real_claude_binding(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    work_dir = tmp_path / "proj"
+    config = work_dir / ".ccb"
+    config.mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_tmux(
+        fake_bin,
+        [{"pane_id": "%8", "title": "CCB-Claude-eb24f3ae", "cwd": str(work_dir)}],
+    )
+    project_id = compute_ccb_project_id(work_dir)
+    session_file = config / ".claude-session"
+    binding = dict(REAL_CLAUDE_SESSION_FIELDS)
+    binding["ccb_project_id"] = project_id
+    binding["ccb_session_id"] = "ai-1793907200-999"
+    binding["work_dir"] = str(work_dir)
+    binding["work_dir_norm"] = str(work_dir)
+    binding["claude_session_path"] = str(config / "claude-log.jsonl")
+    session_file.write_text(json.dumps(binding, indent=2), encoding="utf-8")
+    record = {
+        "ccb_session_id": "ai-1793907200-999",
+        "ccb_project_id": project_id,
+        "work_dir": str(work_dir),
+        "terminal": "tmux",
+        "ccb_pid": os.getpid(),
+        "updated_at": int(time.time()),
+        "providers": {
+            "claude": {
+                "pane_id": "%8",
+                "pane_title_marker": "CCB-Claude-eb24f3ae",
+                "session_file": str(session_file),
+                "claude_session_id": binding["claude_session_id"],
+                "claude_session_path": binding["claude_session_path"],
+                "member_id": "member-claude",
+                "member_token": "token-claude",
+            }
+        },
+    }
+    (run_dir / "ccb-session-ai-1793907200-999.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+    (run_dir / "ccb-roles-ai-1793907200-999.json").write_text(
+        json.dumps(
+            {
+                "launch_id": "ai-1793907200-999",
+                "claims": {
+                    "member-claude": {
+                        "role": "lead",
+                        "pane_id": "%8",
+                        "provider": "claude",
+                        "pane_pid": "4242",
+                        "claimed_at": 1,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    written = json.loads(session_file.read_text(encoding="utf-8"))
+    assert "session_id" not in written
+    assert written["ccb_session_id"] == "ai-1793907200-999"
+
+    entries = _run_ccb_list(tmp_path)
+
+    assert entries[0]["providers"]["claude"]["role"] == "lead"
+    assert "token-claude" not in json.dumps(entries)
+    env = os.environ.copy()
+    env.pop("CCB_RUN_DIR", None)
+    env["HOME"] = str(tmp_path)
+    env["USERPROFILE"] = str(tmp_path)
+    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    human = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "ccb-list")],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    ).stdout
+    assert "role:lead" in human
+    assert "id:" not in human
+
+    binding.pop("ccb_session_id")
+    session_file.write_text(json.dumps(binding, indent=2), encoding="utf-8")
+    entries = _run_ccb_list(tmp_path)
+    assert entries[0]["providers"]["claude"]["role"] == ""

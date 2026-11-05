@@ -635,6 +635,13 @@ class AILauncher:
         # Occurrence identity is private launch state, never a provider or role.
         self._live_slots = [uuid.uuid4().hex for _ in self.providers] if self.providers.count("codex") == 2 else []
         self._live_tokens = [uuid.uuid4().hex for _ in self._live_slots]
+        # Claim credentials for launches WITHOUT a live-session inventory. A
+        # pair launch already exports a live credential per occurrence, so it
+        # mints nothing here and never gets a second identity.
+        self._member_slots: dict[str, tuple[str, str]] = {}
+        if not self._live_slots:
+            for provider in self.providers:
+                self._member_slots[provider] = (uuid.uuid4().hex, uuid.uuid4().hex)
         self._launch_slot = len(self.providers) - 1
         self._cleaned = False
         self._askd_checked = False
@@ -672,7 +679,7 @@ class AILauncher:
         """Managed env + explicit caller marker for the pane/provider process."""
         env = self._managed_env_overrides()
         prov = (provider or "").strip().lower()
-        if prov in {"claude", "codex", "gemini", "opencode", "hermes", "email", "manual"}:
+        if prov in {"claude", "codex", "gemini", "opencode", "hermes", "pi", "email", "manual"}:
             env["CCB_CALLER"] = prov
         # Merge per-provider launch_env from config.
         extra = self.launch_env.get(prov)
@@ -683,7 +690,37 @@ class AILauncher:
         if self._live_slots and prov == self.providers[self._launch_slot]:
             env["CCB_LIVE_ID"] = self._live_slots[self._launch_slot]
             env["CCB_LIVE_TOKEN"] = self._live_tokens[self._launch_slot]
+        member = self._member_credential(provider)
+        if member[0] and member[1]:
+            env["CCB_MEMBER_ID"] = member[0]
+            env["CCB_MEMBER_TOKEN"] = member[1]
         return env
+
+    def _member_credential(self, provider: str) -> tuple[str, str]:
+        """This provider occurrence's role-claim credential.
+
+        In a pair launch that IS the occurrence's live ID/token, so no second
+        identity exists; every other launch gets its own member credential.
+        """
+        prov = (provider or "").strip().lower()
+        if self._live_slots:
+            if prov != self.providers[self._launch_slot]:
+                return "", ""
+            return self._live_slots[self._launch_slot], self._live_tokens[self._launch_slot]
+        return self._member_slots.get(prov, ("", ""))
+
+    def _member_registry_fields(self, provider: str) -> dict:
+        """Additive claim metadata for a non-pair provider entry.
+
+        Pair launches carry their identity in `live_sessions`, so they add
+        nothing here; a member token never reaches a project session file.
+        """
+        if self._live_slots:
+            return {}
+        member_id, member_token = self._member_credential(provider)
+        if not member_id or not member_token:
+            return {}
+        return {"member_id": member_id, "member_token": member_token}
 
     def _provider_slot_key(self, provider: str) -> str:
         if self._live_slots and self.providers.count(provider) > 1:
@@ -838,6 +875,34 @@ class AILauncher:
             return backend.get_current_pane_id()
         except Exception:
             return (os.environ.get("TMUX_PANE") or "").strip()
+
+    # Launch credentials belong to the pane process and the private launch
+    # registry. They never go into a command string that is written to a
+    # project session file; recovery re-derives them from the registry.
+    _CREDENTIAL_ENV_KEYS = (
+        "CCB_MEMBER_ID",
+        "CCB_MEMBER_TOKEN",
+        "CCB_LIVE_ID",
+        "CCB_LIVE_TOKEN",
+    )
+
+    def _persistable_env(self, env: dict) -> dict:
+        """The subset of a launch env that may be written to a project file."""
+        return {k: v for k, v in (env or {}).items() if k not in self._CREDENTIAL_ENV_KEYS}
+
+    def _launch_commands(self, provider: str, agent_cmd: str, *, title_cmd: str = "") -> tuple[str, str]:
+        """(command executed in the pane, command safe to persist).
+
+        The executed command carries the launch credential so the pane can
+        claim a role. The persisted copy does not: session files live in the
+        project, and the recovery daemons prepend the credential again from
+        the private registry when they respawn a pane.
+        """
+        env = self._provider_env_overrides(provider)
+        path_cmd = _build_export_path_cmd(self.script_dir / "bin")
+        executed = title_cmd + self._build_env_prefix(env) + path_cmd + agent_cmd
+        persisted = title_cmd + self._build_env_prefix(self._persistable_env(env)) + path_cmd + agent_cmd
+        return executed, persisted
 
     def _build_env_prefix(self, env: dict) -> str:
         if not env:
@@ -1702,6 +1767,7 @@ class AILauncher:
                                 "session_file": str(path),
                                 "claude_session_id": data.get("claude_session_id"),
                                 "claude_session_path": data.get("claude_session_path"),
+                                **self._member_registry_fields("claude"),
                             }
                         },
                     }
@@ -2364,12 +2430,11 @@ class AILauncher:
         if not output_fifo.exists():
             os.mkfifo(output_fifo, 0o644)
 
-        env_overrides = self._provider_env_overrides("codex")
         agent_cmd = self._compose_agent_shell(
             "codex",
             ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd()),
         )
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
+        start_cmd, stored_cmd = self._launch_commands("codex", agent_cmd)
         pane_title_marker = self._provider_marker("codex")
 
         backend = TmuxBackend()
@@ -2444,7 +2509,7 @@ class AILauncher:
             output_fifo,
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
-            codex_start_cmd=start_cmd,
+            codex_start_cmd=stored_cmd,
         ):
             return None
 
@@ -2460,9 +2525,8 @@ class AILauncher:
         runtime = self.runtime_dir / "gemini"
         runtime.mkdir(parents=True, exist_ok=True)
 
-        env_overrides = self._provider_env_overrides("gemini")
         agent_cmd = self._compose_agent_shell("gemini", self._build_gemini_start_cmd())
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
+        start_cmd, stored_cmd = self._launch_commands("gemini", agent_cmd)
         pane_title_marker = f"CCB-Gemini-{self.project_id[:8]}"
 
         backend = TmuxBackend()
@@ -2497,7 +2561,7 @@ class AILauncher:
             None,
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
-            start_cmd=start_cmd,
+            start_cmd=stored_cmd,
         )
 
         print(f"✅ {t('started_backend', provider='Gemini', terminal='tmux pane', pane_id=pane_id)}")
@@ -2512,12 +2576,11 @@ class AILauncher:
         runtime = self.runtime_dir / "opencode"
         runtime.mkdir(parents=True, exist_ok=True)
 
-        env_overrides = self._provider_env_overrides("opencode")
         agent_cmd = self._compose_agent_shell(
             "opencode",
             ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd()),
         )
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
+        start_cmd, stored_cmd = self._launch_commands("opencode", agent_cmd)
         pane_title_marker = f"CCB-OpenCode-{self.project_id[:8]}"
 
         backend = TmuxBackend()
@@ -2555,7 +2618,7 @@ class AILauncher:
             None,
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
-            start_cmd=start_cmd,
+            start_cmd=stored_cmd,
         )
 
         print(f"✅ {t('started_backend', provider='OpenCode', terminal='tmux pane', pane_id=pane_id)}")
@@ -2569,9 +2632,8 @@ class AILauncher:
     ) -> str | None:
         runtime = self._provider_runtime("hermes")
         runtime.mkdir(parents=True, exist_ok=True)
-        env_overrides = self._provider_env_overrides("hermes")
         agent_cmd = self._compose_agent_shell("hermes", self._get_start_cmd("hermes"))
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + agent_cmd
+        start_cmd, stored_cmd = self._launch_commands("hermes", agent_cmd)
         pane_title_marker = self._provider_marker("hermes")
         backend = TmuxBackend()
         use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
@@ -2597,7 +2659,7 @@ class AILauncher:
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Hermes")
         self.tmux_panes["hermes"] = pane_id
         if not self._write_hermes_session(
-            runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd,
+            runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=stored_cmd,
         ):
             return None
         print(f"✅ {t('started_backend', provider='Hermes', terminal='tmux pane', pane_id=pane_id)}")
@@ -2620,14 +2682,9 @@ class AILauncher:
                 pass
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         agent_cmd = self._compose_agent_shell("hermes", self._get_start_cmd("hermes"))
-        start_cmd = (
-            title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("hermes"))
-            + _build_export_path_cmd(self.script_dir / "bin")
-            + agent_cmd
-        )
+        start_cmd, stored_cmd = self._launch_commands("hermes", agent_cmd, title_cmd=title_cmd)
         if not self._write_hermes_session(
-            runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd,
+            runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=stored_cmd,
         ):
             return 1
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
@@ -2681,6 +2738,7 @@ class AILauncher:
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
+                        **self._member_registry_fields("hermes"),
                     }
                 },
             })
@@ -2743,7 +2801,14 @@ class AILauncher:
                 "ccb_project_id": compute_ccb_project_id(work_dir),
                 "work_dir": str(work_dir),
                 "terminal": self.terminal_type,
-                "providers": {"pi": {"pane_id": pane_id, "pane_title_marker": pane_title_marker, "session_file": str(session_file)}},
+                "providers": {
+                    "pi": {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(session_file),
+                        **self._member_registry_fields("pi"),
+                    }
+                },
             })
         except Exception:
             pass
@@ -2754,7 +2819,9 @@ class AILauncher:
     def _start_pi_tmux(self, *, parent_pane=None, direction=None):
         runtime = self._provider_runtime("pi")
         runtime.mkdir(parents=True, exist_ok=True)
-        start_cmd = self._build_env_prefix(self._provider_env_overrides("pi")) + _build_export_path_cmd(self.script_dir / "bin") + self._compose_agent_shell("pi", self._get_start_cmd("pi"))
+        start_cmd, stored_cmd = self._launch_commands(
+            "pi", self._compose_agent_shell("pi", self._get_start_cmd("pi"))
+        )
         pane_title_marker = self._provider_marker("pi")
         backend = TmuxBackend()
         use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
@@ -2764,7 +2831,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Pi")
         self.tmux_panes["pi"] = pane_id
-        if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd):
+        if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=stored_cmd):
             return None
         print(f"✅ {t('started_backend', provider='Pi', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
@@ -2778,8 +2845,10 @@ class AILauncher:
             backend = TmuxBackend()
             backend.set_pane_title(pane_id, marker)
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Pi")
-        start_cmd = self._build_env_prefix(self._provider_env_overrides("pi")) + _build_export_path_cmd(self.script_dir / "bin") + self._compose_agent_shell("pi", self._get_start_cmd("pi"))
-        if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=marker, start_cmd=start_cmd):
+        start_cmd, stored_cmd = self._launch_commands(
+            "pi", self._compose_agent_shell("pi", self._get_start_cmd("pi"))
+        )
+        if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=marker, start_cmd=stored_cmd):
             return 1
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
@@ -2852,12 +2921,7 @@ class AILauncher:
             "codex",
             ShellAgentCommand(prelude="", agent_command=self._build_codex_start_cmd()),
         )
-        start_cmd = (
-            title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("codex"))
-            + _build_export_path_cmd(self.script_dir / "bin")
-            + recorded_agent_cmd
-        )
+        start_cmd, stored_cmd = self._launch_commands("codex", recorded_agent_cmd, title_cmd=title_cmd)
 
         if not self._write_codex_session(
             runtime,
@@ -2866,7 +2930,7 @@ class AILauncher:
             output_fifo,
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
-            codex_start_cmd=start_cmd,
+            codex_start_cmd=stored_cmd,
         ):
             return 1
 
@@ -2965,18 +3029,13 @@ class AILauncher:
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         agent_cmd = self._compose_agent_shell("gemini", self._build_gemini_start_cmd())
-        start_cmd = (
-            title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("gemini"))
-            + _build_export_path_cmd(self.script_dir / "bin")
-            + agent_cmd
-        )
+        start_cmd, stored_cmd = self._launch_commands("gemini", agent_cmd, title_cmd=title_cmd)
         self._write_gemini_session(
             runtime,
             None,
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
-            start_cmd=start_cmd,
+            start_cmd=stored_cmd,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
@@ -3002,18 +3061,13 @@ class AILauncher:
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         opencode_command = ShellAgentCommand(prelude="", agent_command=self._build_opencode_start_cmd())
         opencode_cmd = self._compose_agent_shell("opencode", opencode_command)
-        start_cmd = (
-            title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("opencode"))
-            + _build_export_path_cmd(self.script_dir / "bin")
-            + opencode_cmd
-        )
+        start_cmd, stored_cmd = self._launch_commands("opencode", opencode_cmd, title_cmd=title_cmd)
         self._write_opencode_session(
             runtime,
             None,
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
-            start_cmd=start_cmd,
+            start_cmd=stored_cmd,
         )
 
         # tmux path: run OpenCode directly (without shell -lc) to avoid shell startup side-effects
@@ -3130,6 +3184,7 @@ class AILauncher:
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
+                        **self._member_registry_fields("codex"),
                     }
                 },
             })
@@ -3210,6 +3265,7 @@ class AILauncher:
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
+                        **self._member_registry_fields("gemini"),
                     }
                 },
             })
@@ -3260,6 +3316,7 @@ class AILauncher:
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
+                        **self._member_registry_fields("opencode"),
                     }
                 },
             })
@@ -3560,6 +3617,15 @@ class AILauncher:
         if self._cleaned:
             return
         self._cleaned = True
+
+        # A launch's claims die with it. A fresh launch -- including `ccb -r`
+        # -- mints new credentials and must inherit no assignment.
+        try:
+            from live_roles import invalidate_roles_for_launch
+
+            invalidate_roles_for_launch(self.session_id)
+        except Exception:
+            pass
 
         # Stop watchdog thread first
         self._stop_daemon_watchdog()

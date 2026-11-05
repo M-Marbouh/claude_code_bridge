@@ -78,6 +78,11 @@ def _data_from_registry(record: dict, fallback_work_dir: Path) -> dict:
         return data
 
     data["ccb_project_id"] = record.get("ccb_project_id")
+    # The CCB launch identity, distinct from Claude's own session id below:
+    # laskd rewrites .claude-session from this projection, so without it the
+    # rewritten binding would lose the launch it belongs to.
+    if record.get("ccb_session_id"):
+        data["ccb_session_id"] = record.get("ccb_session_id")
     data["work_dir"] = record.get("work_dir") or str(fallback_work_dir)
     data["terminal"] = record.get("terminal")
 

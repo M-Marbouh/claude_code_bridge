@@ -4,6 +4,9 @@
 
 ### Added
 
+- Any CCB launch can now record a session role: non-pair launches export a member credential, `ccb-role` accepts it, and `ccb-list` shows the role beside the provider without printing the member ID. Pair launches keep their existing live ID and token as the same credential.
+- Role claims are serialized by a launch-scoped lock, so concurrent claims for one name produce exactly one holder, and a malformed live-session inventory never falls back to provider entries.
+- Pi is a local `ask` caller: its requests reach the lead and the result returns to the Pi pane through `.pi-session`, with Pi named in completion notifications.
 - Clarified that Gemini CLI was retired for individual accounts on 2026-06-18; enterprise accounts still work.
 - Added the three CCB role skills (`ccb-lead`, `ccb-implementer`, `ccb-ratifier`) to Pi, OpenCode, Gemini and Hermes. Each provider copy is rendered from one provider-neutral body so the copies cannot drift; only the `ccb-*` role directories are written, and only for providers whose home already exists or whose override variable is set.
 - Added duplicate Codex pairing, including coexistence with other unique providers, with contextual sibling routing from either Codex pane.
@@ -17,6 +20,8 @@
 
 ### Fixed
 
+- Kept a launch's identity in the Claude session binding when the Claude daemon rewrites it, so a role claim still authenticates after that rewrite; a binding without a launch id no longer authenticates at all.
+- A role assignment no longer survives an in-place respawn or a replacement pane. On a terminal that can respawn a pane in place (tmux), a claim stores the pane process that was validated when the role was recorded, and a pane whose process changed is not current; a replacement pane is refused by its pane id. Roles recorded by an earlier release have no such witness and are therefore not current after upgrading: re-run the role skill or `ccb-role set` once in each pane.
 - `ask pi` no longer refuses to send when Pi's last reply mentions words such as "working" or "running". Pi is treated as busy only when its own activity indicator is shown (the spinner in the editor border, or a built-in status line above the editor), and the pane is checked twice before sending.
 - `ask pi` now delivers the reply after Pi is switched to an earlier session inside Pi (for example with `/resume` after a relaunch). The request is located in any valid session of the project's Pi session folder, and a request that has not yet appeared is no longer reported as "not accepted" while Pi shows activity.
 - Codex and Claude replies whose final line ends with the request's `CCB_DONE` marker inline now complete once the provider's turn has ended, instead of waiting out the idle timeout and failing as incomplete. The marker is stripped from the delivered reply.

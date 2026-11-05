@@ -455,16 +455,21 @@ ROLE_SKILL_FILES = tuple(
 )
 
 
-def test_role_skill_live_session_id_wording_is_updated_in_every_role_file() -> None:
+def test_role_skill_credential_wording_is_updated_in_every_role_file() -> None:
+    """A role can be recorded from any launch, so the wording no longer claims
+    that roles need a launch with live session IDs."""
     assert len(ROLE_SKILL_FILES) == 9
     for path in ROLE_SKILL_FILES:
         text = path.read_text(encoding="utf-8")
-        assert "this launch has no live session IDs" in text, (
-            f"{path} does not carry the replacement wording"
+        assert "this session has no CCB launch credential" in text, (
+            f"{path} does not carry the credential wording"
         )
-        assert "the launch has no paired session" not in text, (
-            f"{path} still carries the old wording"
-        )
+        for stale in (
+            "this launch has no live session IDs",
+            "the launch has no paired session",
+            "Roles exist only in launches with live session IDs",
+        ):
+            assert stale not in text, f"{path} still carries {stale!r}"
 
 
 def test_role_skills_are_not_created_for_absent_provider_homes(tmp_path: Path) -> None:

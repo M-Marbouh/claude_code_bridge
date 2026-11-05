@@ -342,6 +342,18 @@ class TerminalBackend(ABC):
     @abstractmethod
     def create_pane(self, cmd: str, cwd: str, direction: str = "right", percent: int = 50, parent_pane: Optional[str] = None) -> str: ...
 
+    def pane_pid(self, pane_id: str) -> str:
+        """Identity of the process currently owning `pane_id`, when the
+        terminal exposes one -- "" when it cannot (or the pane is gone).
+
+        This is a pane INCARNATION witness: a respawned pane gets a new pid,
+        so a recorded value stops matching without anyone having to write to
+        disk. WezTerm's `cli list` exposes no per-pane process, so that
+        backend inherits this "" and callers fall back to the marker/session
+        evidence instead.
+        """
+        return ""
+
     def pane_liveness(self, pane_id: str) -> str:
         """Tri-state liveness probe for provider wait loops: "alive",
         "gone", or "unknown" -- distinct from `is_alive()`, which callers
@@ -798,6 +810,24 @@ class TmuxBackend(TerminalBackend):
             return self.is_pane_alive(pane_id)
         cp = self._tmux_run(["has-session", "-t", pane_id], capture=True)
         return cp.returncode == 0
+
+    def pane_pid(self, pane_id: str) -> str:
+        """tmux exposes the pane's current process id; empty when it cannot."""
+        pane = str(pane_id or "").strip()
+        if not pane or not self._looks_like_tmux_target(pane):
+            return ""
+        try:
+            cp = self._tmux_run(
+                ["display-message", "-p", "-t", pane, "#{pane_pid}"],
+                capture=True,
+                timeout=2.0,
+            )
+        except Exception:
+            return ""
+        if cp.returncode != 0:
+            return ""
+        pid = str(getattr(cp, "stdout", "") or "").strip()
+        return pid if pid.isdigit() else ""
 
     def pane_liveness(self, pane_id: str) -> str:
         """Tri-state probe used by wait loops (see `TerminalBackend.

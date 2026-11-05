@@ -505,7 +505,14 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                 status["role"] = roles.get(live_session.live_id, "")
                 entries.append((f"{live_session.provider}:{live_session.live_id}", live_session.provider, status, group))
         else:
-            # ABSENT: today's legacy per-provider projection, unchanged.
+            # ABSENT: today's legacy per-provider projection. A provider
+            # entry may additionally carry a member credential, in which case
+            # a role claimed by that membership is shown here -- independently
+            # of live IDs, which this launch does not have.
+            try:
+                member_roles = roles_for_record(record)
+            except Exception:
+                member_roles = {}
             for provider, provider_data in _get_providers_map(record).items():
                 if provider not in SUPPORTED_PROVIDERS or not isinstance(provider_data, dict):
                     continue
@@ -521,6 +528,8 @@ def _registry_sessions(include_stale: bool) -> list[dict[str, Any]]:
                     configured=configured,
                     panes=panes,
                 )
+                member_id = str(provider_data.get("member_id") or "").strip()
+                status["role"] = member_roles.get(member_id, "") if member_id else ""
                 entries.append((f"{provider}:0", provider, status, group))
 
         statuses: dict[str, tuple[str, dict[str, Any], str]] = {
@@ -801,7 +810,11 @@ def _print_human(entries: list[dict[str, Any]]) -> None:
                 live_id = str(provider_data.get("live_id") or "")
                 if live_id:
                     suffix += f"  id:{live_id}"
-                    role = str(provider_data.get("role") or "")
+                # A role is rendered on its own evidence: a launch without
+                # live IDs still shows who holds what. A member id is never
+                # printed here -- it is not usable with --live-id.
+                role = str(provider_data.get("role") or "")
+                if live_id or role:
                     suffix += f"  role:{role}" if role else "  role:-"
                 print(f"          {provider:<14} pane:{pane_id}  {dot} {state}{suffix}")
 

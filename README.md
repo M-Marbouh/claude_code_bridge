@@ -65,7 +65,7 @@ From the third provider in such a launch (for example Claude leading a Codex pai
 ask codex --live-id <id> "implementer: build the parser"
 ```
 
-A session may record the role its conversation was given with `ccb-role set <role>` (and `ccb-role clear`), and `ccb-list` then shows it next to the live ID, so a lead that lost its context can find who is who. Roles are display only: routing never reads them and they grant nothing. Only the session itself can record its role, a role already held by another member is refused, and a role disappears when the launch ends or the member's pane dies or is replaced. A member that starts a new conversation in the same pane keeps its displayed role, so tasks should name the role they are for and a member should decline a role it does not hold.
+A session in any launch may record the role its conversation was given with `ccb-role set <role>` (and `ccb-role clear`), and `ccb-list` then shows it for that provider, so a lead that lost its context can find who is who. In a launch with a Codex pair the role is shown next to the live ID; other launches show the role without printing a member ID, because that ID is not usable with `--live-id`. Roles are display only: routing never reads them and they grant nothing. Only the session itself can record its role, a role already held by another member is refused, and a role disappears when the launch ends or the member's pane dies or is replaced. A member that starts a new conversation in the same pane keeps its displayed role, so tasks should name the role they are for and a member should decline a role it does not hold.
 
 Model, reasoning effort, account, and native subagent choices remain native tool settings. They may differ between panes and may be changed independently; CCB does not select or persist that policy. A third Codex or a repeated non-Codex provider is rejected. Duplicate-provider `ccb -r` is not supported; start a fresh pair and use each tool's native session controls if needed. Existing unique-provider `ccb -r` behavior is unchanged.
 
@@ -221,7 +221,7 @@ The skip-unless-home-exists rule applies to those four providers only: each is s
 
 Each body says to take the role only when the user explicitly assigns it in the current conversation, which includes the user invoking the skill, and to do nothing if the file was loaded any other way. Pi additionally sets `disable-model-invocation: true` in the generated frontmatter, so its copy is only reachable through `/skill:ccb-lead`. OpenCode, Gemini and Hermes have no equivalent frontmatter field, so their guard is that sentence together with the explicit user request.
 
-Known limitation: a Pi session can hold a role and answer requests, but it cannot yet start a message to the lead, so Pi midpoint reports do not work yet. Recording a role with `ccb-role set` also still needs a launch with live session IDs.
+Known limitation: peer-to-peer messaging (`ask --peer`) stays limited to Claude and Codex, as sender and as destination; a Pi session can start a local `ask` and receive the result, and can record a role, but a Pi request cannot be sent with `--peer`. Recording a role needs a CCB launch credential, which CCB exports into every managed pane; a session started outside CCB has none and cannot record a role.
 
 ## Troubleshooting
 

@@ -1925,3 +1925,77 @@ def test_validate_route_still_allows_genuinely_callerless_routing_to_unique_dest
     outcome = pane_registry.validate_route(live_id="s1", launch_id="ai-1", provider="codex")
 
     assert outcome.ok is True
+
+
+def test_daemon_set_role_keeps_the_wire_fields_and_never_echoes_the_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        ccb_runtime_status, "find_running_state_file", lambda *a, **k: tmp_path / "askd.json"
+    )
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "daemon-token"}
+    )
+
+    def _request(_state, request, **_kwargs):
+        captured.update(request)
+        return {
+            "type": "ask.response",
+            "id": request.get("id"),
+            "exit_code": 0,
+            "reply": "role 'lead' recorded for this pi session (pane %11)",
+        }
+
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "request_daemon", _request)
+
+    ok, detail = ccb_runtime_status.daemon_set_role(tmp_path, "member-1", "session-secret", "lead")
+
+    assert ok
+    assert "session-secret" not in detail
+    assert captured["operation"] == "set_role"
+    # New fields plus the historical pair-only names, so an older daemon still works.
+    assert captured["member_id"] == "member-1"
+    assert captured["member_token"] == "session-secret"
+    assert captured["live_id"] == "member-1"
+    assert captured["live_token"] == "session-secret"
+
+
+def test_status_output_never_contains_a_member_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    _write_config(work_dir, "pi")
+    project_id = compute_ccb_project_id(work_dir)
+    _write_session(work_dir, ".pi-session", provider="pi", pane_id="%11", project_id=project_id)
+    _write_registry(
+        Path.home(),
+        "ai-status-token",
+        {
+            "ccb_session_id": "ai-status-token",
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {
+                "pi": {
+                    "pane_id": "%11",
+                    "pane_title_marker": "CCB-Pi-x",
+                    "session_file": str(work_dir / ".ccb" / ".pi-session"),
+                    "member_id": "member-pi",
+                    "member_token": "very-secret-token",
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry, "get_backend_for_session", lambda _rec: _FakeBackend({"%11"}, {"CCB-Pi-x": "%11"})
+    )
+    monkeypatch.setattr(ccb_runtime_status, "is_project_askd_online", lambda *_a, **_k: True)
+
+    status = resolve_project_runtime_status(work_dir)
+
+    dumped = json.dumps(status.to_dict())
+    assert "very-secret-token" not in dumped
+    assert "member-pi" not in dumped

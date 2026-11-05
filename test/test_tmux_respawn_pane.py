@@ -49,3 +49,19 @@ def test_respawn_pane_without_remain_on_exit(monkeypatch: pytest.MonkeyPatch) ->
     assert calls
     respawn_cmd = [c for c in calls if c[0] == "respawn-pane"]
     assert len(respawn_cmd) >= 1
+
+
+def test_respawn_pane_without_kill_live_omits_force_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = terminal.TmuxBackend()
+    calls: list[list[str]] = []
+
+    def fake_tmux_run(self, args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(["tmux", *args], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+
+    backend.respawn_pane("%9", cmd="echo hi", remain_on_exit=False, kill_live=False)
+
+    respawn_cmd = next(c for c in calls if c[0] == "respawn-pane")
+    assert "-k" not in respawn_cmd

@@ -107,6 +107,66 @@ def test_tmux_is_pane_alive_uses_pane_dead(monkeypatch: pytest.MonkeyPatch, stdo
     assert backend.is_pane_alive("%9") is expected
 
 
+@pytest.mark.parametrize(("stdout", "returncode", "expected"), [("1\n", 0, True), ("0\n", 0, False), ("", 0, False), ("1\n", 1, False)])
+def test_tmux_is_pane_dead_requires_positive_dead_read(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: bool
+) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        assert args == ["display-message", "-p", "-t", "%9", "#{pane_dead}"]
+        return _cp(stdout=stdout, returncode=returncode)
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+
+    assert backend.is_pane_dead("%9") is expected
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("CCB-Other-session\t\n", True),
+        ("OpenCode\tCCB-Other-session\n", True),
+        ("CCB-This-session\tCCB-This-session\n", False),
+        ("OpenCode\t\n", False),
+    ],
+)
+def test_tmux_detects_conflicting_ccb_marker(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, expected: bool
+) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        assert args == ["display-message", "-p", "-t", "%9", "#{pane_title}\t#{@ccb_marker}"]
+        return _cp(stdout=stdout)
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+
+    assert backend.pane_has_different_ccb_marker("%9", "CCB-This-session") is expected
+
+
+@pytest.mark.parametrize(
+    ("marker", "stdout", "returncode", "raises"),
+    [
+        ("CCB-This-session", "", 1, False),
+        ("CCB-This-session", "", 0, True),
+        ("", "OpenCode\tCCB-Other-session\n", 0, False),
+        ("", "CCB-Other-session\t\n", 0, False),
+    ],
+    ids=["probe-nonzero", "probe-raises", "empty-marker-stable", "empty-marker-title"],
+)
+def test_tmux_marker_check_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, marker: str, stdout: str, returncode: int, raises: bool
+) -> None:
+    def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        if raises:
+            raise subprocess.TimeoutExpired(args, 1)
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+
+    backend = terminal.TmuxBackend()
+    monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
+
+    assert backend.pane_has_different_ccb_marker("%9", marker) is True
+
+
 def test_tmux_send_text_always_deletes_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
 

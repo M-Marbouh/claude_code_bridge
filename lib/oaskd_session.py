@@ -136,6 +136,7 @@ class OpenCodeProjectSession:
                 return True, pane_id
             # else: pane alive but belongs to wrong project — fall through to marker resolution
 
+        resolved: Optional[str] = None
         if marker and callable(resolver):
             resolved = resolver(marker, self.work_dir)
             if resolved and backend.is_alive(str(resolved)):
@@ -150,13 +151,28 @@ class OpenCodeProjectSession:
             respawn = getattr(backend, "respawn_pane", None)
             if start_cmd and callable(respawn):
                 last_err: str | None = None
-                target = pane_id
-                if marker and callable(resolver):
+                is_pane_dead = getattr(backend, "is_pane_dead", None)
+                candidates = [resolved]
+                if pane_id and str(pane_id) != str(resolved or ""):
+                    candidates.append(pane_id)
+                for target in candidates:
+                    if not target or not str(target).startswith("%") or not callable(is_pane_dead):
+                        continue
                     try:
-                        target = resolver(marker) or target
+                        if not is_pane_dead(str(target)):
+                            continue
                     except Exception:
-                        pass
-                if target and str(target).startswith("%"):
+                        continue
+                    if str(target) != str(resolved or ""):
+                        cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
+                        foreign_marker = getattr(backend, "pane_has_different_ccb_marker", None)
+                        try:
+                            if not callable(cwd_check) or not cwd_check(str(target), self.work_dir):
+                                continue
+                            if not callable(foreign_marker) or foreign_marker(str(target), marker):
+                                continue
+                        except Exception:
+                            continue
                     try:
                         saver = getattr(backend, "save_crash_log", None)
                         if callable(saver):
@@ -167,7 +183,7 @@ class OpenCodeProjectSession:
                                 saver(str(target), str(crash_log), lines=1000)
                             except Exception:
                                 pass
-                        respawn(str(target), cmd=start_cmd, cwd=self.work_dir, remain_on_exit=True)
+                        respawn(str(target), cmd=start_cmd, cwd=self.work_dir, remain_on_exit=True, kill_live=False)
                         if backend.is_alive(str(target)):
                             self.data["pane_id"] = str(target)
                             self.data["updated_at"] = _now_str()

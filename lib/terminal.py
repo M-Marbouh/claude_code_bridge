@@ -700,6 +700,37 @@ class TmuxBackend(TerminalBackend):
             return False
         return (cp.stdout or "").strip() == "0"
 
+    def is_pane_dead(self, pane_id: str) -> bool:
+        if not pane_id:
+            return False
+        try:
+            cp = self._tmux_run(["display-message", "-p", "-t", pane_id, "#{pane_dead}"], capture=True)
+        except Exception:
+            return False
+        return cp.returncode == 0 and (cp.stdout or "").strip() == "1"
+
+    def pane_has_different_ccb_marker(self, pane_id: str, marker: str) -> bool:
+        """True when the pane carries another CCB marker OR its marker state is
+        unknown. Fails closed: recovery treats True as "not provably ours"."""
+        if not pane_id:
+            return True
+        marker = (marker or "").strip()
+        try:
+            cp = self._tmux_run(
+                ["display-message", "-p", "-t", pane_id, "#{pane_title}\t#{@ccb_marker}"],
+                capture=True,
+            )
+        except Exception:
+            return True
+        if cp.returncode != 0:
+            return True
+        title, _, stable_marker = (cp.stdout or "").rstrip("\n").partition("\t")
+        title = title.strip()
+        stable_marker = stable_marker.strip()
+        if stable_marker.startswith("CCB-") and (not marker or stable_marker != marker):
+            return True
+        return title.startswith("CCB-") and (not marker or not title.startswith(marker))
+
     def _ensure_not_in_copy_mode(self, pane_id: str) -> None:
         try:
             cp = self._tmux_run(["display-message", "-p", "-t", pane_id, "#{pane_in_mode}"], capture=True, timeout=1.0)
@@ -838,7 +869,8 @@ class TmuxBackend(TerminalBackend):
         self._tmux_run(["attach", "-t", pane_id], check=False)
 
     def respawn_pane(self, pane_id: str, *, cmd: str, cwd: str | None = None,
-                     stderr_log_path: str | None = None, remain_on_exit: bool = True) -> None:
+                     stderr_log_path: str | None = None, remain_on_exit: bool = True,
+                     kill_live: bool = True) -> None:
         """
         Respawn a pane process (`respawn-pane -k`) to (re)mount an AI CLI session.
 
@@ -901,7 +933,10 @@ class TmuxBackend(TerminalBackend):
         if remain_on_exit:
             self._tmux_run(["set-option", "-p", "-t", pane_id, "remain-on-exit", "on"], check=False)
 
-        tmux_args = ["respawn-pane", "-k", "-t", pane_id]
+        tmux_args = ["respawn-pane"]
+        if kill_live:
+            tmux_args.append("-k")
+        tmux_args.extend(["-t", pane_id])
         if start_dir:
             tmux_args.extend(["-c", start_dir])
         tmux_args.append(full)

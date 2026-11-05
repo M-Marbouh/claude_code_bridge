@@ -18,6 +18,15 @@ class FakeTmuxBackend:
     def is_alive(self, pane_id: str) -> bool:
         return bool(self.alive.get(pane_id, False))
 
+    def is_pane_dead(self, pane_id: str) -> bool:
+        return pane_id in self.alive and not self.alive[pane_id]
+
+    def pane_belongs_to_cwd(self, pane_id: str, work_dir: str) -> bool:
+        return True
+
+    def pane_has_different_ccb_marker(self, pane_id: str, marker: str) -> bool:
+        return False
+
     def find_pane_by_title_marker(self, marker: str, cwd_hint: str = "") -> str | None:
         for prefix, pane in self.marker_map.items():
             if marker.startswith(prefix) or prefix.startswith(marker):
@@ -28,7 +37,8 @@ class FakeTmuxBackend:
         self.crash_logs.append((pane_id, crash_log_path))
 
     def respawn_pane(self, pane_id: str, *, cmd: str, cwd: str | None = None,
-                     stderr_log_path: str | None = None, remain_on_exit: bool = True) -> None:
+                     stderr_log_path: str | None = None, remain_on_exit: bool = True,
+                     kill_live: bool = True) -> None:
         self.respawned.append(pane_id)
         self.alive[pane_id] = True
 

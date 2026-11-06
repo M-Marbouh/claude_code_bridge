@@ -3,18 +3,24 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 import time
 from pathlib import Path
 
 import askd_rpc
 import askd_runtime
 import ccb_runtime_status
+import launcher_identity
 import peer_routing
 import pytest
 from ccb_runtime_status import ProviderRuntimeStatus
 
-
 ROOT = Path(__file__).resolve().parents[1]
+
+_needs_procfs = pytest.mark.skipif(
+    not launcher_identity._procfs_available(),
+    reason="needs Linux /proc for process-start evidence",
+)
 
 
 def _load_ask_module():
@@ -1246,6 +1252,114 @@ def test_preflight_target_falls_back_to_status_when_no_inventory(monkeypatch) ->
 
     assert ok is True
     assert route_out == {}
+
+
+@_needs_procfs
+def test_preflight_never_borrows_a_dead_foreign_launchs_inventory(monkeypatch, tmp_path: Path) -> None:
+    """Amendment regression at the `ask` boundary.
+
+    This launch's record has no `live_sessions` inventory; a foreign launch
+    with the same work_dir has one naming this caller's pane id, but its owner
+    is another incarnation (reused pid). Routing must fall through to today's
+    legacy status path, carry no route, and attempt no delivery.
+    """
+    import launcher_identity
+
+    ask = _load_ask_module()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    work_dir = tmp_path / "project"
+    cfg = work_dir / ".ccb"
+    cfg.mkdir(parents=True)
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    project_id = ask.compute_ccb_project_id(work_dir)
+
+    start = launcher_identity.process_start_epoch(os.getpid())
+    assert start is not None
+    current_id = f"ai-{int(start) + 1}-{os.getpid()}"
+    (cfg / ".codex-session").write_text(
+        json.dumps(
+            {
+                "active": True,
+                "provider": "codex",
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "pane_id": "%7",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / f"ccb-session-{current_id}.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": current_id,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {"codex": {"pane_id": "%7"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    foreign_id = f"ai-{int(time.time()) - 3600}-{os.getpid()}"
+    (run_dir / f"ccb-session-{foreign_id}.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": foreign_id,
+                "ccb_pid": os.getpid(),
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {"codex": {"pane_id": "%8"}},
+                "live_sessions": [
+                    {
+                        "live_id": "foreign-caller",
+                        "provider": "claude",
+                        "pane_id": "%7",
+                        "terminal": "tmux",
+                        "session_file": str(cfg / ".claude-session"),
+                    },
+                    {
+                        "live_id": "foreign-codex",
+                        "provider": "codex",
+                        "pane_id": "%9",
+                        "terminal": "tmux",
+                        "session_file": str(cfg / ".codex-foreign"),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    delivered: list = []
+    monkeypatch.setattr(
+        askd_rpc,
+        "request_daemon",
+        lambda *_a, **_k: delivered.append(True) or {"exit_code": 0, "reply": ""},
+    )
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_a, **_k: _provider_status(mounted=True, daemon_online=True),
+    )
+
+    route_out: dict = {}
+    ok = ask._preflight_target(
+        "codex",
+        work_dir=work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        route_out=route_out,
+    )
+
+    assert ok is True
+    assert route_out == {}
+    assert delivered == []
 
 
 def test_inherited_route_from_env_reads_all_fields_when_task_id_matches(monkeypatch) -> None:

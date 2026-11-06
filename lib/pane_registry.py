@@ -24,6 +24,7 @@ from live_sessions import (
     read_inventory,
 )
 from process_lock import _is_pid_alive
+from launcher_identity import launcher_alive, process_identity
 from project_id import compute_ccb_project_id, normalize_work_dir
 from terminal import get_backend_for_session
 
@@ -106,12 +107,17 @@ def _record_ccb_pid(data: Dict[str, Any]) -> Optional[int]:
 
 
 def _registry_owner_alive(data: Dict[str, Any]) -> Optional[bool]:
-    """Return launcher liveness, or None for records without owner identity."""
+    """Return launcher liveness, or None for records without owner identity.
+
+    Liveness here means the SAME process that wrote the record, not merely
+    that the recorded pid exists: a thread id or a reused pid made a dead
+    launch look alive and sent `ask` into it. See `launcher_identity`.
+    """
     pid = _record_ccb_pid(data)
     if pid is None:
         return None
     try:
-        return bool(_is_pid_alive(pid))
+        return launcher_alive(data, pid)
     except Exception:
         return None
 
@@ -979,6 +985,21 @@ def upsert_registry(record: Dict[str, Any]) -> bool:
     owner_pid = _record_ccb_pid(data)
     if owner_pid is not None:
         data["ccb_pid"] = owner_pid
+        # Raw identity for the pid: its start offset in this boot plus the
+        # boot id. Both are invariant for the process and independent of the
+        # wall clock, so a clock step cannot turn a live launcher into a false
+        # death. Only the owner itself can supply it: when this write comes
+        # from another process (a pane member), the stored value is left
+        # exactly as it is, and a later process that happens to reuse the pid
+        # cannot forge it. When the boot id (or the start offset) cannot be
+        # read, `process_identity` returns `{}` and NOTHING is written: a
+        # ticks-only record would not identify a process (ticks repeat every
+        # boot), and this record then uses the legacy launch-id window like a
+        # record from before this deploy.
+        if owner_pid == os.getpid():
+            identity = process_identity(owner_pid)
+            if identity:
+                data.update(identity)
 
     # Ensure ccb_project_id exists (best-effort from work_dir).
     if not (data.get("ccb_project_id") or "").strip():

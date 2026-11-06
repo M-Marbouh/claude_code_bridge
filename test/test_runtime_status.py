@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 import ccb_runtime_status
+import launcher_identity
 import pane_registry
 from ccb_runtime_status import (
     ProjectRuntimeStatus,
@@ -15,6 +18,11 @@ from ccb_runtime_status import (
     resolve_project_runtime_status,
 )
 from project_id import compute_ccb_project_id
+
+_needs_procfs = pytest.mark.skipif(
+    not launcher_identity._procfs_available(),
+    reason="needs Linux /proc for process-start evidence",
+)
 
 
 class _FakeBackend:
@@ -907,6 +915,118 @@ def test_resolve_live_route_returns_none_when_record_has_no_inventory(
     )
 
     assert resolve_live_route("codex", work_dir) is None
+
+
+def _native_thread_id() -> int:
+    ids: list[int] = []
+    ready = threading.Event()
+
+    def worker() -> None:
+        ids.append(threading.get_native_id())
+        ready.set()
+        time.sleep(30)  # stays a live thread for the whole test
+
+    threading.Thread(target=worker, daemon=True).start()
+    assert ready.wait(5)
+    return ids[0]
+
+
+@_needs_procfs
+@pytest.mark.parametrize("foreign_owner", ["thread", "reused_pid"])
+def test_resolve_live_route_never_enters_a_dead_foreign_launchs_inventory(
+    runtime_env,
+    monkeypatch: pytest.MonkeyPatch,
+    foreign_owner: str,
+) -> None:
+    """Amendment regression for the dead-launch routing bug.
+
+    This launch's record carries NO `live_sessions` inventory (the normal case
+    outside a two-Codex pair), while a foreign launch with the same work_dir
+    carries one whose members include this caller's pane id -- pane ids repeat
+    across launches. That record's owner is a thread id (the field bug) or a
+    reused pid (another incarnation), so it must not be eligible: no route may
+    resolve into it, and this launch must still read alive.
+    """
+    home, work_dir, project_id = runtime_env
+    start = launcher_identity.process_start_epoch(os.getpid())
+    assert start is not None
+    current_id = f"ai-{int(start) + 1}-{os.getpid()}"
+    _write_session(work_dir, ".codex-session", provider="codex", pane_id="%7", project_id=project_id)
+    _write_registry(
+        home,
+        current_id,
+        {
+            "ccb_session_id": current_id,
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%7", "pane_title_marker": "CCB-Codex-current"}},
+        },
+    )
+
+    foreign_pid = _native_thread_id() if foreign_owner == "thread" else os.getpid()
+    foreign_id = f"ai-{int(time.time()) - 3600}-{foreign_pid}"
+    foreign_session = work_dir / ".ccb" / ".claude-session"
+    foreign_session.write_text(json.dumps({"active": True}), encoding="utf-8")
+    _write_registry(
+        home,
+        foreign_id,
+        {
+            "ccb_session_id": foreign_id,
+            "ccb_pid": foreign_pid,
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%8"}},
+            "live_sessions": [
+                {
+                    "live_id": "foreign-caller",
+                    "provider": "claude",
+                    "pane_id": "%7",
+                    "terminal": "tmux",
+                    "session_file": str(foreign_session),
+                },
+                {
+                    "live_id": "foreign-codex",
+                    "provider": "codex",
+                    "pane_id": "%9",
+                    "terminal": "tmux",
+                    "session_file": str(foreign_session),
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%7"}, {"CCB-Codex-current": "%7"}),
+    )
+
+    from live_sessions import find_caller, read_inventory
+
+    foreign_record = json.loads(
+        (home / ".ccb" / "run" / f"ccb-session-{foreign_id}.json").read_text(encoding="utf-8")
+    )
+    # The caller evidence supplied below WOULD match the foreign inventory by
+    # pane id alone, which is what made this borrowable before the fix.
+    assert find_caller(
+        read_inventory(foreign_record).sessions, pane_id="%7", terminal="tmux"
+    ) is not None
+    # But the recorded owner is not the process that wrote the record.
+    assert ccb_runtime_status._registry_owner_alive(foreign_record) is False
+    assert [
+        record["ccb_session_id"]
+        for record, *_rest in ccb_runtime_status._iter_qualifying_registry_records(project_id=project_id)
+    ] == [current_id]
+
+    outcome = resolve_live_route("codex", work_dir, caller_pane_id="%7", caller_terminal="tmux")
+
+    # Legacy path: this caller's own launch has no inventory to route through.
+    assert outcome is None
+    # And the genuine launch this caller belongs to still reads mounted.
+    assert resolve_project_runtime_status(work_dir).providers["codex"].mounted is True
 
 
 def test_resolve_live_route_refuses_on_invalid_inventory(runtime_env) -> None:

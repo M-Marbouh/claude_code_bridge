@@ -15,6 +15,7 @@ import pytest
 
 import ccb_runtime_status
 import live_roles
+import launcher_identity
 import pane_registry
 from ccb_runtime_status import resolve_live_route
 from live_roles import roles_for_record, set_own_role
@@ -22,6 +23,11 @@ from project_id import compute_ccb_project_id
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = "ai-1"
+
+_needs_procfs = pytest.mark.skipif(
+    not launcher_identity._procfs_available(),
+    reason="needs Linux /proc for process-start evidence",
+)
 
 
 class _FakeBackend:
@@ -374,6 +380,10 @@ def non_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         record["ccb_project_id"] = project_id
         record["work_dir"] = str(work_dir)
         record["ccb_pid"] = os.getpid()
+        # This launch is the process running the test: record its raw identity
+        # too, exactly as the launcher does, so ownership identifies the
+        # process instead of merely finding a live pid.
+        record.update(launcher_identity.process_identity(os.getpid()) or {})
         record["updated_at"] = int(time.time())
         entry_by_provider = {}
         members: dict[str, tuple[str, str]] = {}
@@ -956,6 +966,7 @@ def _real_claude_launch(tmp_path, monkeypatch):
         "work_dir": str(work_dir),
         "terminal": "tmux",
         "ccb_pid": os.getpid(),
+        **(launcher_identity.process_identity(os.getpid()) or {}),
         "updated_at": int(time.time()),
         "providers": {
             "claude": {

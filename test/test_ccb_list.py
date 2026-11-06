@@ -12,6 +12,8 @@ from pathlib import Path
 
 from project_id import compute_ccb_project_id
 
+import launcher_identity
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -955,6 +957,9 @@ def _non_pair_role_launch(tmp_path: Path) -> tuple[Path, dict]:
     record["work_dir"] = str(work_dir)
     record["ccb_project_id"] = compute_ccb_project_id(work_dir)
     record["ccb_pid"] = os.getpid()
+    # This launch is the process running the test: record its raw identity too,
+    # exactly as the launcher does.
+    record.update(launcher_identity.process_identity(os.getpid()) or {})
     record["updated_at"] = int(time.time())
     for provider, entry in record["providers"].items():
         session_file = config / f".{provider}-session"
@@ -1128,6 +1133,7 @@ def test_ccb_list_shows_a_role_for_a_real_claude_binding(tmp_path: Path) -> None
         "work_dir": str(work_dir),
         "terminal": "tmux",
         "ccb_pid": os.getpid(),
+        **(launcher_identity.process_identity(os.getpid()) or {}),
         "updated_at": int(time.time()),
         "providers": {
             "claude": {

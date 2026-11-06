@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -1729,3 +1730,239 @@ def test_daemon_show_role_accepts_the_historical_pair_fields(pair, tmp_path: Pat
 
     assert good["exit_code"] == 0
     assert good["reply"] == "implementer"
+
+
+# --- ccb-role brief ---------------------------------------------------------------
+#
+# `brief` is the launch-side path that replaced invoking a skill: a session reads
+# the instructions for the role its launch recorded for it, without the user
+# typing anything, and gains nothing else.
+
+BUILTIN_ROLE_BODIES = {
+    role: (ROOT / "role_skills" / f"ccb-{role}.md").read_text(encoding="utf-8")
+    for role in ("lead", "ratifier", "implementer")
+}
+
+
+def _installed_layout(tmp_path: Path, body_suffix: str = ""):
+    """A prefix laid out like a real install, invoked through a PATH symlink.
+
+    `<prefix>/bin/ccb-role` is the real script, `<prefix>/lib` and
+    `<prefix>/role_skills` sit next to it, and `<home>/.local/bin/ccb-role`
+    is the symlink the installer creates. The role bodies are copies with a
+    sentinel appended, so reading the repo's own files cannot pass the test.
+    """
+    prefix = tmp_path / "prefix"
+    (prefix / "bin").mkdir(parents=True)
+    shutil.copy2(ROOT / "bin" / "ccb-role", prefix / "bin" / "ccb-role")
+    (prefix / "lib").symlink_to(ROOT / "lib", target_is_directory=True)
+    skills = prefix / "role_skills"
+    skills.mkdir()
+    for role, body in BUILTIN_ROLE_BODIES.items():
+        (skills / f"ccb-{role}.md").write_text(body + body_suffix, encoding="utf-8")
+    link_dir = tmp_path / "home" / ".local" / "bin"
+    link_dir.mkdir(parents=True)
+    link = link_dir / "ccb-role"
+    link.symlink_to(prefix / "bin" / "ccb-role")
+    return prefix, link
+
+
+def _load_cli_from(path: Path):
+    loader = importlib.machinery.SourceFileLoader("ccb_role_installed_test", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("role", ["lead", "ratifier", "implementer"])
+def test_ccb_role_brief_prints_the_shipped_body(non_pair, monkeypatch, capsys, role: str) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, role)[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["brief"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == BUILTIN_ROLE_BODIES[role]
+    assert captured.err == ""
+    # A brief is read-only: the recorded role is still exactly what it was.
+    assert show_own_role(member_id, token) == (True, role)
+
+
+def test_ccb_role_brief_resolves_role_skills_through_an_installed_symlink(
+    non_pair, monkeypatch, tmp_path: Path, capsys
+) -> None:
+    sentinel = "installed-layout sentinel 4f2c\n"
+    _prefix, link = _installed_layout(tmp_path / "installed", body_suffix=sentinel)
+    launch = non_pair(("claude",))
+    member_id, token = launch.members["claude"]
+    assert set_own_role(member_id, token, "lead")[0]
+    cli = _load_cli_from(link)
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["brief"]) == 0
+    out = capsys.readouterr().out
+
+    assert out == BUILTIN_ROLE_BODIES["lead"] + sentinel
+
+
+def test_ccb_role_brief_for_a_builtin_role_with_no_body_file_exits_1(
+    non_pair, monkeypatch, tmp_path: Path, capsys
+) -> None:
+    prefix, link = _installed_layout(tmp_path)
+    (prefix / "role_skills" / "ccb-lead.md").unlink()
+    launch = non_pair(("claude",))
+    member_id, token = launch.members["claude"]
+    assert set_own_role(member_id, token, "lead")[0]
+    cli = _load_cli_from(link)
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["brief"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No role instructions are installed for 'lead'" in captured.err
+    # The refusal does not touch the role it could not brief.
+    assert show_own_role(member_id, token) == (True, "lead")
+
+
+def test_ccb_role_brief_for_a_custom_role_notes_it_and_keeps_the_role(
+    non_pair, monkeypatch, capsys
+) -> None:
+    launch = non_pair(("hermes",))
+    member_id, token = launch.members["hermes"]
+    assert set_own_role(member_id, token, "scribe")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["brief"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "Role: scribe (no role instructions are installed for this role)\n"
+    assert captured.err == ""
+
+    # Neither the note nor a later brief changes the recorded role.
+    assert cli.main(["show"]) == 0
+    assert capsys.readouterr().out == "scribe\n"
+    assert show_own_role(member_id, token) == (True, "scribe")
+
+
+def test_ccb_role_brief_never_reads_a_file_for_a_custom_role(
+    non_pair, monkeypatch, capsys, tmp_path
+) -> None:
+    launch = non_pair(("hermes",))
+    member_id, token = launch.members["hermes"]
+    assert set_own_role(member_id, token, "scribe")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+    stray = tmp_path / "role_skills"
+    stray.mkdir()
+    (stray / "ccb-scribe.md").write_text("STRAY BODY\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_role_skills_dir", lambda: stray)
+
+    assert cli.main(["brief"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "Role: scribe (no role instructions are installed for this role)\n"
+    assert "STRAY BODY" not in captured.out
+
+
+def test_ccb_role_brief_without_a_role_exits_1_with_empty_stdout(
+    non_pair, monkeypatch, capsys
+) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["brief"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no role recorded for this session" in captured.err
+
+
+def test_ccb_role_brief_without_a_credential_exits_1_with_empty_stdout(
+    monkeypatch, capsys
+) -> None:
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli)
+
+    assert cli.main(["brief"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no CCB launch credential" in captured.err
+
+
+def test_ccb_role_brief_refuses_another_sessions_credential(
+    non_pair, monkeypatch, capsys
+) -> None:
+    launch = non_pair(("pi", "claude"))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "implementer")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token + "x")
+
+    assert cli.main(["brief"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "own" in captured.err
+
+
+def test_ccb_role_brief_does_not_brief_a_replaced_pane_process(
+    non_pair, monkeypatch, capsys
+) -> None:
+    launch = non_pair(("claude",))
+    member_id, token = launch.members["claude"]
+    entry = launch.record()["providers"]["claude"]
+    pane, marker = entry["pane_id"], entry["pane_title_marker"]
+    backend = _CapableBackend({pane}, {marker: pane}, {pane: "1001"})
+    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _rec: backend)
+    assert set_own_role(member_id, token, "lead")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+    assert cli.main(["brief"]) == 0
+    capsys.readouterr()
+
+    backend.pane_pids[pane] = "2002"
+
+    assert cli.main(["brief"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip()
+
+
+def test_ccb_role_brief_uses_the_daemon_inside_the_sandbox(monkeypatch, capsys) -> None:
+    cli = _load_role_cli()
+    monkeypatch.setattr(cli, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(cli, "resolve_daemon_work_dir", lambda wd: wd)
+    monkeypatch.setattr(
+        cli, "show_own_role", lambda *_a: pytest.fail("sandbox must not read the run dir directly")
+    )
+    monkeypatch.setattr(cli, "daemon_show_role", lambda *_a: (True, "ratifier"))
+    monkeypatch.setenv("CCB_MEMBER_ID", "member-1")
+    monkeypatch.setenv("CCB_MEMBER_TOKEN", "session-secret")
+
+    assert cli.main(["brief"]) == 0
+    assert capsys.readouterr().out == BUILTIN_ROLE_BODIES["ratifier"]
+
+
+def test_ccb_role_usage_lists_brief(monkeypatch, capsys) -> None:
+    cli = _load_role_cli()
+
+    assert cli.main(["brief", "extra"]) == 1
+    assert "ccb-role brief" in capsys.readouterr().err
+
+
+def test_ccb_role_show_still_prints_only_the_role_after_a_brief(
+    non_pair, monkeypatch, capsys
+) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "lead")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["brief"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["show"]) == 0
+    assert capsys.readouterr().out == "lead\n"

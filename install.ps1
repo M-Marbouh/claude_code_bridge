@@ -176,7 +176,7 @@ function Copy-ProjectItems {
     New-Item -ItemType Directory -Path $DestinationRoot -Force | Out-Null
   }
 
-  foreach ($item in @("ccb", "lib", "bin", "config")) {
+  foreach ($item in @("ccb", "lib", "bin", "config", "role_skills")) {
     $src = Join-Path $SourceRoot $item
     $dst = Join-Path $DestinationRoot $item
     if (Test-Path $src) {

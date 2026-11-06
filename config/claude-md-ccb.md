@@ -5,7 +5,9 @@ Use `/ask <provider>` to consult `codex`, `gemini`, `opencode`, or `claude` in t
 
 Mounted sessions are co-equal collaborators: authority follows evidence, not identity. Provider identity, launch order, model, and account do not assign a role. Either session may propose, implement, review, challenge, or synthesize work when that is its current assignment.
 
-The current explicit assignment for this session determines its role. It supersedes provider identity, launch order, recalled Memsearch history, and previous session roles. Historical role assignments are context only and must not establish current ownership. If no current assignment exists, do not infer one from history. Role assignment does not override standing engineering rules or grant additional action permissions.
+The current explicit assignment for this session determines its role. It supersedes provider identity, launch order, recalled session history, and previous session roles. Historical role assignments are context only and must not establish current ownership. If no current assignment exists, do not infer one from history. Role assignment does not override standing engineering rules or grant additional action permissions.
+
+If you are a top-level CCB session (`CCB_SESSION_ID` is set) — never a subagent, helper or native agent spawned inside a session, even though it inherits that environment — run `ccb-role brief` once at the start of each conversation. If it prints role instructions, follow them: a role CCB recorded for this session is the user's assignment. If it fails, take no role. An explicit assignment from the user later in the conversation overrides it.
 
 Session role assignments are operational context, not architectural decisions. Automatic history capture may record them, but they must not be promoted into standing rules or ADRs. Durable decisions may define provider-neutral, session-assigned roles; they must not assign lasting ownership to whichever agent or model currently performs a role.
 

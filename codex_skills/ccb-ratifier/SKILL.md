@@ -7,7 +7,7 @@ description: Assign the current Codex session as an on-demand independent ratifi
 
 Current-session assignment: on-demand independent ratifier.
 
-Take this role only when the user explicitly assigns it in the current conversation; the user invoking this skill counts as assigning it. If this skill was loaded any other way, do nothing and continue the current task without taking the role.
+Take this role when the user explicitly assigns it in the current conversation, when the user invokes this skill, or when `ccb-role brief` printed these instructions for this session. On that last path only, if this session's recorded role is a different one, do not take this role. If this skill was loaded any other way, do nothing and continue the current task without taking the role.
 
 Review only the bounded proposal, decision, or result presented by the requesting lead. Independently pressure-test its assumptions, invariants, compatibility, negative controls, contract effects, material alternatives, and unresolved risks. Distinguish actual blockers from optional improvements.
 

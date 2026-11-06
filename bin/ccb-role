@@ -5,6 +5,7 @@ ccb-role - Record the role this session's conversation was assigned.
 Usage:
     ccb-role set <role>     Record this session's role (e.g. implementer, ratifier)
     ccb-role show           Print this session's own currently recorded role
+    ccb-role brief          Print the recorded role's instructions, if any are installed
     ccb-role clear          Remove this session's role
 
 The role is shown by `ccb-list` so a lead can find who is who. A role never
@@ -23,6 +24,13 @@ launch credential is outside a CCB launch and cannot record or read a role.
 `ccb-role show` prints the role alone on stdout and exits 0; every refusal
 (no role, not this session's credential, stale pane or launch) prints nothing
 on stdout, a reason on stderr, and exits 1.
+`ccb-role brief` takes the same validation path and then prints the role's
+instructions, so a session inside a launch can take the role its launch
+recorded for it without the user invoking a skill: the read-only body of
+`role_skills/ccb-<role>.md` beside this executable. A recorded role with no
+installed instructions prints one line naming the role and exits 0; it never
+changes the role. Every refusal there behaves exactly like `show`: empty
+stdout, a reason on stderr, exit 1.
 """
 from __future__ import annotations
 
@@ -47,7 +55,49 @@ setup_windows_encoding()
 
 
 def _usage() -> None:
-    print("Usage: ccb-role set <role> | ccb-role show | ccb-role clear", file=sys.stderr)
+    print(
+        "Usage: ccb-role set <role> | ccb-role show | ccb-role brief | ccb-role clear",
+        file=sys.stderr,
+    )
+
+
+# The roles CCB ships instructions for. Any other recorded role is a custom
+# role that `set` accepts and that simply has no shipped instructions.
+BUILTIN_ROLES = ("lead", "ratifier", "implementer")
+
+
+def _role_skills_dir() -> Path:
+    """The instructions that ship beside this executable.
+
+    Derived from the resolved script path exactly like the `lib/` import above,
+    so an installed symlink in a bin directory on PATH still finds the prefix's
+    `role_skills/` next to its own `lib/`. Nothing is read from the environment.
+    """
+    return Path(__file__).resolve().parent.parent / "role_skills"
+
+
+def _print_brief(role: str) -> int:
+    """Print the instructions for a recorded role; never change the role."""
+    if role not in BUILTIN_ROLES:
+        # Custom roles never read a file: CCB ships no instructions for them,
+        # and a stray file in the install prefix must not become a briefing.
+        print(f"Role: {role} (no role instructions are installed for this role)")
+        return 0
+    body_path = _role_skills_dir() / f"ccb-{role}.md"
+    try:
+        body = body_path.read_text(encoding="utf-8")
+    except OSError:
+        body = ""
+    if not body.strip():
+        # A shipped role with no body means a broken install, not a custom
+        # role: say so instead of silently briefing nothing.
+        print(
+            f"[ERROR] No role instructions are installed for '{role}' ({body_path}).",
+            file=sys.stderr,
+        )
+        return 1
+    sys.stdout.write(body if body.endswith("\n") else body + "\n")
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -59,7 +109,7 @@ def main(argv: list[str]) -> int:
         role = argv[1]
     elif action == "clear" and len(argv) == 1:
         role = ""
-    elif action == "show" and len(argv) == 1:
+    elif action in ("show", "brief") and len(argv) == 1:
         role = None
     else:
         _usage()
@@ -81,8 +131,9 @@ def main(argv: list[str]) -> int:
         return 1
 
     if role is None:
-        # Read-only: stdout carries the role and nothing else. Every refusal
-        # keeps stdout empty, so a caller can trust a nonempty stdout.
+        # Read-only: stdout carries the role (or its instructions) and nothing
+        # else. Every refusal keeps stdout empty, so a caller can trust a
+        # nonempty stdout.
         try:
             if inside_managed_codex_sandbox():
                 ok, detail = daemon_show_role(
@@ -96,6 +147,8 @@ def main(argv: list[str]) -> int:
         if not ok:
             print(f"[ERROR] {detail}", file=sys.stderr)
             return 1
+        if action == "brief":
+            return _print_brief(detail)
         print(detail)
         return 0
 

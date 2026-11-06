@@ -401,9 +401,15 @@ def test_ccb_role_skill_bodies_are_provider_neutral_and_identical_everywhere(
                 f"neutral {role} body names {provider_name}"
             )
         assert (
-            "Take this role only when the user explicitly assigns it in the current "
-            "conversation; the user invoking this skill counts as assigning it." in neutral_body
+            "Take this role when the user explicitly assigns it in the current "
+            "conversation, when the user invokes this skill, or when `ccb-role brief` "
+            "printed these instructions for this session." in neutral_body
         ), f"neutral {role} body lacks the explicit-assignment guard"
+        # The automatic path must yield to a role that is already recorded.
+        assert (
+            "On that last path only, if this session's recorded role is a different one, "
+            "do not take this role." in neutral_body
+        ), f"neutral {role} body lacks the recorded-role check"
 
     # Pi is the only one of these loaders that documents the field, so only the
     # Pi copy may declare it; the other three rely on the body guard.
@@ -1100,6 +1106,10 @@ def test_windows_installer_functionally_copies_template_and_injects_block(
     )
 
     assert (install_prefix / "config" / "agents-md-ccb.md").is_file()
+    # `ccb-role brief` reads these from the install prefix, so the Windows copy
+    # list must carry them too, not only the Unix rsync/tar tree.
+    assert (install_prefix / "role_skills" / "ccb-lead.md").is_file()
+    assert (install_prefix / "role_skills" / "descriptions.tsv").is_file()
     agents_md = codex_home / "AGENTS.md"
     content = agents_md.read_text(encoding="utf-8")
     assert content.count(RATIFICATION_START) == 1
@@ -1383,3 +1393,110 @@ def test_managed_templates_keep_native_agents_outside_ccb_topology() -> None:
     )
     assert "Do not use Claude sub-agents" not in peer_skill
     assert "CCB addresses only mounted top-level panes" in peer_skill
+
+
+# --- N2: sessions read their own role instructions --------------------------------
+#
+# `ccb-role brief` only helps if the managed instruction blocks tell a top-level
+# session to run it, so the paragraph is pinned in every block CCB writes.
+
+BRIEF_PARAGRAPH_NEEDLES = (
+    "If you are a top-level CCB session (`CCB_SESSION_ID` is set)",
+    "never a subagent, helper or native agent spawned inside a session",
+    "run `ccb-role brief` once at the start of each conversation",
+    "a role CCB recorded for this session is the user's assignment",
+    "If it fails, take no role",
+    "An explicit assignment from the user later in the conversation overrides it",
+)
+
+
+def _brief_paragraph(text: str) -> str:
+    """The paragraph exactly as one managed block spells it."""
+    for line in text.splitlines():
+        if line.startswith("If you are a top-level CCB session"):
+            return line
+    raise AssertionError("no `ccb-role brief` paragraph in this block")
+
+
+def _assert_brief_paragraph(text: str, where: str) -> None:
+    for needle in BRIEF_PARAGRAPH_NEEDLES:
+        assert needle in text, f"{where} lacks the ccb-role brief paragraph ({needle!r})"
+
+
+def _assert_no_personal_history_tool(text: str, where: str) -> None:
+    assert "Memsearch" not in text, f"{where} still names Memsearch"
+    assert "memsearch" not in text.lower(), f"{where} still names memsearch"
+    assert "recalled session history" in text, f"{where} lost the history wording"
+
+
+@pytest.mark.parametrize("mode", ["inline", "route"])
+def test_claude_md_block_carries_the_ccb_role_brief_paragraph(
+    tmp_path: Path, mode: str
+) -> None:
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_claude_md_config",),
+        env_extra={"CCB_CLAUDE_MD_MODE": mode},
+    )
+
+    claude_text = (home / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+    template_text = (REPO_ROOT / "config" / "claude-md-ccb.md").read_text(encoding="utf-8")
+    rules = home / ".claude" / "rules" / "ccb-config.md"
+    if mode == "route":
+        # Claude.md keeps only the pointer; the full text lands in rules/.
+        assert "~/.claude/rules/ccb-config.md" in claude_text
+        assert rules.is_file()
+        full_text = rules.read_text(encoding="utf-8")
+        _assert_brief_paragraph(full_text, "route-mode ccb-config.md")
+        _assert_no_personal_history_tool(full_text, "route-mode ccb-config.md")
+        assert _brief_paragraph(full_text) == _brief_paragraph(template_text)
+    else:
+        assert not rules.exists()
+        _assert_brief_paragraph(claude_text, "inline-mode CLAUDE.md")
+        _assert_no_personal_history_tool(claude_text, "inline-mode CLAUDE.md")
+        assert _brief_paragraph(claude_text) == _brief_paragraph(template_text)
+
+
+def test_codex_agents_block_carries_the_ccb_role_brief_paragraph(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    install_prefix = _prepare_install_prefix(tmp_path)
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=codex_home,
+        functions=("install_agents_md_config",),
+    )
+
+    agents_text = (codex_home / "AGENTS.md").read_text(encoding="utf-8")
+    _assert_brief_paragraph(agents_text, "Codex AGENTS.md")
+    _assert_no_personal_history_tool(agents_text, "Codex AGENTS.md")
+    # One paragraph, identically worded, in every managed block.
+    assert _brief_paragraph(agents_text) == _brief_paragraph(
+        (REPO_ROOT / "config" / "claude-md-ccb.md").read_text(encoding="utf-8")
+    )
+
+
+def test_no_managed_template_names_a_personal_history_tool() -> None:
+    for name in ("claude-md-ccb.md", "claude-md-ccb-route.md", "agents-md-ccb.md"):
+        text = (REPO_ROOT / "config" / name).read_text(encoding="utf-8")
+        assert "Memsearch" not in text, f"{name} still names Memsearch"
+        assert "memsearch" not in text.lower(), f"{name} still names memsearch"
+
+
+def test_windows_copy_list_ships_the_role_skill_bodies() -> None:
+    """`ccb-role brief` reads <prefix>/role_skills, so Windows must copy it.
+
+    Asserted from the installer source because a functional run needs a
+    PowerShell the installing host may not have.
+    """
+    source = INSTALL_PS1.read_text(encoding="utf-8")
+    body = source.split("function Copy-ProjectItems", 1)[1]
+    copy_list = body.split("foreach ($item in", 1)[1].split(")", 1)[0]
+    for item in ('"ccb"', '"lib"', '"bin"', '"config"', '"role_skills"'):
+        assert item in copy_list, f"Windows copy list is missing {item}"

@@ -234,8 +234,10 @@ Known limitation: peer-to-peer messaging (`ask --peer`) stays limited to Claude 
 A launch can enforce which roles may send new work to which roles. It is off unless the launch opts in:
 
 ```bash
-ccb --role-policy enforce     # or: role_policy = "enforce" in .ccb/ccb.config
+ccb --role-policy enforce
 ```
+
+or, to make it the project default, `"role_policy": "enforce"` in a JSON `.ccb/ccb.config` (see the example under [Pre-assigning roles at launch](#pre-assigning-roles-at-launch)). The plain-text config format cannot carry it: a `role_policy` entry there is rejected as a malformed provider entry and the launch refuses, so switch that project's config to JSON first.
 
 The flag wins over the config value. The launcher writes the choice into the launch record before any pane starts, and the policy of the **destination** launch governs: a launch without the setting behaves exactly as before.
 

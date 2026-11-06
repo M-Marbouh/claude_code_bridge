@@ -18,7 +18,7 @@ import live_roles
 import launcher_identity
 import pane_registry
 from ccb_runtime_status import resolve_live_route
-from live_roles import roles_for_record, set_own_role
+from live_roles import roles_for_record, set_own_role, show_own_role
 from project_id import compute_ccb_project_id
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1362,3 +1362,370 @@ def test_an_existing_pair_claim_without_a_witness_needs_reclaiming(pair) -> None
     assert ok, detail
     assert live_roles._read_claims(LAUNCH)["cx1"]["pane_pid"]
     assert roles_for_record(record) == {"cx1": "implementer"}
+
+
+# --- ccb-role show ---------------------------------------------------------------
+#
+# The claims file shape below is this launch's actual file: opaque member ids,
+# the pane each claim was made from, and the pane process witness.
+
+REAL_CLAIMS_LAUNCH = "ai-1793971548-867082"
+REAL_CLAIMS = {
+    "1f81291bc5c640b2b306bc7ce1dcfa81": {
+        "role": "implementer",
+        "pane_id": "%6",
+        "provider": "pi",
+        "pane_pid": "868037",
+        "claimed_at": 1793971562,
+    },
+    "03f5aebccca04cf693297bebf8e90ec8": {
+        "role": "ratifier",
+        "pane_id": "%7",
+        "provider": "codex",
+        "pane_pid": "868232",
+        "claimed_at": 1793971575,
+    },
+    "bbac1b1cb5204108bda9b4e663e476cf": {
+        "role": "lead",
+        "pane_id": "%1",
+        "provider": "claude",
+        "pane_pid": "108991",
+        "claimed_at": 1793971735,
+    },
+}
+
+
+def _claim_token(member_id: str) -> str:
+    return f"token-{member_id[:8]}"
+
+
+def _real_claims_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A launch whose recorded claims are exactly the shape of a real one."""
+    work_dir = tmp_path / "project"
+    cfg = work_dir / ".ccb"
+    cfg.mkdir(parents=True)
+    project_id = compute_ccb_project_id(work_dir)
+    entries: dict = {}
+    alive: set[str] = set()
+    markers: dict[str, str] = {}
+    pane_pids: dict[str, str] = {}
+    for member_id, claim in REAL_CLAIMS.items():
+        provider = claim["provider"]
+        pane = claim["pane_id"]
+        marker = f"CCB-{provider}-{member_id[:6]}"
+        session_file = cfg / f".{provider}-session"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "session_id": REAL_CLAIMS_LAUNCH,
+                    "ccb_project_id": project_id,
+                    "work_dir": str(work_dir),
+                    "pane_id": pane,
+                    "pane_title_marker": marker,
+                    "terminal": "tmux",
+                    "active": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        entries[provider] = {
+            "pane_id": pane,
+            "pane_title_marker": marker,
+            "session_file": str(session_file),
+            "member_id": member_id,
+            "member_token": _claim_token(member_id),
+        }
+        alive.add(pane)
+        markers[marker] = pane
+        pane_pids[pane] = claim["pane_pid"]
+    record = {
+        "ccb_session_id": REAL_CLAIMS_LAUNCH,
+        "ccb_pid": os.getpid(),
+        **(launcher_identity.process_identity(os.getpid()) or {}),
+        "ccb_project_id": project_id,
+        "work_dir": str(work_dir),
+        "terminal": "tmux",
+        "updated_at": int(time.time()),
+        "providers": entries,
+    }
+    path = tmp_path / ".ccb" / "run" / f"ccb-session-{REAL_CLAIMS_LAUNCH}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_claim_file(REAL_CLAIMS_LAUNCH, json.loads(json.dumps(REAL_CLAIMS)))
+    backend = _CapableBackend(alive, markers, pane_pids)
+    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _rec: backend)
+    return work_dir, path, backend
+
+
+@pytest.mark.parametrize("member_id", list(REAL_CLAIMS))
+def test_show_returns_the_recorded_role(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member_id: str) -> None:
+    _real_claims_launch(tmp_path, monkeypatch)
+
+    ok, detail = show_own_role(member_id, _claim_token(member_id))
+
+    assert ok, detail
+    assert detail == REAL_CLAIMS[member_id]["role"]
+
+
+def test_show_returns_a_custom_role_accepted_by_set(non_pair) -> None:
+    launch = non_pair(("hermes",))
+    member_id, token = launch.members["hermes"]
+    assert set_own_role(member_id, token, "scribe")[0]
+
+    assert show_own_role(member_id, token) == (True, "scribe")
+
+
+def _role_env(monkeypatch: pytest.MonkeyPatch, cli, *, member_id: str = "", token: str = "") -> None:
+    monkeypatch.setattr(cli, "inside_managed_codex_sandbox", lambda: False)
+    for key in ("CCB_MEMBER_ID", "CCB_MEMBER_TOKEN", "CCB_LIVE_ID", "CCB_LIVE_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    if member_id:
+        monkeypatch.setenv("CCB_MEMBER_ID", member_id)
+    if token:
+        monkeypatch.setenv("CCB_MEMBER_TOKEN", token)
+
+
+def test_ccb_role_show_prints_only_the_role(non_pair, monkeypatch, capsys) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "ratifier")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["show"]) == 0
+    assert capsys.readouterr().out == "ratifier\n"
+
+
+def test_ccb_role_show_without_a_role_exits_1_with_empty_stdout(non_pair, monkeypatch, capsys) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+
+    assert cli.main(["show"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no role recorded for this session" in captured.err
+
+
+def test_ccb_role_show_without_a_credential_exits_1_with_empty_stdout(monkeypatch, capsys) -> None:
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli)
+
+    assert cli.main(["show"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no CCB launch credential" in captured.err
+
+
+def test_show_refuses_another_sessions_credential(non_pair) -> None:
+    launch = non_pair(("pi", "claude"))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "implementer")[0]
+
+    ok, detail = show_own_role(member_id, token + "x")
+
+    assert not ok and "own" in detail
+
+
+def test_show_refuses_a_member_in_two_launch_records(non_pair, tmp_path: Path) -> None:
+    launch = non_pair(("pi",))
+    second = launch.record()
+    second["ccb_session_id"] = "ai-1793895837-1479999"
+    path = tmp_path / ".ccb" / "run" / "ccb-session-ai-1793895837-1479999.json"
+    path.write_text(json.dumps(second), encoding="utf-8")
+
+    ok, detail = show_own_role(*launch.members["pi"])
+
+    assert not ok and "more than one launch record" in detail
+
+
+def test_show_refuses_a_launch_that_is_not_running(non_pair) -> None:
+    launch = non_pair(("pi",))
+    record = launch.record()
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait()
+    record["ccb_pid"] = exited.pid
+    record.pop("ccb_pid_start_ticks", None)
+    record.pop("ccb_boot_id", None)
+    launch.record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    ok, detail = show_own_role(*launch.members["pi"])
+
+    assert not ok and "no longer running" in detail
+
+
+@_needs_procfs
+def test_show_refuses_a_reused_launcher_pid(non_pair) -> None:
+    """C0b: the numeric pid is the test process, but not the launch's."""
+    launch = non_pair(("pi",))
+    record = launch.record()
+    record["ccb_pid"] = os.getpid()
+    record.pop("ccb_pid_start_ticks", None)
+    record.pop("ccb_boot_id", None)
+    launch.record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    ok, detail = show_own_role(*launch.members["pi"])
+
+    assert not ok and "no longer running" in detail
+
+
+def test_show_refuses_when_the_pane_is_gone(non_pair, monkeypatch) -> None:
+    launch = non_pair(("claude",))
+    member_id, token = launch.members["claude"]
+    assert set_own_role(member_id, token, "lead")[0]
+    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _rec: _FakeBackend(set(), {}))
+
+    ok, detail = show_own_role(member_id, token)
+
+    assert not ok and "pane" in detail
+
+
+def test_show_does_not_return_a_role_for_a_replaced_pane_process(non_pair, monkeypatch) -> None:
+    """Same pane id, different process behind it: the old role is not shown."""
+    launch = non_pair(("claude",))
+    member_id, token = launch.members["claude"]
+    entry = launch.record()["providers"]["claude"]
+    pane, marker = entry["pane_id"], entry["pane_title_marker"]
+    backend = _CapableBackend({pane}, {marker: pane}, {pane: "1001"})
+    monkeypatch.setattr(pane_registry, "get_backend_for_session", lambda _rec: backend)
+    assert set_own_role(member_id, token, "implementer")[0]
+    assert show_own_role(member_id, token) == (True, "implementer")
+
+    backend.pane_pids[pane] = "2002"
+
+    ok, detail = show_own_role(member_id, token)
+    assert not ok
+    assert "implementer" not in detail
+    assert roles_for_record(launch.record()) == {}
+
+
+@pytest.mark.parametrize("payload", ["not json", "{}", '{"claims": []}', '{"launch_id": "x"}'])
+def test_show_refuses_an_unreadable_or_corrupt_claims_file(non_pair, payload: str) -> None:
+    launch = non_pair(("pi",))
+    path = live_roles.roles_path_for_launch("ai-1793895837-1479705")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+    ok, detail = show_own_role(*launch.members["pi"])
+
+    assert not ok and "no role recorded for this session" in detail
+
+
+def test_show_is_read_only(non_pair, monkeypatch) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "implementer")[0]
+    claims_path = live_roles.roles_path_for_launch("ai-1793895837-1479705")
+    before = claims_path.read_bytes()
+    monkeypatch.setattr(
+        live_roles, "_write_claims", lambda *_a, **_k: pytest.fail("show must not write claims")
+    )
+    monkeypatch.setattr(
+        live_roles, "_role_lock", lambda *_a, **_k: pytest.fail("show must not take the role lock")
+    )
+    monkeypatch.setattr(
+        live_roles, "set_own_role", lambda *_a, **_k: pytest.fail("show must not call set_own_role")
+    )
+
+    assert show_own_role(member_id, token) == (True, "implementer")
+    assert not show_own_role(member_id, token + "x")[0]
+    assert not show_own_role(member_id, "")[0]
+
+    assert claims_path.read_bytes() == before
+
+
+def test_ccb_role_show_host_path_never_calls_the_daemon(non_pair, monkeypatch, capsys) -> None:
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "lead")[0]
+    cli = _load_role_cli()
+    _role_env(monkeypatch, cli, member_id=member_id, token=token)
+    monkeypatch.setattr(
+        cli, "daemon_show_role", lambda *_a, **_k: pytest.fail("host path must not use the daemon")
+    )
+    monkeypatch.setattr(
+        cli, "daemon_set_role", lambda *_a, **_k: pytest.fail("host path must not use the daemon")
+    )
+
+    assert cli.main(["show"]) == 0
+    assert capsys.readouterr().out == "lead\n"
+
+
+def test_ccb_role_show_goes_through_the_daemon_inside_the_sandbox(monkeypatch, capsys) -> None:
+    cli = _load_role_cli()
+    seen: dict = {}
+    monkeypatch.setattr(cli, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(cli, "resolve_daemon_work_dir", lambda wd: wd)
+    monkeypatch.setattr(
+        cli, "show_own_role", lambda *_a: pytest.fail("sandbox must not read the run dir directly")
+    )
+    monkeypatch.setattr(
+        cli, "set_own_role", lambda *_a: pytest.fail("sandbox must not write the run dir directly")
+    )
+
+    def _daemon(work_dir, member_id, token):
+        seen.update(member_id=member_id, token=token)
+        return True, "implementer"
+
+    monkeypatch.setattr(cli, "daemon_show_role", _daemon)
+    monkeypatch.setenv("CCB_MEMBER_ID", "member-1")
+    monkeypatch.setenv("CCB_MEMBER_TOKEN", "session-secret")
+
+    assert cli.main(["show"]) == 0
+    assert capsys.readouterr().out == "implementer\n"
+    assert seen == {"member_id": "member-1", "token": "session-secret"}
+
+
+def test_ccb_role_show_sandbox_refusal_keeps_stdout_empty(monkeypatch, capsys) -> None:
+    cli = _load_role_cli()
+    monkeypatch.setattr(cli, "inside_managed_codex_sandbox", lambda: True)
+    monkeypatch.setattr(cli, "resolve_daemon_work_dir", lambda wd: wd)
+    monkeypatch.setattr(
+        cli,
+        "daemon_show_role",
+        lambda *_a: (False, "the launch daemon could not report this session's role"),
+    )
+    monkeypatch.setenv("CCB_MEMBER_ID", "member-1")
+    monkeypatch.setenv("CCB_MEMBER_TOKEN", "session-secret")
+
+    assert cli.main(["show"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not report" in captured.err
+
+
+def test_daemon_show_role_operation_returns_only_the_role(non_pair, tmp_path: Path) -> None:
+    import askd.daemon as askd_daemon
+
+    launch = non_pair(("pi",))
+    member_id, token = launch.members["pi"]
+    assert set_own_role(member_id, token, "scribe")[0]
+    daemon = askd_daemon.UnifiedAskDaemon(state_file=tmp_path / "askd.json")
+
+    bad = daemon._handle_request(
+        {"operation": "show_role", "member_id": member_id, "member_token": "wrong"}
+    )
+    good = daemon._handle_request(
+        {"operation": "show_role", "member_id": member_id, "member_token": token}
+    )
+
+    assert bad["exit_code"] == 1
+    assert good["exit_code"] == 0
+    assert good["reply"] == "scribe"
+    assert token not in good["reply"]
+
+
+def test_daemon_show_role_accepts_the_historical_pair_fields(pair, tmp_path: Path) -> None:
+    import askd.daemon as askd_daemon
+
+    assert set_own_role("cx1", "tok-cx1", "implementer")[0]
+    daemon = askd_daemon.UnifiedAskDaemon(state_file=tmp_path / "askd.json")
+
+    good = daemon._handle_request(
+        {"operation": "show_role", "live_id": "cx1", "live_token": "tok-cx1"}
+    )
+
+    assert good["exit_code"] == 0
+    assert good["reply"] == "implementer"

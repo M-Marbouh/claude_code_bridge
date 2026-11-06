@@ -4,6 +4,7 @@ ccb-role - Record the role this session's conversation was assigned.
 
 Usage:
     ccb-role set <role>     Record this session's role (e.g. implementer, ratifier)
+    ccb-role show           Print this session's own currently recorded role
     ccb-role clear          Remove this session's role
 
 The role is shown by `ccb-list` so a lead can find who is who. A role never
@@ -18,7 +19,10 @@ CCB_LIVE_ID/CCB_LIVE_TOKEN in a launch with live session IDs). A launcher may
 also record the roles configured in `ccb.config` at launch, with each
 session's own credential. The role lasts only for the current launch and
 disappears if the session's pane dies or is replaced. A session with no CCB
-launch credential is outside a CCB launch and cannot record a role.
+launch credential is outside a CCB launch and cannot record or read a role.
+`ccb-role show` prints the role alone on stdout and exits 0; every refusal
+(no role, not this session's credential, stale pane or launch) prints nothing
+on stdout, a reason on stderr, and exits 1.
 """
 from __future__ import annotations
 
@@ -31,14 +35,19 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
-from ccb_runtime_status import daemon_set_role, inside_managed_codex_sandbox, resolve_daemon_work_dir
-from live_roles import set_own_role
+from ccb_runtime_status import (
+    daemon_set_role,
+    daemon_show_role,
+    inside_managed_codex_sandbox,
+    resolve_daemon_work_dir,
+)
+from live_roles import set_own_role, show_own_role
 
 setup_windows_encoding()
 
 
 def _usage() -> None:
-    print("Usage: ccb-role set <role> | ccb-role clear", file=sys.stderr)
+    print("Usage: ccb-role set <role> | ccb-role show | ccb-role clear", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -50,6 +59,8 @@ def main(argv: list[str]) -> int:
         role = argv[1]
     elif action == "clear" and len(argv) == 1:
         role = ""
+    elif action == "show" and len(argv) == 1:
+        role = None
     else:
         _usage()
         return 1
@@ -68,6 +79,25 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if role is None:
+        # Read-only: stdout carries the role and nothing else. Every refusal
+        # keeps stdout empty, so a caller can trust a nonempty stdout.
+        try:
+            if inside_managed_codex_sandbox():
+                ok, detail = daemon_show_role(
+                    resolve_daemon_work_dir(Path.cwd()), member_id, member_token
+                )
+            else:
+                ok, detail = show_own_role(member_id, member_token)
+        except Exception as exc:
+            print(f"[ERROR] Role lookup failed: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print(f"[ERROR] {detail}", file=sys.stderr)
+            return 1
+        print(detail)
+        return 0
 
     try:
         if inside_managed_codex_sandbox():

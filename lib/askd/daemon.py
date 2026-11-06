@@ -309,6 +309,8 @@ class UnifiedAskDaemon:
             return self._handle_queue_status(msg)
         if operation == "set_role":
             return self._handle_set_role(msg)
+        if operation == "show_role":
+            return self._handle_show_role(msg)
         if operation == "resolve_route":
             return self._handle_resolve_route(msg)
         if operation == "peer_identify_sender":
@@ -628,6 +630,30 @@ class UnifiedAskDaemon:
             )
         except Exception as exc:
             ok, detail = False, f"role update failed: {exc}"
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "exit_code": 0 if ok else 1,
+            "reply": detail,
+        }
+
+    def _handle_show_role(self, msg: dict) -> dict:
+        """Return a session's own recorded role for a sandboxed caller.
+
+        Read-only counterpart of `_handle_set_role`: the session's own launch
+        credential is the authorization, and the reply is the role alone on
+        success -- nothing else is a role.
+        """
+        from live_roles import show_own_role
+
+        try:
+            ok, detail = show_own_role(
+                str(msg.get("member_id") or msg.get("live_id") or ""),
+                str(msg.get("member_token") or msg.get("live_token") or ""),
+            )
+        except Exception as exc:
+            ok, detail = False, f"role lookup failed: {exc}"
         return {
             "type": "ask.response",
             "v": 1,

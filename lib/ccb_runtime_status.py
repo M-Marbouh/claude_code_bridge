@@ -294,6 +294,55 @@ def daemon_set_role(work_dir: Path, member_id: str, member_token: str, role: str
     return int(response.get("exit_code", 1)) == 0, str(response.get("reply") or "")
 
 
+def daemon_show_role(work_dir: Path, member_id: str, member_token: str) -> tuple[bool, str]:
+    """Ask the host daemon for this session's own recorded role (sandboxed callers).
+
+    Strict by construction: a successful reply is a role name and nothing
+    else -- exactly one token, no whitespace, matching the role grammar. An
+    older daemon that does not know `show_role` falls through to normal
+    dispatch and answers with an unrelated error (today "Missing 'provider'
+    field"), so failure wording is never interpreted here. Any non-success
+    exit code, a non-`ask.response` type, an empty reply or anything that is
+    not one valid role token is a refusal; the caller prints nothing on
+    stdout for it.
+    """
+    from live_roles import ROLE_NAME_RE
+
+    state_file = find_running_state_file(
+        "askd.json",
+        protocol_prefix="ask",
+        work_dir=work_dir,
+        timeout_s=0.5,
+    )
+    state = askd_rpc.read_state(state_file) if state_file is not None else None
+    if not state or not str(state.get("token") or ""):
+        raise RuntimeError("Unified askd daemon state is unavailable")
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"show-role-{os.getpid()}",
+        "token": str(state.get("token")),
+        "operation": "show_role",
+        "live_id": member_id,
+        "live_token": member_token,
+        "member_id": member_id,
+        "member_token": member_token,
+    }
+    response = askd_rpc.request_daemon(state, request, connect_timeout_s=2.0, response_timeout_s=8.0)
+    if response.get("type") != "ask.response":
+        raise RuntimeError("askd returned an invalid response")
+    try:
+        success = int(response.get("exit_code", 1)) == 0
+    except (TypeError, ValueError):
+        success = False
+    if not success:
+        return False, "the launch daemon could not report this session's role"
+    role = str(response.get("reply") or "")
+    if not role or any(character.isspace() for character in role) or not ROLE_NAME_RE.fullmatch(role):
+        return False, "the launch daemon returned an invalid role"
+    return True, role
+
+
 def describe_queue_status(queues: list[dict], *, stuck_after_s: float = 600.0) -> tuple[bool, str]:
     """Summarize provider queues as (stuck, one line).
 

@@ -2119,3 +2119,100 @@ def test_status_output_never_contains_a_member_token(
     dumped = json.dumps(status.to_dict())
     assert "very-secret-token" not in dumped
     assert "member-pi" not in dumped
+
+
+def _daemon_show_with(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, response: dict):
+    monkeypatch.setattr(
+        ccb_runtime_status, "find_running_state_file", lambda *a, **k: tmp_path / "askd.json"
+    )
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "daemon-token"}
+    )
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc,
+        "request_daemon",
+        lambda _state, request, **_kwargs: dict(response, id=request.get("id")),
+    )
+    return ccb_runtime_status.daemon_show_role(tmp_path, "member-1", "session-secret")
+
+
+def test_daemon_show_role_accepts_a_custom_role(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    ok, detail = _daemon_show_with(
+        monkeypatch, tmp_path, {"type": "ask.response", "exit_code": 0, "reply": "scribe"}
+    )
+
+    assert ok
+    assert detail == "scribe"
+    assert "session-secret" not in detail
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ["", "   ", "lead\nx", "lead\n", "implementer!", "Lead", "two words", "x" * 40, None, 7],
+)
+def test_daemon_show_role_rejects_anything_but_one_valid_role_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reply
+) -> None:
+    ok, detail = _daemon_show_with(
+        monkeypatch, tmp_path, {"type": "ask.response", "exit_code": 0, "reply": reply}
+    )
+
+    assert not ok
+    assert detail and "session-secret" not in detail
+
+
+def test_daemon_show_role_fails_closed_on_an_old_daemons_unrelated_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An old daemon does not know `show_role` and answers normal dispatch.
+    # Failure wording is never interpreted, so this must not leak a "role".
+    ok, detail = _daemon_show_with(
+        monkeypatch,
+        tmp_path,
+        {"type": "ask.response", "exit_code": 1, "reply": "Missing 'provider' field"},
+    )
+
+    assert not ok
+    assert "Missing 'provider' field" not in detail
+    assert "provider" not in detail
+
+
+@pytest.mark.parametrize("exit_code", ["junk", None, 1, -1])
+def test_daemon_show_role_fails_closed_on_a_non_success_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_code
+) -> None:
+    ok, detail = _daemon_show_with(
+        monkeypatch,
+        tmp_path,
+        {"type": "ask.response", "exit_code": exit_code, "reply": "lead"},
+    )
+
+    assert not ok
+
+
+def test_daemon_show_role_sends_the_wire_fields_and_no_role(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        ccb_runtime_status, "find_running_state_file", lambda *a, **k: tmp_path / "askd.json"
+    )
+    monkeypatch.setattr(
+        ccb_runtime_status.askd_rpc, "read_state", lambda _path: {"token": "daemon-token"}
+    )
+
+    def _request(_state, request, **_kwargs):
+        captured.update(request)
+        return {"type": "ask.response", "id": request.get("id"), "exit_code": 0, "reply": "lead"}
+
+    monkeypatch.setattr(ccb_runtime_status.askd_rpc, "request_daemon", _request)
+
+    ok, detail = ccb_runtime_status.daemon_show_role(tmp_path, "member-1", "session-secret")
+
+    assert ok and detail == "lead"
+    assert captured["operation"] == "show_role"
+    assert captured["member_id"] == "member-1"
+    assert captured["member_token"] == "session-secret"
+    assert captured["live_id"] == "member-1"
+    assert captured["live_token"] == "session-secret"
+    assert "role" not in captured

@@ -598,6 +598,47 @@ def set_own_role(member_id: str, token: str, role: str) -> Tuple[bool, str]:
     return True, "role cleared for this session"
 
 
+def show_own_role(member_id: str, token: str) -> Tuple[bool, str]:
+    """Read the calling session's own currently recorded role.
+
+    Read-only and lock-free: claim writes are atomic (`_write_claims` replaces
+    the file), so a reader sees either the previous file or the next one, never
+    a partial claim. The identity checks are the same as `set_own_role`'s
+    under-lock re-read -- the credential names exactly one member of one live
+    launch, that member is active, and its pane is current.
+
+    The role itself comes only from `roles_for_record`, which re-validates each
+    claim including its stored pane-process witness (`pane_pid`), so a claim
+    whose pane now runs a different process is not returned. Nothing is cached
+    and there is no fallback to `ccb.config` or to a previously seen role.
+
+    Returns `(True, role)` or `(False, reason)`; any exception is a refusal.
+    """
+    try:
+        member_id = _clean(member_id)
+        token = _clean(token)
+        if not member_id or not token:
+            return False, NO_CREDENTIAL_MESSAGE
+        record, member, reason = _find_own_member(member_id, token)
+        if record is None or member is None:
+            return False, _refusal_reason(reason, member_id)
+        if not _clean(record.get("ccb_session_id")):
+            return False, "this launch record has no launch ID"
+        if _registry_owner_alive(record) is False:
+            return False, "this session's launch is no longer running"
+        if not member.active:
+            return False, "this session is no longer active in its launch"
+        check = check_member(record, member)
+        if not check.current:
+            return False, f"this session's pane is not current: {check.reason}"
+        role = roles_for_record(record).get(member.member_id, "")
+        if not role:
+            return False, "no role recorded for this session"
+        return True, role
+    except Exception:
+        return False, "role lookup failed"
+
+
 def invalidate_pane_claims(launch_id: str, pane_id: str) -> Optional[int]:
     """Drop claims recorded against `pane_id` in `launch_id`.
 

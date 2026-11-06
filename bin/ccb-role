@@ -6,14 +6,19 @@ Usage:
     ccb-role set <role>     Record this session's role (e.g. implementer, ratifier)
     ccb-role clear          Remove this session's role
 
-The role is shown by `ccb-list` so a lead can find who is who. It is a
-display name only: routing never reads it and it grants no permissions.
-Only the session itself can set its role, using the credential CCB exported
-into its pane (CCB_MEMBER_ID/CCB_MEMBER_TOKEN, or CCB_LIVE_ID/CCB_LIVE_TOKEN
-in a launch with live session IDs). The role lasts only for the current
-launch and disappears if the session's pane dies or is replaced. A session
-with no CCB launch credential is outside a CCB launch and cannot record a
-role.
+The role is shown by `ccb-list` so a lead can find who is who. A role never
+selects a destination: `ask` chooses its destination by provider or route,
+and `--to-role <role>` only asserts that destination's role (verified on
+every launch). A launch started with `role_policy = "enforce"` refuses
+delivery that the role matrix does not allow. A role grants nothing else: it
+restricts no edits, push, deploy or any other action.
+Only the session itself can set its role with this command, using the
+credential CCB exported into its pane (CCB_MEMBER_ID/CCB_MEMBER_TOKEN, or
+CCB_LIVE_ID/CCB_LIVE_TOKEN in a launch with live session IDs). A launcher may
+also record the roles configured in `ccb.config` at launch, with each
+session's own credential. The role lasts only for the current launch and
+disappears if the session's pane dies or is replaced. A session with no CCB
+launch credential is outside a CCB launch and cannot record a role.
 """
 from __future__ import annotations
 

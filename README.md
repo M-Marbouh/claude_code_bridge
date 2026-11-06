@@ -65,7 +65,7 @@ From the third provider in such a launch (for example Claude leading a Codex pai
 ask codex --live-id <id> "implementer: build the parser"
 ```
 
-A session in any launch may record the role its conversation was given with `ccb-role set <role>` (and `ccb-role clear`), and `ccb-list` then shows it for that provider, so a lead that lost its context can find who is who. In a launch with a Codex pair the role is shown next to the live ID; other launches show the role without printing a member ID, because that ID is not usable with `--live-id`. Roles are display only: routing never reads them and they grant nothing. Only the session itself can record its role, a role already held by another member is refused, and a role disappears when the launch ends or the member's pane dies or is replaced. A member that starts a new conversation in the same pane keeps its displayed role, so tasks should name the role they are for and a member should decline a role it does not hold.
+A session in any launch may record the role its conversation was given with `ccb-role set <role>` (and `ccb-role clear`), and `ccb-list` then shows it for that provider, so a lead that lost its context can find who is who. In a launch with a Codex pair the role is shown next to the live ID; other launches show the role without printing a member ID, because that ID is not usable with `--live-id`. A role never selects a destination: `ask` chooses its destination by provider or route, and `--to-role <role>` only asserts that destination's role, which is verified on every launch; an enforcing launch also gates delivery on the role matrix below. A role grants nothing else. Only the session itself can record its role with `ccb-role` — with the one exception that a launcher records the roles configured in `ccb.config` at launch, using each session's own credential. A role already held by another member is refused, and a role disappears when the launch ends or the member's pane dies or is replaced. A member that starts a new conversation in the same pane keeps its displayed role, so tasks should name the role they are for and a member should decline a role it does not hold.
 
 Model, reasoning effort, account, and native subagent choices remain native tool settings. They may differ between panes and may be changed independently; CCB does not select or persist that policy. A third Codex or a repeated non-Codex provider is rejected. Duplicate-provider `ccb -r` is not supported; start a fresh pair and use each tool's native session controls if needed. Existing unique-provider `ccb -r` behavior is unchanged.
 
@@ -244,6 +244,30 @@ With enforcement on, the fixed matrix is:
 | external (manual, email, another launch, `--peer`, legacy sender, missing credential) | only a session holding `lead` |
 
 `ask --to-role <role>` asserts the destination's role and is always verified, even in a non-enforcing launch; under enforcement it is required for role-holding members. A refusal names the sender role, the target role and the allowed targets, and the request is refused before it is queued — never reported as submitted. Verified correlated peer replies still reach the original requester whatever role it now holds.
+
+### Pre-assigning roles at launch
+
+A launch can start with its roles already recorded, so an enforcing launch is ready as soon as its panes exist. In a JSON `ccb.config`:
+
+```json
+{
+  "providers": ["claude", "pi", "codex"],
+  "role_policy": "enforce",
+  "roles": {"claude": "lead", "codex": "ratifier", "pi": "implementer"}
+}
+```
+
+In a plain-text `ccb.config`, a provider token may carry its role:
+
+```text
+claude=lead, codex=ratifier, pi=implementer
+```
+
+Both forms mean the same thing and are optional per session: a provider left out of `roles`, or a `null`/`""` list entry, stays unassigned. A provider that appears more than once takes a list in the launch's provider order — `"roles": {"codex": ["ratifier", "implementer"]}` — and per-session roles for a duplicate provider are supported only where CCB already has a per-session identity for it (today the Codex pair). A role naming a provider this launch does not start, a role count that does not match that provider's occurrence count, a role assigned to two sessions, and a malformed annotation (`codex=`, `=lead`, `codex=a=b`, or a bad role name) are all config errors: the launch refuses before any pane starts. If a pane cannot claim its role — for example a WezTerm pane whose title marker does not resolve within about two seconds — the launch names the pane and the refusal, continues as `DEGRADED`, and that session can still run `ccb-role set <role>`.
+
+`roles` records launch roles only: it does not load role skills and gives the session no instructions. A session takes a role's responsibilities only when its own conversation says so.
+
+**Known limitation — WezTerm:** roles currently work on tmux only. On WezTerm a role is tied to the pane's title marker, and Claude Code and Pi replace their pane titles once they start, so a role claimed at launch (or later with `ccb-role set`) stops counting a moment later. Under `--role-policy enforce` that leaves the session unreachable. A fix is planned; until then, use tmux for role-enforced launches.
 
 **This guards against misrouting, not against permissions.** Every pane, daemon and the launcher run as one OS user, so any process can rewrite the files the gate reads or type into another pane directly. What enforcement does guarantee is that every CCB ingress path applies the same rule and fails closed: local `ask`, `--notify`, `--peer`, the bridge's direct reply path, background submissions and email ingress. **Action limits are not provided**: enforcement does not restrict edits, push, deploy or any other external effect, and a role grants no such authority.
 

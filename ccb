@@ -15,6 +15,7 @@ import atexit
 import argparse
 import uuid
 import getpass
+import inspect
 import platform
 import tempfile
 import re
@@ -30,7 +31,7 @@ sys.path.insert(0, str(script_dir / "lib"))
 from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_shell_type, get_backend_for_session
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
-from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, provider_pairing_error
+from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, provider_pairing_error, resolve_roles_for_providers
 from ccb_mcpv_bridge import (
     Decision,
     DecisionKind,
@@ -271,6 +272,14 @@ def _build_keep_open_cmd(provider: str, start_cmd: str) -> str:
         f'read -r _; '
         f'exit $code'
     )
+
+
+# How long a WezTerm claim waits for the pane title marker to resolve. The
+# title comes from the command a pane runs, which has not started yet for an
+# anchor, so a bounded wait is the honest way to claim there: never a faked
+# resolution, and a timeout reports the same DEGRADED refusal as any other.
+ROLE_CLAIM_MARKER_TIMEOUT_S = 2.0
+ROLE_CLAIM_MARKER_POLL_S = 0.05
 
 
 def _build_pane_title_cmd(marker: str) -> str:
@@ -607,6 +616,7 @@ class AILauncher:
         launch_args: dict | None = None,
         launch_env: dict | None = None,
         role_policy: str = "",
+        roles: list | None = None,
     ):
         self.providers = providers or ["codex"]
         pairing_error = provider_pairing_error(self.providers, resume=resume)
@@ -621,6 +631,14 @@ class AILauncher:
         # record; nothing a pane process does can change it for its own
         # launch (A1). Absent/"" means off, which is today's behaviour.
         self.role_policy = role_policy if role_policy in ("", "off", "enforce") else ""
+        # Roles pre-assigned by ccb.config, one entry per provider occurrence in
+        # the launch's original provider order ("" = this occurrence stays
+        # unassigned). Claimed for each pane once its binding is published.
+        assignments = list(roles) if roles else [""] * len(self.providers)
+        if len(assignments) != len(self.providers):
+            raise ValueError("roles must name one role per provider occurrence")
+        self.roles = [str(role or "").strip().lower() for role in assignments]
+        self._role_claim_degraded = False
         self.script_dir = Path(__file__).resolve().parent
         self.invocation_dir = Path.cwd()
         # Project root is strictly the current working directory.
@@ -768,6 +786,169 @@ class AILauncher:
             "ccb_pid": self.ccb_pid,
             "role_policy": self.role_policy,
         })
+
+    def _assigned_role(self, slot: int) -> str:
+        if 0 <= slot < len(self.roles):
+            return self.roles[slot]
+        return ""
+
+    def _claim_pane_marker(self, provider: str) -> str:
+        """The title marker this provider occurrence's binding records."""
+        if provider == "claude":
+            return self._claude_marker()
+        return self._provider_marker(provider)
+
+    def _emit_pane_title_marker(self, marker: str) -> bool:
+        """Write the OSC 0 title sequence on this pane's own terminal.
+
+        `_build_pane_title_cmd` wraps the same sequence in a shell command for a
+        pane that is about to run it. The launcher already owns the anchor pane's
+        terminal, so it writes the raw sequence instead of a command string.
+        """
+        marker = (marker or "").strip()
+        if not marker:
+            return False
+        try:
+            sys.stdout.write(f"\033]0;{marker}\007")
+            sys.stdout.flush()
+        except Exception:
+            return False
+        return True
+
+    def _wait_for_pane_title_marker(
+        self, marker: str, pane_id: str, *, emit: bool
+    ) -> bool:
+        """WezTerm: bounded wait until `marker` resolves to `pane_id`.
+
+        A WezTerm pane's title marker is emitted by the command the pane runs,
+        which has not started yet when an anchor claims. The launcher emits the
+        sequence itself for the anchor and waits briefly; for a spawned pane the
+        pane's own command is already running. Nothing is claimed on a marker
+        the backend has not resolved -- a timeout stays a reported refusal.
+
+        The wait owns its deadline: the remaining budget is handed to the
+        listing call, polling stops once it has passed, and a resolution that
+        only completes after the deadline counts as a timeout rather than a
+        success.
+        """
+        marker = (marker or "").strip()
+        pane_id = (pane_id or "").strip()
+        if not marker or not pane_id:
+            return False
+        if emit and not self._emit_pane_title_marker(marker):
+            return False
+        try:
+            from pane_registry import get_backend_for_session
+
+            backend = get_backend_for_session({"terminal": self.terminal_type})
+        except Exception:
+            backend = None
+        resolver = getattr(backend, "find_pane_by_title_marker", None)
+        if not callable(resolver):
+            return False
+        # The listing can run a CLI call; handing it the remaining budget keeps
+        # it from overshooting the deadline it is being asked to respect.
+        accepts_timeout = False
+        try:
+            accepts_timeout = "timeout" in inspect.signature(resolver).parameters
+        except (TypeError, ValueError):
+            accepts_timeout = False
+        deadline = time.monotonic() + ROLE_CLAIM_MARKER_TIMEOUT_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                if accepts_timeout:
+                    resolved = resolver(marker, str(self.project_root), timeout=remaining)
+                else:
+                    resolved = resolver(marker, str(self.project_root))
+            except Exception:
+                resolved = ""
+            finished = time.monotonic()
+            if finished > deadline:
+                # A late resolution is not evidence the pane had the marker
+                # while it was awaited.
+                return False
+            if str(resolved or "").strip() == pane_id:
+                return True
+            pause = min(ROLE_CLAIM_MARKER_POLL_S, max(0.0, deadline - time.monotonic()))
+            if pause:
+                time.sleep(pause)
+
+    def _claim_launch_role(self, marker: str = "", *, is_anchor: bool = False) -> None:
+        """Claim this pane's pre-assigned role, once its identity is published.
+
+        Called after the pane's session binding exists and before its provider
+        process starts. The claim goes through the same `set_own_role` path a
+        session uses itself, so every check stands: a refusal is reported, the
+        launch continues, and the session can still claim the role by hand.
+        Nothing here fakes readiness.
+
+        Two preparations are unconditional because a later manual claim needs
+        them too: the live inventory is republished (a pane that writes its own
+        binding only in its startup method would otherwise still be judged
+        inactive), and on WezTerm the pane's title marker is waited for. A
+        failure of either is reported only when a role is actually assigned.
+        """
+        slot = self._launch_slot
+        role = self._assigned_role(slot)
+        provider = self.providers[slot] if 0 <= slot < len(self.providers) else ""
+        occurrence = self.providers[: slot + 1].count(provider) if provider else 0
+        label = (
+            f"{provider} session {occurrence} of {self.providers.count(provider)}"
+            if provider
+            else "current pane"
+        )
+        if self._live_slots and not self._publish_live_inventory():
+            if role:
+                self._report_role_claim_failure(
+                    label, role, "launch inventory could not be published"
+                )
+            return
+        if not role or not provider:
+            return
+        if self.terminal_type == "wezterm":
+            pane_id = (
+                self._current_pane_id()
+                if is_anchor
+                else self.wezterm_panes.get(self._provider_slot_key(provider), "")
+            )
+            if not self._wait_for_pane_title_marker(
+                marker or self._claim_pane_marker(provider), pane_id, emit=is_anchor
+            ):
+                self._report_role_claim_failure(
+                    label, role, "pane title marker did not resolve to this pane in time"
+                )
+                return
+        member_id, member_token = self._member_credential(provider)
+        if not member_id or not member_token:
+            self._report_role_claim_failure(label, role, "this pane has no launch credential")
+            return
+        try:
+            from live_roles import set_own_role
+
+            claimed, detail = set_own_role(member_id, member_token, role)
+        except Exception as exc:  # a role claim never breaks a launch
+            claimed, detail = False, f"role claim failed: {exc}"
+        if not claimed:
+            self._report_role_claim_failure(label, role, detail or "refused")
+
+    def _report_role_claim_failure(self, label: str, role: str, reason: str) -> None:
+        target = f"role '{role}'" if role else "a role"
+        print(
+            f"⚠️ Could not assign {target} to the {label}: {reason}",
+            file=sys.stderr,
+        )
+        if self._role_claim_degraded:
+            return
+        self._role_claim_degraded = True
+        retry = f"`ccb-role set {role}`" if role else "`ccb-role set <role>`"
+        print(
+            "⚠️ This launch is DEGRADED, not role-ready: that session can still run "
+            f"{retry} to assign it.",
+            file=sys.stderr,
+        )
 
     def _publish_live_inventory(self) -> bool:
         if not self._live_slots:
@@ -2710,6 +2891,7 @@ class AILauncher:
             runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=stored_cmd,
         ):
             return 1
+        self._claim_launch_role(pane_title_marker, is_anchor=True)
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
     def _write_hermes_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
@@ -2869,10 +3051,13 @@ class AILauncher:
             backend.set_pane_title(pane_id, marker)
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Pi")
         start_cmd, stored_cmd = self._launch_commands(
-            "pi", self._compose_agent_shell("pi", self._get_start_cmd("pi"))
+            "pi",
+            self._compose_agent_shell("pi", self._get_start_cmd("pi")),
+            title_cmd=_build_pane_title_cmd(marker) if self.terminal_type == "wezterm" else "",
         )
         if not self._write_pi_session(runtime, pane_id=pane_id, pane_title_marker=marker, start_cmd=stored_cmd):
             return 1
+        self._claim_launch_role(marker, is_anchor=True)
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
     def _start_cmd_pane(
@@ -2956,6 +3141,8 @@ class AILauncher:
             codex_start_cmd=stored_cmd,
         ):
             return 1
+
+        self._claim_launch_role(pane_title_marker, is_anchor=True)
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
         self._maybe_start_caskd()
@@ -3060,6 +3247,7 @@ class AILauncher:
             pane_title_marker=pane_title_marker,
             start_cmd=stored_cmd,
         )
+        self._claim_launch_role(pane_title_marker, is_anchor=True)
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
@@ -3092,6 +3280,7 @@ class AILauncher:
             pane_title_marker=pane_title_marker,
             start_cmd=stored_cmd,
         )
+        self._claim_launch_role(pane_title_marker, is_anchor=True)
 
         # tmux path: run OpenCode directly (without shell -lc) to avoid shell startup side-effects
         # that can make the TUI appear to hang before rendering.
@@ -3563,6 +3752,10 @@ class AILauncher:
         print()
         print(f"Executing: {' '.join(cmd)}")
 
+        # The anchor's binding and inventory are already published; claim its
+        # pre-assigned role before the provider process starts.
+        self._claim_launch_role(self._claude_marker(), is_anchor=True)
+
         try:
             # Let subprocess inherit stdio by default. Explicitly passing sys.stdin/out/err
             # can produce non-console handles on Windows (especially after re-wrapping
@@ -3896,6 +4089,8 @@ class AILauncher:
                 pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
             if pane_id and not self._publish_live_inventory():
                 return None
+            if pane_id:
+                self._claim_launch_role()
             if pane_id and self.providers.count(item) == 1 and item != "claude":
                 self._warmup_provider(item)
             return pane_id
@@ -4199,6 +4394,13 @@ def cmd_start(args):
     flag_role_policy = str(getattr(args, "role_policy", "") or "").strip().lower()
     role_policy = flag_role_policy or configured_role_policy
 
+    # Roles from ccb.config are validated against the providers this launch
+    # will actually start, before any pane exists or any role is written.
+    roles, roles_error = resolve_roles_for_providers(config_data, providers)
+    if roles_error:
+        print(f"[ERROR] {roles_error}", file=sys.stderr)
+        return 2
+
     launcher = AILauncher(
         providers=providers,
         resume=resume,
@@ -4207,6 +4409,7 @@ def cmd_start(args):
         launch_args=launch_args,
         launch_env=launch_env,
         role_policy=role_policy,
+        roles=roles,
     )
     try:
         return launcher.run_up()

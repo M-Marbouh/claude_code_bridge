@@ -1372,8 +1372,15 @@ class WeztermBackend(TerminalBackend):
                     return str(pane_id)
         return None
 
-    def find_pane_by_title_marker(self, marker: str, cwd_hint: str = "") -> Optional[str]:
-        panes = self._list_panes()
+    def find_pane_by_title_marker(
+        self, marker: str, cwd_hint: str = "", *, timeout: float | None = None
+    ) -> Optional[str]:
+        """Pane whose title starts with `marker`.
+
+        `timeout` is the budget for the underlying `wezterm cli list` call. It is
+        optional: callers that do not pass it keep the listing's own default.
+        """
+        panes = self._list_panes() if timeout is None else self._list_panes(timeout=timeout)
         if panes is None:
             return None
         return self._pane_id_by_title_marker(panes, marker, cwd_hint)

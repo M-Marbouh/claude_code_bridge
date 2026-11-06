@@ -1,4 +1,4 @@
-"""Session-held role names for live sessions, for display only.
+"""Session-held role names for live sessions.
 
 A session in any CCB launch may record the role its current conversation was
 assigned, so a lead that lost its own context can rediscover who is who from
@@ -6,8 +6,12 @@ assigned, so a lead that lost its own context can rediscover who is who from
 
 The rules that keep this from becoming authority or durable state:
 
-- Routing never reads roles. A lead addresses a session by its live ID, or
-  by provider where a launch has no live-session inventory.
+- Routing reads a role only to verify a destination, never to choose one.
+  `ask --to-role <role>` asserts the destination's role on every launch, and a
+  launch with `role_policy = "enforce"` refuses delivery the role matrix does
+  not allow. Roles never select a destination: a lead still addresses a
+  session by its live ID, or by provider where a launch has no live-session
+  inventory. A role grants no other authority.
 - Only the session itself can record its role: the claim must present that
   session's own per-launch credential. A launch with a live-session inventory
   uses `CCB_LIVE_ID`/`CCB_LIVE_TOKEN`; every other launch uses the member

@@ -1033,6 +1033,275 @@ def _resolve_within_launch(
     return resolution, caller
 
 
+def _member_authenticated_launch(
+    member_id: str,
+    member_token: str,
+    *,
+    caller_launch_id: str,
+    project_id: str,
+    caller_live_id: str = "",
+    caller_token: str = "",
+) -> Tuple[Optional[dict[str, Any]], Any, Optional[Resolution], bool]:
+    """Verify a member credential down to exactly ONE launch record, host-side.
+
+    HARD conflicts refuse outright, before anything else can be considered: a
+    credential that does not authenticate exactly one member here (missing,
+    wrong token, contradictory membership), a launch in another project, a
+    `CCB_SESSION_ID` naming another launch, a supplied pair LIVE credential
+    that does not name the same member of the same launch, a launch whose owner
+    is POSITIVELY dead (`False`), or an inactive member.
+
+    What remains is a credential that IS this session's, whose binding cannot
+    be CONFIRMED right now: the owner's liveness is merely unproven (`None`), or
+    `check_member` says the pane binding is not current (a WezTerm title marker
+    that does not resolve, a pane process that cannot be read, a stale
+    binding). That is reported as `demoted=True` rather than refused, so the
+    caller may use the guarded fallback: the credential still identifies the
+    launch, but it no longer proves the pane. A demoted caller gets no role
+    and no delivery authority it did not already have.
+
+    Returns `(record, member, refusal, demoted)`.
+    """
+    from live_roles import _find_own_member, _refusal_reason, check_member
+
+    record, member, reason = _find_own_member(member_id, member_token)
+    if record is None or member is None:
+        return (
+            None,
+            None,
+            Resolution(error=UNKNOWN_CALLER, detail=_refusal_reason(reason, member_id)),
+            False,
+        )
+    launch_id = str(record.get("ccb_session_id") or "").strip()
+    if _effective_project_id(record) != project_id:
+        return (
+            None,
+            None,
+            Resolution(
+                error=UNKNOWN_CALLER,
+                detail="this session's launch belongs to another project",
+            ),
+            False,
+        )
+    if caller_launch_id and caller_launch_id != launch_id:
+        return (
+            None,
+            None,
+            Resolution(
+                error=UNKNOWN_CALLER,
+                detail="CCB_SESSION_ID does not name this session's launch",
+            ),
+            False,
+        )
+    if caller_live_id and caller_token:
+        live_record, live_member, _live_reason = _find_own_member(caller_live_id, caller_token)
+        if live_record is None or live_member is None:
+            return (
+                None,
+                None,
+                Resolution(
+                    error=UNKNOWN_CALLER,
+                    detail=(
+                        "the pair credential presented with the member credential "
+                        "is not this session's own"
+                    ),
+                ),
+                False,
+            )
+        if (
+            str(live_record.get("ccb_session_id") or "").strip() != launch_id
+            or live_member.member_id != member.member_id
+        ):
+            return (
+                None,
+                None,
+                Resolution(
+                    error=UNKNOWN_CALLER,
+                    detail="the pair and member credentials name different sessions",
+                ),
+                False,
+            )
+    liveness = _registry_owner_alive(record)
+    if liveness is False:
+        return (
+            None,
+            None,
+            Resolution(
+                error=UNAVAILABLE,
+                detail="this session's launch is no longer running",
+            ),
+            False,
+        )
+    if not member.active:
+        return (
+            None,
+            None,
+            Resolution(
+                error=UNAVAILABLE,
+                detail="this session is no longer active in its launch",
+            ),
+            False,
+        )
+    if liveness is None:
+        # The owner process cannot be proven either way. Do not refuse a live
+        # launch on an evidence limit: demote to the guarded fallback.
+        return record, member, None, True
+    check = check_member(record, member)
+    if not check.current:
+        # A credential we verified, but a pane binding we cannot confirm
+        # (WezTerm marker, unreadable pane process, stale binding): demote.
+        return record, member, None, True
+    return record, member, None, False
+
+
+def _verified_live_caller(
+    caller_live_id: str, caller_token: str, records: list[dict[str, Any]]
+) -> bool:
+    """True only when a LIVE pair credential is VERIFIED, not merely present.
+
+    The token must match the `auth_token` of exactly one inventory session
+    carrying that live id in an eligible launch record. Two nonempty fields
+    authenticate nothing on their own; treating them as authentication let a
+    bogus pair exempt the caller from the ambiguity guard.
+    """
+    live_id = str(caller_live_id or "").strip()
+    token = str(caller_token or "").strip()
+    if not live_id or not token:
+        return False
+    found = 0
+    for record in records:
+        inventory = read_inventory_for_record(record)
+        if not inventory.valid:
+            continue
+        session = find_caller(inventory.sessions, live_id=live_id)
+        if session is None:
+            continue
+        if not session.auth_token or not hmac.compare_digest(session.auth_token, token):
+            continue
+        found += 1
+    return found == 1
+
+
+def _resolve_for_authenticated_launch(
+    record: dict[str, Any],
+    member: Any,
+    provider: str,
+    *,
+    project_id: str,
+    check_daemon: bool,
+    target_live_id: str,
+    caller_pane_id: str,
+    caller_terminal: str,
+    records: list[dict[str, Any]],
+    demoted: bool = False,
+) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
+    """Resolve strictly inside the launch a member credential identified.
+
+    Pane evidence may help locate the caller's own session INSIDE that
+    launch, but it must never select a different launch: when it would, this
+    refuses rather than routing into the other one.
+
+    When the credential's binding could not be confirmed (`demoted`), the
+    guard is STRICTER, never looser: the identified launch must be the SOLE
+    eligible launch in the project, compared by launch id against the
+    qualifying records. The identification can name a record the qualifying
+    list excludes (an expired record), so ownership is never inferred from a
+    list length. Multiple candidates, or only a foreign candidate, refuse.
+    """
+    identified_launch_id = str(record.get("ccb_session_id") or "").strip()
+    eligible_ids = [
+        str(other.get("ccb_session_id") or "").strip()
+        for other in records
+        if str(other.get("ccb_session_id") or "").strip()
+    ]
+    if demoted:
+        if identified_launch_id not in eligible_ids:
+            return (
+                Resolution(
+                    error=AMBIGUOUS,
+                    detail=(
+                        "this session's launch cannot be confirmed and another CCB "
+                        "launch is the only eligible launch for this project"
+                        if eligible_ids
+                        else "this session's launch cannot be confirmed and no eligible "
+                        "CCB launch is registered for this project"
+                    ),
+                ),
+                None,
+            )
+        if len(eligible_ids) > 1:
+            return (
+                Resolution(
+                    error=AMBIGUOUS,
+                    detail="more than one live CCB launch for this project; cannot pick the destination",
+                ),
+                None,
+            )
+
+    for other in records:
+        # The identified record was loaded by the membership lookup, so it is
+        # a different dict instance than the qualifying list's copy: compare
+        # the launch id, never object identity.
+        if str(other.get("ccb_session_id") or "").strip() == identified_launch_id:
+            continue
+        inventory = read_inventory_for_record(other)
+        pane_match = False
+        if inventory.valid:
+            pane_match = (
+                find_caller(inventory.sessions, pane_id=caller_pane_id, terminal=caller_terminal)
+                is not None
+            )
+        if not pane_match and caller_pane_id:
+            pane_match = _record_claims_pane(other, caller_pane_id, caller_terminal)
+        if pane_match:
+            return (
+                Resolution(
+                    error=UNKNOWN_CALLER,
+                    detail="caller launch mismatch: the supplied pane evidence names another launch",
+                ),
+                None,
+            )
+
+    inventory = read_inventory_for_record(record)
+    if not inventory.present:
+        # A verified caller whose own launch has no inventory is the legacy
+        # case -- but only when no OTHER eligible launch competes with it. The
+        # identified launch can be absent from the qualifying list (expired),
+        # so this compares launch ids instead of counting records.
+        competitors = [
+            other
+            for other in records
+            if str(other.get("ccb_session_id") or "").strip() != identified_launch_id
+        ]
+        if competitors:
+            return (
+                Resolution(
+                    error=AMBIGUOUS,
+                    detail=(
+                        "this session's launch carries no live session inventory and "
+                        "another CCB launch exists for this project"
+                    ),
+                ),
+                None,
+            )
+        return None
+    caller = None
+    if inventory.valid:
+        caller = find_caller(inventory.sessions, live_id=member.member_id)
+        if caller is None:
+            caller = find_caller(
+                inventory.sessions, pane_id=caller_pane_id, terminal=caller_terminal
+            )
+    return _resolve_within_launch(
+        record,
+        provider,
+        caller=caller,
+        project_id=project_id,
+        check_daemon=check_daemon,
+        target_live_id=target_live_id,
+    )
+
+
 def _resolve_live_route_host(
     provider: str,
     work_dir: str | Path,
@@ -1041,6 +1310,9 @@ def _resolve_live_route_host(
     caller_terminal: str = "",
     caller_live_id: str = "",
     caller_token: str = "",
+    caller_member_id: str = "",
+    caller_member_token: str = "",
+    caller_launch_id: str = "",
     check_daemon: bool = True,
     target_live_id: str = "",
 ) -> Optional[Tuple[Resolution, Optional[LiveSession]]]:
@@ -1048,6 +1320,12 @@ def _resolve_live_route_host(
     operational checks) real terminal/daemon state must be visible to run
     this. Never called directly from inside a managed Codex sandbox --
     `resolve_live_route` proxies through the daemon RPC for that case.
+
+    GUARANTEE (also stated in the README): when the destination launch is
+    ambiguous at this preflight, the caller is refused with zero delivery
+    instead of being routed into another live launch. A launch that starts, or
+    a binding that is replaced, AFTER this check is not covered; destination
+    pinning through queue and injection remains backlog.
     """
     try:
         resolved_work_dir = Path(work_dir).expanduser().resolve()
@@ -1057,6 +1335,62 @@ def _resolve_live_route_host(
 
     qualifying = list(_iter_qualifying_registry_records(project_id=project_id))
     records = [record for record, _wd, _eff, _ts, _stale in qualifying]
+
+    # A member credential is the caller's own launch identity. One half of it
+    # is not evidence and is refused before anything else happens.
+    member_id = str(caller_member_id or "").strip()
+    member_token = str(caller_member_token or "").strip()
+    if bool(member_id) != bool(member_token):
+        return (
+            Resolution(
+                error=UNKNOWN_CALLER,
+                detail="CCB_MEMBER_ID and CCB_MEMBER_TOKEN must be supplied together",
+            ),
+            None,
+        )
+    if member_id and member_token:
+        record, member, refusal, demoted = _member_authenticated_launch(
+            member_id,
+            member_token,
+            caller_launch_id=str(caller_launch_id or "").strip(),
+            project_id=project_id,
+            caller_live_id=str(caller_live_id or "").strip(),
+            caller_token=str(caller_token or "").strip(),
+        )
+        if refusal is not None:
+            return refusal, None
+        return _resolve_for_authenticated_launch(
+            record,
+            member,
+            provider,
+            project_id=project_id,
+            check_daemon=check_daemon,
+            target_live_id=target_live_id,
+            caller_pane_id=str(caller_pane_id or "").strip(),
+            caller_terminal=str(caller_terminal or "").strip(),
+            records=records,
+            demoted=demoted,
+        )
+
+    # No credential authenticated an exact caller launch: no member
+    # credential, and no pair LIVE credential either (a sandbox proxy carries
+    # neither). Count the eligible launches BEFORE any pane matching, because
+    # a pane match is exactly what can belong to the other launch. Eligibility
+    # already excludes launches whose owner is positively dead; an unproven
+    # owner (`None`) still counts.
+    # Only a VERIFIED LIVE pair credential (token checked against the
+    # matching inventory session) may exempt a caller from this guard. Two
+    # nonempty fields are not authentication.
+    authenticated_live = _verified_live_caller(caller_live_id, caller_token, records)
+    if not authenticated_live and len(records) > 1:
+        return (
+            Resolution(
+                error=AMBIGUOUS,
+                detail="more than one live CCB launch for this project; cannot pick the destination",
+            ),
+            None,
+        )
+
     have_evidence = bool(caller_pane_id or caller_terminal or caller_live_id or caller_token)
 
     # Finding 3: establish the CALLER'S OWN LAUNCH first, by searching
@@ -1325,6 +1659,9 @@ def resolve_live_route(
     caller_terminal: str = "",
     caller_live_id: str = "",
     caller_token: str = "",
+    caller_member_id: str = "",
+    caller_member_token: str = "",
+    caller_launch_id: str = "",
     check_daemon: bool = True,
     _allow_daemon_proxy: bool = True,
     target_live_id: str = "",
@@ -1346,11 +1683,14 @@ def resolve_live_route(
 
     Inside a managed Codex sandbox this proxies to the host daemon over
     RPC (Finding 1) rather than resolving locally or bypassing -- see
-    `_daemon_resolve_live_route`. Resolution is always scoped to the
-    CALLER'S OWN launch record (Finding 3) and, once a destination is
-    picked, still subject to the same operational checks `resolve_project_
-    runtime_status` would run (Finding 6): caller-awareness supersedes the
-    provider-wide ambiguity verdict only.
+    `_daemon_resolve_live_route`. The member-credential parameters are
+    host-path only and are deliberately NOT part of the daemon RPC: a
+    sandboxed caller resolves through the host's unauthenticated path, which
+    refuses when the project carries more than one eligible launch. Resolution
+    is always scoped to the CALLER'S OWN launch record (Finding 3) and, once a
+    destination is picked, still subject to the same operational checks
+    `resolve_project_runtime_status` would run (Finding 6): caller-awareness
+    supersedes the provider-wide ambiguity verdict only.
     """
     if _allow_daemon_proxy and inside_managed_codex_sandbox():
         return _daemon_resolve_live_route(
@@ -1370,6 +1710,9 @@ def resolve_live_route(
         caller_terminal=caller_terminal,
         caller_live_id=caller_live_id,
         caller_token=caller_token,
+        caller_member_id=caller_member_id,
+        caller_member_token=caller_member_token,
+        caller_launch_id=caller_launch_id,
         check_daemon=check_daemon,
         target_live_id=target_live_id,
     )

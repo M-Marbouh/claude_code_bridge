@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1422,10 +1424,15 @@ def test_resolve_live_route_refuses_two_competing_launches_without_caller_eviden
     assert caller is None
 
 
-def test_resolve_live_route_uses_correct_launch_when_caller_identifies_it(runtime_env, monkeypatch) -> None:
-    # The SAME two-launch setup as above, but this time the caller's own
-    # pane places them unambiguously in "ai-2" -- resolution must proceed
-    # strictly within that launch and never even consider "ai-1"'s.
+def test_resolve_live_route_refuses_two_live_launches_without_a_credentialed_caller(
+    runtime_env, monkeypatch
+) -> None:
+    # The SAME two-launch setup as above. The caller's pane would place them in
+    # "ai-2", but pane evidence alone is NOT identity: pane ids repeat across
+    # launches, so with two eligible launches and no credential that names the
+    # caller's launch, preflight refuses with zero delivery instead of routing
+    # into whichever launch the pane happens to match. This is the documented
+    # compatibility exception for duplicate launches in one project.
     home, work_dir, project_id = runtime_env
     session_file_2 = work_dir / ".ccb" / "codex-session-ai2.json"
     session_file_2.parent.mkdir(parents=True, exist_ok=True)
@@ -1481,10 +1488,12 @@ def test_resolve_live_route_uses_correct_launch_when_caller_identifies_it(runtim
 
     assert outcome is not None
     resolution, caller = outcome
-    assert resolution.ok is True, resolution
-    assert resolution.session.launch_id == "ai-2"
-    assert resolution.session.pane_id == "%21"
-    assert caller is not None and caller.live_id == "caller"
+    assert resolution.ok is False
+    assert resolution.error == "ambiguous"
+    assert resolution.detail == (
+        "more than one live CCB launch for this project; cannot pick the destination"
+    )
+    assert caller is None
 
 
 def test_resolve_live_route_refuses_after_identity_succeeds_but_pane_is_dead(
@@ -2216,3 +2225,704 @@ def test_daemon_show_role_sends_the_wire_fields_and_no_role(
     assert captured["live_id"] == "member-1"
     assert captured["live_token"] == "session-secret"
     assert "role" not in captured
+
+
+# --- preflight destination-launch ambiguity (C0c-min) ------------------------
+#
+# Guarantee: when the destination launch is ambiguous at preflight, refuse with
+# zero delivery instead of routing into another live launch. Eligibility excludes
+# only launches whose owner is positively dead; unproven (`None`) counts.
+
+OWN_LAUNCH = "ai-own"
+FOREIGN_LAUNCH = "ai-foreign"
+OWN_MEMBER = "member-own"
+OWN_TOKEN = "token-own"
+
+
+def _owned(record: dict) -> dict:
+    record["ccb_pid"] = os.getpid()
+    record.update(launcher_identity.process_identity(os.getpid()) or {})
+    return record
+
+
+def _launch_binding(work_dir: Path, launch_id: str, provider: str, pane: str, marker: str) -> Path:
+    path = work_dir / ".ccb" / f".{provider}-session"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "session_id": launch_id,
+                "ccb_project_id": compute_ccb_project_id(work_dir),
+                "work_dir": str(work_dir),
+                "pane_id": pane,
+                "pane_title_marker": marker,
+                "terminal": "tmux",
+                "active": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _own_launch_with_inventory(
+    home: Path, work_dir: Path, project_id: str, *, caller_active: bool = True
+) -> None:
+    caller_file = _launch_binding(work_dir, OWN_LAUNCH, "claude", "%7", "CCB-Claude-own")
+    sibling_file = _launch_binding(work_dir, OWN_LAUNCH, "codex", "%9", "CCB-Codex-sib")
+    _write_registry(
+        home,
+        OWN_LAUNCH,
+        _owned(
+            {
+                "ccb_session_id": OWN_LAUNCH,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {"claude": {"pane_id": "%7"}, "codex": {"pane_id": "%9"}},
+                "live_sessions": [
+                    {
+                        "live_id": OWN_MEMBER,
+                        "provider": "claude",
+                        "pane_id": "%7",
+                        "terminal": "tmux",
+                        "pane_title_marker": "CCB-Claude-own",
+                        "session_file": str(caller_file),
+                        "auth_token": OWN_TOKEN,
+                        "active": caller_active,
+                    },
+                    {
+                        "live_id": "sib",
+                        "provider": "codex",
+                        "pane_id": "%9",
+                        "terminal": "tmux",
+                        "pane_title_marker": "CCB-Codex-sib",
+                        "session_file": str(sibling_file),
+                        "auth_token": "token-sib",
+                    },
+                ],
+            }
+        ),
+    )
+
+
+def _own_launch_without_inventory(home: Path, work_dir: Path, project_id: str) -> None:
+    caller_file = _launch_binding(work_dir, OWN_LAUNCH, "claude", "%7", "CCB-Claude-own")
+    _write_registry(
+        home,
+        OWN_LAUNCH,
+        _owned(
+            {
+                "ccb_session_id": OWN_LAUNCH,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {
+                    "claude": {
+                        "pane_id": "%7",
+                        "pane_title_marker": "CCB-Claude-own",
+                        "session_file": str(caller_file),
+                        "member_id": OWN_MEMBER,
+                        "member_token": OWN_TOKEN,
+                    },
+                    "codex": {"pane_id": "%8"},
+                },
+            }
+        ),
+    )
+
+
+def _foreign_launch(
+    home: Path, work_dir: Path, project_id: str, *, repeats_caller_pane: bool, inventory: bool = True
+) -> dict:
+    caller_pane = "%7" if repeats_caller_pane else "%11"
+    record = _owned(
+        {
+            "ccb_session_id": FOREIGN_LAUNCH,
+            "ccb_project_id": project_id,
+            "work_dir": str(work_dir),
+            "terminal": "tmux",
+            "updated_at": int(time.time()),
+            "providers": {"codex": {"pane_id": "%8"}},
+        }
+    )
+    if inventory:
+        record["live_sessions"] = [
+            {"live_id": "foreign-caller", "provider": "claude", "pane_id": caller_pane, "terminal": "tmux"},
+            {"live_id": "foreign-codex", "provider": "codex", "pane_id": "%8", "terminal": "tmux"},
+        ]
+    _write_registry(home, FOREIGN_LAUNCH, record)
+    return record
+
+
+def _own_panes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%7", "%9"}, {"CCB-Claude-own": "%7", "CCB-Codex-sib": "%9"}),
+    )
+
+
+def test_authenticated_member_refuses_when_a_foreign_inventory_repeats_the_caller_pane(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=True)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert "caller launch mismatch" in resolution.detail
+    assert caller is None
+
+
+def test_authenticated_member_routes_inside_its_own_launch(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.launch_id == OWN_LAUNCH
+    assert resolution.session.live_id == "sib"
+    assert caller is not None and caller.live_id == OWN_MEMBER
+
+
+def test_unauthenticated_host_path_refuses_two_live_launches(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The sandbox host handler calls `_resolve_live_route_host` without member
+    # fields, so this is that path.
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=True)
+    _own_panes(monkeypatch)
+
+    outcome = ccb_runtime_status._resolve_live_route_host(
+        "codex", work_dir, caller_pane_id="%7", caller_terminal="tmux"
+    )
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is False
+    assert resolution.detail == (
+        "more than one live CCB launch for this project; cannot pick the destination"
+    )
+    assert caller is None
+
+
+def test_verified_member_without_inventory_refuses_when_another_launch_exists(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_without_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "carries no live session inventory" in resolution.detail
+
+
+def test_unauthenticated_two_launches_without_inventories_refuse(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_without_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route("codex", work_dir, caller_pane_id="%7", caller_terminal="tmux")
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "more than one live CCB launch" in resolution.detail
+
+
+def test_a_competitor_with_unproven_liveness_still_counts(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_without_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _own_panes(monkeypatch)
+
+    def _liveness(record):
+        if str(record.get("ccb_session_id") or "") == FOREIGN_LAUNCH:
+            return None  # unproven owner: still eligible for ambiguity
+        return True
+
+    monkeypatch.setattr(ccb_runtime_status, "_registry_owner_alive", _liveness)
+
+    outcome = resolve_live_route("codex", work_dir, caller_pane_id="%7", caller_terminal="tmux")
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "more than one live CCB launch" in resolution.detail
+
+
+def test_a_positively_dead_competitor_is_ignored(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_without_inventory(home, work_dir, project_id)
+    dead = _foreign_launch(
+        home, work_dir, project_id, repeats_caller_pane=False, inventory=False
+    )
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait()
+    dead["ccb_pid"] = exited.pid
+    dead.pop("ccb_pid_start_ticks", None)
+    dead.pop("ccb_boot_id", None)
+    _write_registry(home, FOREIGN_LAUNCH, dead)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    # Single eligible launch WITH a verified caller and no inventory: legacy.
+    assert outcome is None
+
+
+def test_a_partial_member_credential_is_refused(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route("codex", work_dir, caller_member_id=OWN_MEMBER)
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "must be supplied together" in resolution.detail
+
+
+def test_a_wrong_member_token_is_refused(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token="not-the-token"
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "not this session's own" in resolution.detail
+
+
+def test_a_conflicting_launch_id_is_refused(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+        caller_launch_id=FOREIGN_LAUNCH,
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "CCB_SESSION_ID" in resolution.detail
+
+
+def test_an_inactive_member_is_refused(runtime_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id, caller_active=False)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "no longer active" in resolution.detail
+
+
+def test_a_member_whose_pane_cannot_be_confirmed_is_demoted_to_the_guarded_fallback(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A credential we verified, but a pane we cannot confirm: with the launch
+    # being the ONLY eligible one, the route proceeds through the guarded
+    # fallback instead of refusing a live launch on an evidence limit.
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    # The caller's own pane is gone; the destination's pane is fine.
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%9"}, {"CCB-Codex-sib": "%9"}),
+    )
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.live_id == "sib"
+
+
+def test_an_authenticated_pair_with_both_credential_forms_is_unchanged(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        caller_live_id=OWN_MEMBER,
+        caller_token=OWN_TOKEN,
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.live_id == "sib"
+    assert caller is not None and caller.live_id == OWN_MEMBER
+
+
+def test_authenticated_live_routing_keeps_its_current_behaviour(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _own_panes(monkeypatch)
+
+    # No member fields at all: the LIVE pair credential alone still resolves.
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_live_id=OWN_MEMBER, caller_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.live_id == "sib"
+
+
+# --- C0c-min corrections: guarded demotion, verified LIVE, launch-id scope ----
+
+def _expire(home: Path, launch_id: str) -> None:
+    path = home / ".ccb" / "run" / f"ccb-session-{launch_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["updated_at"] = int(time.time()) - 8 * 24 * 3600
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _caller_marker_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Caller pane alive, its title marker does not resolve; sibling fine."""
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _FakeBackend({"%7", "%9"}, {"CCB-Codex-sib": "%9"}),
+    )
+
+
+def _liveness_by_launch(monkeypatch: pytest.MonkeyPatch, overrides: dict) -> None:
+    def _liveness(record):
+        launch_id = str(record.get("ccb_session_id") or "")
+        if launch_id in overrides:
+            return overrides[launch_id]
+        return True
+
+    monkeypatch.setattr(ccb_runtime_status, "_registry_owner_alive", _liveness)
+
+
+def test_a_marker_failure_with_a_sole_launch_still_routes(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.live_id == "sib"
+
+
+def test_a_marker_failure_with_a_competitor_refuses(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert resolution.detail == (
+        "more than one live CCB launch for this project; cannot pick the destination"
+    )
+
+
+def test_unproven_liveness_with_a_sole_launch_still_routes(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _own_panes(monkeypatch)
+    _liveness_by_launch(monkeypatch, {OWN_LAUNCH: None})
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is True, resolution
+    assert resolution.session.live_id == "sib"
+
+
+def test_unproven_liveness_with_a_competitor_refuses(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _own_panes(monkeypatch)
+    _liveness_by_launch(monkeypatch, {OWN_LAUNCH: None})
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert resolution.detail == (
+        "more than one live CCB launch for this project; cannot pick the destination"
+    )
+
+
+def test_a_sole_foreign_candidate_on_demotion_refuses(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _expire(home, OWN_LAUNCH)  # the credential's launch is not even qualifying
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "is the only eligible launch" in resolution.detail
+
+
+def test_bogus_live_credentials_do_not_exempt_the_ambiguity_guard(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_without_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_live_id="bogus-live", caller_token="bogus-token"
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "more than one live CCB launch" in resolution.detail
+
+
+def test_retained_live_fields_do_not_bypass_the_demoted_guard(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        # A genuine pair credential for the same member/launch: it must not
+        # skip the demoted guard just because it is retained.
+        caller_live_id=OWN_MEMBER,
+        caller_token=OWN_TOKEN,
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "more than one live CCB launch" in resolution.detail
+
+
+def test_an_expired_own_record_with_one_eligible_foreign_launch_refuses(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_without_inventory(home, work_dir, project_id)
+    _expire(home, OWN_LAUNCH)
+    _foreign_launch(home, work_dir, project_id, repeats_caller_pane=False, inventory=False)
+    _own_panes(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_pane_id="%7",
+        caller_terminal="tmux",
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "carries no live session inventory" in resolution.detail
+
+
+def test_a_launch_id_conflict_still_refuses_before_demotion(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+        caller_launch_id=FOREIGN_LAUNCH,
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "CCB_SESSION_ID" in resolution.detail
+
+
+def test_an_inactive_member_still_refuses_before_demotion(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id, caller_active=False)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "no longer active" in resolution.detail
+
+
+def test_a_positively_dead_launch_still_refuses_before_demotion(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _caller_marker_unresolved(monkeypatch)
+    _liveness_by_launch(monkeypatch, {OWN_LAUNCH: False})
+
+    outcome = resolve_live_route(
+        "codex", work_dir, caller_member_id=OWN_MEMBER, caller_member_token=OWN_TOKEN
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "no longer running" in resolution.detail
+
+
+def test_a_conflicting_live_credential_still_refuses_before_demotion(
+    runtime_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, work_dir, project_id = runtime_env
+    _own_launch_with_inventory(home, work_dir, project_id)
+    _caller_marker_unresolved(monkeypatch)
+
+    outcome = resolve_live_route(
+        "codex",
+        work_dir,
+        caller_live_id="bogus-live",
+        caller_token="bogus-token",
+        caller_member_id=OWN_MEMBER,
+        caller_member_token=OWN_TOKEN,
+    )
+
+    assert outcome is not None
+    resolution, _caller = outcome
+    assert resolution.ok is False
+    assert "pair credential" in resolution.detail

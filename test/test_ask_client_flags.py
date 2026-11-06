@@ -1489,7 +1489,9 @@ def test_default_async_background_script_carries_resolved_route_via_env(
         return _Proc()
 
     def _fake_preflight(_provider, *, work_dir=None, caller_pane_id="", caller_terminal="",
-                        caller_live_id="", caller_token="", route_out=None):
+                        caller_live_id="", caller_token="", caller_member_id="",
+                        caller_member_token="", caller_launch_id="", route_out=None,
+                        **kwargs):
         if route_out is not None:
             route_out.update(
                 live_id="s2",
@@ -2428,3 +2430,240 @@ def test_ask_resend_creates_new_async_request_for_exact_live_id(
     assert "CCB_ROUTE_LIVE_ID=target-live" in new_script_file.read_text(encoding="utf-8")
     assert 'export CCB_REQ_ID="20261003-184537-000-1738289"' in new_script_file.read_text(encoding="utf-8")
     assert {path: path.read_bytes() for path in original_files} == original_files
+
+
+# --- preflight launch ambiguity (C0c-min) -----------------------------------
+#
+# Guarantee: an ambiguous destination launch is refused at preflight with zero
+# delivery instead of routing into another live launch. Preflight only; a new
+# launch or binding replacement after the check is not covered.
+
+_OWN_LAUNCH = "ai-own"
+_FOREIGN_LAUNCH = "ai-foreign"
+_OWN_MEMBER = "member-own"
+_OWN_TOKEN = "token-own"
+
+
+class _PaneBackend:
+    def __init__(self, alive: set[str], markers: dict[str, str]):
+        self.alive = set(alive)
+        self.markers = dict(markers)
+
+    def is_alive(self, pane_id: str) -> bool:
+        return pane_id in self.alive
+
+    def find_pane_by_title_marker(self, marker: str, cwd_hint: str = "") -> str | None:
+        return self.markers.get(marker)
+
+
+def _two_live_launch_project(ask, tmp_path: Path):
+    work_dir = tmp_path / "project"
+    cfg = work_dir / ".ccb"
+    cfg.mkdir(parents=True)
+    run_dir = tmp_path / ".ccb" / "run"
+    run_dir.mkdir(parents=True)
+    project_id = ask.compute_ccb_project_id(work_dir)
+    identity = launcher_identity.process_identity(os.getpid()) or {}
+    own_file = cfg / ".claude-session"
+    own_file.write_text(
+        json.dumps(
+            {
+                "session_id": _OWN_LAUNCH,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "pane_id": "%7",
+                "pane_title_marker": "CCB-Claude-own",
+                "terminal": "tmux",
+                "active": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / f"ccb-session-{_OWN_LAUNCH}.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": _OWN_LAUNCH,
+                "ccb_pid": os.getpid(),
+                **identity,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {
+                    "claude": {
+                        "pane_id": "%7",
+                        "pane_title_marker": "CCB-Claude-own",
+                        "session_file": str(own_file),
+                        "member_id": _OWN_MEMBER,
+                        "member_token": _OWN_TOKEN,
+                    },
+                    "codex": {"pane_id": "%8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / f"ccb-session-{_FOREIGN_LAUNCH}.json").write_text(
+        json.dumps(
+            {
+                "ccb_session_id": _FOREIGN_LAUNCH,
+                "ccb_pid": os.getpid(),
+                **identity,
+                "ccb_project_id": project_id,
+                "work_dir": str(work_dir),
+                "terminal": "tmux",
+                "updated_at": int(time.time()),
+                "providers": {"codex": {"pane_id": "%9"}},
+                "live_sessions": [
+                    {
+                        "live_id": "foreign-caller",
+                        "provider": "claude",
+                        "pane_id": "%7",
+                        "terminal": "tmux",
+                    },
+                    {
+                        "live_id": "foreign-codex",
+                        "provider": "codex",
+                        "pane_id": "%9",
+                        "terminal": "tmux",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return work_dir
+
+
+def _prepare_ambiguity_case(monkeypatch, tmp_path: Path, *, member: bool):
+    import pane_registry
+
+    ask = _load_ask_module()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    work_dir = _two_live_launch_project(ask, tmp_path)
+    context = ask._UnifiedDaemonContext(tmp_path / "askd.json", {"token": "tok"}, work_dir)
+    delivered: list = []
+    monkeypatch.setattr(ask, "_use_unified_daemon", lambda: True)
+    monkeypatch.setattr(ask, "_resolve_unified_daemon_context", lambda: context)
+    monkeypatch.setattr(ask, "_send_via_unified_daemon", lambda *a, **k: delivered.append(k) or 0)
+    monkeypatch.setattr(ask, "_caller_pane_info", lambda: ("%7", "tmux"))
+    monkeypatch.setattr(ask, "_require_caller", lambda: "pi")
+    monkeypatch.setenv("CCB_CALLER", "pi")
+    monkeypatch.setattr(
+        ask.subprocess, "Popen", lambda *_a, **_k: pytest.fail("started a delivery child process")
+    )
+    monkeypatch.setattr(
+        pane_registry,
+        "get_backend_for_session",
+        lambda _rec: _PaneBackend({"%7"}, {"CCB-Claude-own": "%7"}),
+    )
+    for key in ("CCB_LIVE_ID", "CCB_LIVE_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    if member:
+        monkeypatch.setenv("CCB_MEMBER_ID", _OWN_MEMBER)
+        monkeypatch.setenv("CCB_MEMBER_TOKEN", _OWN_TOKEN)
+        monkeypatch.setenv("CCB_SESSION_ID", _OWN_LAUNCH)
+    else:
+        for key in ("CCB_MEMBER_ID", "CCB_MEMBER_TOKEN", "CCB_SESSION_ID"):
+            monkeypatch.delenv(key, raising=False)
+    return ask, delivered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ask", "codex", "hello"],
+        ["ask", "codex", "--background", "hello"],
+    ],
+)
+def test_request_and_background_paths_refuse_with_zero_delivery(
+    monkeypatch, tmp_path: Path, capsys, argv
+) -> None:
+    ask, delivered = _prepare_ambiguity_case(monkeypatch, tmp_path, member=True)
+
+    rc = ask.main(argv)
+
+    assert rc == ask.EXIT_ERROR
+    assert delivered == []
+    err = capsys.readouterr().err
+    assert "CCB_ROUTE_ERROR target=codex" in err
+    assert "caller launch mismatch" in err
+
+
+def test_notify_path_refuses_with_zero_delivery(monkeypatch, tmp_path: Path, capsys) -> None:
+    ask, delivered = _prepare_ambiguity_case(monkeypatch, tmp_path, member=True)
+
+    rc = ask.main(["ask", "codex", "--notify", "FYI"])
+
+    assert rc == ask.EXIT_ERROR
+    assert delivered == []
+    err = capsys.readouterr().err
+    assert "CCB_ROUTE_ERROR target=codex" in err
+    assert "caller launch mismatch" in err
+
+
+def test_an_uncredentialed_request_refuses_two_live_launches(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ask, delivered = _prepare_ambiguity_case(monkeypatch, tmp_path, member=False)
+
+    rc = ask.main(["ask", "codex", "hello"])
+
+    assert rc == ask.EXIT_ERROR
+    assert delivered == []
+    assert "more than one live CCB launch" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ask", "codex", "hello"],
+        ["ask", "codex", "--notify", "FYI"],
+    ],
+)
+def test_a_partial_member_credential_refuses_before_dispatch(
+    monkeypatch, tmp_path: Path, capsys, argv
+) -> None:
+    ask, delivered = _prepare_ambiguity_case(monkeypatch, tmp_path, member=False)
+    monkeypatch.setenv("CCB_MEMBER_ID", _OWN_MEMBER)  # token missing
+
+    rc = ask.main(argv)
+
+    assert rc == ask.EXIT_ERROR
+    assert delivered == []
+    assert "must be supplied together" in capsys.readouterr().err
+
+
+def test_preflight_passes_the_member_credential_and_launch_id(monkeypatch) -> None:
+    ask = _load_ask_module()
+    captured: dict = {}
+    monkeypatch.setattr(
+        ask,
+        "provider_status_for_target",
+        lambda *_a, **_k: _provider_status(mounted=True, daemon_online=True),
+    )
+    monkeypatch.setattr(ask, "resolve_live_route", lambda *_a, **kw: captured.update(kw) or None)
+
+    ok = ask._preflight_target(
+        "codex",
+        work_dir="/tmp/proj",
+        caller_member_id="member-1",
+        caller_member_token="secret",
+        caller_launch_id="ai-1",
+    )
+
+    assert ok is True
+    assert captured["caller_member_id"] == "member-1"
+    assert captured["caller_member_token"] == "secret"
+    assert captured["caller_launch_id"] == "ai-1"
+
+
+def test_member_credential_has_no_live_fallback(monkeypatch) -> None:
+    ask = _load_ask_module()
+    for key in ("CCB_MEMBER_ID", "CCB_MEMBER_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CCB_LIVE_ID", "s1")
+    monkeypatch.setenv("CCB_LIVE_TOKEN", "secret")
+
+    assert ask._member_credential() == ("", "")

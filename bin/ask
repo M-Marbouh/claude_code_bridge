@@ -443,6 +443,9 @@ def _preflight_target(
     caller_terminal: str = "",
     caller_live_id: str = "",
     caller_token: str = "",
+    caller_member_id: str = "",
+    caller_member_token: str = "",
+    caller_launch_id: str = "",
     route_out: dict | None = None,
     target_live_id: str = "",
 ) -> bool:
@@ -481,6 +484,9 @@ def _preflight_target(
             caller_terminal=caller_terminal,
             caller_live_id=caller_live_id,
             caller_token=caller_token,
+            caller_member_id=caller_member_id,
+            caller_member_token=caller_member_token,
+            caller_launch_id=caller_launch_id,
             target_live_id=target_live_id,
         )
     except Exception as exc:
@@ -864,6 +870,19 @@ def _sender_credential() -> tuple[str, str]:
         member_id = member_id or (os.environ.get("CCB_LIVE_ID") or "").strip()
         member_token = member_token or (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
     return member_id, member_token
+
+
+def _member_credential() -> tuple[str, str]:
+    """The MEMBER credential only: CCB_MEMBER_ID/CCB_MEMBER_TOKEN.
+
+    Deliberately no LIVE fallback. Route resolution authenticates the caller's
+    launch with this exact pair; the pair LIVE credential is passed alongside
+    it unchanged for pair launches, which export both forms.
+    """
+    return (
+        (os.environ.get("CCB_MEMBER_ID") or "").strip(),
+        (os.environ.get("CCB_MEMBER_TOKEN") or "").strip(),
+    )
 
 
 def _normalized_role(value: str) -> str:
@@ -2170,6 +2189,15 @@ def main(argv: list[str]) -> int:
             caller_pane_id, caller_terminal = _caller_pane_info()
             caller_live_id = (os.environ.get("CCB_LIVE_ID") or "").strip()
             caller_token = (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+            caller_member_id, caller_member_token = _member_credential()
+            caller_launch_id = (os.environ.get("CCB_SESSION_ID") or "").strip()
+            if bool(caller_member_id) != bool(caller_member_token):
+                print(
+                    "[ERROR] CCB_MEMBER_ID and CCB_MEMBER_TOKEN must be supplied together; "
+                    "refusing to route without a verified caller launch.",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
             if caller_live_id and caller_token:
                 # Codex tool sandboxes may drop TMUX_PANE while retaining an
                 # unrelated outer WEZTERM_PANE. The per-launch credential is
@@ -2184,6 +2212,9 @@ def main(argv: list[str]) -> int:
                 caller_terminal=caller_terminal,
                 caller_live_id=caller_live_id,
                 caller_token=caller_token,
+                caller_member_id=caller_member_id,
+                caller_member_token=caller_member_token,
+                caller_launch_id=caller_launch_id,
                 route_out=route_fields,
                 **({"target_live_id": peer_live_id} if peer_live_id else {}),
             ):
@@ -2221,6 +2252,15 @@ def main(argv: list[str]) -> int:
                 notify_caller_pane_id, notify_caller_terminal = _caller_pane_info()
                 notify_caller_live_id = (os.environ.get("CCB_LIVE_ID") or "").strip()
                 notify_caller_token = (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+                notify_member_id, notify_member_token = _member_credential()
+                notify_launch_id = (os.environ.get("CCB_SESSION_ID") or "").strip()
+                if bool(notify_member_id) != bool(notify_member_token):
+                    print(
+                        "[ERROR] CCB_MEMBER_ID and CCB_MEMBER_TOKEN must be supplied together; "
+                        "refusing to route without a verified caller launch.",
+                        file=sys.stderr,
+                    )
+                    return EXIT_ERROR
                 if notify_caller_live_id and notify_caller_token:
                     notify_caller_pane_id, notify_caller_terminal = "", ""
                 notify_route_fields: dict = {}
@@ -2231,6 +2271,9 @@ def main(argv: list[str]) -> int:
                     caller_terminal=notify_caller_terminal,
                     caller_live_id=notify_caller_live_id,
                     caller_token=notify_caller_token,
+                    caller_member_id=notify_member_id,
+                    caller_member_token=notify_member_token,
+                    caller_launch_id=notify_launch_id,
                     route_out=notify_route_fields,
                     **({"target_live_id": peer_live_id} if peer_live_id else {}),
                 ):

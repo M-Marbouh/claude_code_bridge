@@ -57,11 +57,17 @@ def main(argv: list[str]) -> int:
         _usage()
         return EXIT_ERROR
 
-    provider = argv[1].lower()
-
-    if provider in ("-h", "--help"):
+    if any(arg in ("-h", "--help") for arg in argv[1:]):
         _usage()
         return EXIT_OK
+
+    if len(argv) > 2:
+        # Never reset a pane on a command line we do not fully understand.
+        print(f"[ERROR] Unexpected arguments: {' '.join(argv[2:])}", file=sys.stderr)
+        _usage()
+        return EXIT_ERROR
+
+    provider = argv[1].lower()
 
     if provider not in PROVIDER_COMMANDS:
         print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)

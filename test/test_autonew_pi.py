@@ -433,3 +433,33 @@ def test_live_pi_sessions_reports_only_qualified_entries(monkeypatch, tmp_path: 
 
     assert error == ""
     assert [(s.launch_id, s.pane_id, s.terminal) for s in sessions] == [("launch-1", PANE, "tmux")]
+
+
+@pytest.mark.parametrize("args", [["pi", "--help"], ["codex", "-h"], ["--help", "pi"]])
+def test_help_anywhere_prints_usage_and_sends_nothing(monkeypatch, capsys, tmp_path: Path, args) -> None:
+    project = _project(tmp_path)
+    _write_launch(Path.home(), "launch-a", project, panes=(PANE,), inventory=False)
+    backend = FakePiBackend([_screen("screen-idle.txt")])
+    _use_backend(monkeypatch, backend)
+    monkeypatch.chdir(project)
+
+    code = _autonew().main(["autonew", *args])
+
+    assert code == 0
+    assert backend.sent == []
+    assert "Usage: autonew <provider>" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("provider", ["pi", "codex"])
+def test_extra_arguments_refuse_and_send_nothing(monkeypatch, capsys, tmp_path: Path, provider: str) -> None:
+    project = _project(tmp_path)
+    _write_launch(Path.home(), "launch-a", project, panes=(PANE,), inventory=False)
+    backend = FakePiBackend([_screen("screen-idle.txt")])
+    _use_backend(monkeypatch, backend)
+    monkeypatch.chdir(project)
+
+    code = _autonew().main(["autonew", provider, "now"])
+
+    assert code == 1
+    assert backend.sent == []
+    assert "Unexpected arguments: now" in capsys.readouterr().err

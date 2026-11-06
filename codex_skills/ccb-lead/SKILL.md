@@ -15,6 +15,8 @@ Use the implementation/review peer for execution and evidence, not as an indepen
 
 Delegate bounded implementation to the other mounted session by default. Implement directly only when the change is genuinely trivial, inherently inseparable from the architectural investigation, or explicitly assigned to this session by the user.
 
+On substantive plans and decisions — anything beyond a tiny mechanical fix or an amendment applied exactly as specified — treat the ratifier's verdict as evidence, not as a ruling: verify it and every amendment against the code and live data, state your own assessment and the strongest material objection you weighed, and contest the verdict with evidence when yours disagrees. Do not manufacture disagreement.
+
 Drive ratified plans and bounded phases to completion. Reopen settled decisions only when new evidence reveals a material conflict covered by the standing global rules.
 
 ## Addressing the pair
@@ -23,7 +25,7 @@ On taking this assignment, run `ccb-role set lead`. If it reports that this sess
 
 Before contacting a peer, run `ccb-list` and read this project's sessions; each member shows its `role:` and, in a launch with live session IDs, an `id:`. Send to one member with `ask <provider> --live-id <id> ...` when `ccb-list` shows an id for that session, or with `ask <provider>` when it shows none, and start every message with the role it is for, for example `implementer: ...` or `ratifier: ...`. A bare `ask <provider>` reaches that provider's other session when this session is one of the pair; from outside a pair of the same provider it is refused as ambiguous rather than guessing, so name the exact live ID there. Re-read `ccb-list` after any context reset instead of relying on memory.
 
-If a needed role is missing or shown as `role:-`, ask the user to assign it. Never infer a role from pane order or launch order. A refused route means that session is gone or was replaced; re-check `ccb-list` rather than retrying or sending to the other member.
+If a needed role is missing or shown as `role:-`, ask the user to assign it. Launch roles may be preassigned in `.ccb/ccb.config`; a running session's role is the one `ccb-list` shows, and editing the config does not change it. Never infer a role from pane order or launch order. A refused route means that session is gone or was replaced; re-check `ccb-list` rather than retrying or sending to the other member.
 
 Add `--to-role <role>` to every `ask` that addresses a pair member, for example `ask pi --to-role implementer ...`, so a wrong destination is refused instead of delivered to the wrong session. In a launch that enforces role policy, a send to the wrong role, or a missing `--to-role` for a role-holding member, is refused with the reason. That gate guards against misrouting; it is not a permission system. It restricts no edits, no push and no deploy — those limits do not exist yet, and this role grants no such authority.
 

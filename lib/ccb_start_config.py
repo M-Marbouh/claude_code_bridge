@@ -152,15 +152,58 @@ def _data_from_tokens(tokens: list[str]) -> dict:
     return data
 
 
+def _configured_providers(data: dict) -> list[str]:
+    """The providers the config itself lists, in config order.
+
+    A config without a providers list means the same default list a launch
+    without a provider argument falls back to (see `cmd_start`), so a role for
+    any of those providers is a role the config itself can express.
+    """
+    raw = data.get("providers")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+    listed = [str(provider) for provider in raw if provider is not None]
+    return listed or list(DEFAULT_PROVIDERS)
+
+
+def roles_skipped_for_launch(data: dict, providers: list[str]) -> list[tuple[str, list[str]]]:
+    """Config roles for providers the config lists but this launch does not start.
+
+    Returns `(provider, non-blank roles)` pairs in config order. These are
+    skipped rather than refused, so a CLI subset of a roled config launches;
+    `cmd_start` names them in one informational line before any pane starts.
+    """
+    raw = data.get("roles")
+    if not isinstance(raw, dict):
+        return []
+    skipped: list[tuple[str, list[str]]] = []
+    # Walk the config's provider order (not the roles mapping's key order),
+    # once per provider. Roles for providers the config does not list are a
+    # config error that `resolve_roles_for_providers` has already refused.
+    for provider in dict.fromkeys(_configured_providers(data)):
+        if provider in providers:
+            continue
+        roles = raw.get(provider)
+        if not isinstance(roles, list) or not any(roles):
+            # Blank-only entries assign nothing, so they are not worth a note.
+            continue
+        skipped.append((provider, [role for role in roles if role]))
+    return skipped
+
+
 def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[str], str]:
     """Map ccb.config roles onto the launch's effective providers.
 
     Returns `(assignments, error)`: one role (or "") per provider occurrence in
     the launch's original provider order, and a config error when the roles
-    cannot be honoured. Never guesses: a role naming a provider this launch
-    does not start, a role count that does not match the provider's occurrence
-    count, a role assigned to two sessions, or per-occurrence roles for a
-    duplicate provider without occurrence identities are all refused.
+    cannot be honoured. Never guesses: a role naming a provider the config
+    itself does not list, a role count that does not match the provider's
+    occurrence count, a role assigned to two sessions, or per-occurrence roles
+    for a duplicate provider without occurrence identities are all refused. A
+    role for a provider the config lists but this launch does not start is
+    skipped, and `roles_skipped_for_launch` reports it for the launch note.
     """
     error = str(data.get("roles_error") or "")
     if error:
@@ -172,6 +215,7 @@ def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[
     if not isinstance(raw, dict):
         return [], "roles must map providers to role names in ccb.config"
 
+    configured = _configured_providers(data)
     for provider, roles in raw.items():
         if not isinstance(roles, list):
             return [], f"roles for '{provider}' must be a role name or a list in ccb.config"
@@ -180,10 +224,15 @@ def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[
             # constrains nothing: plain-text tokens add such entries for every
             # unannotated provider, and a CLI override must be able to drop one.
             continue
-        if provider not in providers:
+        if provider not in configured:
             return [], (
-                f"roles assigns a role to '{provider}', which this launch does not start"
+                f"roles assigns a role to '{provider}', which ccb.config's "
+                f"providers do not include"
             )
+        if provider not in providers:
+            # The config does list this provider; this launch just does not
+            # start it. Its role is skipped, never guessed onto another pane.
+            continue
         count = providers.count(provider)
         if len(roles) != count:
             return [], (

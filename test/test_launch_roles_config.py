@@ -22,11 +22,13 @@ from ccb_start_config import (
     normalize_start_config_data,
     provider_pairing_error,
     resolve_roles_for_providers,
+    roles_skipped_for_launch,
 )
 from test_ccb_agent_composition import _load_ccb_module
 
 
 REAL_ANNOTATED = "claude=lead, codex=ratifier, codex=implementer"
+OWNER_SUBSET = "codex=ratifier, pi=implementer, claude=lead\n"
 REAL_JSON = {
     "providers": ["claude", "pi", "codex"],
     "role_policy": "enforce",
@@ -116,7 +118,7 @@ def test_malformed_plain_text_annotation_is_an_error(tmp_path: Path, text, needl
 @pytest.mark.parametrize(
     ("roles", "needle"),
     [
-        ({"pi": "lead"}, "which this launch does not start"),
+        ({"pi": "lead"}, "ccb.config's providers do not include"),
         ({"codex": ["ratifier"]}, "one role per codex session (2), got 1"),
         ({"codex": ["lead", "lead"]}, "assigned to more than one session"),
         ({"codex": ["ratifier", "implementer"], "claude": "lead"}, "") ,
@@ -217,11 +219,74 @@ def test_cmd_start_expands_occurrences_without_indexing_blank_roles(
     assert capsys.readouterr().err == ""
 
 
-def test_cli_override_that_drops_a_roled_provider_is_refused() -> None:
+def test_skipped_roles_follow_config_provider_order_not_roles_key_order() -> None:
+    normalized = normalize_start_config_data(
+        {
+            "providers": ["codex", "pi", "claude"],
+            "roles": {"claude": "lead", "pi": "implementer", "codex": "ratifier"},
+        }
+    )
+    assert roles_skipped_for_launch(normalized, ["pi"]) == [
+        ("codex", ["ratifier"]),
+        ("claude", ["lead"]),
+    ]
+
+
+def test_cli_override_that_drops_a_roled_provider_skips_its_role() -> None:
+    # The config lists `pi`, so its role is a real assignment; this launch just
+    # does not start it, and guessing it onto another pane would be worse.
     normalized = normalize_start_config_data(dict(REAL_JSON))
     assignments, error = resolve_roles_for_providers(normalized, ["claude", "codex"])
+    assert error == ""
+    assert assignments == ["lead", "ratifier"]
+    assert roles_skipped_for_launch(normalized, ["claude", "codex"]) == [
+        ("pi", ["implementer"])
+    ]
+    # Nothing is skipped when the launch does start every roled provider.
+    assert roles_skipped_for_launch(normalized, normalized["providers"]) == []
+
+
+@pytest.mark.parametrize("providers_value", [
+    ["claude", "codex", "codex"],
+    "claude, codex, codex",  # the plain-text form of the same provider list
+])
+def test_a_role_for_a_provider_the_config_does_not_list_is_refused(providers_value) -> None:
+    normalized = normalize_start_config_data(
+        {"providers": providers_value, "roles": {"pi": "lead"}}
+    )
+    assignments, error = resolve_roles_for_providers(normalized, normalized["providers"])
     assert assignments == []
-    assert "pi" in error and "does not start" in error
+    assert "ccb.config's providers do not include" in error
+    assert roles_skipped_for_launch(normalized, ["claude"]) == []
+
+
+def test_a_config_without_a_provider_list_uses_the_default_providers() -> None:
+    # `codex` is in the default list, so the config can express its role: a
+    # launch that does not start it skips the role instead of refusing.
+    normalized = normalize_start_config_data({"roles": {"codex": "ratifier"}})
+    assert "providers" not in normalized
+    assert resolve_roles_for_providers(normalized, ["claude"]) == ([""], "")
+    assert roles_skipped_for_launch(normalized, ["claude"]) == [("codex", ["ratifier"])]
+
+    # `pi` is not a default provider, so nothing in the config lists it.
+    normalized = normalize_start_config_data({"roles": {"pi": "implementer"}})
+    assignments, error = resolve_roles_for_providers(normalized, ["claude"])
+    assert assignments == []
+    assert "which ccb.config's providers do not include" in error
+
+
+def test_a_role_count_mismatch_for_a_started_provider_is_still_refused() -> None:
+    pair_roles = normalize_start_config_data(
+        {"providers": ["codex", "codex"], "roles": {"codex": ["ratifier", "implementer"]}}
+    )
+    assignments, error = resolve_roles_for_providers(pair_roles, ["codex"])
+    assert assignments == []
+    assert "one role per codex session (1), got 2" in error
+
+    single_role = normalize_start_config_data({"providers": ["codex"], "roles": {"codex": "ratifier"}})
+    assignments, error = resolve_roles_for_providers(single_role, ["codex", "codex"])
+    assert assignments == []
+    assert "one role per codex session (2), got 1" in error
 
 
 @pytest.mark.parametrize("blank", [None, ""])
@@ -289,6 +354,52 @@ def test_cmd_start_accepts_a_cli_override_that_drops_an_unassigned_provider(
     assert capsys.readouterr().err == ""
 
 
+def test_cmd_start_skips_a_roled_provider_the_cli_omits(monkeypatch, tmp_path, capsys) -> None:
+    ccb = _load_ccb_module()
+    config_text = json.dumps(
+        {
+            "providers": ["claude", "pi"],
+            "roles": {"claude": "lead", "pi": "implementer"},
+        }
+    )
+    result, constructed = _cmd_start(monkeypatch, tmp_path, config_text, ["claude"], ccb)
+    assert result == 0
+    assert constructed and constructed[0]["roles"] == ["lead"]
+    err = capsys.readouterr().err
+    assert "Not starting pi (implementer)" in err
+    assert "skipped for this launch" in err
+    assert err.count("Not starting") == 1
+
+
+@pytest.mark.parametrize(
+    ("cli_providers", "expected_roles", "skipped_needle", "skipped_absent"),
+    [
+        (["pi"], ["implementer"], "Not starting codex (ratifier), claude (lead)", "pi"),
+        (["claude", "codex"], ["lead", "ratifier"], "Not starting pi (implementer)", "claude"),
+    ],
+)
+def test_cmd_start_launches_a_subset_of_the_owner_config(
+    monkeypatch, tmp_path, capsys, cli_providers, expected_roles, skipped_needle, skipped_absent
+) -> None:
+    ccb = _load_ccb_module()
+    result, constructed = _cmd_start(monkeypatch, tmp_path, OWNER_SUBSET, cli_providers, ccb)
+    assert result == 0
+    assert constructed and constructed[0]["roles"] == expected_roles
+    err = capsys.readouterr().err
+    assert skipped_needle in err
+    assert err.count("Not starting") == 1
+    # The line names the skipped providers only, never one this launch starts.
+    assert f"Not starting {skipped_absent}" not in err
+
+
+def test_cmd_start_says_nothing_when_no_role_is_skipped(monkeypatch, tmp_path, capsys) -> None:
+    ccb = _load_ccb_module()
+    result, constructed = _cmd_start(monkeypatch, tmp_path, OWNER_SUBSET, [], ccb)
+    assert result == 0
+    assert constructed and constructed[0]["roles"] == ["ratifier", "implementer", "lead"]
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize(
     ("config_text", "cli_providers", "needle"),
     [
@@ -306,9 +417,9 @@ def test_cmd_start_accepts_a_cli_override_that_drops_an_unassigned_provider(
             "roles given both in providers and in roles; use one",
         ),
         (
-            json.dumps({"providers": ["claude", "pi"], "roles": {"claude": "lead", "pi": "implementer"}}),
+            json.dumps({"providers": ["claude"], "roles": {"pi": "implementer"}}),
             ["claude"],
-            "which this launch does not start",
+            "which ccb.config's providers do not include",
         ),
     ],
 )

@@ -31,7 +31,7 @@ sys.path.insert(0, str(script_dir / "lib"))
 from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_shell_type, get_backend_for_session
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
-from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, provider_pairing_error, resolve_roles_for_providers
+from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config, provider_pairing_error, resolve_roles_for_providers, roles_skipped_for_launch
 from ccb_mcpv_bridge import (
     Decision,
     DecisionKind,
@@ -4448,6 +4448,17 @@ def cmd_start(args):
     if roles_error:
         print(f"[ERROR] {roles_error}", file=sys.stderr)
         return 2
+    # Roles for configured providers this launch does not start are skipped, so
+    # a CLI subset of a roled config launches; say so once, before any pane.
+    skipped_roles = roles_skipped_for_launch(config_data, providers)
+    if skipped_roles:
+        detail = ", ".join(
+            f"{provider} ({', '.join(provider_roles)})" for provider, provider_roles in skipped_roles
+        )
+        print(
+            f"ℹ️ Not starting {detail}; their ccb.config roles are skipped for this launch.",
+            file=sys.stderr,
+        )
 
     launcher = AILauncher(
         providers=providers,

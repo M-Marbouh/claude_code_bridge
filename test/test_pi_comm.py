@@ -199,7 +199,9 @@ def test_completion_controls_reject_wrong_id_user_toolcall_and_nonabort_error(tm
     assistant["message"]["stopReason"] = "error"
     assistant["message"]["errorMessage"] = "provider failed"
     session_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    assert load_session(tmp_path, session_id).exchange("synthetic").state == "incomplete"
+    # An error as the last row has no retry edit yet: non-final "errored" (R4 plan); the adapter
+    # still ends the task incomplete with this reason after its grace window.
+    assert load_session(tmp_path, session_id).exchange("synthetic").state == "errored"
 
     # Neither a user-row marker nor a thinking part is a terminal assistant text row.
     assistant["message"]["stopReason"] = "stop"
@@ -310,3 +312,222 @@ def test_editor_draft_with_quoted_dialog_marker_is_not_idle() -> None:
     lines = (FIXTURES / "screen-idle-quoting-marker.txt").read_text().splitlines()
     lines[_idle_marker_rule_index(lines) - 1] = "draft text"
     assert classify_pane_screen("\n".join(lines)) != "idle"
+
+
+REQ = "r4-retry"
+
+
+def _write_rows(tmp_path: Path, session_id: str, rows: list[dict]) -> Path:
+    path = tmp_path / f"synthetic_{session_id}.jsonl"
+    header = {"type": "session", "id": session_id, "cwd": "<SCRATCH>/work", "version": 3}
+    path.write_text("".join(json.dumps(row) + "\n" for row in [header, *rows]))
+    return path
+
+
+def _user_row(row_id: str, parent: str | None, req_id: str = REQ) -> dict:
+    return {"type": "message", "id": row_id, "parentId": parent, "message": {"role": "user", "content": [{"type": "text", "text": f"CCB_REQ_ID: {req_id}\nrequest"}]}}
+
+
+def _error_row(row_id: str, parent: str | None, message: str = "terminated", tool_call: str = "") -> dict:
+    content: list[dict] = [{"type": "thinking", "thinking": "thinking"}]
+    if tool_call:
+        content.append({"type": "toolCall", "id": tool_call, "name": "bash", "arguments": {"command": "true"}})
+    return {"type": "message", "id": row_id, "parentId": parent, "message": {"role": "assistant", "content": content, "stopReason": "error", "errorMessage": message}}
+
+
+def _edit_row(row_id: str, parent: str | None, target: str, replacement=None) -> dict:
+    return {"type": "context_edit", "id": row_id, "parentId": parent, "targetId": target, "replacement": replacement}
+
+
+def _tool_result_row(row_id: str, parent: str | None, tool_call: str) -> dict:
+    return {"type": "message", "id": row_id, "parentId": parent, "message": {"role": "toolResult", "toolCallId": tool_call, "toolName": "bash", "content": [{"type": "text", "text": "ok"}], "isError": False}}
+
+
+def _done_row(row_id: str, parent: str | None, req_id: str = REQ) -> dict:
+    return {"type": "message", "id": row_id, "parentId": parent, "message": {"role": "assistant", "content": [{"type": "text", "text": f"answer\nCCB_DONE: {req_id}"}], "stopReason": "stop"}}
+
+
+def test_real_retry_record_completes_and_recovers_completion(tmp_path: Path) -> None:
+    _path, session_id = _copy_session(tmp_path, "s11_retry_recovery.jsonl")
+    session = load_session(tmp_path, session_id)
+    exchange = session.exchange("20261106-203214-836-218252")
+    assert exchange.state == "completed"
+    assert exchange.completion_id == "0fe4f717"
+    assert exchange.reply.rstrip().endswith("CCB_DONE: 20261106-203214-836-218252")
+    recovered = session.completed_exchange("20261106-203214-836-218252")
+    assert recovered.state == "completed"
+    assert recovered.completion_id == "0fe4f717"
+
+
+def test_error_with_retry_edit_and_no_later_row_is_retrying(tmp_path: Path) -> None:
+    session_id = "11111111-1111-4111-8111-111111111111"
+    _write_rows(tmp_path, session_id, [_user_row("u1", None), _error_row("e1", "u1"), _edit_row("x1", "e1", "e1")])
+    exchange = load_session(tmp_path, session_id).exchange(REQ)
+    assert exchange.state == "retrying"
+    assert exchange.error_id == "e1"
+    assert "terminated" in exchange.reason
+
+
+def test_error_as_last_row_is_errored_with_its_entry_id(tmp_path: Path) -> None:
+    session_id = "22222222-2222-4222-8222-222222222222"
+    _write_rows(tmp_path, session_id, [_user_row("u1", None), _error_row("e1", "u1")])
+    exchange = load_session(tmp_path, session_id).exchange(REQ)
+    assert exchange.state == "errored"
+    assert exchange.error_id == "e1"
+    assert exchange.reason == "Pi turn failed: terminated"
+
+
+def test_error_with_later_messages_and_no_retry_edit_is_incomplete(tmp_path: Path) -> None:
+    session_id = "33333333-3333-4333-8333-333333333333"
+    _write_rows(tmp_path, session_id, [_user_row("u1", None), _error_row("e1", "u1"), _done_row("a1", "e1")])
+    exchange = load_session(tmp_path, session_id).exchange(REQ)
+    assert exchange.state == "incomplete"
+    assert exchange.reason == "Pi turn failed: terminated"
+
+
+def test_two_retries_then_done_completes(tmp_path: Path) -> None:
+    session_id = "44444444-4444-4444-8444-444444444444"
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "e1"),
+        _error_row("e2", "x1"),
+        _edit_row("x2", "e2", "e2"),
+        _done_row("a1", "x2"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "completed"
+
+
+def test_exhausted_retry_ending_in_error_is_errored_then_final(tmp_path: Path) -> None:
+    session_id = "55555555-5555-4555-8555-555555555555"
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "e1"),
+        _error_row("e2", "x1"),
+    ])
+    exchange = load_session(tmp_path, session_id).exchange(REQ)
+    assert exchange.state == "errored" and exchange.error_id == "e2"
+
+    # A trailing non-message row is a permitted intervening row, not a final outcome.
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "e1"),
+        _error_row("e2", "x1"),
+        {"type": "model_change", "id": "m1", "parentId": "e2", "provider": "p", "modelId": "m"},
+    ])
+    trailing = load_session(tmp_path, session_id).exchange(REQ)
+    assert trailing.state == "errored" and trailing.error_id == "e2"
+
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "e1"),
+        _error_row("e2", "x1"),
+        _done_row("a1", "e2"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "incomplete"
+
+
+def test_retry_edit_behind_own_tool_results_is_accepted(tmp_path: Path) -> None:
+    session_id = "66666666-6666-4666-8666-666666666666"
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1", tool_call="call-1"),
+        _tool_result_row("t1", "e1", "call-1"),
+        _edit_row("x1", "t1", "e1"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "retrying"
+
+
+def test_user_message_before_retry_edit_is_not_a_retry(tmp_path: Path) -> None:
+    session_id = "77777777-7777-4777-8777-777777777777"
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        {"type": "message", "id": "manual", "parentId": "e1", "message": {"role": "user", "content": [{"type": "text", "text": "continue"}]}},
+        _edit_row("x1", "manual", "e1"),
+    ])
+    exchange = load_session(tmp_path, session_id).exchange(REQ)
+    assert exchange.state == "incomplete"
+    assert exchange.reason == "Pi turn failed: terminated"
+
+
+def test_unrelated_edit_does_not_suppress_the_error(tmp_path: Path) -> None:
+    session_id = "88888888-8888-4888-8888-888888888888"
+    # An edit for another entry is a permitted intervening row: the error is still not retried,
+    # so the failure waits for its retry edit (non-final "errored") instead of being final.
+    _write_rows(tmp_path, session_id, [_user_row("u1", None), _error_row("e1", "u1"), _edit_row("x1", "e1", "other")])
+    unrelated = load_session(tmp_path, session_id).exchange(REQ)
+    assert unrelated.state == "errored" and unrelated.error_id == "e1"
+
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "other"),
+        _edit_row("x2", "x1", "e1"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "retrying"
+
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "other"),
+        _done_row("a1", "x1"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "incomplete"
+
+
+def test_non_null_replacement_edit_does_not_suppress_the_error(tmp_path: Path) -> None:
+    session_id = "99999999-9999-4999-8999-999999999999"
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "e1", replacement=[{"type": "text", "text": "edited"}]),
+    ])
+    replaced = load_session(tmp_path, session_id).exchange(REQ)
+    assert replaced.state == "errored" and replaced.error_id == "e1"
+
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _edit_row("x1", "e1", "e1", replacement=[{"type": "text", "text": "edited"}]),
+        _done_row("a1", "x1"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "incomplete"
+
+
+def _custom_message_row(row_id: str, parent: str | None) -> dict:
+    return {
+        "type": "custom_message", "id": row_id, "parentId": parent, "timestamp": "2026-11-06T20:32:48.946Z",
+        "customType": "placeholder", "content": [{"type": "text", "text": "placeholder"}], "display": True,
+    }
+
+
+def test_failed_turn_with_custom_message_flush_stays_errored_then_retries(tmp_path: Path) -> None:
+    session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    # Pi flushes pending custom messages at turn end, before it writes the recovery edit.
+    _write_rows(tmp_path, session_id, [_user_row("u1", None), _error_row("e1", "u1"), _custom_message_row("c1", "e1")])
+    flushed = load_session(tmp_path, session_id).exchange(REQ)
+    assert flushed.state == "errored"
+    assert flushed.error_id == "e1"
+
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _custom_message_row("c1", "e1"),
+        _edit_row("x1", "c1", "e1"),
+    ])
+    assert load_session(tmp_path, session_id).exchange(REQ).state == "retrying"
+
+    _write_rows(tmp_path, session_id, [
+        _user_row("u1", None),
+        _error_row("e1", "u1"),
+        _custom_message_row("c1", "e1"),
+        _edit_row("x1", "c1", "e1"),
+        _done_row("a1", "x1"),
+    ])
+    completed = load_session(tmp_path, session_id).exchange(REQ)
+    assert completed.state == "completed"
+    assert "CCB_DONE: " + REQ in completed.reply

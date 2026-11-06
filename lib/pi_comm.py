@@ -64,7 +64,8 @@ class PiSession:
         start = chain_ids.index(anchor_id)
         rows = chain[start:]
         parked = False
-        for row in rows[1:]:
+        for index in range(1, len(rows)):
+            row = rows[index]
             message = _message(row)
             if row.get("type") == "message" and message.get("role") == "user":
                 later_ids = [rid for rid in _REQ_LINE.findall(_text_parts(message.get("content"))) if rid]
@@ -81,7 +82,22 @@ class PiSession:
                 if message.get("errorMessage") == ABORTED_ERROR:
                     parked = True
                     continue
-                return PiExchange("incomplete", reason=f"Pi turn failed: {message.get('errorMessage') or 'unknown error'}", rows=tuple(rows))
+                reason = f"Pi turn failed: {message.get('errorMessage') or 'unknown error'}"
+                error_id = str(row.get("id") or "")
+                retry_index, blocked_index = _retry_edit_scan(rows, index)
+                if retry_index is None and blocked_index is not None:
+                    return PiExchange("incomplete", reason=reason, rows=tuple(rows))
+                if retry_index is None:
+                    # Pi writes its retry context_edit after flushing pending custom messages at turn
+                    # end, so a read can land on a failed row before the edit exists. Carries the
+                    # failed entry id for its own grace window.
+                    return PiExchange("errored", reason=reason, rows=tuple(rows), error_id=error_id)
+                if not any(
+                    later.get("type") == "message" and _message(later).get("role") in {"user", "assistant"}
+                    for later in rows[retry_index + 1:]
+                ):
+                    return PiExchange("retrying", reason=reason, rows=tuple(rows), error_id=error_id)
+                continue
             if stop_reason != "stop":
                 continue
             parts = message.get("content")
@@ -152,6 +168,35 @@ class PiExchange:
     reason: str = ""
     rows: tuple[dict[str, Any], ...] = ()
     completion_id: str = ""
+    error_id: str = ""
+
+
+def _retry_edit_scan(rows: list[dict[str, Any]], index: int) -> tuple[int | None, int | None]:
+    """Scan the rows after the failed assistant row at `index` for Pi's retry edit.
+
+    Returns `(edit_index, blocked_index)`: `edit_index` is the retry edit (a null-replacement
+    `context_edit` whose targetId is the failed row); `blocked_index` is the first row that ends the
+    attempt, i.e. any message row other than the failed row's own toolResult rows. At most one is
+    set; both are None when only permitted intervening rows follow and no retry edit exists yet
+    (Pi flushes pending custom messages at turn end before deciding to retry, so those, model or
+    thinking-level changes, other Pi non-message rows and unrelated edits may appear first).
+    """
+    failed = rows[index]
+    error_id = str(failed.get("id") or "")
+    tool_ids = {
+        str(part.get("id") or "") for part in _message(failed).get("content") or []
+        if isinstance(part, dict) and part.get("type") == "toolCall"
+    }
+    for later_index in range(index + 1, len(rows)):
+        later = rows[later_index]
+        if later.get("type") == "message":
+            message = _message(later)
+            if message.get("role") == "toolResult" and str(message.get("toolCallId") or "") in tool_ids:
+                continue
+            return None, later_index
+        if later.get("type") == "context_edit" and later.get("replacement") is None and str(later.get("targetId") or "") == error_id:
+            return later_index, None
+    return None, None
 
 
 def _message(entry: dict[str, Any]) -> dict[str, Any]:

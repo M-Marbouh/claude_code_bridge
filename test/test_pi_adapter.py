@@ -682,3 +682,284 @@ def test_spaced_custom_loader_frame_refuses_with_zero_sends(monkeypatch, tmp_pat
     assert result.exit_code == 1
     assert "busy" in result.reply
     assert backend.sent == []
+
+
+class _Clock:
+    """Monotonic clock driven by a tick list; the current tick is visible to screens."""
+
+    def __init__(self, monkeypatch, ticks: list[float]):
+        self.now = 0.0
+        self._ticks = iter(ticks)
+        monkeypatch.setattr("askd.adapters.pi.time.monotonic", self)
+        monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+    def __call__(self) -> float:
+        self.now = next(self._ticks)
+        return self.now
+
+
+def _session_header(session_id: str, work_dir: Path) -> dict:
+    return {"type": "session", "id": session_id, "cwd": str(work_dir), "version": 3}
+
+
+def _anchor_row(req_id: str) -> dict:
+    return {"type": "message", "id": "user1", "parentId": None, "message": {"role": "user", "content": [{"type": "text", "text": f"CCB_REQ_ID: {req_id}\nrequest"}]}}
+
+
+def _error_session_row(row_id: str, parent: str | None) -> dict:
+    return {"type": "message", "id": row_id, "parentId": parent, "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "t"}], "stopReason": "error", "errorMessage": "terminated"}}
+
+
+def _retry_edit_row(row_id: str, parent: str, target: str) -> dict:
+    return {"type": "context_edit", "id": row_id, "parentId": parent, "targetId": target, "replacement": None}
+
+
+def _done_session_row(row_id: str, parent: str, req_id: str) -> dict:
+    return {"type": "message", "id": row_id, "parentId": parent, "message": {"role": "assistant", "content": [{"type": "text", "text": f"answer\nCCB_DONE: {req_id}"}], "stopReason": "stop"}}
+
+
+def _write_session(path: Path, work_dir: Path, session_id: str, rows: list[dict]) -> None:
+    path.write_text("".join(json.dumps(row) + "\n" for row in [_session_header(session_id, work_dir), *rows]))
+
+
+def _adapt_with_session(monkeypatch, tmp_path: Path, session_id: str, session_path: Path, backend: FakeBackend, first_rows: list[dict]):
+    binding = _binding(tmp_path, session_path.parent, session_id)
+
+    def send(pane, text):
+        backend.sent.append((pane, text))
+        _write_session(session_path, tmp_path, session_id, first_rows)
+
+    backend.send_text = send
+    monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
+    monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    adapter = PiAdapter()
+    monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
+    return adapter
+
+
+def test_retrying_turn_delivers_the_later_reply(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "retry-then-done"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1")],
+    )
+    alive = {"calls": 0}
+
+    def is_alive(_pane):
+        alive["calls"] += 1
+        if alive["calls"] == 2:
+            _write_session(session_path, tmp_path, session_id, [
+                _anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1"),
+                _done_session_row("final1", "edit1", req_id),
+            ])
+        return True
+
+    backend.is_alive = is_alive
+    _Clock(monkeypatch, [0.0, 0.0, 0.0, 0.5])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0
+    assert result.reply.strip() == "answer"
+    assert len(backend.sent) == 1
+
+
+def test_retrying_turn_stops_after_confirmed_idle_retry_window(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "retry-cancelled"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1")],
+    )
+    clock = _Clock(monkeypatch, [0.0, 0.0, 0.0, 29.9, 30.1])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 2
+    assert result.reply == "Pi retry stopped before a reply"
+    assert result.status == "incomplete"
+    # Survived 29.9 s of idle and ended at 30.1 s, well before the parked 60 s deadline.
+    assert clock.now == 30.1
+    assert len(backend.sent) == 1
+
+
+def test_retrying_idle_window_resets_on_activity(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "retry-restarted-clock"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1")],
+    )
+    idle_screen = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    busy_screen = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    clock = _Clock(monkeypatch, [0.0, 0.0, 0.0, 29.9, 30.0, 59.9, 90.1, 120.2])
+    backend.get_pane_content = lambda _pane, lines=40: busy_screen if 30.0 <= clock.now < 60.0 else idle_screen
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 2
+    assert result.reply == "Pi retry stopped before a reply"
+    # 30.1 s of idle only counted after the last non-idle read at 59.9, not from t=0.
+    assert clock.now >= 90.1
+
+
+def test_errored_turn_becomes_incomplete_after_grace(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "error-no-edit"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1")],
+    )
+    clock = _Clock(monkeypatch, [0.0, 0.0, 0.0, 9.9, 10.1])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 2
+    assert result.reply == "Pi turn failed: terminated"
+    assert result.status == "incomplete"
+    # Ended only after the 10 s grace (still running at 9.9 s).
+    assert clock.now == 10.1
+
+
+def test_retry_edit_within_grace_keeps_waiting_and_completes(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "late-edit"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1")],
+    )
+    alive = {"calls": 0}
+
+    def is_alive(_pane):
+        alive["calls"] += 1
+        if alive["calls"] == 2:
+            _write_session(session_path, tmp_path, session_id, [
+                _anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1"),
+                _done_session_row("final1", "edit1", req_id),
+            ])
+        return True
+
+    backend.is_alive = is_alive
+    _Clock(monkeypatch, [0.0, 0.0, 0.0, 9.0])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0
+    assert result.reply.strip() == "answer"
+
+
+def test_errored_grace_restarts_for_a_later_failed_retry(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "two-failures"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1")],
+    )
+    alive = {"calls": 0}
+
+    def is_alive(_pane):
+        alive["calls"] += 1
+        if alive["calls"] == 2:
+            _write_session(session_path, tmp_path, session_id, [
+                _anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1"),
+                _error_session_row("err2", "edit1"),
+            ])
+        return True
+
+    backend.is_alive = is_alive
+    clock = _Clock(monkeypatch, [0.0, 0.0, 0.0, 5.0, 12.0, 15.1])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 2
+    assert result.reply == "Pi turn failed: terminated"
+    assert result.status == "incomplete"
+    # 12.0 - 0.0 is past the first grace, so the window restarted at the second failure (5.0)
+    # and only expired at 15.1.
+    assert clock.now == 15.1
+
+
+def _custom_session_row(row_id: str, parent: str | None) -> dict:
+    return {
+        "type": "custom_message", "id": row_id, "parentId": parent, "timestamp": "2026-11-06T20:32:48.946Z",
+        "customType": "placeholder", "content": [{"type": "text", "text": "placeholder"}], "display": True,
+    }
+
+
+def test_custom_message_flush_before_retry_edit_still_delivers_the_reply(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "flush-then-retry"
+    backend = FakeBackend()
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), _error_session_row("err1", "user1")],
+    )
+    alive = {"calls": 0}
+
+    def is_alive(_pane):
+        alive["calls"] += 1
+        if alive["calls"] == 2:
+            _write_session(session_path, tmp_path, session_id, [
+                _anchor_row(req_id), _error_session_row("err1", "user1"),
+                _custom_session_row("custom1", "err1"),
+            ])
+        if alive["calls"] == 3:
+            _write_session(session_path, tmp_path, session_id, [
+                _anchor_row(req_id), _error_session_row("err1", "user1"),
+                _custom_session_row("custom1", "err1"),
+                _retry_edit_row("edit1", "custom1", "err1"),
+                _done_session_row("final1", "edit1", req_id),
+            ])
+        return True
+
+    backend.is_alive = is_alive
+    _Clock(monkeypatch, [0.0, 0.0, 0.0, 1.0, 2.0])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0
+    assert result.reply.strip() == "answer"
+    assert len(backend.sent) == 1
+
+
+def test_errored_state_without_an_entry_id_still_expires_after_grace(monkeypatch, tmp_path: Path):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_path = session_dir / f"2026-11-06T18-00-00.000Z_{session_id}.jsonl"
+    req_id = "error-without-id"
+    backend = FakeBackend()
+    identless_error = _error_session_row("ignored", "user1")
+    identless_error.pop("id")
+    adapter = _adapt_with_session(
+        monkeypatch, tmp_path, session_id, session_path, backend,
+        [_anchor_row(req_id), identless_error],
+    )
+    clock = _Clock(monkeypatch, [0.0, 0.0, 0.0, 10.1])
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 2
+    assert result.reply == "Pi turn failed: terminated"
+    assert result.status == "incomplete"
+    assert clock.now == 10.1

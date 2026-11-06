@@ -24,6 +24,10 @@ from terminal import get_backend_for_session
 
 PARK_TIMEOUT_S = 60.0
 ANCHOR_TIMEOUT_S = 12.0
+# Pi writes its retry context_edit ~1 ms after a failed row; a session read can land in between.
+ERROR_GRACE_S = 10.0
+# A retry whose pane stays confirmed idle this long has stopped without writing a reply.
+RETRY_IDLE_S = 30.0
 
 
 def _write_log(line: str) -> None:
@@ -262,6 +266,9 @@ class PiAdapter(BaseProviderAdapter):
 
         deadline = None if float(req.timeout_s) < 0 else started + float(req.timeout_s)
         parked_at: float | None = None
+        errored_at: float | None = None
+        errored_id = ""
+        retry_idle_at: float | None = None
         anchor_seen = False
         anchor_ms: int | None = None
         saw_busy = False
@@ -341,6 +348,43 @@ class PiAdapter(BaseProviderAdapter):
                     break
                 if exchange.state != "parked":
                     parked_at = None
+                if exchange.state == "errored":
+                    # Grace is per failed entry id: a later failed retry starts a fresh window.
+                    if errored_at is None or exchange.error_id != errored_id:
+                        errored_id = exchange.error_id
+                        errored_at = now
+                    elif errored_at is not None and now - errored_at >= ERROR_GRACE_S:
+                        result = ProviderResult(
+                            exit_code=2, reply=exchange.reason, req_id=task.req_id,
+                            session_key=session_key, done_seen=False, anchor_seen=anchor_seen,
+                            anchor_ms=anchor_ms, log_path=transcript_path,
+                            status=COMPLETION_STATUS_INCOMPLETE,
+                            extra={"destination_transcript_path": transcript_path, "destination_conversation_id": pi_session_id},
+                        )
+                        break
+                else:
+                    errored_id = ""
+                    errored_at = None
+                if exchange.state == "retrying":
+                    # Pi retries on its own: watch the pane instead of the parked deadline.
+                    # Unknown reads reset the timer, so an operator draft here waits for the overall
+                    # timeout just like pending; that residual is unchanged from today.
+                    if _capture_confirmed_state(backend, str(session["pane_id"])) == "idle":
+                        if retry_idle_at is None:
+                            retry_idle_at = now
+                        elif now - retry_idle_at >= RETRY_IDLE_S:
+                            result = ProviderResult(
+                                exit_code=2, reply="Pi retry stopped before a reply",
+                                req_id=task.req_id, session_key=session_key, done_seen=False,
+                                anchor_seen=anchor_seen, anchor_ms=anchor_ms, log_path=transcript_path,
+                                status=COMPLETION_STATUS_INCOMPLETE,
+                                extra={"destination_transcript_path": transcript_path, "destination_conversation_id": pi_session_id},
+                            )
+                            break
+                    else:
+                        retry_idle_at = None
+                else:
+                    retry_idle_at = None
                 if parked_at is not None and now - parked_at >= PARK_TIMEOUT_S:
                     result = ProviderResult(
                         exit_code=2, reply="Pi interrupted request continuation deadline expired.",

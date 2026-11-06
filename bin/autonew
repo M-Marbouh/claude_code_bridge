@@ -6,7 +6,11 @@ Usage:
     autonew <provider>
 
 Providers:
-    gemini, codex, opencode, claude
+    gemini, codex, opencode, claude, pi
+
+Pi is gated: it refuses (exit 1, nothing typed) unless the project publishes exactly one live Pi
+session, that pane's identity verifies, and the pane is confirmed idle. A reset that lands on a busy
+Pi would drop the in-flight turn, and one that lands on a draft would concatenate with it.
 
 This command directly sends '/new' to the provider's terminal pane
 without any context injection or protocol wrapping.
@@ -24,6 +28,7 @@ sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_OK
 from pane_registry import load_registry_by_project_id, _get_providers_map
+from pi_comm import reset_destination
 from project_id import compute_ccb_project_id
 from terminal import get_backend_for_session
 
@@ -34,6 +39,7 @@ PROVIDER_COMMANDS = {
     "codex": "/new",
     "opencode": "/new",
     "claude": "/new",
+    "pi": "/new",
 }
 
 
@@ -41,7 +47,7 @@ def _usage() -> None:
     print("Usage: autonew <provider>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, claude, pi", file=sys.stderr)
     print("", file=sys.stderr)
     print("Sends /new to the provider's pane to start a new session.", file=sys.stderr)
 
@@ -62,43 +68,51 @@ def main(argv: list[str]) -> int:
         print(f"[ERROR] Available: {', '.join(sorted(PROVIDER_COMMANDS.keys()))}", file=sys.stderr)
         return EXIT_ERROR
 
-    # Get current project ID
     work_dir = Path(os.getcwd())
-    try:
-        project_id = compute_ccb_project_id(work_dir)
-    except Exception as e:
-        print(f"[ERROR] Failed to compute project ID: {e}", file=sys.stderr)
-        return EXIT_ERROR
 
-    # Load registry for this project and provider
-    record = load_registry_by_project_id(project_id, provider)
-    if not record:
-        print(f"[ERROR] No active {provider} session found for this project.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Get provider's pane_id
-    providers_map = _get_providers_map(record)
-    provider_entry = providers_map.get(provider, {})
-    pane_id = str(provider_entry.get("pane_id") or "").strip()
-
-    if not pane_id:
-        print(f"[ERROR] No pane_id found for {provider}.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Get terminal backend
-    backend = get_backend_for_session(record)
-    if not backend:
-        print("[ERROR] Terminal backend not available.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Check if pane is alive
-    try:
-        if not backend.is_alive(pane_id):
-            print(f"[ERROR] {provider} pane {pane_id} is not alive.", file=sys.stderr)
+    if provider == "pi":
+        # Fail-closed gate: unique live Pi session, verified pane identity, confirmed idle pane.
+        backend, pane_id, error = reset_destination(work_dir)
+        if error:
+            print(f"[ERROR] {provider}: {error}", file=sys.stderr)
             return EXIT_ERROR
-    except Exception as e:
-        print(f"[ERROR] Failed to check pane status: {e}", file=sys.stderr)
-        return EXIT_ERROR
+    else:
+        # Get current project ID
+        try:
+            project_id = compute_ccb_project_id(work_dir)
+        except Exception as e:
+            print(f"[ERROR] Failed to compute project ID: {e}", file=sys.stderr)
+            return EXIT_ERROR
+
+        # Load registry for this project and provider
+        record = load_registry_by_project_id(project_id, provider)
+        if not record:
+            print(f"[ERROR] No active {provider} session found for this project.", file=sys.stderr)
+            return EXIT_ERROR
+
+        # Get provider's pane_id
+        providers_map = _get_providers_map(record)
+        provider_entry = providers_map.get(provider, {})
+        pane_id = str(provider_entry.get("pane_id") or "").strip()
+
+        if not pane_id:
+            print(f"[ERROR] No pane_id found for {provider}.", file=sys.stderr)
+            return EXIT_ERROR
+
+        # Get terminal backend
+        backend = get_backend_for_session(record)
+        if not backend:
+            print("[ERROR] Terminal backend not available.", file=sys.stderr)
+            return EXIT_ERROR
+
+        # Check if pane is alive
+        try:
+            if not backend.is_alive(pane_id):
+                print(f"[ERROR] {provider} pane {pane_id} is not alive.", file=sys.stderr)
+                return EXIT_ERROR
+        except Exception as e:
+            print(f"[ERROR] Failed to check pane status: {e}", file=sys.stderr)
+            return EXIT_ERROR
 
     # Send reset command to the pane
     reset_cmd = PROVIDER_COMMANDS[provider]

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -355,38 +356,224 @@ class PiCommunicator:
     """Pane and exact-session health probe used by ccb-ping."""
 
     def ping(self, display: bool = True) -> tuple[bool, str]:
-        from terminal import get_backend_for_session
-
-        loaded = load_session_file(Path.cwd(), os.environ.get("CCB_SESSION_FILE"))
-        if not loaded:
-            return False, "Pi session file not found"
-        _path, data = loaded
-        if data.get("active") is not True:
-            return False, "Pi session is inactive"
-        pane_id = str(data.get("pane_id") or "").strip()
-        marker = str(data.get("pane_title_marker") or "").strip()
-        backend = get_backend_for_session(data)
-        if not pane_id or not marker or backend is None or not backend.is_alive(pane_id):
-            return False, "Pi pane is not active"
-        finder = getattr(backend, "find_pane_by_title_marker", None)
-        if not callable(finder) or str(finder(marker, str(Path.cwd())) or "").strip() != pane_id:
-            return False, "Pi pane identity could not be verified"
-        session_dir_raw = str(data.get("pi_session_dir") or "").strip()
-        session_dir = Path(session_dir_raw).expanduser() if session_dir_raw else None
-        session_id = str(data.get("pi_session_id") or "").strip()
-        if not session_id or session_dir is None:
-            return False, "Pi session binding is incomplete"
-        try:
-            load_session(session_dir, session_id)
-        except PiSessionError as exc:
-            if exc.kind != "not_created":
-                return False, str(exc)
+        backend, pane_id, _data, error = _verify_pane(Path.cwd(), os.environ.get("CCB_SESSION_FILE"))
+        if error:
+            return False, error
         screen = backend.get_pane_content(pane_id, lines=40)
         state = classify_pane_screen(screen or "")
         if state != "idle":
             return False, f"Pi pane is {state}; input is not verified idle"
         return True, "Pi pane and session are ready"
 
+
+def _verify_pane(
+    work_dir: Path, explicit_path: str | Path | None = None
+) -> tuple[Any, str, dict[str, Any] | None, str]:
+    """The ccb-ping readiness evidence: (backend, pane_id, binding, error).
+
+    Identical checks and messages to `PiCommunicator.ping`, minus the idle screen read, so callers that
+    must act on the pane (ccb-ping refuses, autonew sends) share one destination verification.
+    """
+    from terminal import get_backend_for_session
+
+    loaded = load_session_file(work_dir, explicit_path)
+    if not loaded:
+        return None, "", None, "Pi session file not found"
+    _path, data = loaded
+    if data.get("active") is not True:
+        return None, "", data, "Pi session is inactive"
+    pane_id = str(data.get("pane_id") or "").strip()
+    marker = str(data.get("pane_title_marker") or "").strip()
+    backend = get_backend_for_session(data)
+    if not pane_id or not marker or backend is None or not backend.is_alive(pane_id):
+        return None, "", data, "Pi pane is not active"
+    finder = getattr(backend, "find_pane_by_title_marker", None)
+    if not callable(finder) or str(finder(marker, str(work_dir)) or "").strip() != pane_id:
+        return None, "", data, "Pi pane identity could not be verified"
+    session_dir_raw = str(data.get("pi_session_dir") or "").strip()
+    session_dir = Path(session_dir_raw).expanduser() if session_dir_raw else None
+    session_id = str(data.get("pi_session_id") or "").strip()
+    if not session_id or session_dir is None:
+        return None, "", data, "Pi session binding is incomplete"
+    try:
+        load_session(session_dir, session_id)
+    except PiSessionError as exc:
+        if exc.kind != "not_created":
+            return None, "", data, str(exc)
+    return backend, pane_id, data, ""
+
+
+def capture_screen_state(backend: Any, pane_id: str) -> tuple[str, str | None]:
+    """Classify one pane capture; ("unknown", None) when the capture is unavailable."""
+    try:
+        screen = backend.get_pane_content(pane_id, lines=40)
+    except Exception:
+        return "unknown", None
+    if screen is None:
+        return "unknown", None
+    return classify_pane_screen(screen), screen
+
+
+def screen_context(screen: str) -> tuple[str, ...] | None:
+    """The two lines above the last editor rule; a repaint moves them."""
+    lines = screen.splitlines()
+    for index in range(len(lines) - 4, -1, -1):
+        if lines[index].startswith("─"):
+            return tuple(lines[max(0, index - 2):index])
+    return None
+
+
+def capture_confirmed_state(backend: Any, pane_id: str) -> str:
+    """Double capture: "idle" only when two reads agree the pane is idle.
+
+    Shared by the askd adapter (pre-send readiness, retry idle window) and autonew (a reset must never
+    land on a busy pane or concatenate with an editor draft).
+    """
+    first_state, first_screen = capture_screen_state(backend, pane_id)
+    if first_screen is None or first_state != "idle":
+        return first_state
+    time.sleep(0.2)
+    second_state, second_screen = capture_screen_state(backend, pane_id)
+    if second_screen is None:
+        return "unknown"
+    if screen_context(first_screen) != screen_context(second_screen):
+        return "busy"
+    return second_state
+
+
+@dataclass(frozen=True)
+class LivePiSession:
+    """One live Pi session a launch record publishes (autonew destination evidence)."""
+
+    launch_id: str
+    pane_id: str
+    terminal: str = ""
+
+
+def _live_session_pane_alive(record: dict[str, Any], session: Any) -> bool:
+    """Apply `_provider_pane_alive`'s pane rules to a `live_sessions` member.
+
+    Reuses that one implementation by projecting the member into the record shape it reads
+    (terminal, work_dir, providers), so inventory members and provider entries are judged alike.
+    """
+    from pane_registry import _provider_pane_alive
+
+    return _provider_pane_alive(
+        {
+            "terminal": session.terminal or str(record.get("terminal") or ""),
+            "work_dir": session.work_dir or str(record.get("work_dir") or ""),
+            "providers": {
+                "pi": {"pane_id": session.pane_id, "pane_title_marker": session.pane_title_marker},
+            },
+        },
+        "pi",
+    )
+
+
+def live_pi_sessions(project_id: str) -> tuple[tuple[LivePiSession, ...], str]:
+    """The live Pi sessions this project's launch records publish, by the registry's own rules.
+
+    A record counts only when it is not stale and its project matches, exactly as
+    `load_registry_by_project_id` qualifies records. A Pi session counts only when it is active AND
+    its pane is alive with a matching title marker: the rule `_provider_pane_alive` applies to
+    provider entries, applied here to `live_sessions` members too. Returns `(sessions, error)`;
+    `error` is set when a launch's inventory is broken, because then "exactly one" cannot be proven.
+    """
+    from pane_registry import (
+        _coerce_updated_at,
+        _get_providers_map,
+        _is_stale,
+        _iter_registry_files,
+        _load_registry_file,
+        _provider_pane_alive,
+        read_inventory_for_record,
+    )
+    from project_id import compute_ccb_project_id
+
+    wanted = (project_id or "").strip()
+    found: list[LivePiSession] = []
+    for path in _iter_registry_files():
+        record = _load_registry_file(path)
+        if not record:
+            continue
+        if _is_stale(_coerce_updated_at(record.get("updated_at"), path)):
+            continue
+        record_project = str(record.get("ccb_project_id") or "").strip()
+        if not record_project:
+            work_dir = str(record.get("work_dir") or "").strip()
+            try:
+                record_project = compute_ccb_project_id(Path(work_dir)) if work_dir else ""
+            except Exception:
+                record_project = ""
+        if not wanted or record_project != wanted:
+            continue
+        launch_id = str(record.get("ccb_session_id") or "").strip()
+        record_terminal = str(record.get("terminal") or "").strip().lower()
+        inventory = read_inventory_for_record(record)
+        if inventory.status == "invalid":
+            return (), f"a launch for this project ({launch_id}) publishes a broken Pi inventory; refusing to guess a destination"
+        if inventory.status == "valid":
+            for session in inventory.sessions:
+                if session.provider != "pi" or not session.active:
+                    continue
+                if not _live_session_pane_alive(record, session):
+                    continue
+                found.append(LivePiSession(
+                    launch_id=session.launch_id or launch_id,
+                    pane_id=session.pane_id,
+                    terminal=(session.terminal or record_terminal).strip().lower(),
+                ))
+            continue
+        entry = _get_providers_map(record).get("pi")
+        if isinstance(entry, dict) and _provider_pane_alive(record, "pi"):
+            found.append(LivePiSession(
+                launch_id=launch_id,
+                pane_id=str(entry.get("pane_id") or "").strip(),
+                terminal=str(entry.get("terminal") or record_terminal).strip().lower(),
+            ))
+    return tuple(found), ""
+
+
+def reset_destination(work_dir: Path) -> tuple[Any, str, str]:
+    """Resolve the single live, idle Pi pane that `/new` may be sent to: (backend, pane_id, error).
+
+    Fail-closed. Requires exactly one eligible live Pi session for the project (none and several both
+    refuse), and corroborates that session against the binding: same launch, same terminal backend,
+    same pane id. Then the binding and pane identity must verify and the pane must be confirmed idle.
+    """
+    from project_id import compute_ccb_project_id
+
+    try:
+        project_id = compute_ccb_project_id(work_dir)
+    except Exception as exc:
+        return None, "", f"Pi project identity could not be computed: {exc}"
+    sessions, inventory_error = live_pi_sessions(project_id)
+    if inventory_error:
+        return None, "", inventory_error
+    if not sessions:
+        return None, "", "no live Pi session for this project; refusing to send /new"
+    if len(sessions) > 1:
+        return None, "", f"{len(sessions)} live Pi sessions for this project; refusing to pick one"
+    backend, pane_id, binding, error = _verify_pane(work_dir)
+    if error:
+        return None, "", error
+    bound = binding or {}
+    disagree = []
+    launch_id = str(bound.get("session_id") or "").strip()
+    terminal = str(bound.get("terminal") or "").strip().lower()
+    sole = sessions[0]
+    if sole.launch_id != launch_id:
+        disagree.append(f"launch {sole.launch_id or '<none>'} is not binding launch {launch_id or '<none>'}")
+    if sole.terminal != terminal:
+        disagree.append(f"terminal {sole.terminal or '<none>'} is not binding terminal {terminal or '<none>'}")
+    if sole.pane_id != pane_id:
+        disagree.append(f"live pane {sole.pane_id or '<none>'} is not binding pane {pane_id or '<none>'}")
+    if disagree:
+        return None, "", "Pi destination disagrees with its binding: " + "; ".join(disagree)
+    state = capture_confirmed_state(backend, pane_id)
+    if state != "idle":
+        return None, "", f"Pi pane is {state}; refusing to send /new"
+    return backend, pane_id, ""
 
 _DIALOG_MARKERS = (
     "Project trust",

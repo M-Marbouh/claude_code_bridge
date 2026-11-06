@@ -16,7 +16,15 @@ from completion_hook import (
     notify_completion,
 )
 from pane_registry import validate_route
-from pi_comm import PiExchange, PiSessionError, classify_pane_screen, load_candidate_sessions
+from pi_comm import (
+    PiExchange,
+    PiSessionError,
+    capture_confirmed_state,
+    capture_screen_state,
+    classify_pane_screen,
+    load_candidate_sessions,
+    screen_context,
+)
 from project_id import compute_ccb_project_id
 from providers import PI_SPEC
 from task_receipts import PersistOutcome, persist_proven_result
@@ -91,35 +99,10 @@ def _check_pane(data: dict[str, Any], work_dir: Path):
     return backend, ""
 
 
-def _capture_screen_state(backend: Any, pane_id: str) -> tuple[str, str | None]:
-    try:
-        screen = backend.get_pane_content(pane_id, lines=40)
-    except Exception:
-        return "unknown", None
-    if screen is None:
-        return "unknown", None
-    return classify_pane_screen(screen), screen
-
-
-def _screen_context(screen: str) -> tuple[str, ...] | None:
-    lines = screen.splitlines()
-    for index in range(len(lines) - 4, -1, -1):
-        if lines[index].startswith("─"):
-            return tuple(lines[max(0, index - 2):index])
-    return None
-
-
-def _capture_confirmed_state(backend: Any, pane_id: str) -> str:
-    first_state, first_screen = _capture_screen_state(backend, pane_id)
-    if first_screen is None or first_state != "idle":
-        return first_state
-    time.sleep(0.2)
-    second_state, second_screen = _capture_screen_state(backend, pane_id)
-    if second_screen is None:
-        return "unknown"
-    if _screen_context(first_screen) != _screen_context(second_screen):
-        return "busy"
-    return second_state
+# The capture helpers live in pi_comm so autonew's Pi gate and this adapter share one implementation.
+_capture_screen_state = capture_screen_state
+_screen_context = screen_context
+_capture_confirmed_state = capture_confirmed_state
 
 
 def _anchor_landed(

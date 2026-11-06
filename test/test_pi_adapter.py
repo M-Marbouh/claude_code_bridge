@@ -297,6 +297,37 @@ def test_completed_reply_strips_trailing_done_marker(monkeypatch, tmp_path: Path
     assert result.reply.strip() == "PANEB"
 
 
+def _refuse_with_screen(monkeypatch, tmp_path: Path, screen: str, req_id: str):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, session_id)
+    backend = FakeBackend()
+    backend.get_pane_content = lambda *_args, **_kwargs: screen
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    return adapter.handle_task(_task(tmp_path, req_id)), backend
+
+
+def test_real_trust_dialog_screen_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
+    screen = (FIXTURES / "screen-trust-dialog.txt").read_text(encoding="utf-8")
+    result, backend = _refuse_with_screen(monkeypatch, tmp_path, screen, "trust-dialog-screen")
+    assert result.exit_code == 1
+    assert "project-trust or selector decision" in result.reply
+    assert backend.sent == []
+
+
+def test_editor_draft_with_quoted_marker_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
+    lines = (FIXTURES / "screen-idle-quoting-marker.txt").read_text(encoding="utf-8").splitlines()
+    rules = [index for index, line in enumerate(lines) if line.startswith("\u2500" * 8)]
+    lines[max(rules) - 1] = "draft text"
+    result, backend = _refuse_with_screen(monkeypatch, tmp_path, "\n".join(lines), "draft-marker-screen")
+    # An unrecognised editor region still falls back to the marker scan (ratified amendment 1),
+    # so the draft screen is refused as a dialog; what matters is that nothing is sent.
+    assert result.exit_code == 1
+    assert "selector decision" in result.reply
+    assert backend.sent == []
+
+
 def test_capture_failure_before_send_refuses_without_sending(monkeypatch, tmp_path: Path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()

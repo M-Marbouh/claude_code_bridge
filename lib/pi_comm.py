@@ -365,11 +365,26 @@ _LOADER_LINE = re.compile(
 
 
 def classify_pane_screen(screen: str) -> str:
-    """Classify pane readiness from visible dialogs, activity, and editor box."""
+    """Classify pane readiness from visible dialogs, activity, and editor box.
+
+    The editor-box structure decides first; the dialog-marker scan only runs when the
+    structure is unrecognised, so transcript text quoting a marker cannot fake a dialog.
+    Accepted limitation: an extension overlay that draws a built-in dialog title while
+    leaving the editor box visible now classifies as "idle" (the marker scan used to
+    catch it). Built-in selectors replace the editor box entirely, so they are unaffected.
+    """
     text = screen or ""
+    state = _classify_pane_structure(text)
+    if state in ("idle", "busy"):
+        return state
     if any(marker.casefold() in text.casefold() for marker in _DIALOG_MARKERS):
         return "dialog"
-    lines = text.splitlines()
+    return "unknown"
+
+
+def _classify_pane_structure(screen: str) -> str:
+    """Structural editor-box parse; "unknown" means no recognised editor box."""
+    lines = screen.splitlines()
     if len(lines) < 5 or not _MODEL_FOOTER.fullmatch(lines[-1]):
         return "unknown"
     if not _CWD_LINE.fullmatch(lines[-2]) or not _RULE_LINE.fullmatch(lines[-3]):

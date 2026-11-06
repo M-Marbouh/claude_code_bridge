@@ -282,3 +282,31 @@ def test_one_character_top_border_is_not_idle() -> None:
         "<CCB_CWD> (master)", "model • high",
     ])
     assert classify_pane_screen(screen) == "unknown"
+
+
+def _idle_marker_rule_index(lines: list[str]) -> int:
+    return max(index for index, line in enumerate(lines) if line.startswith("─" * 8))
+
+
+def test_real_trust_dialog_screen_is_dialog() -> None:
+    screen = (FIXTURES / "screen-trust-dialog.txt").read_text()
+    assert "Trust project folder?" in screen
+    assert classify_pane_screen(screen) == "dialog"
+
+
+def test_real_idle_screen_quoting_a_dialog_marker_stays_idle() -> None:
+    screen = (FIXTURES / "screen-idle-quoting-marker.txt").read_text()
+    assert "does not require project trust" in screen
+    assert classify_pane_screen(screen) == "idle"
+
+
+def test_real_busy_screen_quoting_a_dialog_marker_stays_busy() -> None:
+    screen = (FIXTURES / "screen-busy-quoting-marker.txt").read_text()
+    assert "does not require project trust" in screen
+    assert classify_pane_screen(screen) == "busy"
+
+
+def test_editor_draft_with_quoted_dialog_marker_is_not_idle() -> None:
+    lines = (FIXTURES / "screen-idle-quoting-marker.txt").read_text().splitlines()
+    lines[_idle_marker_rule_index(lines) - 1] = "draft text"
+    assert classify_pane_screen("\n".join(lines)) != "idle"

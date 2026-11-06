@@ -1930,7 +1930,12 @@ class AILauncher:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if session_id:
             data["claude_session_id"] = session_id
+        # Both launch-id names must name this launch. laskd rewrites this file
+        # from the registry and writes the launch id under `ccb_session_id`, so
+        # a relaunch that only restamped `session_id` left the previous
+        # launch's `ccb_session_id` behind and the binding contradicted itself.
         data["session_id"] = self.session_id
+        data["ccb_session_id"] = self.session_id
         try:
             data["ccb_project_id"] = compute_ccb_project_id(work_dir)
         except Exception:
@@ -3345,6 +3350,9 @@ class AILauncher:
         work_dir = self.project_root
         data.update({
             "session_id": self.session_id,
+            # Same launch id under both names; see the note in
+            # `_write_local_claude_session`.
+            "ccb_session_id": self.session_id,
             "ccb_project_id": compute_ccb_project_id(work_dir),
             "runtime_dir": str(runtime),
             "input_fifo": str(input_fifo),

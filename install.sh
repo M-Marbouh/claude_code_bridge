@@ -1585,6 +1585,15 @@ install_tmux_config() {
     echo "Installed: $git_install_path"
   fi
 
+  # Install ccb-activity.py (live CCB request counts for the status line)
+  local ccb_activity_script="$REPO_ROOT/config/ccb-activity.py"
+  local activity_install_path="$BIN_DIR/ccb-activity.py"
+  if [[ -f "$ccb_activity_script" ]]; then
+    cp "$ccb_activity_script" "$activity_install_path"
+    chmod +x "$activity_install_path"
+    echo "Installed: $activity_install_path"
+  fi
+
   # Install tmux UI toggle scripts (enable/disable CCB theming per-session)
   local ccb_tmux_on_script="$REPO_ROOT/config/ccb-tmux-on.sh"
   local ccb_tmux_off_script="$REPO_ROOT/config/ccb-tmux-off.sh"
@@ -1679,6 +1688,7 @@ uninstall_tmux_config() {
   local border_script="$BIN_DIR/ccb-border.sh"
   local tmux_on_script="$BIN_DIR/ccb-tmux-on.sh"
   local tmux_off_script="$BIN_DIR/ccb-tmux-off.sh"
+  local activity_script="$BIN_DIR/ccb-activity.py"
 
   # Remove ccb-status.sh script
   if [[ -f "$status_script" ]]; then
@@ -1690,6 +1700,12 @@ uninstall_tmux_config() {
   if [[ -f "$border_script" ]]; then
     rm -f "$border_script"
     echo "Removed: $border_script"
+  fi
+
+  # Remove ccb-activity.py script
+  if [[ -f "$activity_script" ]]; then
+    rm -f "$activity_script"
+    echo "Removed: $activity_script"
   fi
 
   # Remove tmux UI toggle scripts

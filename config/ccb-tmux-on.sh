@@ -4,15 +4,19 @@ set -euo pipefail
 command -v tmux >/dev/null 2>&1 || exit 0
 [[ -n "${TMUX:-}" ]] || exit 0
 
-session=""; window=""; owner="${CCB_SESSION_ID:-manual}"
+session=""; window=""; owner="${CCB_SESSION_ID:-manual}"; layout="${CCB_STATUS_BAR:-slim}"
 while (($#)); do
   case "$1" in
     --session) session="${2:-}"; shift 2 ;;
     --window) window="${2:-}"; shift 2 ;;
     --owner) owner="${2:-}"; shift 2 ;;
+    --layout) layout="${2:-}"; shift 2 ;;
     *) exit 2 ;;
   esac
 done
+# Status-bar layout: `slim` (default, one row) or `classic` (two rows). An
+# unknown value falls back to slim instead of failing the launch.
+case "$layout" in slim|classic) ;; *) layout=slim ;; esac
 if [[ -z "$session" ]]; then
   session="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{session_id}' 2>/dev/null || true)"
 fi
@@ -138,15 +142,25 @@ else
   bg="#1e1e2e"; fg="#cdd6f4"; muted="#6c7086"; blue="#89b4fa"; purple="#cba6f7"; red="#f38ba8"; orange="#fab387"; green="#a6e3a1"; teal="#94e2d5"
   border_inactive='fg=#3b4261,bold'; border_active='fg=#7aa2f7,bold'; pane_default_fg="#565f89"
 fi
-status_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ccb-status.sh"
-git_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ccb-git.sh"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+git_script="$script_dir/ccb-git.sh"
+activity_script="$script_dir/ccb-activity.py"
+# Live CCB request activity for the focused pane's project. The helper scopes
+# the shared daemon's queues to that project and prints nothing when idle or on
+# any error; it counts CCB requests only, never typing into a pane.
+status_activity="#($activity_script \"#{pane_id}\" \"#{pane_current_path}\")"
 tmux set-option -t "$session" status-position bottom
 tmux set-option -t "$session" status-interval "${CCB_TMUX_STATUS_INTERVAL:-5}"
 tmux set-option -t "$session" status-style "bg=$bg fg=$fg"
-tmux set-option -t "$session" status 2
+if [[ "$layout" == classic ]]; then
+  tmux set-option -t "$session" status 2
+  tmux set-option -t "$session" 'status-format[1]' "#[align=centre,bg=$bg,fg=$muted]Copy: MouseDrag  Paste: Shift-Ctrl-v  Focus: Ctrl-b o"
+else
+  # `status on` is tmux's one-row value; `status 1` is rejected as unknown.
+  tmux set-option -t "$session" status on
+fi
 tmux set-option -t "$session" status-left-length 80
-tmux set-option -t "$session" status-right-length 120
-tmux set-option -t "$session" 'status-format[1]' "#[align=centre,bg=$bg,fg=$muted]Copy: MouseDrag  Paste: Shift-Ctrl-v  Focus: Ctrl-b o"
+tmux set-option -t "$session" status-right-length 360
 tmux set-option -t "$session" 'status-format[0]' "#[align=left bg=$bg]#{T:status-left}#[align=centre fg=$muted]#{b:pane_current_path}#[align=right]#{T:status-right}"
 git_info='-'; [[ -x "$git_script" ]] && git_info="#($git_script \"#{pane_current_path}\")"
 accent="#{?client_prefix,$red,#{?pane_in_mode,$orange,$purple}}"
@@ -154,7 +168,11 @@ label='#{?client_prefix,KEY,#{?pane_in_mode,COPY,INPUT}}'
 tmux set-option -t "$session" status-left "#[fg=$bg,bg=$accent,bold] $label #[fg=$accent,bg=$purple]#[fg=$bg,bg=$purple] $git_info #[fg=$purple,bg=$bg]"
 ccb_version="$(ccb --print-version 2>/dev/null || echo '?')"
 tmux set-option -t "$session" @ccb_version "$ccb_version"
-status_right="#[fg=$red,bg=$bg]#[fg=$bg,bg=$red,bold] #{?#{@ccb_agent},#{@ccb_agent},-} #[fg=$purple,bg=$red]#[fg=$bg,bg=$purple,bold] CCB:#{@ccb_version} #[fg=$blue,bg=$purple]#[fg=$fg,bg=$blue] #($status_script modern) #[fg=$orange,bg=$blue]#[fg=$bg,bg=$orange,bold] %m/%d %a %H:%M #[default]#{T:@ccb_status_right_extra}"
+if [[ "$layout" == classic ]]; then
+  status_right="#[fg=$red,bg=$bg]#[fg=$bg,bg=$red,bold] #{?#{@ccb_agent},#{@ccb_agent},-} #[fg=$purple,bg=$red]#[fg=$bg,bg=$purple,bold] CCB:#{@ccb_version} #[fg=$blue,bg=$purple]#[fg=$fg,bg=$blue] $status_activity #[fg=$orange,bg=$blue]#[fg=$bg,bg=$orange,bold] %m/%d %a %H:%M #[default]#{T:@ccb_status_right_extra}"
+else
+  status_right="#[fg=$fg,bg=$bg]$status_activity #[default]#{T:@ccb_status_right_extra}"
+fi
 tmux set-option -t "$session" status-right "$status_right"
 tmux set-window-option -t "$window" window-status-format ''
 tmux set-window-option -t "$window" window-status-current-format ''

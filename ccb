@@ -606,6 +606,35 @@ def _shrink_ccb_logs() -> int:
     return removed
 
 
+STATUS_BAR_LAYOUTS = ("slim", "classic")
+
+
+def _resolve_status_bar_layout(config_data: dict) -> str:
+    """The tmux status-bar layout for this launch.
+
+    `CCB_STATUS_BAR` overrides `ccb.config`'s `status_bar`; the default is
+    `slim`. An unknown value is reported and falls back to `slim` -- the status
+    bar is cosmetic, so it must never fail a launch. A plain-text config carries
+    no such key and therefore gets `slim` too.
+    """
+    configured = config_data.get("status_bar") if isinstance(config_data, dict) else None
+    raw = os.environ.get("CCB_STATUS_BAR")
+    source = "CCB_STATUS_BAR"
+    if raw is None or not str(raw).strip():
+        raw = configured
+        source = "status_bar in ccb.config"
+    if raw is None or not str(raw).strip():
+        return "slim"
+    value = str(raw).strip().lower()
+    if value in STATUS_BAR_LAYOUTS:
+        return value
+    print(
+        f"⚠️ {source}: unknown status bar layout {raw!r}; using 'slim'",
+        file=sys.stderr,
+    )
+    return "slim"
+
+
 class AILauncher:
     def __init__(
         self,
@@ -617,6 +646,7 @@ class AILauncher:
         launch_env: dict | None = None,
         role_policy: str = "",
         roles: list | None = None,
+        status_bar: str = "",
     ):
         self.providers = providers or ["codex"]
         pairing_error = provider_pairing_error(self.providers, resume=resume)
@@ -631,6 +661,9 @@ class AILauncher:
         # record; nothing a pane process does can change it for its own
         # launch (A1). Absent/"" means off, which is today's behaviour.
         self.role_policy = role_policy if role_policy in ("", "off", "enforce") else ""
+        # tmux status-bar layout resolved by the launcher (env > ccb.config >
+        # slim) and handed to ccb-tmux-on.sh when the theme is activated.
+        self.status_bar = status_bar if status_bar in STATUS_BAR_LAYOUTS else "slim"
         # Roles pre-assigned by ccb.config, one entry per provider occurrence in
         # the launch's original provider order ("" = this occurrence stays
         # unassigned). Claimed for each pane once its binding is published.
@@ -1632,7 +1665,13 @@ class AILauncher:
             if getattr(self, "_tmux_ui_owned", False):
                 return
             script = Path.home() / ".local" / "bin" / "ccb-tmux-on.sh"
-            args = [str(script), "--session", target[0], "--window", target[1], "--owner", self.session_id]
+            args = [
+                str(script),
+                "--session", target[0],
+                "--window", target[1],
+                "--owner", self.session_id,
+                "--layout", getattr(self, "status_bar", "slim"),
+            ]
         else:
             if not getattr(self, "_tmux_ui_owned", False):
                 return
@@ -4401,6 +4440,7 @@ def cmd_start(args):
         return 2
     flag_role_policy = str(getattr(args, "role_policy", "") or "").strip().lower()
     role_policy = flag_role_policy or configured_role_policy
+    status_bar = _resolve_status_bar_layout(config_data)
 
     # Roles from ccb.config are validated against the providers this launch
     # will actually start, before any pane exists or any role is written.
@@ -4418,6 +4458,7 @@ def cmd_start(args):
         launch_env=launch_env,
         role_policy=role_policy,
         roles=roles,
+        status_bar=status_bar,
     )
     try:
         return launcher.run_up()

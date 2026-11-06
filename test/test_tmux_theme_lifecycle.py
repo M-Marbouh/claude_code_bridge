@@ -184,27 +184,32 @@ def test_fallback_lock_without_flock(tmux_server, tmp_path):
     assert subprocess.run([str(ON), *args], env=fallback_env).returncode == 0
     # A silent no-op activation must fail here: ownership and theme must both be applied.
     assert run("show-options", "-qv", "-t", session, "@ccb_active").stdout.strip() == "owner"
-    assert value(run, "session", session, "status") == "2"
+    # Slim is the default layout: one row, which tmux spells `on`.
+    assert value(run, "session", session, "status") == "on"
     assert not list((Path(env["CCB_RUNTIME_TMP"]) / "ccb-tmux-locks").glob("*.d"))
     assert subprocess.run([str(OFF), *args], env=fallback_env).returncode == 0
     assert not run("show-options", "-qv", "-t", session, "@ccb_active").stdout.strip()
     assert not run("show-options", "-q", "-t", session, "status").stdout
 
 
+ACTIVITY_SEGMENT = f'#({ROOT / "config" / "ccb-activity.py"} "#{{pane_id}}" "#{{pane_current_path}}")'
+
+
 def test_status_right_extension_is_appended_once(tmux_server, tmp_path):
     run, env, session, window = tmux_server
     env = {**env, "PATH": f"{env['PATH']}:{shutil.which('tmux') or ''}"}
     args = ["--session", session, "--window", window, "--owner", "owner"]
+    # Default layout is slim: one row, no agent/version/clock, activity then
+    # the user's extension last.
     assert subprocess.run([str(ON), *args], env=env).returncode == 0
+    assert value(run, "session", session, "status") == "on"
     current = run("show-options", "-qv", "-t", session, "status-right").stdout.rstrip("\n")
-    expected = ('#[fg=#f38ba8,bg=#1e1e2e]#[fg=#1e1e2e,bg=#f38ba8,bold] #{?#{@ccb_agent},#{@ccb_agent},-} '
-                '#[fg=#cba6f7,bg=#f38ba8]#[fg=#1e1e2e,bg=#cba6f7,bold] CCB:#{@ccb_version} '
-                f'#[fg=#89b4fa,bg=#cba6f7]#[fg=#cdd6f4,bg=#89b4fa] #({ROOT / "config" / "ccb-status.sh"} modern) '
-                '#[fg=#fab387,bg=#89b4fa]#[fg=#1e1e2e,bg=#fab387,bold] %m/%d %a %H:%M #[default]'
-                '#{T:@ccb_status_right_extra}')
-    assert current == expected
+    assert current == f"#[fg=#cdd6f4,bg=#1e1e2e]{ACTIVITY_SEGMENT} #[default]#{{T:@ccb_status_right_extra}}"
     assert current.endswith("#[default]#{T:@ccb_status_right_extra}")
     assert current.count("#{T:@ccb_status_right_extra}") == 1
+    assert "#{@ccb_agent}" not in current
+    assert "@ccb_version" not in current
+    assert "%m/%d" not in current
     run("set-option", "-g", "@ccb_status_right_extra", "GLOBAL_WIDGET")
     assert run("display-message", "-p", "#{T:status-right}").stdout.strip().endswith("GLOBAL_WIDGET")
     run("set-option", "-t", session, "@ccb_status_right_extra", "SESSION_WIDGET")
@@ -215,6 +220,18 @@ def test_status_right_extension_is_appended_once(tmux_server, tmp_path):
     assert run("display-message", "-p", "#{T:status-right}").stdout.strip().endswith("SESSION_WIDGET")
     run("set-option", "-u", "-t", session, "@ccb_status_right_extra")
     assert run("display-message", "-p", "#{T:status-right}").stdout.strip().endswith("RELOADED_WIDGET")
+    assert subprocess.run([str(OFF), *args], env=env).returncode == 0
+
+    # Classic: two rows, agent/version/activity/clock, extension still last.
+    assert subprocess.run([str(ON), *args, "--layout", "classic"], env=env).returncode == 0
+    assert value(run, "session", session, "status") == "2"
+    classic = run("show-options", "-qv", "-t", session, "status-right").stdout.rstrip("\n")
+    assert "#{?#{@ccb_agent},#{@ccb_agent},-}" in classic
+    assert "CCB:#{@ccb_version}" in classic
+    assert ACTIVITY_SEGMENT in classic
+    assert "%m/%d %a %H:%M" in classic
+    assert classic.endswith("#[default]#{T:@ccb_status_right_extra}")
+    assert classic.count("#{T:@ccb_status_right_extra}") == 1
     assert subprocess.run([str(OFF), *args], env=env).returncode == 0
 
 
@@ -322,12 +339,16 @@ def test_theme_matches_head_except_status_extra(tmux_server, tmp_path, theme):
 
         current_dir = tmp_path / "current-config"
         current_dir.mkdir()
-        for name in ("ccb-tmux-on.sh", "ccb-tmux-off.sh", "ccb-border.sh", "ccb-status.sh", "ccb-git.sh"):
+        for name in ("ccb-tmux-on.sh", "ccb-tmux-off.sh", "ccb-border.sh", "ccb-status.sh",
+                     "ccb-git.sh", "ccb-activity.py"):
             target = current_dir / name
             target.write_text((ROOT / "config" / name).read_text(encoding="utf-8"), encoding="utf-8")
             target.chmod(0o755)
         current_env = {**env, "TMUX_PANE": current_pane, "PATH": f"{common_bin}:{env['PATH']}"}
-        result = subprocess.run([str(current_dir / "ccb-tmux-on.sh"), "--session", session, "--window", window, "--owner", "golden"],
+        # Classic keeps today's two-row layout; only the activity segment and
+        # the widened right-length may differ from the baseline below.
+        result = subprocess.run([str(current_dir / "ccb-tmux-on.sh"), "--session", session, "--window", window,
+                                 "--owner", "golden", "--layout", "classic"],
                                 env=current_env, capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
 
@@ -354,6 +375,16 @@ def test_theme_matches_head_except_status_extra(tmux_server, tmp_path, theme):
         actual = options(run, session, window, current_pane)
         expected_right = expected.pop("status-right", "").replace(str(original_dir), "<config>")
         actual_right = actual.pop("status-right", "").replace(str(current_dir), "<config>")
+
+        def without_activity(text):
+            # The live-activity segment replaced the old daemon-dots segment.
+            return re.sub(r"#\([^)]*(?:ccb-status\.sh modern|ccb-activity\.py[^)]*)\)", "<activity>", text)
+
+        expected_right = without_activity(expected_right)
+        actual_right = without_activity(actual_right)
+        # status-right-length is the other allowed difference: 120 -> 360.
+        assert expected.pop("status-right-length", "") == "120"
+        assert actual.pop("status-right-length", "") == "360"
         assert actual == expected
         assert actual_right == expected_right + "#{T:@ccb_status_right_extra}"
     finally:
@@ -457,3 +488,170 @@ def test_off_finishes_cleanup_when_launch_window_closed(tmux_server):
     assert not run("show-options", "-qv", "-t", session, "@ccb_snapshot_complete").stdout.strip()
     hooks = run("show-hooks", "-t", session, "after-select-pane").stdout
     assert "mine" in hooks and "ccb-border" not in hooks
+
+
+# --- slim vs classic status bar ---------------------------------------------
+
+# The owner's live global extension is two quota widgets: the default command
+# and the `--providers opencode-go` one. The real helper prints different text
+# for each, so this fixture stands in for it with one script and the same two
+# invocations.
+QUOTA_SCRIPT_BODY = (
+    "#!/usr/bin/env python3\n"
+    "import sys\n"
+    "print('QUOTA_GO' if '--providers' in sys.argv else 'QUOTA_DEFAULT')\n"
+)
+
+
+def _quota_widgets(tmp_path):
+    script = tmp_path / "tmux-quota.py"
+    script.write_text(QUOTA_SCRIPT_BODY, encoding="utf-8")
+    script.chmod(0o755)
+    default = f"#(python3 {script} --unicode)"
+    go = f"#(python3 {script} --unicode --providers opencode-go)"
+    return default, go, f"  {default}  {go}"
+
+
+def _agent_row_visible(run, session):
+    return value(run, "session", session, "status")
+
+
+@pytest.mark.parametrize("layout", ["slim", "classic"])
+def test_two_quota_widgets_render_last_in_both_layouts(tmux_server, tmp_path, layout):
+    if not shutil.which("script") or not shutil.which("timeout"):
+        pytest.skip("script and timeout are required to capture an attached tmux client")
+    run, env, session, window = tmux_server
+    default_widget, go_widget, extra = _quota_widgets(tmp_path)
+    run("set-option", "-g", "@ccb_status_right_extra", extra)
+    args = ["--session", session, "--window", window, "--owner", "owner", "--layout", layout]
+    off_args = ["--session", session, "--window", window, "--owner", "owner"]
+    assert subprocess.run([str(ON), *args], env=env).returncode == 0
+
+    # Structurally, CCB's own content ends before the extension and the
+    # extension is the last thing on the right in both layouts.
+    right = value(run, "session", session, "status-right")
+    assert right.endswith("#[default]#{T:@ccb_status_right_extra}")
+    assert right.index("ccb-activity.py") < right.index("#{T:@ccb_status_right_extra}")
+    if layout == "classic":
+        assert right.index("ccb-activity.py") < right.index("%m/%d %a %H:%M")
+    else:
+        assert "@ccb_agent" not in right and "@ccb_version" not in right and "%m/%d" not in right
+
+    # And both widgets really render for an attached client, in order. A
+    # status `#()` job may finish after the first screen paint, so retry the
+    # capture a couple of times instead of depending on one paint.
+    screen = ""
+    for _attempt in range(3):
+        capture_env = {**{k: v for k, v in env.items() if k != "TMUX"}, "TERM": "xterm-256color"}
+        captured = subprocess.run(
+            [shutil.which("timeout"), "4", "sh", "-c", "sleep 5 | script -q -c 'tmux attach-session -t fixture' /dev/null"],
+            env=capture_env, capture_output=True, text=True, check=False,
+        )
+        screen = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()=>][0-9A-Za-z]?", "", captured.stdout)
+        if "QUOTA_DEFAULT" in screen and "QUOTA_GO" in screen:
+            break
+    assert "QUOTA_DEFAULT" in screen, screen[-2000:]
+    assert "QUOTA_GO" in screen, screen[-2000:]
+    # Across repaints, the LAST paint is the settled one: check that ordering.
+    assert screen.rindex("QUOTA_DEFAULT") < screen.rindex("QUOTA_GO")
+    assert subprocess.run([str(OFF), *off_args], env=env).returncode == 0
+
+
+def test_layout_selection_default_env_and_invalid_value(tmux_server):
+    run, env, session, window = tmux_server
+    args = ["--session", session, "--window", window, "--owner", "owner"]
+
+    # Default: slim, one row.
+    assert subprocess.run([str(ON), *args], env=env).returncode == 0
+    assert _agent_row_visible(run, session) == "on"
+    assert subprocess.run([str(OFF), *args], env=env).returncode == 0
+
+    # Env selects classic when no argument is given.
+    classic_env = {**env, "CCB_STATUS_BAR": "classic"}
+    assert subprocess.run([str(ON), *args], env=classic_env).returncode == 0
+    assert _agent_row_visible(run, session) == "2"
+    assert subprocess.run([str(OFF), *args], env=classic_env).returncode == 0
+
+    # An explicit --layout wins over the environment.
+    assert subprocess.run([str(ON), *args, "--layout", "slim"], env=classic_env).returncode == 0
+    assert _agent_row_visible(run, session) == "on"
+    assert subprocess.run([str(OFF), *args], env=classic_env).returncode == 0
+
+    # An unknown value falls back to slim and never fails activation.
+    assert subprocess.run([str(ON), *args, "--layout", "fancy"], env=env).returncode == 0
+    assert _agent_row_visible(run, session) == "on"
+    assert subprocess.run([str(OFF), *args], env=env).returncode == 0
+
+    invalid_env = {**env, "CCB_STATUS_BAR": "fancy"}
+    assert subprocess.run([str(ON), *args], env=invalid_env).returncode == 0
+    assert _agent_row_visible(run, session) == "on"
+    assert subprocess.run([str(OFF), *args], env=invalid_env).returncode == 0
+
+
+def test_classic_layout_round_trip_restores_every_option(tmux_server):
+    run, env, session, window = tmux_server
+    run("set-option", "-t", session, "status-format[1]", "user hint row")
+    keys = ("status", "status-position", "status-left", "status-right", "status-right-length",
+            "status-format[0]", "status-format[1]")
+    before = {key: value(run, "session", session, key) for key in keys}
+    args = ["--session", session, "--window", window, "--owner", "owner", "--layout", "classic"]
+    assert subprocess.run([str(ON), *args], env=env).returncode == 0
+    assert _agent_row_visible(run, session) == "2"
+    assert value(run, "session", session, "status-right-length") == "360"
+    assert "Copy: MouseDrag" in value(run, "session", session, "status-format[1]")
+    assert subprocess.run([str(OFF), "--session", session, "--window", window, "--owner", "owner"],
+                          env=env).returncode == 0
+    assert {key: value(run, "session", session, key) for key in keys} == before
+    assert value(run, "session", session, "status-right-length") == before["status-right-length"]
+
+
+def test_status_bar_layout_resolution(monkeypatch, capsys):
+    ccb = _load_ccb_module()
+    monkeypatch.delenv("CCB_STATUS_BAR", raising=False)
+    assert ccb._resolve_status_bar_layout({}) == "slim"
+    assert ccb._resolve_status_bar_layout({"status_bar": "classic"}) == "classic"
+    assert ccb._resolve_status_bar_layout({"status_bar": "SLIM"}) == "slim"
+
+    monkeypatch.setenv("CCB_STATUS_BAR", "classic")
+    # Env overrides config.
+    assert ccb._resolve_status_bar_layout({"status_bar": "slim"}) == "classic"
+
+    monkeypatch.setenv("CCB_STATUS_BAR", "fancy")
+    assert ccb._resolve_status_bar_layout({"status_bar": "classic"}) == "slim"
+    assert "unknown status bar layout" in capsys.readouterr().err
+
+    monkeypatch.delenv("CCB_STATUS_BAR", raising=False)
+    assert ccb._resolve_status_bar_layout({"status_bar": "fancy"}) == "slim"
+    assert "unknown status bar layout" in capsys.readouterr().err
+    # A plain-text config carries no key at all.
+    assert ccb._resolve_status_bar_layout({"providers": ["claude"]}) == "slim"
+
+
+def test_launcher_passes_the_resolved_layout(monkeypatch, tmp_path):
+    ccb = _load_ccb_module()
+    home_bin = tmp_path / ".local" / "bin"
+    home_bin.mkdir(parents=True)
+    (home_bin / "ccb-tmux-on.sh").touch()
+    monkeypatch.setattr(ccb.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "display-message" in args:
+            return type("Result", (), {"stdout": "$0 @0", "returncode": 0})()
+        return type("Result", (), {"stdout": "", "returncode": 0})()
+
+    monkeypatch.setattr(ccb.subprocess, "run", fake_run)
+    launcher = type("Launcher", (), {"terminal_type": "tmux", "session_id": "launch-token",
+                                     "status_bar": "classic"})()
+    launcher._set_tmux_ui_active = ccb.AILauncher._set_tmux_ui_active.__get__(launcher)
+    launcher._tmux_ui_owned = False
+    launcher._set_tmux_ui_active(True)
+
+    assert calls[-1] == [
+        str(home_bin / "ccb-tmux-on.sh"),
+        "--session", "$0", "--window", "@0", "--owner", "launch-token",
+        "--layout", "classic",
+    ]

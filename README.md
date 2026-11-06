@@ -295,15 +295,27 @@ ccb version
 `ccb clean` also removes oversized-reply artifacts older than `--older-than`; `--dry-run`,
 `--project`, and `--all-projects` apply to both stale session records and reply artifacts.
 
-## tmux status-right extension
+## tmux status bar and status-right extension
 
-Add a widget to the right side of the CCB tmux status bar from your own `tmux.conf`:
+CCB themes the tmux status bar for the session its launcher runs in. The default layout is `slim`: one row, with the mode badge (`INPUT`/`KEY`/`COPY`) and git info on the left, the project folder in the centre, and on the right the live CCB request activity followed by your own `@ccb_status_right_extra` widgets last. There is no agent name, version or clock.
+
+Choose the layout in `.ccb/ccb.config`:
+
+```json
+{"providers": ["codex", "claude"], "status_bar": "classic"}
+```
+
+`classic` restores the previous two-row layout (agent, version, the same activity segment, the clock) and its key-hint row; only the old daemon-dots segment is replaced by the activity segment. `CCB_STATUS_BAR=slim` or `CCB_STATUS_BAR=classic` overrides the config value; an unknown value prints a warning and falls back to `slim` instead of failing the launch. A plain-text `ccb.config` uses `slim`. Both layouts set `status-right-length` to 360.
+
+The activity segment looks like `X 1▶2` — provider letter, running requests, queued requests — and lists only providers with active work. It reads the askd queues, is scoped to the focused pane's project even when one daemon serves several projects, and prints nothing when everything is idle or on any error. It counts **CCB requests only**: work delivered through `ask`, dashboard submissions or the daemon appears; typing directly into a provider pane does not. Peer (`ask --peer`) requests are queued against a destination pane rather than a project, so they are not counted — not every `ask` appears here.
+
+Add a widget to the right side from your own `tmux.conf`:
 
 ```tmux
 set -g @ccb_status_right_extra ' #(your-widget) '
 ```
 
-Native `#[...]` styles and `#()` commands work in the value. Escape literal percent signs as `%%`. The value renders after the clock, and config reloads apply without restarting the theme. The theme lasts for the lifetime of the launcher that owns it.
+Native `#[...]` styles and `#()` commands work in the value. Escape literal percent signs as `%%`. The value renders at the end of the status line, after CCB's own segments (after the clock in `classic`), and config reloads apply without restarting the theme. The theme lasts for the lifetime of the launcher that owns it. `slim` leaves room for several widgets there; this pairs well with [agent-quota.wezterm](https://github.com/M-Marbouh/agent-quota.wezterm), whose quota command can be set as `@ccb_status_right_extra` (optional, not installed or required by CCB); its [compact layout](https://github.com/M-Marbouh/agent-quota.wezterm#compact-layout) and [hiding inactive providers](https://github.com/M-Marbouh/agent-quota.wezterm#hiding-inactive-providers) sections cover fitting it into the one-row bar.
 
 ## Fork changes
 

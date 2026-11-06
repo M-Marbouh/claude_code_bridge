@@ -25,6 +25,7 @@
 
 ### Changed
 
+- Flipped the default tmux status bar to a single-row `slim` layout: mode badge and git info on the left, project folder in the centre, live CCB request activity plus the user's `@ccb_status_right_extra` widgets on the right, with no agent name, version or clock. `status_bar = "classic"` in `ccb.config` (or `CCB_STATUS_BAR=classic`) restores the previous two-row layout; an unknown value warns and falls back to `slim` without failing the launch. `status-right-length` is 360 in both layouts. The activity segment shows running/queued CCB requests for the focused pane's project on a possibly shared daemon, counts CCB requests only (never typing into a pane), and is empty when idle or on error.
 - Made collaboration roles session-assigned and provider-neutral in managed templates and distributed command guidance.
 - Preserved unique-provider and cross-project peer workflows while making duplicate remote destinations fail explicitly as ambiguous.
 - Kept native model, effort, account, resume, and subagent choices outside CCB; native subagents remain internal to their owning top-level session.

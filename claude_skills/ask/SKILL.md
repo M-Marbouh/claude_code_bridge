@@ -17,7 +17,7 @@ The first argument must be the provider name, followed by the message:
 - `opencode` - Send to OpenCode
 - `claude` - Send to Claude
 
-**NOT for cross-project messaging.** If the user says "Ask PRG Claude..." or references another project, use the `peer-ask` skill instead.
+**NOT for cross-project messaging.** If the user says "Ask BSA Claude..." or references another project, use the `peer-ask` skill instead.
 
 ## Execution (MANDATORY)
 

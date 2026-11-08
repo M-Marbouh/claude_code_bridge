@@ -10,10 +10,10 @@ Send a message to Claude or Codex running in another active CCB project.
 ## When to Use
 
 Trigger this skill when the user references another project's Claude or Codex:
-- "Ask PRG Claude about X"
-- "Ask PRG Codex to review X"
-- "Tell content-automation Claude to..."
-- "Ask the test-builder Claude if..."
+- "Ask BSA Claude about X"
+- "Ask BSA Codex to review X"
+- "Tell web-frontend Claude to..."
+- "Ask the api-tests Claude if..."
 - "Send this to Codex in my other project"
 
 ## Execution Steps
@@ -72,10 +72,10 @@ Codex.
 
 ### Step 2 — Match the target project
 
-The user's reference (e.g. "PRG", "content-automation", "test-builder") should be matched against:
+The user's reference (e.g. "BSA", "web-frontend", "api-tests") should be matched against:
 1. **Remembered alias** — check conversation memory or prior confirmed matches first
 2. **Exact basename** — `basename(work_dir)` == reference
-3. **Keyword/abbreviation** — reference words appear in `basename(work_dir)`, or reference is an abbreviation (e.g. "PRG" → "product-review-generator" because P-R-G are initial letters)
+3. **Keyword/abbreviation** — reference words appear in `basename(work_dir)`, or reference is an abbreviation (e.g. "BSA" → "billing-service-api" because B-S-A are initial letters)
 4. **Index** — if reference is a number, use `ccb-list` index directly
 
 **If one clear match:** proceed to Step 3.
@@ -83,9 +83,9 @@ The user's reference (e.g. "PRG", "content-automation", "test-builder") should b
 **If ambiguous or no match:** present the list to the user:
 ```
 I found these active CCB projects:
-  [1] product-review-generator  (17ba87da)
-  [2] test-builder-pro          (3ee7346a)
-  [3] content-automation        (b0e3e2c9)
+  [1] billing-service-api  (17ba87da)
+  [2] api-test-suite          (3ee7346a)
+  [3] web-frontend        (b0e3e2c9)
 
 Which project did you mean? (reply with number or name)
 ```
@@ -106,7 +106,7 @@ identify only the project.
 ### Step 3 — Remember the alias
 
 Once a target is confirmed (by match or user selection), save the alias for this session:
-- If the user used a shorthand like "PRG", remember: "PRG" → `/path/to/product-review-generator`
+- If the user used a shorthand like "BSA", remember: "BSA" → `/path/to/billing-service-api`
 - Use this in future turns without asking again
 
 ### Step 4 — Send the message
@@ -147,14 +147,14 @@ When a reverse peer result arrives, incorporate it into the active task. Backgro
 
 ## Examples
 
-User: "Ask PRG Claude if the discount validation logic is thread-safe"
+User: "Ask BSA Claude if the discount validation logic is thread-safe"
 → if blocked on the answer: ccb-list → match → `ask claude --peer ... --wait`
 
-User: "Ask PRG Codex to review the parser"
+User: "Ask BSA Codex to review the parser"
 → if other work can continue: ccb-list → match → `ask codex --peer ... --background`
 
-User: "Tell content-automation Claude we're using the new schema"
-→ ccb-list → match "content-automation" → ask --peer --notify
+User: "Tell web-frontend Claude we're using the new schema"
+→ ccb-list → match "web-frontend" → ask --peer --notify
 
 User: "Ask Claude in project 3 about the current task"
 → if other work can continue: ccb-list → use index 3 → ask --peer --background

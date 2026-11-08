@@ -10,9 +10,9 @@ Send a request to a mounted Claude or Codex pane in another active CCB project.
 ## When to Use
 
 Use this skill for requests such as:
-- "Ask PRG Claude about X"
-- "Ask PRG Codex to review X"
-- "Tell content-automation Claude..."
+- "Ask BSA Claude about X"
+- "Ask BSA Codex to review X"
+- "Tell web-frontend Claude..."
 - "Send this to Codex in my other project"
 
 Do not use this skill for a provider in the current project; use `ask` instead.

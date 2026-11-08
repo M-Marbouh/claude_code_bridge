@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from pi_comm import PiSessionError, classify_pane_screen, load_session
+from pi_comm import PiSessionError, classify_pane_screen, describe_pane_screen, load_session
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "pi"
@@ -251,7 +251,7 @@ def test_screen_editor_border_activity_is_busy(border: str) -> None:
 def test_non_embedded_loader_above_plain_editor_box_is_busy(loader: str) -> None:
     screen = "\n".join([
         "", loader, "────────────────────", "", "────────────────────",
-        "<CCB_CWD> (master)", "model • high",
+        "<CCB_CWD> (master)", "0.3%/1.0M (auto)",
     ])
     assert classify_pane_screen(screen) == "busy"
 
@@ -259,7 +259,7 @@ def test_non_embedded_loader_above_plain_editor_box_is_busy(loader: str) -> None
 def test_plain_working_paragraph_above_box_is_refuse_safe_busy() -> None:
     screen = "\n".join([
         "", "Working tree clean", "────────────────────", "", "────────────────────",
-        "<CCB_CWD> (master)", "model • high",
+        "<CCB_CWD> (master)", "0.3%/1.0M (auto)",
     ])
     assert classify_pane_screen(screen) == "busy"
 
@@ -312,6 +312,150 @@ def test_editor_draft_with_quoted_dialog_marker_is_not_idle() -> None:
     lines = (FIXTURES / "screen-idle-quoting-marker.txt").read_text().splitlines()
     lines[_idle_marker_rule_index(lines) - 1] = "draft text"
     assert classify_pane_screen("\n".join(lines)) != "idle"
+
+
+REAL_CAPTURES = (
+    "real-idle-28cols-tail.txt",
+    "real-idle-40cols-tail.txt",
+    "real-idle-56cols-tail.txt",
+    "real-idle-106cols-tail.txt",
+    "real-idle-105cols-model-tail.txt",
+)
+
+
+def _idle_screen() -> str:
+    return (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+
+
+def _with_status_line(status: str) -> str:
+    lines = _idle_screen().splitlines()
+    lines[-1] = status
+    return "\n".join(lines)
+
+
+_IDLE_STATS = "↑2.6k ↓179 R5.6k CH92.5% $0.001 0.3%/1.0M (auto)"
+
+
+def _with_footer_right(right: str) -> str:
+    return _with_status_line(f"{_IDLE_STATS}    {right}".rstrip())
+
+
+@pytest.mark.parametrize("capture", REAL_CAPTURES)
+def test_real_idle_captures_at_every_width_read_idle(capture: str) -> None:
+    screen = (FIXTURES / capture).read_text(encoding="utf-8")
+    assert "<CCB_CWD>" in screen and "─" in screen
+    assert classify_pane_screen(screen) == "idle"
+
+
+@pytest.mark.parametrize("right", [
+    "deepseek-flash • xhigh",
+    "deepseek-flash • thinking off",
+    "deepseek-flash",
+    "deepseek-v4.1-fla",
+    "",
+])
+def test_synthetic_idle_footer_variants_read_idle(right: str) -> None:
+    assert classify_pane_screen(_with_footer_right(right)) == "idle"
+
+
+@pytest.mark.parametrize("status", [
+    "↑2.6k ↓179 R5.6...",
+    "$0.011 3.6%/1.0M (auto)",
+    "?/1.0M (auto)",
+    "↑34k ↓7.9k R328k CH98.7% $0.011 3.6%/1.0M (auto)",
+    "W1.2M",
+])
+def test_synthetic_stats_prefixes_read_idle(status: str) -> None:
+    assert classify_pane_screen(_with_status_line(status)) == "idle"
+
+
+@pytest.mark.parametrize("status", [
+    "",
+    "waiting for instructions",
+    "$ ",
+    "R2D2 is here",
+    "3% done",
+])
+def test_negative_status_controls_are_not_idle(status: str) -> None:
+    assert classify_pane_screen(_with_status_line(status)) == "unknown"
+
+
+def test_shell_prompt_below_the_footer_is_not_idle() -> None:
+    screen = _idle_screen().rstrip("\n") + "\n$ echo done"
+    assert classify_pane_screen(screen) == "unknown"
+
+
+def test_footer_shifted_by_a_prompt_in_the_cwd_row_is_not_idle() -> None:
+    lines = _idle_screen().splitlines()
+    lines[-2] = "$ echo done"
+    assert classify_pane_screen("\n".join(lines)) == "unknown"
+
+
+def test_one_row_overlay_over_the_status_line_reads_dialog() -> None:
+    # Ratifier regression: a focused one-row overlay that keeps the box and covers only the
+    # status row must never read idle, or input would reach the overlay.
+    screen = _with_status_line(" Select a session")
+    assert classify_pane_screen(screen) == "dialog"
+
+
+def test_draft_in_the_editor_of_a_real_narrow_capture_is_not_idle() -> None:
+    lines = (FIXTURES / "real-idle-28cols-tail.txt").read_text(encoding="utf-8").splitlines()
+    lines[len(lines) - 4] = "draft"
+    assert classify_pane_screen("\n".join(lines)) == "unknown"
+
+
+def test_describe_names_a_missing_capture_or_box() -> None:
+    assert describe_pane_screen(None) == "pane capture unavailable"
+    assert describe_pane_screen("blank terminal") == "no input box on screen"
+
+
+def test_describe_reports_unrecognised_status_lines_with_pane_width() -> None:
+    lines = (FIXTURES / "real-idle-28cols-tail.txt").read_text(encoding="utf-8").splitlines()
+    lines[-1] = "waiting for input"
+    assert describe_pane_screen("\n".join(lines)) == "status lines not recognised, pane ~28 cols wide"
+
+
+def test_describe_reports_each_structural_step() -> None:
+    lines = _idle_screen().splitlines()
+
+    shifted_cwd = list(lines)
+    shifted_cwd[-2] = "$ echo done"
+    assert describe_pane_screen("\n".join(shifted_cwd)).startswith(
+        "working-directory line above the status lines not recognised"
+    )
+
+    missing_bottom_rule = list(lines)
+    missing_bottom_rule[-3] = ""
+    assert describe_pane_screen("\n".join(missing_bottom_rule)).startswith(
+        "input box bottom border not recognised"
+    )
+
+    no_top_rule = ["reply", "", "────────────────────", "<CCB_CWD> (master)", "0.3%/1.0M (auto)"]
+    assert describe_pane_screen("\n".join(no_top_rule)).startswith("input box top border not found")
+
+    narrow_top_rule = list(lines)
+    narrow_top_rule[3] = "─" * 8
+    assert describe_pane_screen("\n".join(narrow_top_rule)).startswith("input box borders differ in width")
+
+    draft = list(lines)
+    draft[2] = "draft text"
+    assert describe_pane_screen("\n".join(draft)) == "input box has unsent text"
+
+    border_activity = list(lines)
+    border_prefix = "── ⠙ Working "
+    border_activity[1] = border_prefix + "─" * (len(lines[1].rstrip()) - len(border_prefix))
+    assert describe_pane_screen("\n".join(border_activity)) == (
+        "activity shown in the input box border (pane is busy)"
+    )
+
+    loader = list(lines)
+    loader[1:1] = ["", "Working"]
+    assert describe_pane_screen("\n".join(loader)) == "activity message above the input box (pane is busy)"
+
+    dialog = (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8")
+    assert describe_pane_screen(dialog).startswith("a dialog is on screen, pane ~")
+
+    assert describe_pane_screen(_idle_screen()) == "input box is empty and idle"
 
 
 REQ = "r4-retry"
@@ -531,3 +675,11 @@ def test_failed_turn_with_custom_message_flush_stays_errored_then_retries(tmp_pa
     completed = load_session(tmp_path, session_id).exchange(REQ)
     assert completed.state == "completed"
     assert "CCB_DONE: " + REQ in completed.reply
+
+
+def test_describe_keeps_a_busy_screen_that_quotes_a_dialog_marker_busy() -> None:
+    screen = (FIXTURES / "screen-busy-quoting-marker.txt").read_text(encoding="utf-8")
+    assert classify_pane_screen(screen) == "busy"
+    reason = describe_pane_screen(screen)
+    assert "dialog" not in reason
+    assert reason == "activity shown in the input box border (pane is busy)"

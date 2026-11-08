@@ -362,7 +362,7 @@ class PiCommunicator:
         screen = backend.get_pane_content(pane_id, lines=40)
         state = classify_pane_screen(screen or "")
         if state != "idle":
-            return False, f"Pi pane is {state}; input is not verified idle"
+            return False, f"Pi pane is {state}: {describe_pane_screen(screen)}; input is not verified idle"
         return True, "Pi pane and session are ready"
 
 
@@ -585,7 +585,11 @@ _DIALOG_MARKERS = (
     "enter select  escape/ctrl+c cancel",
     "Select a session",
 )
-_MODEL_FOOTER = re.compile(r"^.*\S+\s+[•·]\s+(?:off|minimal|low|medium|high|max)\s*$", re.IGNORECASE | re.MULTILINE)
+# The stats line (footer.js:150-178) always starts with a usage figure and survives right-side
+# truncation: ↑/↓/R/W token counts, the cost, the context percentage, or the unknown-context "?/".
+_STATS_LINE = re.compile(
+    r"^\s*(?:[↑↓RW]\d+(?:\.\d+)?[kM]?(?=\s|\.\.\.|$)|\$\d|\d+(?:\.\d+)?%/|\?/)"
+)
 _RULE_LINE = re.compile(r"^\s*─{8,}\s*$")
 _EDITOR_LINE = re.compile(r"^\s*(?:›\s*)?$")
 _CWD_LINE = re.compile(r"^\s*(?:/|~/|<CCB_CWD>).*\s*$")
@@ -601,6 +605,8 @@ def classify_pane_screen(screen: str) -> str:
 
     The editor-box structure decides first; the dialog-marker scan only runs when the
     structure is unrecognised, so transcript text quoting a marker cannot fake a dialog.
+    The status line is recognised by its stats prefix, not by the model/thinking suffix:
+    that suffix changes with pane width, model type and thinking level.
     Accepted limitation: an extension overlay that draws a built-in dialog title while
     leaving the editor box visible now classifies as "idle" (the marker scan used to
     catch it). Built-in selectors replace the editor box entirely, so they are unaffected.
@@ -614,10 +620,54 @@ def classify_pane_screen(screen: str) -> str:
     return "unknown"
 
 
+def describe_pane_screen(screen: str | None) -> str:
+    """Plain words for why a capture is not a confirmed idle input box.
+
+    Walks the same structural steps as `_classify_pane_structure` and names the first one
+    that failed, with an approximate pane width taken from the longest captured line.
+    """
+    if screen is None:
+        return "pane capture unavailable"
+    lines = screen.splitlines()
+    width = max((len(line.rstrip()) for line in lines), default=0)
+    width_note = f", pane ~{width} cols wide" if width else ""
+    if len(lines) < 5:
+        return "no input box on screen"
+    if _classify_pane_structure(screen) == "unknown" and any(
+        marker.casefold() in screen.casefold() for marker in _DIALOG_MARKERS
+    ):
+        return f"a dialog is on screen{width_note}"
+    if not _STATS_LINE.match(lines[-1]):
+        return f"status lines not recognised{width_note}"
+    if not _CWD_LINE.fullmatch(lines[-2]):
+        return f"working-directory line above the status lines not recognised{width_note}"
+    if not _RULE_LINE.fullmatch(lines[-3]):
+        return f"input box bottom border not recognised{width_note}"
+    editor_end = len(lines) - 3
+    top_index = editor_end - 1
+    while top_index >= 0 and not lines[top_index].startswith("─"):
+        top_index -= 1
+    if top_index < 0:
+        return f"input box top border not found{width_note}"
+    if len(lines[top_index].rstrip()) != len(lines[-3].rstrip()):
+        return f"input box borders differ in width{width_note}"
+    border = _OVERFLOW_LABEL.sub("", lines[top_index])
+    if re.sub(r"[─\s]", "", border):
+        return "activity shown in the input box border (pane is busy)"
+    if not _RULE_LINE.fullmatch(border):
+        return f"input box top border not recognised{width_note}"
+    if top_index >= 2 and not lines[top_index - 2].strip() and _LOADER_LINE.match(lines[top_index - 1]):
+        return "activity message above the input box (pane is busy)"
+    editor = lines[top_index + 1:editor_end]
+    if len(editor) == 1 and _EDITOR_LINE.fullmatch(editor[0]):
+        return "input box is empty and idle"
+    return "input box has unsent text"
+
+
 def _classify_pane_structure(screen: str) -> str:
     """Structural editor-box parse; "unknown" means no recognised editor box."""
     lines = screen.splitlines()
-    if len(lines) < 5 or not _MODEL_FOOTER.fullmatch(lines[-1]):
+    if len(lines) < 5 or not _STATS_LINE.match(lines[-1]):
         return "unknown"
     if not _CWD_LINE.fullmatch(lines[-2]) or not _RULE_LINE.fullmatch(lines[-3]):
         return "unknown"

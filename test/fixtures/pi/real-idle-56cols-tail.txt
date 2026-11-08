@@ -1,0 +1,8 @@
+ keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────
+<CCB_CWD>
+0.0%/0 (auto)                                    unknown

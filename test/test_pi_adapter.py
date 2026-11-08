@@ -14,6 +14,13 @@ from pi_comm import load_session
 FIXTURES = Path(__file__).parent / "fixtures" / "pi"
 
 
+@pytest.fixture(autouse=True)
+def _no_pre_send_retry_wait(monkeypatch):
+    """Keep tests fast; retry tests set the wait they exercise explicitly."""
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 0.0)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
+
+
 class FakeBackend:
     sent: list[tuple[str, str]]
 
@@ -963,3 +970,296 @@ def test_errored_state_without_an_entry_id_still_expires_after_grace(monkeypatch
     assert result.reply == "Pi turn failed: terminated"
     assert result.status == "incomplete"
     assert clock.now == 10.1
+
+
+def _retrying_adapter(monkeypatch, tmp_path: Path, req_id: str, screen):
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(exist_ok=True)
+    binding = _binding(tmp_path, session_dir, session_id)
+    backend = FakeBackend()
+    backend.get_pane_content = lambda _pane, lines=40: screen()
+    loads = []
+
+    def load(req):
+        loads.append(req)
+        return tmp_path / ".pi-session", binding, ""
+
+    monkeypatch.setattr("askd.adapters.pi._load_destination", load)
+    monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    adapter = PiAdapter()
+    monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
+    return adapter, backend, loads
+
+
+def test_pre_send_retry_becomes_idle_and_sends_exactly_once(monkeypatch, tmp_path: Path):
+    req_id = "narrow-retry"
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    screens = iter([busy, idle, idle, idle])
+    adapter, backend, _loads = _retrying_adapter(
+        monkeypatch, tmp_path, req_id, lambda: next(screens, idle),
+    )
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+
+    def send(pane, text):
+        backend.sent.append((pane, text))
+        _write_completed_session(session_dir, tmp_path, session_id, req_id)
+
+    backend.send_text = send
+    logs: list[str] = []
+    monkeypatch.setattr("askd.adapters.pi._write_log", logs.append)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0 and result.status == "completed"
+    assert result.reply.strip() == "Recovered reply"
+    assert len(backend.sent) == 1
+    assert any("pre-send retry" in line and "state=busy" in line for line in logs)
+
+
+def test_pre_send_retry_budget_exhaustion_names_state_and_reason(monkeypatch, tmp_path: Path):
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    adapter, backend, loads = _retrying_adapter(monkeypatch, tmp_path, "still-busy", lambda: busy)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 0.0)
+
+    result = adapter.handle_task(_task(tmp_path, "still-busy"))
+    assert result.exit_code == 1 and result.status == "failed"
+    assert "busy" in result.reply
+    assert "state: busy" in result.reply
+    assert "activity" in result.reply
+    # Initial attempt plus PRE_SEND_RETRY_LIMIT retries.
+    assert len(loads) == 1 + 3
+    assert backend.sent == []
+
+
+def test_pre_send_retry_never_widens_the_request_timeout(monkeypatch, tmp_path: Path):
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    adapter, backend, loads = _retrying_adapter(monkeypatch, tmp_path, "short-timeout", lambda: busy)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 20.0)
+
+    result = adapter.handle_task(_task(tmp_path, "short-timeout", timeout_s=5))
+    assert result.exit_code == 1 and "state: busy" in result.reply
+    assert len(loads) == 1
+    assert backend.sent == []
+
+
+def test_pre_send_retry_cancelled_during_the_wait_sends_nothing(monkeypatch, tmp_path: Path):
+    class CancelOnSecondCheck:
+        checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks >= 2
+
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "cancel-in-wait", lambda: busy)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
+
+    result = adapter.handle_task(_task(tmp_path, "cancel-in-wait", cancel_event=CancelOnSecondCheck()))
+    assert result.status == "cancelled"
+    assert "cancelled before a terminal reply" in result.reply
+    assert backend.sent == []
+
+
+def test_pre_send_retry_rereads_a_binding_that_changed_during_the_wait(monkeypatch, tmp_path: Path):
+    req_id = "rebind-after-wait"
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, session_id)
+    rebound = dict(binding, pane_id="%99")
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    screens = iter([busy, idle, idle, idle])
+    backend = FakeBackend()
+    backend.get_pane_content = lambda _pane, lines=40: next(screens, idle)
+    loads: list[int] = []
+    bindings = [binding, rebound]
+
+    def load(_req):
+        loads.append(len(loads))
+        return tmp_path / ".pi-session", bindings[min(len(loads) - 1, 1)], ""
+
+    def send(pane, text):
+        backend.sent.append((pane, text))
+        _write_completed_session(session_dir, tmp_path, session_id, req_id)
+
+    backend.send_text = send
+    monkeypatch.setattr("askd.adapters.pi._load_destination", load)
+    monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
+    adapter = PiAdapter()
+    monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0
+    assert len(loads) == 2
+    assert [pane for pane, _text in backend.sent] == ["%99"]
+
+
+def test_policy_refusal_after_a_wait_sends_nothing(monkeypatch, tmp_path: Path):
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    screens = iter([busy, idle, idle])
+    adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "policy-after-wait", lambda: next(screens, idle))
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
+    monkeypatch.setattr(
+        "delivery_policy.refusal_for_request", lambda *_args, **_kwargs: "Role policy refuses this send.",
+    )
+
+    result = adapter.handle_task(_task(tmp_path, "policy-after-wait"))
+    assert result.exit_code == 1 and result.reply == "Role policy refuses this send."
+    assert backend.sent == []
+
+
+def test_one_row_overlay_over_the_status_line_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
+    lines = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8").splitlines()
+    lines[-1] = " Select a session"
+    result, backend = _refuse_with_screen(monkeypatch, tmp_path, "\n".join(lines), "overlay-status-screen")
+    assert result.exit_code == 1
+    assert "state: dialog" in result.reply
+    assert backend.sent == []
+
+
+def test_real_narrow_idle_capture_sends_once(monkeypatch, tmp_path: Path):
+    # The reported bug: a 28-col idle pane read "unknown" and was refused before any send.
+    req_id = "narrow-28cols"
+    session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    binding = _binding(tmp_path, session_dir, session_id)
+    screen = (FIXTURES / "real-idle-28cols-tail.txt").read_text(encoding="utf-8")
+    backend = FakeBackend()
+    backend.get_pane_content = lambda _pane, lines=40: screen
+
+    def send(pane, text):
+        backend.sent.append((pane, text))
+        _write_completed_session(session_dir, tmp_path, session_id, req_id)
+
+    backend.send_text = send
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
+
+    result = adapter.handle_task(_task(tmp_path, req_id))
+    assert result.exit_code == 0 and result.status == "completed"
+    assert len(backend.sent) == 1
+
+
+def test_pre_send_retry_binding_that_disappears_during_the_wait_sends_nothing(monkeypatch, tmp_path: Path):
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    adapter, backend, loads = _retrying_adapter(monkeypatch, tmp_path, "binding-gone", lambda: busy)
+    binding = _binding(tmp_path, tmp_path / "sessions", "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+
+    def load(_req):
+        loads.append(1)
+        if len(loads) == 1:
+            return tmp_path / ".pi-session", binding, ""
+        return tmp_path / ".pi-session", None, "Pi session is inactive."
+
+    monkeypatch.setattr("askd.adapters.pi._load_destination", load)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
+
+    result = adapter.handle_task(_task(tmp_path, "binding-gone"))
+    assert result.exit_code == 1 and result.reply == "Pi session is inactive."
+    assert len(loads) == 2
+    assert backend.sent == []
+
+
+def test_pre_send_wait_that_crosses_the_deadline_is_never_injected(monkeypatch, tmp_path: Path):
+    # The wait fits inside the budget when it starts, but the deadline has passed when it
+    # returns; a timed-out request must still never be injected.
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "wait-crosses-deadline", lambda: busy)
+    now = {"t": 0.0}
+    waits = []
+
+    def wait(_task, seconds):
+        waits.append(seconds)
+        now["t"] = 31.0
+        return True
+
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", lambda: now["t"])
+    monkeypatch.setattr("askd.adapters.pi._wait_before_retry", wait)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 20.0)
+
+    result = adapter.handle_task(_task(tmp_path, "wait-crosses-deadline", timeout_s=30))
+    assert waits == [20.0]
+    assert result.exit_code == 2
+    assert result.status == "incomplete"
+    assert result.reply == "Pi request timed out before a terminal CCB_DONE was observed."
+    assert backend.sent == []
+
+
+class _CancelFlag:
+    def __init__(self):
+        self.flag = False
+
+    def is_set(self):
+        return self.flag
+
+
+def test_pre_send_cancel_during_the_idle_recheck_sends_nothing(monkeypatch, tmp_path: Path):
+    # The cancellation lands during the readiness re-check that follows a wait, so the
+    # post-wait guard passes but the post-re-check guard must still refuse.
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    cancel = _CancelFlag()
+    captures = {"count": 0}
+
+    def screen():
+        captures["count"] += 1
+        if captures["count"] == 1:
+            return busy
+        cancel.flag = True
+        return idle
+
+    adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "cancel-in-recheck", screen)
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
+
+    result = adapter.handle_task(_task(tmp_path, "cancel-in-recheck", cancel_event=cancel))
+    assert result.status == "cancelled"
+    assert "cancelled before a terminal reply" in result.reply
+    assert backend.sent == []
+
+
+def test_pre_send_deadline_passing_during_the_idle_recheck_sends_nothing(monkeypatch, tmp_path: Path):
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    now = {"t": 0.0}
+    captures = {"count": 0}
+
+    def screen():
+        captures["count"] += 1
+        if captures["count"] == 1:
+            return busy
+        now["t"] = 31.0
+        return idle
+
+    adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "deadline-in-recheck", screen)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", lambda: now["t"])
+    monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 20.0)
+
+    result = adapter.handle_task(_task(tmp_path, "deadline-in-recheck", timeout_s=30))
+    assert result.exit_code == 2
+    assert result.status == "incomplete"
+    assert result.reply == "Pi request timed out before a terminal CCB_DONE was observed."
+    assert backend.sent == []
+
+
+def test_first_attempt_idle_is_not_blocked_by_the_post_wait_guard(monkeypatch, tmp_path: Path):
+    # No wait happened, so the post-wait guard must not run: the send still happens once and
+    # only the existing post-send poll reacts to the pending cancellation.
+    class AlwaysCancelled:
+        def is_set(self):
+            return True
+
+    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "first-attempt-idle", lambda: idle)
+
+    result = adapter.handle_task(_task(tmp_path, "first-attempt-idle", cancel_event=AlwaysCancelled()))
+    assert len(backend.sent) == 1
+    assert result.status == "cancelled"

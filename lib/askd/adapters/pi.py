@@ -22,6 +22,7 @@ from pi_comm import (
     capture_confirmed_state,
     capture_screen_state,
     classify_pane_screen,
+    describe_pane_screen,
     load_candidate_sessions,
     screen_context,
 )
@@ -36,6 +37,11 @@ ANCHOR_TIMEOUT_S = 12.0
 ERROR_GRACE_S = 10.0
 # A retry whose pane stays confirmed idle this long has stopped without writing a reply.
 RETRY_IDLE_S = 30.0
+# A non-idle pre-send screen is re-checked after this wait, up to this many retries (~60 s).
+PRE_SEND_RETRY_WAIT_S = 20.0
+PRE_SEND_RETRY_LIMIT = 3
+# Cancellation is polled in slices this short while waiting to retry.
+PRE_SEND_WAIT_POLL_S = 0.25
 
 
 def _write_log(line: str) -> None:
@@ -105,6 +111,19 @@ _screen_context = screen_context
 _capture_confirmed_state = capture_confirmed_state
 
 
+def _wait_before_retry(task: QueuedTask, seconds: float) -> bool:
+    """Wait before re-running the pre-send checks; False when the task was cancelled."""
+    if task.cancel_event and task.cancel_event.is_set():
+        return False
+    remaining = seconds
+    while remaining > 0:
+        time.sleep(min(PRE_SEND_WAIT_POLL_S, remaining))
+        remaining -= PRE_SEND_WAIT_POLL_S
+        if task.cancel_event and task.cancel_event.is_set():
+            return False
+    return True
+
+
 def _anchor_landed(
     session_dir: Path,
     work_dir: Path,
@@ -172,66 +191,89 @@ class PiAdapter(BaseProviderAdapter):
         req = task.request
         started = time.monotonic()
         work_dir = Path(req.work_dir).expanduser().resolve()
-        _session_path, session, error = _load_destination(req)
-        session_key = route_session_key(self.key, req.route) if req.route.present else self.compute_session_key(session)
-        if error or session is None:
-            return self._finish(task, ProviderResult(
-                exit_code=1, reply=error or "Pi session unavailable.", req_id=task.req_id,
-                session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-            ))
-        backend, error = _check_pane(session, work_dir)
-        if error or backend is None:
-            return self._finish(task, ProviderResult(
-                exit_code=1, reply=error, req_id=task.req_id, session_key=session_key,
-                done_seen=False, status=COMPLETION_STATUS_FAILED,
-            ))
+        deadline = None if float(req.timeout_s) < 0 else started + float(req.timeout_s)
+        retries_left = PRE_SEND_RETRY_LIMIT
+        # The whole pre-send sequence re-runs after a wait: /new or a relaunch can change the
+        # binding, the pane and the anchor evidence while we wait for a non-idle pane.
+        while True:
+            _session_path, session, error = _load_destination(req)
+            session_key = route_session_key(self.key, req.route) if req.route.present else self.compute_session_key(session)
+            if error or session is None:
+                return self._finish(task, ProviderResult(
+                    exit_code=1, reply=error or "Pi session unavailable.", req_id=task.req_id,
+                    session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+                ))
+            backend, error = _check_pane(session, work_dir)
+            if error or backend is None:
+                return self._finish(task, ProviderResult(
+                    exit_code=1, reply=error, req_id=task.req_id, session_key=session_key,
+                    done_seen=False, status=COMPLETION_STATUS_FAILED,
+                ))
+            pane_id = str(session["pane_id"])
 
-        session_dir = Path(session["pi_session_dir"]).expanduser()
-        bound_session_id = str(session["pi_session_id"])
-        pi_session_id = bound_session_id
-        session_cache: dict = {}
-        try:
-            candidates = load_candidate_sessions(
-                session_dir, work_dir, bound_session_id=bound_session_id,
-                start_dir=session.get("start_dir"), cache=session_cache,
-            )
-        except PiSessionError as exc:
-            return self._finish(task, ProviderResult(
-                exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
-                session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-            ))
-        existing_anchors = [
-            candidate for candidate in candidates
-            if candidate.anchors(task.req_id)
-        ]
-        if existing_anchors:
-            ambiguous = len(existing_anchors) > 1 or any(
-                len(candidate.anchors(task.req_id)) > 1 for candidate in existing_anchors
-            )
-            reason = f"Pi request anchor is ambiguous for {task.req_id}." if ambiguous else f"Pi request anchor already exists for {task.req_id}."
-            return self._finish(task, ProviderResult(
-                exit_code=2 if ambiguous else 1, reply=reason,
-                req_id=task.req_id, session_key=session_key, done_seen=False,
-                status=COMPLETION_STATUS_INCOMPLETE if ambiguous else COMPLETION_STATUS_FAILED,
-            ))
+            session_dir = Path(session["pi_session_dir"]).expanduser()
+            bound_session_id = str(session["pi_session_id"])
+            pi_session_id = bound_session_id
+            session_cache: dict = {}
+            try:
+                candidates = load_candidate_sessions(
+                    session_dir, work_dir, bound_session_id=bound_session_id,
+                    start_dir=session.get("start_dir"), cache=session_cache,
+                )
+            except PiSessionError as exc:
+                return self._finish(task, ProviderResult(
+                    exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
+                    session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+                ))
+            existing_anchors = [
+                candidate for candidate in candidates
+                if candidate.anchors(task.req_id)
+            ]
+            if existing_anchors:
+                ambiguous = len(existing_anchors) > 1 or any(
+                    len(candidate.anchors(task.req_id)) > 1 for candidate in existing_anchors
+                )
+                reason = f"Pi request anchor is ambiguous for {task.req_id}." if ambiguous else f"Pi request anchor already exists for {task.req_id}."
+                return self._finish(task, ProviderResult(
+                    exit_code=2 if ambiguous else 1, reply=reason,
+                    req_id=task.req_id, session_key=session_key, done_seen=False,
+                    status=COMPLETION_STATUS_INCOMPLETE if ambiguous else COMPLETION_STATUS_FAILED,
+                ))
 
-        screen_state = _capture_confirmed_state(backend, str(session["pane_id"]))
-        if screen_state != "idle":
-            if screen_state == "dialog":
-                reason = "Pi is waiting for a project-trust or selector decision in its pane."
-            elif screen_state == "busy":
-                reason = "Pi pane is busy; refusing to send to avoid steering an active turn."
-            else:
-                reason = "Pi pane readiness could not be verified; refusing to send."
-            return self._finish(task, ProviderResult(
-                exit_code=1, reply=reason, req_id=task.req_id, session_key=session_key,
-                done_seen=False, status=COMPLETION_STATUS_FAILED,
-            ))
+            screen_state = _capture_confirmed_state(backend, pane_id)
+            if screen_state == "idle":
+                break
+            if retries_left <= 0 or (
+                deadline is not None and time.monotonic() + PRE_SEND_RETRY_WAIT_S > deadline
+            ):
+                return self._refuse_screen(task, session_key, backend, pane_id, screen_state)
+            _write_log(
+                f"[INFO] pre-send retry provider=pi req_id={task.req_id} "
+                f"state={screen_state} retries_left={retries_left}"
+            )
+            if not _wait_before_retry(task, PRE_SEND_RETRY_WAIT_S):
+                return self._finish(task, ProviderResult(
+                    exit_code=1, reply="Pi request cancelled before a terminal reply was observed.",
+                    req_id=task.req_id, session_key=session_key, done_seen=False,
+                    status=COMPLETION_STATUS_CANCELLED,
+                ))
+            retries_left -= 1
+            # A cancelled or timed-out request must never be injected.
+            stop = self._pre_send_stop(task, session_key, deadline)
+            if stop is not None:
+                return self._finish(task, stop)
+
+        # The readiness re-check after a wait can itself consume the last of the budget or see a
+        # cancellation; check once more before the policy gate, only when a wait happened.
+        if retries_left < PRE_SEND_RETRY_LIMIT:
+            stop = self._pre_send_stop(task, session_key, deadline)
+            if stop is not None:
+                return self._finish(task, stop)
 
         # Phase 3 (E5): role-policy recheck as the LAST step before injection.
         from delivery_policy import refusal_for_request
 
-        refusal = refusal_for_request(req, self.key, expected_pane=str(session["pane_id"]), session=session)
+        refusal = refusal_for_request(req, self.key, expected_pane=pane_id, session=session)
         if refusal:
             _write_log(f"[INFO] policy refused provider=pi req_id={task.req_id} reason={refusal}")
             return self._finish(task, ProviderResult(
@@ -239,7 +281,7 @@ class PiAdapter(BaseProviderAdapter):
                 done_seen=False, status=COMPLETION_STATUS_FAILED,
             ))
         try:
-            backend.send_text(str(session["pane_id"]), wrap_codex_prompt(req.message, task.req_id))
+            backend.send_text(pane_id, wrap_codex_prompt(req.message, task.req_id))
         except Exception as exc:
             return self._finish(task, ProviderResult(
                 exit_code=1, reply=f"Failed to send to Pi pane: {exc}", req_id=task.req_id,
@@ -247,7 +289,6 @@ class PiAdapter(BaseProviderAdapter):
             ))
         anchor_deadline = time.monotonic() + ANCHOR_TIMEOUT_S
 
-        deadline = None if float(req.timeout_s) < 0 else started + float(req.timeout_s)
         parked_at: float | None = None
         errored_at: float | None = None
         errored_id = ""
@@ -426,6 +467,41 @@ class PiAdapter(BaseProviderAdapter):
                 break
             time.sleep(0.25)
         return self._finish(task, result, transcript_path=transcript_path, conversation_id=pi_session_id)
+
+    def _pre_send_stop(
+        self, task: QueuedTask, session_key: str, deadline: float | None,
+    ) -> ProviderResult | None:
+        """Cancelled or expired before injection: the terminal result, else None."""
+        if task.cancel_event and task.cancel_event.is_set():
+            return ProviderResult(
+                exit_code=1, reply="Pi request cancelled before a terminal reply was observed.",
+                req_id=task.req_id, session_key=session_key, done_seen=False,
+                status=COMPLETION_STATUS_CANCELLED,
+            )
+        if deadline is not None and time.monotonic() >= deadline:
+            return ProviderResult(
+                exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
+                req_id=task.req_id, session_key=session_key, done_seen=False,
+                status=COMPLETION_STATUS_INCOMPLETE,
+            )
+        return None
+
+    def _refuse_screen(
+        self, task: QueuedTask, session_key: str, backend: Any, pane_id: str, state: str,
+    ) -> ProviderResult:
+        """Refuse a non-idle pre-send pane, naming the state and why it is not idle."""
+        _state, screen = _capture_screen_state(backend, pane_id)
+        reason = describe_pane_screen(screen)
+        if state == "dialog":
+            lead = "Pi is waiting for a project-trust or selector decision in its pane."
+        elif state == "busy":
+            lead = "Pi pane is busy; refusing to send to avoid steering an active turn."
+        else:
+            lead = "Pi pane readiness could not be verified; refusing to send."
+        return self._finish(task, ProviderResult(
+            exit_code=1, reply=f"{lead} (state: {state}; {reason})", req_id=task.req_id,
+            session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+        ))
 
     def _finish(self, task: QueuedTask, result: ProviderResult, *, transcript_path: str = "", conversation_id: str = "") -> ProviderResult:
         req = task.request

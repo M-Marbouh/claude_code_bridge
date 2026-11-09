@@ -22,14 +22,14 @@ def test_wezterm_pane_shares_window_uses_exact_tab(monkeypatch) -> None:
 def test_wezterm_strict_cwd_check_does_not_fail_open(monkeypatch) -> None:
     backend = terminal.WeztermBackend()
     monkeypatch.setattr(backend, "_list_panes", lambda: [{"pane_id": 1, "cwd": ""}])
-    assert backend.pane_matches_cwd_strict("1", "/home/musta/dev/project") is False
+    assert backend.pane_matches_cwd_strict("1", "/home/user/dev/project") is False
 
     monkeypatch.setattr(
         backend,
         "_list_panes",
-        lambda: [{"pane_id": 1, "cwd": "file:///home/musta/dev/project"}],
+        lambda: [{"pane_id": 1, "cwd": "file:///home/user/dev/project"}],
     )
-    assert backend.pane_matches_cwd_strict("1", "/home/musta/dev/project") is True
+    assert backend.pane_matches_cwd_strict("1", "/home/user/dev/project") is True
 
 
 def test_wezterm_pane_liveness_unknown_when_listing_fails(monkeypatch) -> None:

@@ -76,7 +76,7 @@ def test_bridge_diagnostics_print_when_reply_empty(monkeypatch, capsys) -> None:
         ),
     )
 
-    rc = bridge.main(["--target", "1", "--caller-pane-id", "%cnt", "--caller-terminal", "tmux", "hello"])
+    rc = bridge.main(["--target", "1", "--caller-pane-id", "%7", "--caller-terminal", "tmux", "hello"])
     captured = capsys.readouterr()
 
     assert rc == 0

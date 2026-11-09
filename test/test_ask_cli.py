@@ -33,7 +33,7 @@ def _peer_env(tmp_path: Path, caller: str = "claude") -> dict[str, str]:
     home = tmp_path / "home"
     registry_dir = home / ".ccb" / "run"
     registry_dir.mkdir(parents=True)
-    pane_id = "%cnt"
+    pane_id = "%7"
     record = {
         "ccb_session_id": f"ai-test-{os.getpid()}",
         "ccb_project_id": compute_ccb_project_id(tmp_path),

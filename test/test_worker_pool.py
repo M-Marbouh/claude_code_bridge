@@ -666,7 +666,7 @@ def test_session_worker_exposes_only_actionable_waiting_tasks():
 
 
 # --- queue-time expiry: a queued request is never lost silently -----------
-# Real record, content-automation 2026-11-09 (request C): a request whose caller
+# Real record, 2026-11-09 (request C): a request whose caller
 # stopped waiting while it was still queued used to be skipped with no result and
 # no hook. The worker and the daemon now claim a task under one lock, so exactly
 # one side wins: the worker starts it, or the daemon records "Not sent".

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask, route_session_key
+from askd.completion_delivery import persist_and_notify
 from askd_runtime import log_path, write_log
 from ccb_protocol import strip_done_text, wrap_codex_prompt
 from completion_hook import (
@@ -13,7 +14,6 @@ from completion_hook import (
     COMPLETION_STATUS_COMPLETED,
     COMPLETION_STATUS_FAILED,
     COMPLETION_STATUS_INCOMPLETE,
-    notify_completion,
 )
 from pane_registry import validate_route
 from pi_comm import (
@@ -28,7 +28,6 @@ from pi_comm import (
 )
 from project_id import compute_ccb_project_id
 from providers import PI_SPEC
-from task_receipts import PersistOutcome, persist_proven_result
 from terminal import get_backend_for_session
 
 PARK_TIMEOUT_S = 60.0
@@ -37,9 +36,14 @@ ANCHOR_TIMEOUT_S = 12.0
 ERROR_GRACE_S = 10.0
 # A retry whose pane stays confirmed idle this long has stopped without writing a reply.
 RETRY_IDLE_S = 30.0
-# A non-idle pre-send screen is re-checked after this wait, up to this many retries (~60 s).
+# A non-idle pre-send screen is re-checked after this wait. A dialog or unknown state gets
+# PRE_SEND_RETRY_LIMIT retries (~60 s); a busy pane is waited for without spending that budget.
 PRE_SEND_RETRY_WAIT_S = 20.0
 PRE_SEND_RETRY_LIMIT = 3
+# A busy pre-send wait is logged once, then at most this often.
+BUSY_LOG_INTERVAL_S = 60.0
+# A request stopped before injection was never delivered; its reply says so plainly.
+PRE_SEND_NOT_SENT_REPLY = "Pi request was not sent: CCB stopped waiting before Pi was free."
 # Cancellation is polled in slices this short while waiting to retry.
 PRE_SEND_WAIT_POLL_S = 0.25
 
@@ -193,6 +197,8 @@ class PiAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir).expanduser().resolve()
         deadline = None if float(req.timeout_s) < 0 else started + float(req.timeout_s)
         retries_left = PRE_SEND_RETRY_LIMIT
+        busy_since: float | None = None
+        busy_logged_at: float | None = None
         # The whole pre-send sequence re-runs after a wait: /new or a relaunch can change the
         # binding, the pane and the anchor evidence while we wait for a non-idle pane.
         while True:
@@ -210,6 +216,12 @@ class PiAdapter(BaseProviderAdapter):
                     done_seen=False, status=COMPLETION_STATUS_FAILED,
                 ))
             pane_id = str(session["pane_id"])
+
+            # A cancelled or expired request is never injected. This guard runs on EVERY
+            # pass, including the first idle attempt, so zero sends happen after a stop.
+            stop = self._pre_send_stop(task, session_key, deadline)
+            if stop is not None:
+                return self._finish(task, stop)
 
             session_dir = Path(session["pi_session_dir"]).expanduser()
             bound_session_id = str(session["pi_session_id"])
@@ -243,6 +255,35 @@ class PiAdapter(BaseProviderAdapter):
             screen_state = _capture_confirmed_state(backend, pane_id)
             if screen_state == "idle":
                 break
+            if screen_state == "busy":
+                # Busy is not a refusal: Pi may be busy outside CCB's tracking (the user is
+                # typing, or an earlier request is still running past its own wait). Wait for
+                # the pane instead of spending the dialog retry budget, so queued work is
+                # delivered when Pi is free rather than bounced back to the caller.
+                now = time.monotonic()
+                remaining = None if deadline is None else deadline - now
+                if remaining is not None and remaining <= 0:
+                    stop = self._pre_send_stop(task, session_key, deadline)
+                    if stop is not None:
+                        return self._finish(task, stop)
+                    return self._finish(task, ProviderResult(
+                        exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
+                        req_id=task.req_id, session_key=session_key, done_seen=False,
+                        status=COMPLETION_STATUS_INCOMPLETE,
+                    ))
+                if busy_since is None:
+                    busy_since = now
+                if busy_logged_at is None or now - busy_logged_at >= BUSY_LOG_INTERVAL_S:
+                    busy_logged_at = now
+                    _write_log(
+                        f"[INFO] pre-send waiting for busy Pi provider=pi req_id={task.req_id} "
+                        f"waited_s={int(now - busy_since)}"
+                    )
+                # Never wait past the request deadline: the poll is clamped to the budget left.
+                wait_s = PRE_SEND_RETRY_WAIT_S if remaining is None else min(PRE_SEND_RETRY_WAIT_S, remaining)
+                if not _wait_before_retry(task, wait_s):
+                    return self._finish(task, self._not_sent(task, session_key))
+                continue
             if retries_left <= 0 or (
                 deadline is not None and time.monotonic() + PRE_SEND_RETRY_WAIT_S > deadline
             ):
@@ -252,23 +293,15 @@ class PiAdapter(BaseProviderAdapter):
                 f"state={screen_state} retries_left={retries_left}"
             )
             if not _wait_before_retry(task, PRE_SEND_RETRY_WAIT_S):
-                return self._finish(task, ProviderResult(
-                    exit_code=1, reply="Pi request cancelled before a terminal reply was observed.",
-                    req_id=task.req_id, session_key=session_key, done_seen=False,
-                    status=COMPLETION_STATUS_CANCELLED,
-                ))
+                return self._finish(task, self._not_sent(task, session_key))
             retries_left -= 1
-            # A cancelled or timed-out request must never be injected.
-            stop = self._pre_send_stop(task, session_key, deadline)
-            if stop is not None:
-                return self._finish(task, stop)
 
         # The readiness re-check after a wait can itself consume the last of the budget or see a
-        # cancellation; check once more before the policy gate, only when a wait happened.
-        if retries_left < PRE_SEND_RETRY_LIMIT:
-            stop = self._pre_send_stop(task, session_key, deadline)
-            if stop is not None:
-                return self._finish(task, stop)
+        # cancellation; this guard is the LAST step before the policy gate, so nothing is sent
+        # for a stopped request.
+        stop = self._pre_send_stop(task, session_key, deadline)
+        if stop is not None:
+            return self._finish(task, stop)
 
         # Phase 3 (E5): role-policy recheck as the LAST step before injection.
         from delivery_policy import refusal_for_request
@@ -297,16 +330,19 @@ class PiAdapter(BaseProviderAdapter):
         anchor_ms: int | None = None
         saw_busy = False
         transcript_path = ""
+        caller_stopped_logged = False
         result = None
         while True:
             now = time.monotonic()
             if task.cancel_event and task.cancel_event.is_set():
-                result = ProviderResult(
-                    exit_code=1, reply="Pi request cancelled before a terminal reply was observed.",
-                    req_id=task.req_id, session_key=session_key, done_seen=False,
-                    anchor_seen=anchor_seen, anchor_ms=anchor_ms, status=COMPLETION_STATUS_CANCELLED,
-                )
-                break
+                # The only production setter is the daemon's wait expiry, i.e. the caller stopped
+                # waiting -- not an abort of Pi. Keep tracking to this adapter's deadline and
+                # report the real outcome, so an already-injected turn is never lost.
+                if not caller_stopped_logged:
+                    caller_stopped_logged = True
+                    _write_log(
+                        f"[INFO] caller stopped waiting; still tracking provider=pi req_id={task.req_id}"
+                    )
             if not backend.is_alive(str(session["pane_id"])):
                 result = ProviderResult(
                     exit_code=2, reply="Pi pane died during the request.", req_id=task.req_id,
@@ -468,16 +504,19 @@ class PiAdapter(BaseProviderAdapter):
             time.sleep(0.25)
         return self._finish(task, result, transcript_path=transcript_path, conversation_id=pi_session_id)
 
+    def _not_sent(self, task: QueuedTask, session_key: str) -> ProviderResult:
+        """The terminal result for a request stopped before injection: never delivered."""
+        return ProviderResult(
+            exit_code=1, reply=PRE_SEND_NOT_SENT_REPLY, req_id=task.req_id, session_key=session_key,
+            done_seen=False, status=COMPLETION_STATUS_CANCELLED,
+        )
+
     def _pre_send_stop(
         self, task: QueuedTask, session_key: str, deadline: float | None,
     ) -> ProviderResult | None:
         """Cancelled or expired before injection: the terminal result, else None."""
         if task.cancel_event and task.cancel_event.is_set():
-            return ProviderResult(
-                exit_code=1, reply="Pi request cancelled before a terminal reply was observed.",
-                req_id=task.req_id, session_key=session_key, done_seen=False,
-                status=COMPLETION_STATUS_CANCELLED,
-            )
+            return self._not_sent(task, session_key)
         if deadline is not None and time.monotonic() >= deadline:
             return ProviderResult(
                 exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
@@ -504,24 +543,8 @@ class PiAdapter(BaseProviderAdapter):
         ))
 
     def _finish(self, task: QueuedTask, result: ProviderResult, *, transcript_path: str = "", conversation_id: str = "") -> ProviderResult:
-        req = task.request
-        try:
-            persisted = persist_proven_result(
-                task.req_id, reply=result.reply, status=result.status,
-                transcript_path=transcript_path, conversation_id=conversation_id,
-            )
-        except Exception:
-            persisted = PersistOutcome.FAILED
-        if req.suppress_completion_hook or persisted == PersistOutcome.FAILED:
-            return result
-        notify_completion(
-            provider="pi", output_file=req.output_path, reply=result.reply, req_id=task.req_id,
-            done_seen=result.done_seen, status=result.status, caller=req.caller,
-            email_req_id=req.email_req_id, email_msg_id=req.email_msg_id, email_from=req.email_from,
-            work_dir=req.caller_work_dir or req.work_dir,
-            caller_pane_id=req.caller_pane_id or (req.route.caller_pane_id if req.route.present else ""),
-            caller_terminal=req.caller_terminal or (req.route.caller_terminal if req.route.present else ""),
-            caller_live_id=req.route.caller_live_id if req.route.present else "",
-            route_launch_id=req.route.launch_id if req.route.present else "",
+        persist_and_notify(
+            "pi", task.request, req_id=task.req_id, reply=result.reply, status=result.status,
+            done_seen=result.done_seen, transcript_path=transcript_path, conversation_id=conversation_id,
         )
         return result

@@ -26,6 +26,7 @@ from askd.adapters.base import (
     parse_route_mapping,
     route_session_key,
 )
+from askd.completion_delivery import persist_and_notify
 from askd.registry import ProviderRegistry
 from askd_timeout import codex_idle_timeout_s, codex_max_wait_s, positive_timeout_s
 from askd_runtime import log_path, random_token, state_file_path, write_log
@@ -273,6 +274,42 @@ def _queue_entries(
     return entries
 
 
+def _record_unsent_request(task: QueuedTask, provider: str, budget_s: float | None = None) -> None:
+    """Record and notify a request that expired while still waiting in line.
+
+    The client already stopped waiting (that is why the expiry fired), so the result is
+    delivered the same way an adapter's `_finish` delivers one: receipt first, then the
+    completion hook -- unless the request asked for no hook, was delivery-only, or was a
+    peer reply, which are persisted without notifying.
+    """
+    request = task.request
+    # The budget the caller actually waited: max_wait for implicit progress-mode requests.
+    timeout_s = float(request.timeout_s) if budget_s is None else float(budget_s)
+    reply = (
+        f"Not sent: this request waited in line behind earlier {provider} requests "
+        f"for its whole timeout ({int(timeout_s)} s). Resend it if still needed."
+    )
+    result = ProviderResult(
+        exit_code=2,
+        reply=reply,
+        req_id=task.req_id,
+        session_key=route_session_key(provider, request.route) if request.route.present else f"{provider}:unknown",
+        done_seen=False,
+        status=COMPLETION_STATUS_FAILED,
+    )
+    _write_log(
+        f"[WARN] queued request expired unsent provider={provider} req_id={task.req_id} "
+        f"timeout_s={int(timeout_s)}"
+    )
+    persist_and_notify(
+        provider, request, req_id=task.req_id, reply=result.reply, status=result.status,
+        done_seen=False,
+        notify=not (request.delivery_only or request.peer_destination.present),
+    )
+    # The client contract is unchanged: the waiting caller still gets exit 2 with no reply.
+    task.done_event.set()
+
+
 class UnifiedAskDaemon:
     """
     Unified daemon server for all AI providers.
@@ -517,12 +554,32 @@ class UnifiedAskDaemon:
         task.done_event.wait(timeout=wait_timeout)
         result = task.result
 
-        # If timeout occurred and task is still running, mark it as cancelled
+        # If timeout occurred and task is still running, mark it as cancelled. A task the
+        # worker never claimed was never sent at all: record and notify that explicitly
+        # instead of losing it silently. A started task keeps today's cooperative cancel,
+        # which every provider except Pi acts on exactly as before.
+        unsent = False
         if not result and not task.done_event.is_set():
             _write_log(f"[WARN] Task timeout, marking as cancelled: provider={provider} req_id={task.req_id}")
-            task.cancelled = True
-            if task.cancel_event:
-                task.cancel_event.set()
+            claim_lock = getattr(task, "claim_lock", None)
+            if claim_lock is not None:
+                # Same lock the worker takes before it starts the task, so the two sides
+                # agree on exactly one of "skipped" and "started".
+                with claim_lock:
+                    unsent = not getattr(task, "started", False)
+                    task.cancelled = True
+                    if task.cancel_event:
+                        task.cancel_event.set()
+            else:
+                task.cancelled = True
+                if task.cancel_event:
+                    task.cancel_event.set()
+
+        if unsent:
+            _record_unsent_request(
+                task, provider,
+                budget_s=(wait_timeout - 5.0) if wait_timeout is not None else None,
+            )
 
         if not result:
             return {

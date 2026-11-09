@@ -304,6 +304,11 @@ class QueuedTask:
     result: Optional[ProviderResult] = None
     cancelled: bool = False  # Cancellation flag for timeout/expiry
     cancel_event: Optional[threading.Event] = None  # Event for cooperative cancellation
+    # Claim bookkeeping (queue-time expiry): the worker marks `started` under
+    # `claim_lock` when it dequeues, so the daemon's wait expiry can tell a task
+    # that was never sent apart from one already handed to the adapter.
+    claim_lock: threading.Lock = field(default_factory=threading.Lock)
+    started: bool = False
     # Adapter-reported progress of the in-flight task (phase, timestamps),
     # read by the daemon's queue status so a stuck queue is visible.
     progress: dict = field(default_factory=dict)

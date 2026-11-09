@@ -663,3 +663,228 @@ def test_session_worker_exposes_only_actionable_waiting_tasks():
         adapter.release_first.set()
         worker.stop()
         worker.join(timeout=2)
+
+
+# --- queue-time expiry: a queued request is never lost silently -----------
+# Real record, content-automation 2026-11-09 (request C): a request whose caller
+# stopped waiting while it was still queued used to be skipped with no result and
+# no hook. The worker and the daemon now claim a task under one lock, so exactly
+# one side wins: the worker starts it, or the daemon records "Not sent".
+
+from completion_hook import COMPLETION_STATUS_FAILED
+from task_receipts import PersistOutcome
+import askd.completion_delivery as delivery_mod
+
+
+class _ExpiredWait:
+    """A done_event whose wait expires immediately: the queued-expiry path, without sleeping."""
+
+    def __init__(self):
+        self.timeout = None
+        self.set_called = False
+
+    def wait(self, timeout=None):
+        self.timeout = timeout
+        return False
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        self.set_called = True
+
+
+def _expiry_task(
+    req_id: str,
+    *,
+    started: bool = False,
+    delivery_only: bool = False,
+    peer: bool = False,
+    suppress_hook: bool = False,
+    done_event=None,
+) -> QueuedTask:
+    from askd.adapters.base import PeerDestination
+
+    request = ProviderRequest(
+        client_id="r1", work_dir="/tmp/proj", timeout_s=3600.0, quiet=False,
+        message="hi", caller="claude", req_id=req_id,
+        delivery_only=delivery_only, suppress_completion_hook=suppress_hook,
+        output_path="/tmp/out.txt", caller_pane_id="%0", caller_terminal="tmux",
+        caller_work_dir="/tmp/caller",
+        peer_destination=(
+            PeerDestination(pane_id="%9", terminal="tmux", work_dir="/tmp/peer") if peer else PeerDestination()
+        ),
+    )
+    task = QueuedTask(
+        request=request, created_ms=0, req_id=req_id,
+        done_event=done_event if done_event is not None else _ExpiredWait(),
+        cancel_event=threading.Event(),
+    )
+    task.started = started
+    return task
+
+
+def _expiry_daemon(monkeypatch, task: QueuedTask) -> UnifiedAskDaemon:
+    adapter = _RouteAwareAdapter()
+    registry = ProviderRegistry()
+    registry.register(adapter)
+    daemon = UnifiedAskDaemon(registry=registry, work_dir="/tmp/proj")
+    daemon.pool.submit = lambda _provider, _request: task
+    return daemon, adapter
+
+
+def _expiry_message() -> dict:
+    return {
+        "id": "r1", "provider": "codex", "work_dir": "/tmp/proj",
+        "timeout_s": 3600.0, "message": "hi", "caller": "claude", "req_id": "r1",
+    }
+
+
+def _record_delivery_calls(monkeypatch, outcome: str = PersistOutcome.SAVED) -> list:
+    calls: list = []
+    monkeypatch.setattr(
+        delivery_mod, "persist_proven_result",
+        lambda req_id, **kwargs: calls.append(("persist", req_id, kwargs)) or outcome,
+    )
+    monkeypatch.setattr(
+        delivery_mod, "notify_completion",
+        lambda **kwargs: calls.append(("notify", kwargs)),
+    )
+    return calls
+
+
+def test_queued_expiry_records_and_notifies_an_unsent_request(monkeypatch) -> None:
+    task = _expiry_task("20261109-105754-593-2384617")
+    daemon, adapter = _expiry_daemon(monkeypatch, task)
+    calls = _record_delivery_calls(monkeypatch)
+
+    response = daemon._handle_request(_expiry_message())
+
+    # The client contract is unchanged: exit 2 with an empty reply.
+    assert response["exit_code"] == 2 and response["reply"] == ""
+    # The expiry won the claim, so the adapter never touched the request.
+    assert adapter.started == []
+    assert task.cancelled is True and task.cancel_event.is_set()
+    # Receipt first, notification second.
+    assert [call[0] for call in calls] == ["persist", "notify"]
+    _kind, req_id, persisted = calls[0]
+    assert req_id == task.req_id
+    assert persisted["status"] == COMPLETION_STATUS_FAILED
+    assert persisted["reply"] == (
+        "Not sent: this request waited in line behind earlier codex requests "
+        "for its whole timeout (3600 s). Resend it if still needed."
+    )
+    notified = calls[1][1]
+    assert notified["provider"] == "codex"
+    assert notified["req_id"] == task.req_id
+    assert notified["status"] == COMPLETION_STATUS_FAILED
+    assert notified["done_seen"] is False
+    # The same caller fields Pi's `_finish` passes.
+    assert notified["caller"] == "claude"
+    assert notified["output_file"] == "/tmp/out.txt"
+    assert notified["work_dir"] == "/tmp/caller"
+    assert notified["caller_pane_id"] == "%0"
+    assert notified["caller_terminal"] == "tmux"
+    assert task.done_event.set_called is True
+
+
+def test_queued_expiry_does_not_notify_when_the_receipt_could_not_be_saved(monkeypatch) -> None:
+    task = _expiry_task("failed-persist")
+    daemon, _adapter = _expiry_daemon(monkeypatch, task)
+    calls = _record_delivery_calls(monkeypatch, PersistOutcome.FAILED)
+
+    daemon._handle_request(_expiry_message())
+
+    assert [call[0] for call in calls] == ["persist"]
+
+
+def test_queued_expiry_honours_suppress_completion_hook(monkeypatch) -> None:
+    task = _expiry_task("suppressed-hook", suppress_hook=True)
+    daemon, _adapter = _expiry_daemon(monkeypatch, task)
+    calls = _record_delivery_calls(monkeypatch)
+
+    daemon._handle_request(_expiry_message())
+
+    assert [call[0] for call in calls] == ["persist"]
+
+
+@pytest.mark.parametrize("kind", ["delivery_only", "peer"])
+def test_queued_expiry_persists_only_for_delivery_only_and_peer(monkeypatch, kind: str) -> None:
+    task = _expiry_task(
+        f"{kind}-record", delivery_only=kind == "delivery_only", peer=kind == "peer",
+    )
+    daemon, _adapter = _expiry_daemon(monkeypatch, task)
+    calls = _record_delivery_calls(monkeypatch)
+
+    daemon._handle_request(_expiry_message())
+
+    assert [call[0] for call in calls] == ["persist"]
+    assert calls[0][2]["status"] == COMPLETION_STATUS_FAILED
+
+
+def test_worker_wins_the_claim_and_gets_the_cancel_event_as_before(monkeypatch) -> None:
+    task = _expiry_task("worker-wins", started=True)
+    daemon, _adapter = _expiry_daemon(monkeypatch, task)
+    calls = _record_delivery_calls(monkeypatch)
+
+    response = daemon._handle_request(_expiry_message())
+
+    assert response["exit_code"] == 2 and response["reply"] == ""
+    assert task.cancelled is True and task.cancel_event.is_set()
+    # A started task is never recorded as "not sent".
+    assert calls == []
+
+
+def test_queued_expiry_waits_for_the_worker_claim_lock(monkeypatch) -> None:
+    task = _expiry_task("claim-ordering")
+    daemon, adapter = _expiry_daemon(monkeypatch, task)
+    calls = _record_delivery_calls(monkeypatch)
+    responses: list[dict] = []
+
+    def run_request() -> None:
+        responses.append(daemon._handle_request(_expiry_message()))
+
+    with task.claim_lock:  # the worker holds the claim while it dequeues
+        requester = threading.Thread(target=run_request, daemon=True)
+        requester.start()
+        time.sleep(0.05)
+        # The expiry cannot decide while the claim is held.
+        assert task.cancelled is False and calls == []
+        task.started = True  # the worker wins: it starts the task under the same lock
+    requester.join(timeout=2)
+
+    assert not requester.is_alive()
+    assert responses and responses[0]["exit_code"] == 2
+    assert task.cancelled is True and task.cancel_event.is_set()
+    assert calls == []
+    assert adapter.started == []
+
+
+def test_worker_marks_a_dequeued_task_started() -> None:
+    worker = _EchoWorker("claim-start")
+    worker.start()
+    try:
+        task = _expiry_task("claimed-task", done_event=threading.Event())
+        worker.enqueue(task)
+        assert task.done_event.wait(timeout=2) is True
+        assert task.started is True
+        assert task.result == "ok:claimed-task"
+    finally:
+        worker.stop()
+        worker.join(timeout=2)
+
+
+def test_worker_skips_a_task_cancelled_while_queued_without_starting_it() -> None:
+    worker = _EchoWorker("claim-skip")
+    worker.start()
+    try:
+        task = _expiry_task("skipped-task", done_event=threading.Event())
+        task.cancelled = True
+        task.cancel_event.set()
+        worker.enqueue(task)
+        assert task.done_event.wait(timeout=2) is True
+        assert task.started is False
+        assert task.result is None
+    finally:
+        worker.stop()
+        worker.join(timeout=2)

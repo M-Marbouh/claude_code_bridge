@@ -61,8 +61,19 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
             except queue.Empty:
                 continue
 
-            # Skip cancelled/expired tasks
-            if hasattr(task, 'cancelled') and task.cancelled:
+            # Claiming is atomic with the daemon's wait expiry: a task that the
+            # daemon cancelled while still queued is skipped here and never
+            # handed to the adapter; anything else is marked started before the
+            # handler runs (see `askd.daemon`'s expiry path).
+            claim_lock = getattr(task, "claim_lock", None)
+            if claim_lock is not None:
+                with claim_lock:
+                    if getattr(task, "cancelled", False):
+                        task.done_event.set()
+                        continue
+                    task.started = True
+            elif hasattr(task, 'cancelled') and task.cancelled:
+                # Tasks without a claim lock keep the pre-claim behaviour exactly.
                 task.done_event.set()
                 continue
 

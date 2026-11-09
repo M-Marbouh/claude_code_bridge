@@ -927,36 +927,49 @@ def main(argv: list[str] | None = None) -> int:
         lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
         try:
             if direct_backend is not None:
-                # Revalidate after acquiring the transport lock, just as
-                # queued daemon delivery revalidates at its send boundary.
-                target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
-                direct_pane = str(
-                    ((target.get("providers") or {}).get(args.provider) or {}).get("pane_id") or ""
-                )
-                # Phase 3 (A6.iv/E2): this path reaches a pane without the
-                # daemon, so it applies the same policy module itself.
-                direct_refusal = _direct_reply_policy_refusal(
-                    provider=str(args.provider or "claude"),
-                    pane_id=direct_pane,
-                    work_dir=str(target.get("work_dir") or ""),
-                    ccb_project_id=str(target.get("ccb_project_id") or ""),
-                    reply_receipt=reply_receipt,
-                    to_role=to_role,
-                )
-                if direct_refusal:
-                    print(f"[ERROR] {direct_refusal}", file=sys.stderr)
+                # Item 1/A6: this path bypasses the daemon, so it takes the
+                # same cross-process PANE injection lock the daemon send path
+                # takes, and revalidates only AFTER it holds it -- a pane
+                # replaced while this bridge waited is then refused, not
+                # written to.
+                from pane_lock import PaneLockError, pane_injection_lock
+
+                lock_pane = str(reply_receipt.get("caller_pane_id") or "")
+                try:
+                    with pane_injection_lock(direct_backend, lock_pane, None):
+                        # Revalidate after acquiring the transport lock, just as
+                        # queued daemon delivery revalidates at its send boundary.
+                        target, direct_backend = _validated_direct_reply_target(reply_receipt, args.provider)
+                        direct_pane = str(
+                            ((target.get("providers") or {}).get(args.provider) or {}).get("pane_id") or ""
+                        )
+                        # Phase 3 (A6.iv/E2): this path reaches a pane without the
+                        # daemon, so it applies the same policy module itself.
+                        direct_refusal = _direct_reply_policy_refusal(
+                            provider=str(args.provider or "claude"),
+                            pane_id=direct_pane,
+                            work_dir=str(target.get("work_dir") or ""),
+                            ccb_project_id=str(target.get("ccb_project_id") or ""),
+                            reply_receipt=reply_receipt,
+                            to_role=to_role,
+                        )
+                        if direct_refusal:
+                            print(f"[ERROR] {direct_refusal}", file=sys.stderr)
+                            return 1
+                        exit_code, reply, meta = _send_to_direct_reply_target(
+                            target,
+                            direct_backend,
+                            message,
+                            str(args.sender_work_dir or ""),
+                            str(args.intent or "wait"),
+                            str(args.peer_task_id or ""),
+                            str(args.reply_to or ""),
+                            str(args.provider or "claude"),
+                            str(args.caller or "claude"),
+                        )
+                except PaneLockError as exc:
+                    print(f"[ERROR] {exc}", file=sys.stderr)
                     return 1
-                exit_code, reply, meta = _send_to_direct_reply_target(
-                    target,
-                    direct_backend,
-                    message,
-                    str(args.sender_work_dir or ""),
-                    str(args.intent or "wait"),
-                    str(args.peer_task_id or ""),
-                    str(args.reply_to or ""),
-                    str(args.provider or "claude"),
-                    str(args.caller or "claude"),
-                )
             else:
                 exit_code, reply, meta = _send_to_daemon(
                     target,

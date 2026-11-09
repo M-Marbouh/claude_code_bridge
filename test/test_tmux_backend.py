@@ -78,13 +78,13 @@ def test_tmux_pane_belongs_to_cwd_compares_current_path(monkeypatch: pytest.Monk
     def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
                       input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         assert args == ["display-message", "-p", "-t", "%1", "#{pane_current_path}"]
-        return _cp(stdout="/home/musta/dev/project\n")
+        return _cp(stdout="/home/user/dev/project\n")
 
     backend = terminal.TmuxBackend()
     monkeypatch.setattr(backend, "_tmux_run", fake_tmux_run.__get__(backend, terminal.TmuxBackend))
 
-    assert backend.pane_belongs_to_cwd("%1", "/home/musta/dev/project") is True
-    assert backend.pane_belongs_to_cwd("%1", "/home/musta/dev/other") is False
+    assert backend.pane_belongs_to_cwd("%1", "/home/user/dev/project") is True
+    assert backend.pane_belongs_to_cwd("%1", "/home/user/dev/other") is False
 
 
 @pytest.mark.parametrize(
@@ -173,6 +173,9 @@ def test_tmux_send_text_always_deletes_buffer(monkeypatch: pytest.MonkeyPatch) -
     def fake_tmux_run(self: terminal.TmuxBackend, args: list[str], *, check: bool = False, capture: bool = False,
                       input_bytes: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         calls.append(args)
+        # The pane-injection lock resolves its key through the same runner.
+        if args and args[0] == "display-message":
+            return _cp(stdout="/tmp/tmux-1000/default %1\n")
         if args and args[0] == "paste-buffer":
             raise subprocess.CalledProcessError(1, ["tmux", *args])
         return _cp(stdout="")

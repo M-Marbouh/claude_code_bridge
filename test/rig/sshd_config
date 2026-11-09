@@ -1,0 +1,16 @@
+# Key authentication only, no root, no passwords. Everything else is OpenSSH's
+# default; the restricted-key requirements (no PTY/forwarding) live in the
+# authorized_keys options, which is where sshd enforces them.
+Port 22
+ListenAddress 0.0.0.0
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+AllowUsers b
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+LogLevel VERBOSE
+PidFile /run/sshd/rig.pid
+Subsystem sftp /usr/lib/openssh/sftp-server

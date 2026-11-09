@@ -420,7 +420,9 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
         *,
         live_id: str = "",
         to_role: str = "",
+        **extra: object,
     ) -> int:
+        captured["extra"] = extra
         captured.update(
             target=target,
             provider=provider,
@@ -438,6 +440,8 @@ def test_peer_notify_uses_one_way_foreground_delivery(monkeypatch) -> None:
     rc = ask._handle_peer_mode(["--peer", "/tmp/peer", "--notify", "result"])
 
     assert rc == 0
+    assert captured["extra"] == {"wait_explicit": False, "foreground_explicit": False}
+    captured.pop("extra")
     assert captured == {
         "target": "/tmp/peer",
         "provider": "claude",
@@ -2042,7 +2046,13 @@ def test_ask_forwards_live_id_for_provider_peer_form(monkeypatch) -> None:
     )
 
     assert rc == 0
-    assert captured == {"live_id": "live-b", "to_role": ""}
+    assert captured == {
+        "live_id": "live-b",
+        "to_role": "",
+        "wait_explicit": False,
+        "foreground_explicit": False,
+        "resend_seen": False,
+    }
 
 
 def test_peer_mode_parser_forwards_live_id(monkeypatch) -> None:
@@ -2057,7 +2067,12 @@ def test_peer_mode_parser_forwards_live_id(monkeypatch) -> None:
     rc = ask._handle_peer_mode(["--peer", "/tmp/peer", "--live-id", "live-b", "--notify", "FYI"])
 
     assert rc == 0
-    assert captured == {"live_id": "live-b", "to_role": ""}
+    assert captured == {
+        "live_id": "live-b",
+        "to_role": "",
+        "wait_explicit": False,
+        "foreground_explicit": False,
+    }
 
 
 def _refuse_dispatch(ask, monkeypatch) -> None:
@@ -2329,6 +2344,9 @@ def test_ask_resend_forwards_raw_body_and_live_id_through_peer_mode(
         "live_id": "live-target",
         "preserve_task_id": _RESEND_TASK_ID,
         "to_role": "",
+        "wait_explicit": False,
+        "foreground_explicit": False,
+        "resend_seen": True,
     }
 
 

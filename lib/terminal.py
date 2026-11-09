@@ -752,6 +752,15 @@ class TmuxBackend(TerminalBackend):
             pass
 
     def send_text(self, pane_id: str, text: str) -> None:
+        # One physical pane, one injection at a time -- across threads,
+        # adapters and (from T2) askd daemons. Covers paste, Enter delay,
+        # Enter and buffer cleanup, never a provider turn.
+        from pane_lock import pane_injection_lock
+
+        with pane_injection_lock(self, pane_id, None):
+            self._send_text_locked(pane_id, text)
+
+    def _send_text_locked(self, pane_id: str, text: str) -> None:
         sanitized = (text or "").replace("\r", "").strip()
         if not sanitized:
             return
@@ -1126,6 +1135,13 @@ class WeztermBackend(TerminalBackend):
         return False
 
     def send_text(self, pane_id: str, text: str) -> None:
+        # Same cross-process pane-injection lock as the tmux backend.
+        from pane_lock import pane_injection_lock
+
+        with pane_injection_lock(self, pane_id, None):
+            self._send_text_locked(pane_id, text)
+
+    def _send_text_locked(self, pane_id: str, text: str) -> None:
         sanitized = text.replace("\r", "").strip()
         if not sanitized:
             return

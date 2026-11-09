@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""ccb-remote - inspect and recover cross-machine CCB deliveries (M1).
+
+    ccb-remote status <host-qualified-id>   destination state for a submission
+    ccb-remote list <host>                  allowlisted projects on a host
+
+`status` is the recovery path for a submission whose acknowledgement was lost:
+it reads the outbound receipt (the host comes from the receipt only, never from
+the command line), asks the destination, and records the destination state.
+
+M1 is delivery-only: there is no reply, no wait, and no automatic resubmit.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+if str(lib_dir) not in sys.path:
+    sys.path.insert(0, str(lib_dir))
+
+from compat import setup_windows_encoding  # noqa: E402
+
+setup_windows_encoding()
+
+import remote_client  # noqa: E402
+from cli_output import EXIT_ERROR, EXIT_OK  # noqa: E402
+
+USAGE = """Usage:
+  ccb-remote status <host-qualified-id>   Ask the destination for this request's state
+  ccb-remote list <host>                  List the projects this key may address on <host>
+  ccb-remote -h                           Show this help
+
+Cross-machine delivery is one-way in this milestone: no reply is captured and a
+submission is never retried automatically. `status` is the recovery path for a
+delivery whose acknowledgement was lost.
+"""
+
+
+def _usage(stream=None) -> None:
+    print(USAGE, file=stream or sys.stderr)
+
+
+def _cmd_status(argv: list[str]) -> int:
+    if len(argv) != 1:
+        print("[ERROR] status requires exactly one host-qualified request id", file=sys.stderr)
+        return EXIT_ERROR
+    result = remote_client.status(argv[0])
+    return EXIT_OK if result.exit_code == remote_client.EXIT_ACCEPTED else result.exit_code
+
+
+def _cmd_list(argv: list[str]) -> int:
+    if len(argv) != 1:
+        print("[ERROR] list requires exactly one configured host alias", file=sys.stderr)
+        return EXIT_ERROR
+    result = remote_client.list_projects(argv[0])
+    return EXIT_OK if result.exit_code == remote_client.EXIT_ACCEPTED else result.exit_code
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv[1:])
+    if not args or args[0] in ("-h", "--help"):
+        _usage(sys.stdout if args else sys.stderr)
+        return EXIT_OK if args else EXIT_ERROR
+
+    command, rest = args[0], args[1:]
+    try:
+        if command == "status":
+            return _cmd_status(rest)
+        if command == "list":
+            return _cmd_list(rest)
+    except remote_client.RemoteConfigError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except remote_client.RemoteRefusal as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"[ERROR] Unknown ccb-remote command: {command}", file=sys.stderr)
+    _usage()
+    return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

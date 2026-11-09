@@ -171,21 +171,40 @@ class HermesAdapter(BaseProviderAdapter):
             ), database_path=str(db_path))
 
         prompt = wrap_codex_prompt(req.message, task.req_id)
-        # Phase 3 (E5): role-policy recheck as the LAST step before injection.
+        # Phase 3 (E5) + Item 1: the identity/role-policy recheck runs INSIDE
+        # the cross-process pane-injection lock, so a revoked permission or a
+        # replaced destination during the lock wait is judged AFTER that wait and
+        # immediately before injection. `send_text` re-enters the lock harmlessly.
         from delivery_policy import refusal_for_request
+        from pane_lock import PaneLockError, pane_injection_lock
 
-        refusal = refusal_for_request(req, self.key, expected_pane=pane_id, session=session)
-        if refusal:
-            _write_log(f"[INFO] policy refused provider=hermes req_id={task.req_id} reason={refusal}")
-            return self._finish(task, ProviderResult(
-                exit_code=1, reply=refusal, req_id=task.req_id, session_key=session_key,
-                done_seen=False, status=COMPLETION_STATUS_FAILED,
-            ), database_path=str(db_path))
         try:
-            backend.send_text(pane_id, prompt)
-        except Exception as exc:
+            with pane_injection_lock(backend, pane_id, None):
+                refusal = refusal_for_request(
+                    req, self.key, expected_pane=pane_id, session=session
+                )
+                if refusal:
+                    _write_log(
+                        f"[INFO] policy refused provider=hermes req_id={task.req_id} reason={refusal}"
+                    )
+                    return self._finish(task, ProviderResult(
+                        exit_code=1, reply=refusal, req_id=task.req_id, session_key=session_key,
+                        done_seen=False, status=COMPLETION_STATUS_FAILED,
+                    ), database_path=str(db_path))
+                try:
+                    backend.send_text(pane_id, prompt)
+                except Exception as exc:
+                    return self._finish(task, ProviderResult(
+                        exit_code=1, reply=f"Failed to send to Hermes pane: {exc}", req_id=task.req_id,
+                        session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+                    ), database_path=str(db_path))
+        except PaneLockError as exc:
+            # No injection happened: this IS proven non-delivery.
+            _write_log(
+                f"[WARN] pane injection lock unavailable provider=hermes req_id={task.req_id}: {exc}"
+            )
             return self._finish(task, ProviderResult(
-                exit_code=1, reply=f"Failed to send to Hermes pane: {exc}", req_id=task.req_id,
+                exit_code=1, reply=f"Pane injection lock unavailable: {exc}", req_id=task.req_id,
                 session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
             ), database_path=str(db_path))
 

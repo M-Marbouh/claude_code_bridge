@@ -309,6 +309,18 @@ class QueuedTask:
     # that was never sent apart from one already handed to the adapter.
     claim_lock: threading.Lock = field(default_factory=threading.Lock)
     started: bool = False
+    # Remote (cross-machine) deliveries only: the host-qualified request id of
+    # the destination journal record this task must keep in step. Set by the
+    # remote submit path BEFORE the task is enqueued, so the worker can never
+    # race the assignment; empty for every local task.
+    remote_record_id: str = ""
+    #: The daemon that owns the remote journal record (its askd state file).
+    remote_owner: str = ""
+    #: True ONLY when this task was refused by the enqueue-time destination
+    #: check, before any worker could see it. Never inferred from the shape of
+    #: `result`: a synchronous worker can leave an unsuccessful result behind
+    #: after a partial send, and nothing may call that "proven pre-dispatch".
+    refused_before_queue: bool = False
     # Adapter-reported progress of the in-flight task (phase, timestamps),
     # read by the daemon's queue status so a stuck queue is visible.
     progress: dict = field(default_factory=dict)
@@ -378,6 +390,95 @@ class BaseProviderAdapter(ABC):
     def on_stop(self) -> None:
         """Called when the daemon stops. Override for cleanup."""
         pass
+
+
+def saved_destination_refusal(
+    *,
+    route,
+    provider: str,
+    work_dir: str,
+    pane_id: str,
+    backend,
+    terminal: str = "",
+    pane_title_marker: str = "",
+    validate_route_fn=None,
+) -> str:
+    """Re-confirm, AFTER the pane-injection lock is held, the EXACT destination.
+
+    Everything a routed task depends on -- the live session binding, launch,
+    session file, project, pane, terminal -- was resolved BEFORE the wait for
+    the lock. Another sender, a relaunch or an operator can replace it while
+    this task waits, so this read-only check runs last, immediately before the
+    role policy and the injection. Returns "" when the destination is still the
+    saved one, else a refusal (the caller must then send nothing).
+
+    Read-only on purpose: `ensure_pane()` may CREATE a pane, which must never
+    happen while holding the injection lock.
+    """
+    if route is not None and getattr(route, "present", False):
+        from project_id import compute_ccb_project_id
+
+        if validate_route_fn is None:
+            from pane_registry import validate_route as validate_route_fn
+
+        try:
+            request_project_id = compute_ccb_project_id(Path(work_dir))
+        except Exception:
+            request_project_id = ""
+        outcome = validate_route_fn(
+            live_id=route.live_id,
+            launch_id=route.launch_id,
+            provider=provider,
+            pane_id=route.pane_id,
+            terminal=route.terminal,
+            session_file=route.session_file,
+            ccb_project_id=route.ccb_project_id,
+            request_project_id=request_project_id,
+            caller_pane_id=getattr(route, "caller_pane_id", ""),
+            caller_terminal=getattr(route, "caller_terminal", ""),
+            caller_live_id=getattr(route, "caller_live_id", ""),
+            caller_token=getattr(route, "caller_token", ""),
+        )
+        if not outcome.ok:
+            return f"Routed destination is no longer available ({outcome.error})."
+        if route.pane_id and pane_id and route.pane_id != pane_id:
+            return "Routed destination pane changed while this task waited."
+        if route.terminal and terminal and route.terminal != terminal:
+            return "Routed destination terminal changed while this task waited."
+
+    if backend is None:
+        return "Terminal backend is unavailable."
+    # Liveness/cwd/marker checks apply only when the backend can report them;
+    # a backend with no such capability is not evidence of a replacement (the
+    # routed binding check above is the unconditional one).
+    is_alive = getattr(backend, "is_alive", None)
+    if callable(is_alive):
+        try:
+            alive = bool(is_alive(pane_id))
+        except Exception:
+            return "Destination pane identity could not be confirmed."
+        if not alive:
+            return "Destination pane is no longer alive."
+
+    cwd_check = getattr(backend, "pane_matches_cwd_strict", None)
+    if callable(cwd_check):
+        try:
+            matches = bool(cwd_check(pane_id, work_dir))
+        except Exception:
+            return "Destination pane identity could not be confirmed."
+        if not matches:
+            return "Destination pane no longer matches its recorded project."
+
+    if terminal != "wezterm" and pane_title_marker:
+        resolver = getattr(backend, "find_pane_by_title_marker", None)
+        if callable(resolver):
+            try:
+                resolved = str(resolver(pane_title_marker, work_dir) or "").strip()
+            except Exception:
+                return "Destination pane identity could not be confirmed."
+            if resolved != pane_id:
+                return "Destination pane no longer matches its recorded marker."
+    return ""
 
 
 def _pane_gone_probes_threshold() -> int:

@@ -114,6 +114,8 @@ SCRIPTS_TO_LINK=(
   bin/lping
   bin/ask
   bin/ccb-list
+  bin/ccb-remote
+  bin/ccb-remote-gate
   bin/ccb-mounted
   bin/ccb-bridge-ask
   bin/ccb-ping

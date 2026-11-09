@@ -216,21 +216,46 @@ class OpenCodeAdapter(BaseProviderAdapter):
             pass
 
         prompt = wrap_opencode_prompt(req.message, task.req_id)
-        # Phase 3 (E5): role-policy recheck as the LAST step before injection.
+        # Phase 3 (E5) + Item 1: the identity/role-policy recheck runs INSIDE
+        # the cross-process pane-injection lock, so a revoked permission, a
+        # replaced destination or another sender during the lock wait is judged
+        # AFTER that wait and immediately before injection. `send_text` re-enters
+        # the same lock harmlessly on this thread; the lock is released before
+        # any wait for the provider's answer.
         from delivery_policy import refusal_for_request
+        from pane_lock import PaneLockError, pane_injection_lock
 
-        refusal = refusal_for_request(req, self.key, expected_pane=pane_id, session=session)
-        if refusal:
-            _write_log(f"[INFO] policy refused provider=opencode req_id={task.req_id} reason={refusal}")
+        try:
+            with pane_injection_lock(backend, pane_id, None):
+                refusal = refusal_for_request(
+                    req, self.key, expected_pane=pane_id, session=session
+                )
+                if refusal:
+                    _write_log(
+                        f"[INFO] policy refused provider=opencode req_id={task.req_id} reason={refusal}"
+                    )
+                    return ProviderResult(
+                        exit_code=1,
+                        reply=refusal,
+                        req_id=task.req_id,
+                        session_key=session_key,
+                        done_seen=False,
+                        status=COMPLETION_STATUS_FAILED,
+                    )
+                backend.send_text(pane_id, prompt)
+        except PaneLockError as exc:
+            # No injection happened: this IS proven non-delivery.
+            _write_log(
+                f"[WARN] pane injection lock unavailable provider=opencode req_id={task.req_id}: {exc}"
+            )
             return ProviderResult(
                 exit_code=1,
-                reply=refusal,
+                reply=f"Pane injection lock unavailable: {exc}",
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
                 status=COMPLETION_STATUS_FAILED,
             )
-        backend.send_text(pane_id, prompt)
 
         # Async mode: timeout_s == 0 means fire-and-forget
         if float(req.timeout_s) == 0.0:

@@ -109,6 +109,16 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
 
             outcome = revalidate_peer_destination(request.peer_destination)
             if not outcome.ok:
+                if getattr(task, "remote_record_id", ""):
+                    # Proven pre-dispatch refusal: the remote journal must say
+                    # so instead of leaving the record queued forever.
+                    from remote_delivery import record_pre_dispatch_failure
+
+                    record_pre_dispatch_failure(
+                        task.remote_record_id,
+                        "destination unavailable at the send checkpoint",
+                        owner=getattr(task, "remote_owner", ""),
+                    )
                 return ProviderResult(
                     exit_code=1,
                     reply=f"Peer destination is no longer available ({outcome.error}).",
@@ -122,6 +132,14 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
             # G6: the role-policy recheck lives INSIDE send_peer_message, as
             # the last step before its own send_text, so it judges the
             # endpoint that send actually resolved.
+            if getattr(task, "remote_record_id", ""):
+                # Remote delivery: keep the destination journal in step with
+                # the send (durable dispatch intent, then delivered/failed/
+                # outcome-unknown). Everything else is the local peer path.
+                from remote_delivery import deliver_remote_task
+
+                return deliver_remote_task(task, self.adapter.key, self.session_key)
+
             from peer_routing import send_peer_message
 
             return send_peer_message(task, self.adapter.key, self.session_key)
@@ -138,6 +156,16 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
 
     def _handle_exception(self, exc: Exception, task: QueuedTask) -> ProviderResult:
         _write_log(f"[ERROR] provider={self.adapter.key} session={self.session_key} req_id={task.req_id} {exc}")
+        if getattr(task, "remote_record_id", ""):
+            # An unexpected worker failure proves nothing about delivery, so it
+            # can never be recorded as `failed`.
+            from remote_delivery import record_outcome_unknown
+
+            record_outcome_unknown(
+                task.remote_record_id,
+                "unexpected worker exception",
+                owner=getattr(task, "remote_owner", ""),
+            )
         return self.adapter.handle_exception(exc, task)
 
 
@@ -155,7 +183,14 @@ class _UnifiedWorkerPool:
                 self._pools[provider_key] = PerSessionWorkerPool[_SessionWorker]()
             return self._pools[provider_key]
 
-    def submit(self, provider: str, request: ProviderRequest) -> Optional[QueuedTask]:
+    def submit(
+        self,
+        provider: str,
+        request: ProviderRequest,
+        *,
+        remote_record_id: str = "",
+        remote_owner: str = "",
+    ) -> Optional[QueuedTask]:
         adapter = self._registry.get(provider)
         if not adapter:
             return None
@@ -169,6 +204,8 @@ class _UnifiedWorkerPool:
             done_event=threading.Event(),
             cancelled=False,
             cancel_event=cancel_event,
+            remote_record_id=remote_record_id,
+            remote_owner=remote_owner,
         )
 
         if request.route.present:
@@ -199,6 +236,7 @@ class _UnifiedWorkerPool:
                 caller_token=request.route.caller_token,
             )
             if not outcome.ok:
+                task.refused_before_queue = True
                 task.result = ProviderResult(
                     exit_code=1,
                     reply=f"Routed destination is no longer available ({outcome.error}).",
@@ -225,6 +263,7 @@ class _UnifiedWorkerPool:
 
                 outcome = revalidate_peer_destination(request.peer_destination)
                 if not outcome.ok:
+                    task.refused_before_queue = True
                     task.result = ProviderResult(
                         exit_code=1,
                         reply=f"Peer destination is no longer available ({outcome.error}).",
@@ -354,6 +393,13 @@ class UnifiedAskDaemon:
             return self._handle_peer_identify_sender(msg)
         if operation == "check_delivery":
             return self._handle_check_delivery(msg)
+        # Cross-machine (T2): narrow remote ops, never the general dispatcher.
+        if operation == "remote_list":
+            return self._remote_service().handle_list(msg)
+        if operation == "remote_submit":
+            return self._remote_service().handle_submit(msg)
+        if operation == "remote_status":
+            return self._remote_service().handle_status(msg)
 
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
@@ -719,6 +765,39 @@ class UnifiedAskDaemon:
             "reply": detail,
         }
 
+    def _remote_service(self):
+        """Lazily built remote delivery service (journal + destination config).
+
+        The journal and config belong to the destination USER, not to this
+        project, so `list`/`status` answer identically from any of the user's
+        daemons; whichever daemon accepts a `submit` becomes that record's
+        owner and is the only one that processes it.
+        """
+        if getattr(self, "_remote_service_instance", None) is None:
+            from remote_delivery import RemoteDeliveryService
+
+            self._remote_service_instance = RemoteDeliveryService(
+                registry=self.registry,
+                enqueue=self._enqueue_remote,
+                owner_daemon=str(self.state_file),
+                log=_write_log,
+            )
+        return self._remote_service_instance
+
+    def _enqueue_remote(self, provider: str, request, remote_record_id: str):
+        return self.pool.submit(
+            provider,
+            request,
+            remote_record_id=remote_record_id,
+            remote_owner=str(self.state_file),
+        )
+
+    def _recover_remote_records(self) -> None:
+        try:
+            self._remote_service().recover()
+        except Exception as exc:
+            _write_log(f"[WARN] remote journal recovery failed: {exc}")
+
     def _handle_check_delivery(self, msg: dict) -> dict:
         """Read-only role-policy preflight for an async sender.
 
@@ -1021,6 +1100,9 @@ class UnifiedAskDaemon:
             request_queue_size=128,
             on_stop=_on_stop,
             work_dir=self.work_dir,
+            # Recovery runs only once this process has taken exclusive
+            # ownership of the daemon (see AskDaemonServer._take_ownership).
+            on_owned=self._recover_remote_records,
         )
         return server.serve_forever()
 

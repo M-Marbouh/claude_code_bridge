@@ -84,6 +84,7 @@ class AskDaemonServer:
         parent_pid: Optional[int] = None,
         managed: Optional[bool] = None,
         work_dir: Optional[str] = None,
+        on_owned: Optional[Callable[[], None]] = None,
     ):
         self.spec = spec
         self.host = host
@@ -93,6 +94,11 @@ class AskDaemonServer:
         self.request_handler = request_handler
         self.request_queue_size = request_queue_size
         self.on_stop = on_stop
+        # Runs once, AFTER this process has taken exclusive ownership of the
+        # daemon (the singleton lock) and BEFORE any request is served. That is
+        # the only safe moment for startup recovery of user-scoped state.
+        self.on_owned = on_owned
+        self._ownership_lock = None
         self.parent_pid = parent_pid if parent_pid is not None else _env_parent_pid()
         self.work_dir = work_dir or os.getcwd()
         env_managed = _env_truthy("CCB_MANAGED")
@@ -104,9 +110,14 @@ class AskDaemonServer:
         self._started_at = None
         self._state_write_lock = threading.Lock()  # Serialize persistent state writes
 
-    def serve_forever(self) -> int:
-        run_dir().mkdir(parents=True, exist_ok=True)
+    def _take_ownership(self) -> bool:
+        """Take the daemon singleton lock, then run the ownership hook.
 
+        Returns False when another process already owns this daemon. The hook
+        runs only after ownership is held, so two daemons can never both act on
+        the same user-scoped journal records.
+        """
+        run_dir().mkdir(parents=True, exist_ok=True)
         lock = ProviderLock(
             self.spec.lock_name,
             cwd=str(self.state_file.parent),
@@ -114,6 +125,37 @@ class AskDaemonServer:
             lock_dir=self.state_file.parent,
         )
         if not lock.try_acquire():
+            return False
+        self._ownership_lock = lock  # keep the lock object alive for the process lifetime
+        if self.on_owned is not None:
+            try:
+                self.on_owned()
+            except Exception as exc:
+                write_log(
+                    log_path(self.spec.log_file_name),
+                    f"[WARN] {self.spec.daemon_key} startup hook failed: {exc}",
+                )
+        return True
+
+    def _release_ownership(self) -> None:
+        """Release the daemon singleton lock held by THIS process.
+
+        The lock object lives on `self` (`_take_ownership`), not in a local
+        variable of `serve_forever`: releasing a name that is out of scope raised
+        NameError inside a swallowing `except`, so shutdown kept the flock and a
+        new daemon in the same process could never take ownership.
+        """
+        lock = getattr(self, "_ownership_lock", None)
+        self._ownership_lock = None
+        if lock is None:
+            return
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+    def serve_forever(self) -> int:
+        if not self._take_ownership():
             return 2
 
         protocol_prefix = self.spec.protocol_prefix
@@ -476,10 +518,7 @@ class AskDaemonServer:
                     mailbox_path.rmdir()
                 except Exception:
                     pass
-            try:
-                lock.release()
-            except Exception:
-                pass
+            self._release_ownership()
         return 0
 
     def _write_state(self, host: str, port: int, *, mailbox_path: Path | None = None) -> None:

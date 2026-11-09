@@ -1176,6 +1176,8 @@ def _usage() -> None:
     print("  --background            Background task or non-blocking peer consultation", file=sys.stderr)
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
     print("  --peer TARGET           Send to the selected provider in another CCB project", file=sys.stderr)
+    print("                          TARGET may be <project> (local) or <host>::<project> (another", file=sys.stderr)
+    print("                          machine, one-way delivery: no reply, no wait, never retried)", file=sys.stderr)
     print("  --wait                  Peer reply blocks the sender's next action (default)", file=sys.stderr)
     print("  --reply-to TASK_ID      Correlate a peer response with an earlier task", file=sys.stderr)
     print("  --live-id ID            Deliver to this exact live session (this launch, or --peer's)", file=sys.stderr)
@@ -1740,6 +1742,104 @@ def _run_peer_bridge_background(
     return EXIT_OK
 
 
+def _remote_peer_refusal(
+    *,
+    provider: str,
+    reply_to: str,
+    wait_explicit: bool,
+    foreground_explicit: bool,
+    resend_seen: bool,
+    to_role: str,
+) -> str:
+    """Why this remote peer request cannot be delivered as asked, else "".
+
+    This milestone is delivery-only, so anything that expects a reply is
+    refused BEFORE a receipt is written or a connection is made.
+    """
+    if provider not in ("claude", "codex"):
+        return (
+            f"[ERROR] Cross-machine delivery supports claude and codex only, not {provider}"
+        )
+    if reply_to:
+        return "[ERROR] --reply-to is not available for cross-machine delivery (no reply in this milestone)"
+    if wait_explicit:
+        return "[ERROR] --wait is not available for cross-machine delivery: this milestone is one-way"
+    if foreground_explicit:
+        return "[ERROR] --foreground is not available for cross-machine delivery: this milestone is one-way"
+    if resend_seen:
+        return "[ERROR] --resend is not available for cross-machine delivery"
+    role = (to_role or "").strip().lower()
+    if role and role != "lead":
+        # The destination independently enforces one rule for a remote sender:
+        # the target session must hold the lead role. Another assertion could
+        # only fail later, after acceptance, so refuse it here instead.
+        return (
+            "[ERROR] Cross-machine delivery can only assert --to-role lead; "
+            f"a remote sender may not name {role}"
+        )
+    return ""
+
+
+def _run_remote_peer(
+    peer_target: str,
+    peer_provider: str,
+    message: str,
+    *,
+    intent: str,
+    reply_to: str,
+    live_id: str,
+    to_role: str,
+    sender_work_dir: str,
+    wait_explicit: bool = False,
+    foreground_explicit: bool = False,
+    resend_seen: bool = False,
+) -> int:
+    refusal = _remote_peer_refusal(
+        provider=peer_provider,
+        reply_to=reply_to,
+        wait_explicit=wait_explicit,
+        foreground_explicit=foreground_explicit,
+        resend_seen=resend_seen,
+        to_role=to_role,
+    )
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return EXIT_ERROR
+    from remote_client import RemoteConfigError, RemoteRefusal, caller_claims, submit
+
+    try:
+        host, project = _remote_selector(peer_target)
+    except RemoteRefusal as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    try:
+        claims = caller_claims(
+            caller=_require_caller(), work_dir=sender_work_dir, role_assertion=to_role
+        )
+        result = submit(
+            host,
+            project,
+            peer_provider,
+            message,
+            intent=intent,
+            dest_session=live_id,
+            caller_claims=claims,
+        )
+    except RemoteConfigError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except RemoteRefusal as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_OK if result.ok else result.exit_code
+
+
+def _remote_selector(target: str) -> tuple[str, str]:
+    from remote_client import parse_selector
+
+    return parse_selector(target)
+
+
 def _run_peer_bridge(
     peer_target: str,
     peer_provider: str,
@@ -1752,6 +1852,9 @@ def _run_peer_bridge(
     live_id: str = "",
     preserve_task_id: str = "",
     to_role: str = "",
+    wait_explicit: bool = False,
+    foreground_explicit: bool = False,
+    resend_seen: bool = False,
 ) -> int:
     if peer_provider not in PEER_PROVIDERS:
         print(
@@ -1771,6 +1874,26 @@ def _run_peer_bridge(
             file=sys.stderr,
         )
         return EXIT_ERROR
+    if "::" in (peer_target or ""):
+        # Cross-machine: a new, separate path. A target with "::" never falls
+        # back to local peer lookup, so a typo cannot deliver to a local pane.
+        return _run_remote_peer(
+            peer_target,
+            peer_provider,
+            message,
+            intent=intent,
+            reply_to=reply_to,
+            live_id=live_id,
+            to_role=to_role,
+            sender_work_dir=str(
+                _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))
+                or _normalized_work_dir(Path.cwd())
+                or Path.cwd()
+            ),
+            wait_explicit=wait_explicit,
+            foreground_explicit=foreground_explicit,
+            resend_seen=resend_seen,
+        )
     if intent == "notify":
         sender_work_dir = (
             _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))
@@ -1822,6 +1945,11 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
     peer_live_id_seen = False
     peer_to_role = ""
     peer_to_role_seen = False
+    # Presence only: adding these to the parse loop would change what a LOCAL
+    # peer target receives as message text. They are consulted only on the
+    # cross-machine branch, which refuses them before writing anything.
+    peer_wait_explicit = "--wait" in argv
+    peer_foreground_explicit = "--foreground" in argv
     parts: list[str] = []
 
     it = iter(argv)
@@ -1892,6 +2020,7 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
         if token == "--wait":
             peer_intent = "wait"
             foreground_mode = False
+            peer_wait_explicit = True
             continue
         if token == "--background":
             peer_intent = "background"
@@ -1932,6 +2061,8 @@ def _handle_peer_mode(argv: list[str], peer_provider: str = "claude") -> int:
         peer_reply_to,
         live_id=peer_live_id,
         to_role=peer_to_role,
+        wait_explicit=peer_wait_explicit,
+        foreground_explicit=peer_foreground_explicit,
     )
 
 
@@ -1981,6 +2112,7 @@ def main(argv: list[str]) -> int:
     resend_task_id = ""
     resend_seen = False
     peer_foreground_explicit = False
+    peer_wait_explicit = False
     parts: list[str] = []
 
     it = iter(argv[2:])
@@ -2069,6 +2201,7 @@ def main(argv: list[str]) -> int:
         if token == "--wait":
             peer_intent = "wait"
             foreground_mode = False
+            peer_wait_explicit = True
             continue
         if token == "--background":
             peer_intent = "background"
@@ -2162,6 +2295,9 @@ def main(argv: list[str]) -> int:
             peer_reply_to,
             live_id=peer_live_id,
             to_role=peer_to_role,
+            wait_explicit=peer_wait_explicit,
+            foreground_explicit=peer_foreground_explicit,
+            resend_seen=bool(resend_options),
             **resend_options,
         )
 

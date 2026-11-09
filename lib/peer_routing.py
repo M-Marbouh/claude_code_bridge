@@ -428,12 +428,24 @@ def revalidate_peer_destination(destination) -> DestinationResolution:
     return DestinationResolution()
 
 
-def send_peer_message(task, provider: str, session_key: str):
-    """Send a queued delivery-only message to its exact saved endpoint."""
+def send_peer_message(task, provider: str, session_key: str, *, before_dispatch=None):
+    """Send a queued delivery-only message to its exact saved endpoint.
+
+    The pane-injection lock is taken BEFORE `revalidate_peer_destination` and
+    the role-policy recheck, so both judge the destination AFTER any wait for
+    another sender -- a pane replaced while this task waited is refused, not
+    sent to blindly. The backend's own `send_text` lock re-enters harmlessly.
+
+    `before_dispatch` runs inside that lock, after those checks and
+    immediately before `send_text`; T2's remote dispatch uses it to durably
+    commit `dispatch-in-progress`. If it raises, nothing is sent (proven
+    non-delivery) and the caller may record `failed`.
+    """
     from askd.adapters.base import ProviderResult
     from ccb_protocol import wrap_codex_delivery_prompt
     from completion_hook import COMPLETION_STATUS_FAILED
     from laskd_protocol import wrap_claude_delivery_prompt
+    from pane_lock import PaneLockError, pane_injection_lock
     from terminal import get_backend_for_session
 
     request = task.request
@@ -443,10 +455,6 @@ def send_peer_message(task, provider: str, session_key: str):
     if task.cancelled or (task.cancel_event and task.cancel_event.is_set()):
         return ProviderResult(exit_code=2, reply="Peer delivery cancelled.", req_id=task.req_id,
                               session_key=session_key, done_seen=False, status="cancelled")
-    outcome = revalidate_peer_destination(destination)
-    if not outcome.ok:
-        return ProviderResult(exit_code=1, reply=f"Peer destination unavailable ({outcome.error}).",
-                              req_id=task.req_id, session_key=session_key, done_seen=False, status="failed")
     wrapper = wrap_codex_delivery_prompt if provider == "codex" else wrap_claude_delivery_prompt
     prompt = request.message if request.no_wrap else wrapper(request.message, task.req_id)
     backend = get_backend_for_session({"terminal": destination.terminal})
@@ -454,19 +462,53 @@ def send_peer_message(task, provider: str, session_key: str):
         return ProviderResult(exit_code=1, reply="Peer destination terminal backend is unavailable.",
                               req_id=task.req_id, session_key=session_key, done_seen=False,
                               status=COMPLETION_STATUS_FAILED)
-    # Phase 3 (E5/G6): the role-policy recheck runs here, immediately before
-    # injection, against the endpoint this send resolved -- never earlier, so
-    # a role or pane change during revalidation above cannot slip through.
-    from delivery_policy import refusal_for_request
+    from contextlib import ExitStack
 
-    refusal = refusal_for_request(
-        request, provider, expected_pane=destination.pane_id
-    )
-    if refusal:
-        return ProviderResult(exit_code=1, reply=refusal, req_id=task.req_id,
-                              session_key=session_key, done_seen=False,
-                              status=COMPLETION_STATUS_FAILED)
-    backend.send_text(destination.pane_id, prompt)
+    with ExitStack() as stack:
+        # ONLY the acquisition is a proven zero-send refusal. Anything a
+        # PaneLockError raised later (inside the body) means the lock WAS held
+        # and the send may have started, so it must never be folded into this
+        # non-delivery answer -- it has to reach the caller as an exception so
+        # a remote record becomes `outcome-unknown`, not `failed`.
+        try:
+            stack.enter_context(pane_injection_lock(backend, destination.pane_id, None))
+        except PaneLockError as exc:
+            return ProviderResult(exit_code=1, reply=f"Pane injection lock unavailable: {exc}",
+                                  req_id=task.req_id, session_key=session_key, done_seen=False,
+                                  status=COMPLETION_STATUS_FAILED)
+        else:
+            outcome = revalidate_peer_destination(destination)
+            if not outcome.ok:
+                return ProviderResult(exit_code=1, reply=f"Peer destination unavailable ({outcome.error}).",
+                                      req_id=task.req_id, session_key=session_key, done_seen=False,
+                                      status="failed")
+            # Phase 3 (E5/G6): the role-policy recheck runs here, immediately
+            # before injection, against the endpoint this send resolved --
+            # never earlier, so a role or pane change during the wait above
+            # cannot slip through.
+            from delivery_policy import refusal_for_request
+
+            refusal = refusal_for_request(
+                request, provider, expected_pane=destination.pane_id
+            )
+            if refusal:
+                return ProviderResult(exit_code=1, reply=refusal, req_id=task.req_id,
+                                      session_key=session_key, done_seen=False,
+                                      status=COMPLETION_STATUS_FAILED)
+            if before_dispatch is not None:
+                try:
+                    before_dispatch()
+                except Exception as exc:
+                    # No dispatch intent could be committed, so nothing was sent.
+                    return ProviderResult(
+                        exit_code=1,
+                        reply=f"Dispatch intent could not be committed; nothing was sent: {exc}",
+                        req_id=task.req_id,
+                        session_key=session_key,
+                        done_seen=False,
+                        status=COMPLETION_STATUS_FAILED,
+                    )
+            backend.send_text(destination.pane_id, prompt)
     return ProviderResult(exit_code=0, reply="Peer message accepted.", req_id=task.req_id,
                           session_key=session_key, done_seen=False, status="completed",
                           extra={"confirmation": "sent"})

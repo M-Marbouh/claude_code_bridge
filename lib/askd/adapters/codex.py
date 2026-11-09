@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from askd.adapters.base import (
+    saved_destination_refusal,
     BaseProviderAdapter,
     PaneDeathTracker,
     ProviderRequest,
@@ -527,21 +528,73 @@ class CodexAdapter(BaseProviderAdapter):
             allow_stale_switch=False,
         )
         state = reader.capture_state()
-        # Phase 3 (E5): role-policy recheck as the LAST step before injection.
+        # Phase 3 (E5) + Item 1: the identity/role-policy recheck runs INSIDE
+        # the cross-process pane-injection lock, so a revoked permission, a
+        # replaced destination or another sender during the lock wait is judged
+        # AFTER that wait and immediately before injection. `send_text` re-enters
+        # the same lock harmlessly on this thread; the lock is released before
+        # any wait for the provider's answer.
         from delivery_policy import refusal_for_request
+        from pane_lock import PaneLockError, pane_injection_lock
 
-        refusal = refusal_for_request(req, self.key, expected_pane=pane_id, session=session)
-        if refusal:
-            _write_log(f"[INFO] policy refused provider=codex req_id={task.req_id} reason={refusal}")
+        try:
+            with pane_injection_lock(backend, pane_id, None):
+                # Fix 5: the destination is re-confirmed AFTER the lock wait,
+                # before the policy check and the injection. A route binding, a
+                # session or a pane replaced while this task waited is refused
+                # here, with nothing sent.
+                destination_refusal = saved_destination_refusal(
+                    route=req.route,
+                    provider=self.key,
+                    work_dir=str(session.work_dir),
+                    pane_id=pane_id,
+                    backend=backend,
+                    terminal=str(session.data.get("terminal") or ""),
+                    pane_title_marker=str(getattr(session, "pane_title_marker", "") or ""),
+                    validate_route_fn=validate_route,
+                )
+                if destination_refusal:
+                    _write_log(
+                        f"[WARN] destination changed provider=codex "
+                        f"req_id={task.req_id}: {destination_refusal}"
+                    )
+                    return ProviderResult(
+                        exit_code=1,
+                        reply=destination_refusal,
+                        req_id=task.req_id,
+                        session_key=session_key,
+                        done_seen=False,
+                        status=COMPLETION_STATUS_FAILED,
+                    )
+                refusal = refusal_for_request(
+                    req, self.key, expected_pane=pane_id, session=session
+                )
+                if refusal:
+                    _write_log(
+                        f"[INFO] policy refused provider=codex req_id={task.req_id} reason={refusal}"
+                    )
+                    return ProviderResult(
+                        exit_code=1,
+                        reply=refusal,
+                        req_id=task.req_id,
+                        session_key=session_key,
+                        done_seen=False,
+                        status=COMPLETION_STATUS_FAILED,
+                    )
+                backend.send_text(pane_id, prompt)
+        except PaneLockError as exc:
+            # No injection happened: this IS proven non-delivery.
+            _write_log(
+                f"[WARN] pane injection lock unavailable provider=codex req_id={task.req_id}: {exc}"
+            )
             return ProviderResult(
                 exit_code=1,
-                reply=refusal,
+                reply=f"Pane injection lock unavailable: {exc}",
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
                 status=COMPLETION_STATUS_FAILED,
             )
-        backend.send_text(pane_id, prompt)
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.monotonic() + float(req.timeout_s))
         progress_mode = not req.timeout_explicit and not req.delivery_only

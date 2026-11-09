@@ -91,6 +91,42 @@ def find_running_state_file(
     return None
 
 
+def find_any_running_state_file(
+    name: str,
+    *,
+    protocol_prefix: str,
+    timeout_s: float = 0.5,
+) -> Path | None:
+    """The user's first reachable daemon state file, in a deterministic order.
+
+    Used by the remote gate, which has no project context: the remote journal
+    and destination config are user-scoped, so any of the user's daemons answers
+    `remote_list`/`remote_status` identically, and whichever one accepts a
+    `remote_submit` becomes that record's owner. Candidates are walked in a
+    fixed order (single run-dir state, then sorted project directories under
+    each state root), never in filesystem enumeration order, so the same setup
+    always reaches the same daemon first.
+    """
+    import askd_rpc
+
+    filename = _state_file_name(name)
+    candidates: list[Path] = []
+    override = (os.environ.get("CCB_RUN_DIR") or "").strip()
+    if override:
+        candidates.append(Path(override).expanduser() / filename)
+    for root in (run_dir(), Path.home() / ".cache" / "ccb"):
+        candidates.append(root / filename)
+        try:
+            project_dirs = sorted(path for path in (root / "projects").glob("*") if path.is_dir())
+        except OSError:
+            project_dirs = []
+        candidates.extend(path / filename for path in project_dirs)
+    for candidate in dict.fromkeys(candidates):
+        if askd_rpc.ping_daemon(protocol_prefix, timeout_s=timeout_s, state_file=candidate):
+            return candidate
+    return None
+
+
 def mailbox_dir(state_file: Path) -> Path | None:
     """Return a private, sandbox-visible mailbox directory for a daemon."""
     if os.name == "nt" or not hasattr(os, "getuid"):

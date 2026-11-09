@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""SSH forced-command gate for cross-machine CCB (Milestone 1: delivery only).
+
+Installed in the destination user's ``authorized_keys`` as::
+
+    restrict,command="<abs path>/ccb-remote-gate --principal <name>" ssh-ed25519 ...
+
+The principal name comes only from that argv, which the destination
+administrator controls; nothing in the frame can change it. The gate refuses
+any non-empty ``SSH_ORIGINAL_COMMAND`` (and any extra argument) before reading
+bytes, then loops over length-prefixed UTF-8 JSON frames on stdin/stdout via
+``lib/remote_protocol.py``.
+
+In T1 only ``hello`` is answered locally. ``list``, ``submit`` and ``status``
+return the enumerated ``unsupported`` error; T2 replaces the single seam
+``dispatch_remote_operation`` with narrow ``askd_rpc.request_daemon()`` calls
+(lib/askd_rpc.py:100) to the destination askd. This gate never spawns a
+process, never evaluates input, and never logs message text.
+
+Design: docs/plans/cross-machine-ccb-proposal.md sections 3 and 6.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+if str(lib_dir) not in sys.path:
+    sys.path.insert(0, str(lib_dir))
+
+USAGE = "ccb-remote-gate --principal <name>"
+
+EXIT_OK = 0
+EXIT_REFUSED = 2
+
+#: Generic refusal text. Never carries exception text or paths.
+INTERNAL_ERROR_MESSAGE = "internal error"
+
+#: The principal is a bounded, lower-case token chosen by the destination admin.
+PRINCIPAL_RE = re.compile(r"[a-z0-9_-]{1,64}")
+
+#: Verbs forwarded to the local askd through :func:`dispatch_remote_operation`.
+FORWARDED_VERBS = ("list", "submit", "status")
+
+
+class _DaemonUnavailable(RuntimeError):
+    """No destination daemon could be reached: nothing was sent to it."""
+
+
+class _AcceptanceUnknown(RuntimeError):
+    """The request may have reached the daemon; acceptance is not proven."""
+
+try:
+    import remote_protocol as proto  # noqa: E402
+except Exception:  # pragma: no cover - a broken install must not leak a traceback
+    try:
+        print("ccb-remote-gate: internal error", file=sys.stderr, flush=True)
+    finally:
+        raise SystemExit(EXIT_REFUSED)
+
+
+def _safe(value: object, limit: int = 64) -> str:
+    """Bound and sanitise a log field; never used for message text."""
+    text = "" if value is None else str(value)
+    cleaned = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in text)
+    return cleaned[:limit]
+
+
+def _log(
+    principal: object, op: object, op_id: object, outcome: str, code: object = None
+) -> None:
+    line = (
+        f"ccb-remote-gate principal={_safe(principal) or '-'}"
+        f" op={_safe(op) or '-'}"
+        f" op_id={_safe(op_id) or '-'}"
+        f" outcome={_safe(outcome)}"
+    )
+    if code:
+        line += f" code={_safe(code)}"
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        # A dead or closed stderr must never turn a refusal into a traceback.
+        pass
+
+
+def _parse_argv(argv: list[str]) -> str | None:
+    """``--principal <name>`` and nothing else, or ``None``."""
+    if len(argv) != 3:
+        return None
+    if argv[1] != "--principal":
+        return None
+    if not PRINCIPAL_RE.fullmatch(argv[2] or ""):
+        return None
+    return argv[2]
+
+
+def _askd_remote_request(op: str, op_id: str, body: dict, principal: str) -> dict:
+    """Forward one verb to the destination user's askd (T2).
+
+    State-file choice: the remote journal and destination config are
+    user-scoped, so `list`/`status` return the same answer from any of the
+    user's daemons, and whichever daemon accepts `submit` becomes the record's
+    owner. The gate therefore targets the first reachable askd state file in a
+    deterministic order (`askd_runtime.find_any_running_state_file`) instead of
+    guessing a project from client input -- the client never names a work_dir.
+    """
+    import askd_rpc
+    from askd_runtime import find_any_running_state_file
+
+    state_file = find_any_running_state_file("askd.json", protocol_prefix="ask", timeout_s=0.5)
+    if state_file is None:
+        raise _DaemonUnavailable()
+    state = askd_rpc.read_state(state_file)
+    if not isinstance(state, dict) or not state.get("token"):
+        raise _DaemonUnavailable()
+
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": str(op_id),
+        "token": state["token"],
+        "operation": f"remote_{op}",
+        "principal": principal,
+    }
+    if op == "submit":
+        request["record"] = body
+    elif op == "status":
+        request["request_id"] = str(body.get("request_id") or "")
+
+    try:
+        return askd_rpc.request_daemon(
+            state, request, connect_timeout_s=5.0, response_timeout_s=30.0
+        )
+    except askd_rpc.DaemonConnectionError:
+        raise _DaemonUnavailable() from None
+    except Exception:
+        # Anything after the request may have been delivered is NOT a proven
+        # non-delivery: report acceptance as unknown rather than inviting a
+        # resend that could duplicate the message.
+        raise _AcceptanceUnknown() from None
+
+
+def dispatch_remote_operation(envelope: dict, *, principal: str) -> dict:
+    """T2 seam: forward an authorized list/submit/status request and map it.
+
+    The principal comes from the gate's own argv only; the frame cannot change
+    it, and the destination askd re-checks it against its config.
+    """
+    op = str(envelope.get("op") or "")
+    op_id = envelope.get("op_id")
+    safe_op = op if op in FORWARDED_VERBS else None
+    safe_op_id = op_id if isinstance(op_id, str) else None
+    if safe_op is None:
+        return proto.error_frame(proto.ERR_UNKNOWN_OP, "unknown op", op_id=safe_op_id, op=op or None)
+
+    body = envelope.get("body")
+    if not isinstance(body, dict):
+        body = {}
+
+    try:
+        response = _askd_remote_request(safe_op, safe_op_id or "", body, principal)
+    except _DaemonUnavailable:
+        return proto.error_frame(
+            proto.ERR_DAEMON_UNAVAILABLE,
+            "no destination daemon is running for this user",
+            op_id=safe_op_id,
+            op=safe_op,
+        )
+    except _AcceptanceUnknown:
+        return proto.error_frame(
+            proto.ERR_ACCEPTANCE_UNKNOWN,
+            "the destination did not answer; acceptance is unknown",
+            op_id=safe_op_id,
+            op=safe_op,
+        )
+
+    if not isinstance(response, dict):
+        return proto.error_frame(
+            proto.ERR_INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE, op_id=safe_op_id, op=safe_op
+        )
+
+    if response.get("ok"):
+        remote = response.get("remote")
+        frame = {"ok": True, "op": safe_op, "op_id": safe_op_id}
+        if isinstance(remote, dict):
+            frame.update(remote)
+        return frame
+
+    error = response.get("error")
+    code = str(error.get("code") or "") if isinstance(error, dict) else ""
+    if code not in proto.ERROR_CODES:
+        code = proto.ERR_INTERNAL_ERROR
+    message = str(error.get("message") or "request refused") if isinstance(error, dict) else "request refused"
+    return proto.error_frame(code, message, op_id=safe_op_id, op=safe_op)
+
+
+def handle_envelope(envelope: dict, *, principal: str) -> dict:
+    """Validate one envelope and return the one response frame."""
+    op_id = envelope.get("op_id")
+    op = envelope.get("op")
+    try:
+        proto.validate_envelope(envelope)
+    except proto.ProtocolError as exc:
+        return proto.error_frame(
+            exc.code,
+            exc.message,
+            op_id=op_id if isinstance(op_id, str) else None,
+            op=op if isinstance(op, str) else None,
+        )
+    if op == "hello":
+        return proto.hello_response(op_id)
+    return dispatch_remote_operation(envelope, principal=principal)
+
+
+def _write(stdout, frame: dict) -> bool:
+    try:
+        proto.write_frame(stdout, frame)
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+    return True
+
+
+def _refuse_internal(stdout, principal: str, op: object = "-", op_id: object = "-") -> int:
+    """Last-resort refusal: generic code, generic message, no exception text."""
+    _write(stdout, proto.error_frame(proto.ERR_INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE))
+    _log(principal, op, op_id, "internal-error", proto.ERR_INTERNAL_ERROR)
+    return EXIT_REFUSED
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+
+    principal = _parse_argv(argv)
+    if principal is None:
+        print(f"ccb-remote-gate: usage: {USAGE}", file=sys.stderr, flush=True)
+        _log("-", "-", "-", "refused-argv")
+        return EXIT_REFUSED
+
+    if os.environ.get("SSH_ORIGINAL_COMMAND"):
+        # A forced command must never become a shell: refuse before reading stdin.
+        _log(principal, "-", "-", "refused-original-command")
+        return EXIT_REFUSED
+
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+
+    while True:
+        try:
+            envelope = proto.read_frame(stdin)
+        except proto.ProtocolError as exc:
+            _write(stdout, proto.error_frame(exc.code, exc.message))
+            _log(principal, "-", "-", "refused-frame", exc.code)
+            return EXIT_REFUSED
+        except Exception:
+            # Unexpected failure while framing: refuse generically, leak nothing.
+            return _refuse_internal(stdout, principal)
+        if envelope is None:
+            _log(principal, "-", "-", "eof")
+            return EXIT_OK
+
+        op = envelope.get("op")
+        op_id = envelope.get("op_id")
+        try:
+            response = handle_envelope(envelope, principal=principal)
+            error = response.get("error") if isinstance(response, dict) else None
+            code = error.get("code") if isinstance(error, dict) else None
+            ok = isinstance(response, dict) and bool(response.get("ok"))
+        except Exception:
+            # Top-level guard: an unexpected failure in dispatch must never
+            # reach the SSH client as a Python traceback.
+            return _refuse_internal(stdout, principal, op, op_id)
+
+        _log(principal, op, op_id, "ok" if ok else "refused-op", code)
+        if not _write(stdout, response):
+            _log(principal, op, op_id, "write-failed")
+            return EXIT_REFUSED
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:  # pragma: no cover - final backstop, no traceback ever
+        try:
+            proto.write_frame(
+                sys.stdout.buffer,
+                proto.error_frame(proto.ERR_INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE),
+            )
+        except Exception:
+            pass
+        try:
+            _log("-", "-", "-", "internal-error", proto.ERR_INTERNAL_ERROR)
+        except Exception:
+            pass
+        sys.exit(EXIT_REFUSED)

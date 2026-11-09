@@ -21,6 +21,30 @@ def _no_pre_send_retry_wait(monkeypatch):
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
 
+def _scripted_clock(values, *, step: float = 0.05):
+    """Fake `time.monotonic`: the scripted values, then a steadily rising clock.
+
+    These tests simulate Pi's wait loops with a scripted clock. A finite
+    iterator gave the flow EXACTLY as many ticks as it happened to need, so any
+    other reader of the shared `time.monotonic` (another helper, a test that
+    leaks a patch, new production code) consumed a tick and the test died with
+    `StopIteration` -- and a frozen clock would instead spin a deadline loop
+    forever. Past the script the clock keeps advancing, so a wait always ends.
+    """
+    ticks = iter(float(value) for value in values)
+    last = float(values[-1]) if values else 0.0
+    extra = {"n": 0}
+
+    def clock() -> float:
+        try:
+            return next(ticks)
+        except StopIteration:
+            extra["n"] += 1
+            return last + step * extra["n"]
+
+    return clock
+
+
 class FakeBackend:
     sent: list[tuple[str, str]]
 
@@ -152,7 +176,7 @@ def test_parked_abort_deadline_expires(monkeypatch, tmp_path: Path):
     backend.send_text = send
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 1.0, 62.0]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 1.0, 62.0]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
     adapter = PiAdapter()
     monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
@@ -416,7 +440,7 @@ def test_resumed_session_anchor_is_tracked_without_rewriting_binding(monkeypatch
     backend.send_text = accept
     adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     original_binding = binding_path.read_bytes()
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.1, 0.2]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.1, 0.2]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
     result = adapter.handle_task(_task(tmp_path, req_id))
@@ -486,7 +510,7 @@ def test_unchanged_candidate_session_is_parsed_once_across_polls(monkeypatch, tm
     ])
     backend.get_pane_content = lambda _pane, lines=40: next(screens)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02, 0.03, 0.04]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02, 0.03, 0.04]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
     result = adapter.handle_task(_task(tmp_path, "never-found"))
@@ -507,7 +531,7 @@ def test_dialog_after_anchor_deadline_fails_with_dialog_message(monkeypatch, tmp
     backend.get_pane_content = lambda _pane, lines=40: next(screens)
     adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
     result = adapter.handle_task(_task(tmp_path, "dialog-no-anchor"))
@@ -562,7 +586,7 @@ def test_invalid_or_foreign_candidate_is_ignored(monkeypatch, tmp_path: Path, in
     backend = FakeBackend()
     adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.1]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.1]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
     result = adapter.handle_task(_task(tmp_path, "ignored"))
@@ -586,7 +610,7 @@ def test_busy_then_idle_without_anchor_reports_unlocated_activity(monkeypatch, t
     backend.get_pane_content = lambda _pane, lines=40: next(screens)
     adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02, 0.03]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02, 0.03]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
     result = adapter.handle_task(_task(tmp_path, "activity-without-anchor"))
@@ -624,7 +648,7 @@ def test_unknown_screen_after_anchor_deadline_allows_late_completion(monkeypatch
 
     monkeypatch.setattr("askd.adapters.pi.load_candidate_sessions", late_candidate)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
-    monkeypatch.setattr("askd.adapters.pi.time.monotonic", iter([0.0, 0.0, 0.02, 0.03, 0.04]).__next__)
+    monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02, 0.03, 0.04]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
     result = adapter.handle_task(_task(tmp_path, "late-anchor"))
@@ -1314,7 +1338,7 @@ def test_first_attempt_idle_is_not_blocked_by_the_post_wait_guard(monkeypatch, t
 
 
 def test_post_injection_cancel_still_delivers_the_later_completion(monkeypatch, tmp_path: Path):
-    # Real record, content-automation 2026-11-09: request B was injected 52 min after submit,
+    # Real record, 2026-11-09: request B was injected 52 min after submit,
     # the caller's wait expired at 11:38:21, and Pi wrote CCB_DONE at 11:40:05. A cancel that
     # means "the caller stopped waiting" must not throw that reply away.
     req_id = "20261109-103816-257-2346016"

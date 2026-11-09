@@ -181,3 +181,12 @@ def test_no_automatic_resubmit_command_exists():
     text = CCB_REMOTE.read_text(encoding="utf-8")
     for command in ('command == "resubmit"', "def _cmd_resubmit"):
         assert command not in text
+
+
+@pytest.mark.parametrize("bad_id", ["", "not-an-id", "20261109-182536-922-2626995", "20261109-182536-922-2626995-habc1\n"])
+def test_status_rejects_a_malformed_id_without_a_traceback(bad_id):
+    result, calls, _log = _run(["status", bad_id])
+    assert result.returncode == 1
+    assert "not a host-qualified request id" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert calls == []

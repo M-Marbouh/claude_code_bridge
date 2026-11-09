@@ -225,7 +225,8 @@ class RemoteHost:
 def _absolute_existing_file(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RemoteConfigError(f"{field_name} must be an absolute path")
-    raw = value.strip()
+    # `~` is expanded by US, not by the shell: this value lives in a JSON file.
+    raw = os.path.expanduser(value.strip())
     if not os.path.isabs(raw):
         raise RemoteConfigError(f"{field_name} must be an absolute path")
     if not os.path.isfile(raw):
@@ -389,6 +390,57 @@ class SessionError(RuntimeError):
         self.detail = detail
 
 
+class _SniffingReader:
+    """Pass-through reader that keeps the first bytes it saw, for diagnostics.
+
+    A destination that answers with something other than a CCB frame (a login
+    banner, a `nologin` notice, a proxy greeting) is otherwise reported only as
+    `malformed response`. The first bytes are bounded and sanitised before they
+    ever reach a reason string, and they cannot contain remote message text:
+    that travels over stdin, never back through the response stream.
+    """
+
+    def __init__(self, stream, keep: int = 200):
+        self._stream = stream
+        self._keep = keep
+        self.head = ""
+
+    def read(self, size: int) -> bytes:
+        chunk = self._stream.read(size)
+        self._record(chunk)
+        return chunk
+
+    def _record(self, chunk: bytes) -> None:
+        if not chunk or len(self.head) >= self._keep:
+            return
+        raw = chunk[: self._keep - len(self.head)]
+        self.head += "".join(
+            char if 32 <= ord(char) <= 126 else " " for char in raw.decode("utf-8", "replace")
+        )
+
+    def drain(self, timeout: float = 0.2) -> str:
+        """Read a little more for the preview, bounded in time and size."""
+        deadline = _monotonic() + timeout
+        while len(self.head) < self._keep:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = select.select([self._stream], [], [], min(remaining, 0.1))
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                chunk = self._stream.read(self._keep - len(self.head))
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            self._record(chunk)
+        return self.head
+
+
 class SshSession:
     """One SSH call: framed stdin/stdout, bounded per-operation waits."""
 
@@ -397,6 +449,7 @@ class SshSession:
         self.timeout_s = op_timeout_s() if timeout_s is None else timeout_s
         self._frames: queue.Queue = queue.Queue()
         self._stderr_tail = ""
+        self._stream_head = ""
         self._closing = False
         self._proc = subprocess.Popen(
             argv,
@@ -414,14 +467,16 @@ class SshSession:
     # -- threads -------------------------------------------------------- #
 
     def _read_loop(self) -> None:
+        sniffer = _SniffingReader(self._proc.stdout)
         try:
             while True:
-                frame = proto.read_frame(self._proc.stdout)
+                frame = proto.read_frame(sniffer)
                 if frame is None:
                     self._frames.put(("eof", None))
                     return
                 self._frames.put(("frame", frame))
         except proto.ProtocolError as exc:
+            self._stream_head = " ".join(sniffer.drain().split())
             self._frames.put(("error", exc))
         except Exception as exc:  # pragma: no cover - transport closed under us
             self._frames.put(("error", exc))
@@ -440,6 +495,52 @@ class SshSession:
 
     def stderr_tail(self) -> str:
         return " ".join(self._stderr_tail.split())[-300:]
+
+    def stderr_summary(self, limit: int = 200) -> str:
+        """What ssh itself said: last non-empty lines, printable ASCII, bounded.
+
+        Only ever used in failure REASONS. The message text never reaches ssh's
+        stderr (it travels over stdin, not as an argument), and the buffer is
+        capped in `_stderr_loop`, so this can neither grow without bound nor
+        leak remote content.
+        """
+        lines = [line.strip() for line in self._stderr_tail.replace("\r", "\n").splitlines()]
+        lines = [line for line in lines if line]
+        joined = " | ".join(lines[-2:])
+        printable = "".join(char if 32 <= ord(char) <= 126 else " " for char in joined)
+        return " ".join(printable.split())[:limit]
+
+    def response_preview(self, limit: int = 120) -> str:
+        """The first bytes of a response that was not a frame (bounded, printable)."""
+        return " ".join(self._stream_head.split())[:limit]
+
+    def exit_detail(self, exc: SessionError) -> str:
+        """A reason that says what ssh reported, e.g. `ssh exited 255: …`.
+
+        Classification is unchanged: this only refines the text of a
+        `not-delivered` result. The state machine decides, never this helper.
+        """
+        try:
+            self._err.join(timeout=0.3)
+        except Exception:
+            pass
+        returncode = self._proc.poll()
+        summary = self.stderr_summary()
+        # A pure transport failure has no useful detail of our own, so lead with
+        # what ssh said. A protocol-level verdict we already have (incompatible
+        # peer, refused handshake) keeps its own text and merely gains ssh's.
+        if exc.kind in {"eof", "closed"}:
+            if returncode is not None:
+                base = f"ssh exited {returncode}"
+                return f"{base}: {summary}" if summary else base
+            return f"{exc.detail}: {summary}" if summary else exc.detail
+        parts = [exc.detail]
+        if summary:
+            parts.append(summary)
+        preview = self.response_preview()
+        if preview:
+            parts.append(f"response text: {preview}")
+        return " | ".join(parts)
 
     def read_frame(self, timeout_s: float | None = None) -> dict:
         budget = self.timeout_s if timeout_s is None else timeout_s
@@ -700,6 +801,17 @@ def _error_message(response: Any) -> str:
     return ""
 
 
+def _exit_detail(session: Any, exc: SessionError) -> str:
+    """`session.exit_detail` when available; the plain detail otherwise."""
+    method = getattr(session, "exit_detail", None)
+    if callable(method):
+        try:
+            return str(method(exc))
+        except Exception:
+            return exc.detail
+    return exc.detail
+
+
 def _acceptance_problem(
     ack: dict, *, request_id: str, digest: str, op: str, op_id: str
 ) -> str:
@@ -814,10 +926,11 @@ def submit(
             capabilities = _hello(session, op_id="hello-1")
             _require_delivery_only(capabilities, provider)
         except SessionError as exc:
-            _transition(receipt, STATE_NOT_DELIVERED, exc.detail, ssh=str(exc.kind))
-            print(f"id={request_id} state={STATE_NOT_DELIVERED} ({exc.detail})", file=err)
+            detail = _exit_detail(session, exc)
+            _transition(receipt, STATE_NOT_DELIVERED, detail, ssh=str(exc.kind))
+            print(f"id={request_id} state={STATE_NOT_DELIVERED} ({detail})", file=err)
             return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
-                                reason=exc.detail, error_code=exc.kind, digest=record["digest"])
+                                reason=detail, error_code=exc.kind, digest=record["digest"])
 
         envelope = {
             "proto": {"major": proto.PROTO_MAJOR, "minor": proto.PROTO_MINOR},
@@ -830,7 +943,7 @@ def submit(
             written = session.write_all(frame)
         except SessionError as exc:
             # Nothing reached the pipe: the destination cannot have accepted it.
-            detail = exc.detail
+            detail = _exit_detail(session, exc)
             _transition(receipt, STATE_NOT_DELIVERED, detail, ssh=str(exc.kind))
             print(f"id={request_id} state={STATE_NOT_DELIVERED} ({detail})", file=err)
             return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,

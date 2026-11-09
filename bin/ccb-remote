@@ -26,6 +26,7 @@ from compat import setup_windows_encoding  # noqa: E402
 setup_windows_encoding()
 
 import remote_client  # noqa: E402
+import remote_protocol  # noqa: E402
 from cli_output import EXIT_ERROR, EXIT_OK  # noqa: E402
 
 USAGE = """Usage:
@@ -46,6 +47,11 @@ def _usage(stream=None) -> None:
 def _cmd_status(argv: list[str]) -> int:
     if len(argv) != 1:
         print("[ERROR] status requires exactly one host-qualified request id", file=sys.stderr)
+        return EXIT_ERROR
+    try:
+        remote_protocol.parse_remote_id(argv[0])
+    except remote_protocol.ProtocolError:
+        print("[ERROR] not a host-qualified request id (expected <local-id>-h<token>)", file=sys.stderr)
         return EXIT_ERROR
     result = remote_client.status(argv[0])
     return EXIT_OK if result.exit_code == remote_client.EXIT_ACCEPTED else result.exit_code

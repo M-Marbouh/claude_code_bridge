@@ -180,6 +180,21 @@ anchor has not appeared yet. `pend <task-id>` rechecks late anchors and reports 
 when delivery cannot yet be observed. CCB does not automatically resend unconfirmed messages because doing
 so without receiver-side idempotency could create real duplicates.
 
+## Cross-machine messaging (preview)
+
+CCB can deliver a one-way message to a Claude or Codex pane in a CCB project on
+another machine over your existing SSH server, with no ports, listeners or
+tunnels added: `ask codex --peer server::demo "hello from the laptop"`, then
+`ccb-remote status <id>` to see whether it reached the pane.
+
+It is preview and deliberately narrow: **one-way only** (no replies yet), Claude
+and Codex only, Linux only, set up by hand once per direction, and role-enforcing
+destinations accept remote messages for `lead` only. A delivered message makes
+that agent act with the destination user's files, tools and credentials — the
+project allow-list limits *where* a message may go, not what the agent can do.
+
+Setup and troubleshooting: [guides/cross-machine.md](guides/cross-machine.md).
+
 ## Session safety
 
 CCB groups runtime records by project path but routes requests using the concrete CCB session and caller pane whenever available. Implicit `pend` lookup is strict to that session; pre-restart receipts remain available by exact task ID. An unfinished task whose host PID is invisible inside a sandbox remains pending until its recorded timeout plus a short grace period has elapsed, preventing PID-namespace isolation from causing false incomplete results. Codex log binding is updated only after the target log contains the exact `CCB_REQ_ID` request anchor; a newer standalone Codex conversation in the same folder cannot win merely because it has a later timestamp.

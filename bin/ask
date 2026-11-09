@@ -1790,6 +1790,7 @@ def _run_remote_peer(
     live_id: str,
     to_role: str,
     sender_work_dir: str,
+    caller: str,
     wait_explicit: bool = False,
     foreground_explicit: bool = False,
     resend_seen: bool = False,
@@ -1814,14 +1815,18 @@ def _run_remote_peer(
         return EXIT_ERROR
     try:
         claims = caller_claims(
-            caller=_require_caller(), work_dir=sender_work_dir, role_assertion=to_role
+            caller=caller, work_dir=sender_work_dir, role_assertion=to_role
         )
         result = submit(
             host,
             project,
             peer_provider,
             message,
-            intent=intent,
+            # Delivery-only contract: a remote message never waits for, or
+            # expects, a reply, so the recorded and labelled intent is always
+            # `notify`. Explicit --wait/--foreground/--reply-to were refused
+            # above; --notify stays accepted and means the same thing here.
+            intent="notify",
             dest_session=live_id,
             caller_claims=claims,
         )
@@ -1885,6 +1890,7 @@ def _run_peer_bridge(
             reply_to=reply_to,
             live_id=live_id,
             to_role=to_role,
+            caller=caller,
             sender_work_dir=str(
                 _normalized_work_dir(os.environ.get("CCB_WORK_DIR"))
                 or _normalized_work_dir(Path.cwd())

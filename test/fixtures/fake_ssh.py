@@ -18,6 +18,9 @@ classify honestly. Behaviour is selected by ``CCB_FAKE_SSH_MODE``:
     list_ok             hello + a project list
     list_refused        hello + unauthorized refusal
     bad_ack             hello + an ack for a different op_id
+    exit255_stderr      exit 255 after printing ssh's own error
+    exit255_chatty      exit 255 after a lot of noisy stderr
+    text_not_frame      print text on stdout instead of a frame (nologin/banner)
     hang                never answer (exercises the per-op deadline)
 
 ``CCB_FAKE_SSH_LOG`` receives the argv as JSON lines, one call per line.
@@ -89,6 +92,25 @@ def main() -> int:
 
     if mode == "exit255":
         return 255
+    if mode == "exit255_stderr":
+        # What ssh really prints when the key, account or host key is refused.
+        sys.stderr.write("bob@example.test: Permission denied (publickey).\n")
+        sys.stderr.flush()
+        return 255
+    if mode == "exit255_chatty":
+        # Many lines, control characters and long content: the summary must stay
+        # bounded, printable and limited to the last non-empty lines.
+        for index in range(200):
+            sys.stderr.write(f"line {index} \x1b[31mnoise\x1b[0m " + "x" * 40 + "\n")
+        sys.stderr.write("bob@example.test: Permission denied (publickey).\n")
+        sys.stderr.flush()
+        return 255
+    if mode == "text_not_frame":
+        # What a `nologin` shell (or a login banner) does: prints to the session
+        # stdout instead of speaking the protocol.
+        sys.stdout.write("This account is currently not available.\n")
+        sys.stdout.flush()
+        return 1
     if mode == "hang":
         import time
 

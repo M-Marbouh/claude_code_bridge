@@ -8,7 +8,15 @@ source side is this working tree, run under a temporary HOME.
 
 Rows live in `test/test_docker_rig.py`; evidence is read from the destination
 (journal records under `/home/b/.ccb/remote/journal/`, and the stub log at
-`/srv/demo/.stub-agent.log`), never from sender output alone.
+`/srv/demo/.stub-agent.log`) and from the isolated source HOME's receipts, never
+from sender output alone.
+
+Reply rows (M2) script the stub through `/srv/demo/.stub-reply.json`
+(`Rig.set_stub_config`); when a delivered prompt carries
+`CCB_REMOTE_REPLY_COMMAND`, the stub runs that exact command from its own pane
+environment. `Rig.start_source_side()` builds the isolated "machine A": its own
+tmux server, a fake launch registry for the asking pane, and (for
+`--background`) a real host-side `askd`.
 
 Knobs:
 
@@ -19,8 +27,10 @@ Files:
 
 - `Dockerfile`, `sshd_config`, `entrypoint.sh` — the container (user `b`,
   key-only sshd, host keys generated at start)
-- `stub_agent.py` — the recording pane agent, installed as `codex`/`claude`
+- `stub_agent.py` — the recording pane agent (and, scripted, the replying
+  agent), installed as `codex`/`claude`
 - `protocol_probe.py` — raw framed-protocol driver (fixed ids, controlled
   hangs) for the duplicate-id and lost-acknowledgement rows
-- `rig.py` — harness: build/start, install for `b`, authorize the restricted
-  keys, launch the destination, read the journal/stub log, pause/restart
+- `rig.py` — harness: build/start, install for `b` (this tree, or another git
+  ref for the M1↔M2 row), authorize the restricted keys, launch the destination,
+  read the journal/stub log, and build the isolated reply source side

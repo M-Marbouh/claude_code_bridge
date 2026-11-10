@@ -17,6 +17,15 @@ classify honestly. Behaviour is selected by ``CCB_FAKE_SSH_MODE``:
     status_not_found    hello + not_found refusal
     list_ok             hello + a project list
     list_refused        hello + unauthorized refusal
+    no_explicit_reply   hello that advertises delivery-only without fetch/explicit-reply
+    ack_ok_delivery_only  the same delivery-only hello, but submit is still acknowledged
+                        (proves delivery-only keeps working against an M1 peer)
+    fetch_answered      hello + fetch reply: answered (reply from CCB_FAKE_SSH_REPLY)
+    fetch_delivered     hello + fetch reply: delivered (no answer yet)
+    fetch_not_found     hello + fetch refused with not_found
+    fetch_bad_digest    hello + fetch reply whose reply digest does not match its text
+    fetch_sequence      hello + fetch reply that answers only after
+                        CCB_FAKE_SSH_ANSWER_AFTER calls (counter in CCB_FAKE_SSH_COUNTER)
     bad_ack             hello + an ack for a different op_id
     exit255_stderr      exit 255 after printing ssh's own error
     exit255_chatty      exit 255 after a lot of noisy stderr
@@ -32,6 +41,7 @@ import json
 import os
 import struct
 import sys
+from pathlib import Path
 
 
 def _read_exact(stream, size: int) -> bytes:
@@ -63,21 +73,48 @@ def write_frame(stream, value: dict) -> None:
     stream.flush()
 
 
-def _hello(op_id: str, *, major: int = 1, delivery: bool = True) -> dict:
+def _hello(op_id: str, *, major: int = 1, delivery: bool = True, explicit: bool = True) -> dict:
+    modes = ["delivery-only"] if delivery else []
+    if delivery and explicit:
+        modes.append("explicit-reply")
+    verbs = ["hello", "list", "submit", "status"]
+    if delivery and explicit:
+        verbs.append("fetch")
     return {
         "ok": True,
         "op": "hello",
         "op_id": op_id,
         "capabilities": {
-            "verbs": ["hello", "list", "submit", "status"],
-            "reply_modes": {
-                "claude": ["delivery-only"] if delivery else [],
-                "codex": ["delivery-only"] if delivery else [],
-            },
+            "verbs": verbs,
+            "reply_modes": {"claude": list(modes), "codex": list(modes)},
             "max_frame": 262144,
             "proto": {"major": major, "minor": 0},
         },
     }
+
+
+def _reply_digest(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fetch_reply(op: str, op_id: str, request_id: str, *, state: str) -> dict:
+    frame = {
+        "ok": True,
+        "op": op,
+        "op_id": op_id,
+        "request_id": request_id,
+        "state": state,
+        "digest": os.environ.get("CCB_FAKE_SSH_REQUEST_DIGEST", ""),
+        "history": [{"state": "delivered", "at": "2026-11-10T11:31:40+00:00"}],
+    }
+    if state == "answered":
+        text = os.environ.get("CCB_FAKE_SSH_REPLY", "the answer\n")
+        frame["reply_text"] = text
+        frame["reply_digest"] = os.environ.get("CCB_FAKE_SSH_REPLY_DIGEST") or _reply_digest(text)
+        frame["history"].append({"state": "answered", "at": "2026-11-10T11:40:00+00:00"})
+    return frame
 
 
 def main() -> int:
@@ -146,10 +183,11 @@ def main() -> int:
             str(first.get("op_id")),
             major=2 if mode == "major2" else 1,
             delivery=mode != "no_delivery",
+            explicit=mode not in ("no_explicit_reply", "ack_ok_delivery_only"),
         ),
     )
 
-    if mode in {"major2", "no_delivery"}:
+    if mode in {"major2", "no_delivery", "no_explicit_reply"}:
         # The source must not submit after an incompatible handshake.
         return 0
 
@@ -197,7 +235,7 @@ def main() -> int:
             },
         )
         return 0
-    if mode == "ack_ok":
+    if mode in {"ack_ok", "ack_ok_delivery_only"}:
         write_frame(
             stdout,
             {
@@ -237,6 +275,41 @@ def main() -> int:
                 ],
             },
         )
+        return 0
+    if mode in {"fetch_answered", "fetch_delivered", "fetch_not_found", "fetch_bad_digest",
+                "fetch_sequence"}:
+        if op != "fetch":
+            write_frame(
+                stdout,
+                {"ok": False, "op": op, "op_id": op_id,
+                 "error": {"code": "unknown_op", "message": "the fake expected a fetch"}},
+            )
+            return 0
+        if mode == "fetch_not_found":
+            write_frame(
+                stdout,
+                {"ok": False, "op": op, "op_id": op_id,
+                 "error": {"code": "not_found", "message": "no such request"}},
+            )
+            return 0
+        state = "delivered"
+        if mode in ("fetch_answered", "fetch_bad_digest"):
+            state = "answered"
+        elif mode == "fetch_sequence":
+            counter_path = os.environ.get("CCB_FAKE_SSH_COUNTER", "")
+            seen = 0
+            if counter_path:
+                try:
+                    seen = int(Path(counter_path).read_text().strip() or 0)
+                except (OSError, ValueError):
+                    seen = 0
+                Path(counter_path).write_text(str(seen + 1))
+            if seen + 1 >= int(os.environ.get("CCB_FAKE_SSH_ANSWER_AFTER", "2")):
+                state = "answered"
+        frame = _fetch_reply(op, op_id, request_id, state=state)
+        if mode == "fetch_bad_digest":
+            frame["reply_digest"] = "0" * 64
+        write_frame(stdout, frame)
         return 0
     if mode in {"list_ok", "list_refused"}:
         if mode == "list_refused":

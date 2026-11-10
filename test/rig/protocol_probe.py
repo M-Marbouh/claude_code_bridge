@@ -143,6 +143,30 @@ def cmd_status(args) -> int:
         session.close()
 
 
+def cmd_fetch(args) -> int:
+    host, session = _open(args.host)
+    try:
+        remote_client._hello(session, op_id="hello-1")
+        session.write_all(
+            proto.encode_frame(
+                {
+                    "proto": {"major": proto.PROTO_MAJOR, "minor": proto.PROTO_MINOR},
+                    "op": "fetch",
+                    "op_id": f"fetch-{args.id}",
+                    "body": {"request_id": args.id},
+                }
+            )
+        )
+        response = session.read_frame()
+        _emit(ok=bool(response.get("ok")), response=response)
+        return 0 if response.get("ok") else 1
+    except remote_client.SessionError as exc:
+        _emit(ok=False, error=exc.kind, detail=exc.detail)
+        return 1
+    finally:
+        session.close()
+
+
 def cmd_list(args) -> int:
     host, session = _open(args.host)
     try:
@@ -189,6 +213,11 @@ def main(argv: list[str]) -> int:
     status.add_argument("--host", default="rig")
     status.add_argument("--id", required=True)
     status.set_defaults(func=cmd_status)
+
+    fetch = sub.add_parser("fetch")
+    fetch.add_argument("--host", default="rig")
+    fetch.add_argument("--id", required=True)
+    fetch.set_defaults(func=cmd_fetch)
 
     listing = sub.add_parser("list")
     listing.add_argument("--host", default="rig")

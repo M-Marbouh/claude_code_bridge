@@ -28,9 +28,17 @@ Durability: every write is a same-directory temp file, `fsync(file)`,
 `os.replace`, `fsync(dir)`. Any failure raises :class:`JournalError` and the
 caller must not acknowledge acceptance or dispatch.
 
-States (M1):
+States (M1 delivery-only):
 
     accepted-pending -> dispatch-in-progress -> delivered | failed | outcome-unknown
+
+States (M2, a schema v2 record that asked for one reply):
+
+    delivered -> answered
+
+`answered` is written in the SAME durable write that stores the reply text and
+its digest, so a reader never sees an answer without the state or the state
+without the answer. `delivered` stays terminal for a delivery-only record.
 
 `failed` is reserved for proven pre-dispatch refusal. An exception from
 `send_text`, or anything after `dispatch-in-progress` was committed, is
@@ -52,11 +60,22 @@ from pathlib import Path
 STATE_ACCEPTED = "accepted-pending"
 STATE_DISPATCHING = "dispatch-in-progress"
 STATE_DELIVERED = "delivered"
+STATE_ANSWERED = "answered"
 STATE_FAILED = "failed"
 STATE_UNKNOWN = "outcome-unknown"
 
-STATES = (STATE_ACCEPTED, STATE_DISPATCHING, STATE_DELIVERED, STATE_FAILED, STATE_UNKNOWN)
-TERMINAL_STATES = frozenset({STATE_DELIVERED, STATE_FAILED})
+STATES = (
+    STATE_ACCEPTED,
+    STATE_DISPATCHING,
+    STATE_DELIVERED,
+    STATE_ANSWERED,
+    STATE_FAILED,
+    STATE_UNKNOWN,
+)
+#: For a delivery-only record `delivered` is terminal; an explicit-reply record
+#: moves on to `answered`, which is terminal for the reply but never reached by
+#: a v1 record.
+TERMINAL_STATES = frozenset({STATE_DELIVERED, STATE_ANSWERED, STATE_FAILED})
 
 
 # Bound at import time so a monkeypatched shared `time` module (used by several
@@ -460,6 +479,33 @@ class RemoteJournal:
             self.write(record)
             return record
 
+    def confirm_durable(self, request_id: str) -> None:
+        """Re-sync ONE record file and its directory; raise if it cannot be proven.
+
+        Used when an earlier write may have landed but was never confirmed
+        durable (`may_exist`): the content is assumed correct, so a retry's
+        success must mean "this exact file is on disk and its rename is
+        synced", never "it apparently worked last time".
+        """
+        path = self.record_path(request_id)
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError as exc:
+            raise JournalError(f"journal record cannot be re-synced: {exc}") from exc
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise JournalError(f"journal record sync failed: {exc}", may_exist=True) from exc
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            _fsync_dir(self.journal_dir)
+        except OSError as exc:
+            raise JournalError(f"journal directory sync failed: {exc}", may_exist=True) from exc
+
     def iter_records(self) -> list[dict]:
         directory = self.journal_dir
         if not directory.is_dir():
@@ -473,6 +519,21 @@ class RemoteJournal:
             if isinstance(record, dict) and record.get("request_id"):
                 records.append(record)
         return records
+
+
+def answer_record(record: dict, text: str, digest: str) -> dict:
+    """Mutate one record into `answered`, carrying the answer and its digest.
+
+    The caller writes the returned record with :meth:`RemoteJournal.write`, so
+    the answer, its digest and the `answered` state land in ONE durable write.
+    The first answer is never overwritten: callers apply the reply-digest rule
+    before calling this.
+    """
+    record["state"] = STATE_ANSWERED
+    record["reply_text"] = text
+    record["reply_digest"] = digest
+    record.setdefault("history", []).append({"state": STATE_ANSWERED, "at": _now()})
+    return record
 
 
 def _split_id(request_id: str) -> tuple[str, str]:

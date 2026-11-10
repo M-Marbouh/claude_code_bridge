@@ -1238,6 +1238,28 @@ def main(argv: list[str]) -> int:
     args = parser.parse_intermixed_args(argv[1:])
 
     target = args.target.strip().lower()
+    remote_request_id = ""
+    if target:
+        # A host-qualified id is a cross-machine submission, not a local task
+        # id: it has its own outbound receipt and is answered by `fetch`.
+        from remote_protocol import ProtocolError, parse_remote_id
+
+        try:
+            parse_remote_id(target)
+        except ProtocolError:
+            remote_request_id = ""
+        else:
+            remote_request_id = target
+    if remote_request_id:
+        if args.legacy or args.count is not None:
+            print(
+                "[ERROR] A remote request ID does not accept a count or --legacy",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        import remote_client
+
+        return remote_client.remote_pend(remote_request_id)
     if args.live_id and not target:
         print("[ERROR] --live-id requires a provider target", file=sys.stderr)
         return EXIT_ERROR

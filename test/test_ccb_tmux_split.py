@@ -71,6 +71,14 @@ def test_run_up_sorts_providers_in_tmux(monkeypatch, tmp_path: Path) -> None:
     launcher = ccb.AILauncher(providers=["opencode", "gemini", "codex"])
     launcher.terminal_type = "tmux"
 
+    # The caller's pane is simulated, never addressed: this unit test must not
+    # reach a real tmux server (an inherited TMUX used to relabel the pane the
+    # suite was started from). The conftest guard scrubs TMUX as well; these
+    # patches keep the test from depending on any server existing.
+    monkeypatch.setattr(launcher, "_current_pane_id", lambda: "%0")
+    monkeypatch.setattr(launcher, "_set_current_pane_label", lambda *_a, **_k: None)
+    monkeypatch.setattr(launcher, "_set_tmux_ui_active", lambda *_a, **_k: None)
+
     called: list[str] = []
 
     def _start_provider(p: str, **_kwargs) -> str:
@@ -176,6 +184,9 @@ def test_run_up_backfills_existing_claude_session_work_dir_fields(monkeypatch, t
     launcher = ccb.AILauncher(providers=["codex"])
     launcher.terminal_type = "tmux"
 
+    monkeypatch.setattr(launcher, "_current_pane_id", lambda: "%0")
+    monkeypatch.setattr(launcher, "_set_current_pane_label", lambda *_a, **_k: None)
+    monkeypatch.setattr(launcher, "_set_tmux_ui_active", lambda *_a, **_k: None)
     monkeypatch.setattr(launcher, "_start_provider_in_current_pane", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(launcher, "cleanup", lambda: None)
 

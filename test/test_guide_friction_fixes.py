@@ -138,8 +138,9 @@ def _load_ask():
     return module
 
 
-@pytest.mark.parametrize("extra", [[], ["--notify"], ["--background"]])
-def test_remote_asks_always_send_notify_intent(monkeypatch, capsys, extra):
+@pytest.mark.parametrize("extra", [[], ["--notify"]])
+def test_plain_remote_asks_stay_delivery_only(monkeypatch, capsys, extra):
+    """M1 behaviour: no flag (or --notify) is a delivery-only submission."""
     ask = _load_ask()
     import remote_client as client_module
 
@@ -160,19 +161,37 @@ def test_remote_asks_always_send_notify_intent(monkeypatch, capsys, extra):
 
     assert rc == 0
     assert seen and seen[0]["intent"] == "notify", seen
+    assert seen[0]["reply_expected"] is False
 
 
-def test_explicit_wait_is_still_refused_for_remote(monkeypatch, capsys):
+def test_explicit_wait_now_asks_for_a_reply(monkeypatch, capsys):
     ask = _load_ask()
     import remote_client as client_module
 
     monkeypatch.setenv("CCB_CALLER", "codex")
+    seen: list[dict] = []
+
+    def fake_submit(host, project, provider, text, **kwargs):
+        seen.append(kwargs)
+        return client_module.RemoteResult(
+            request_id="20261109-182536-922-2626995-habc1",
+            host=host,
+            state=client_module.STATE_ACCEPTED,
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(client_module, "submit", fake_submit)
     monkeypatch.setattr(
-        client_module, "submit", lambda *a, **k: pytest.fail("refused flags must not submit")
+        client_module, "capture_caller_identity", lambda **kwargs: {"pane_id": "%0"}
+    )
+    monkeypatch.setattr(
+        client_module, "wait_for_answer", lambda request_id, timeout_s: client_module.EXIT_WAITING
     )
     rc = ask.main(["ask", "codex", "--peer", "testhost::example-project", "--wait", "hi"])
-    assert rc == 1
-    assert "not available for cross-machine delivery" in capsys.readouterr().err
+
+    assert rc == client_module.EXIT_WAITING
+    assert seen and seen[0]["reply_expected"] is True
+    assert seen[0]["intent"] == "wait"
 
 
 # --------------------------------------------------------------------------- #

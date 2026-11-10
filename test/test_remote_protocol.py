@@ -174,10 +174,12 @@ def test_unknown_mandatory_field_refused_with_positive_control():
 
 def test_unknown_op_refused_and_known_verbs_accepted():
     with pytest.raises(proto.ProtocolError) as excinfo:
-        proto.validate_envelope(_envelope(op="fetch"))
+        proto.validate_envelope(_envelope(op="cancel"))
     assert excinfo.value.code == proto.ERR_UNKNOWN_OP
     for verb in proto.VERBS:
         assert proto.validate_envelope(_envelope(op=verb)) is not None
+    # M2 adds the pull-based fetch verb; it is envelope-valid like the rest.
+    assert "fetch" in proto.VERBS
 
 
 def test_bad_op_id_and_non_object_body_refused():
@@ -188,19 +190,39 @@ def test_bad_op_id_and_non_object_body_refused():
     assert proto.validate_envelope(_envelope(body={"a": 1})) is not None
 
 
-def test_hello_capabilities_are_exactly_delivery_only():
+def test_hello_advertises_delivery_only_and_explicit_reply():
     response = proto.hello_response("op-42")
     assert response["ok"] is True
     assert response["op"] == "hello"
     assert response["op_id"] == "op-42"
     assert response["capabilities"] == {
-        "verbs": ["hello", "list", "submit", "status"],
-        "reply_modes": {"claude": ["delivery-only"], "codex": ["delivery-only"]},
+        "verbs": ["hello", "list", "submit", "status", "fetch"],
+        "reply_modes": {
+            "claude": ["delivery-only", "explicit-reply"],
+            "codex": ["delivery-only", "explicit-reply"],
+        },
         "max_frame": 256 * 1024,
-        "proto": {"major": 1, "minor": 0},
+        "proto": {"major": 1, "minor": 1},
     }
     # No provider beyond Claude/Codex may be advertised.
     assert set(response["capabilities"]["reply_modes"]) == {"claude", "codex"}
+
+
+def test_m1_delivery_only_is_still_advertised_with_positive_control():
+    # The shipped M1 source refuses to submit unless `delivery-only` is
+    # advertised for the provider; M2 must keep advertising it.
+    capabilities = proto.capabilities()
+    for provider in ("claude", "codex"):
+        assert proto.advertises(capabilities, provider, proto.DELIVERY_ONLY_MODE)
+        assert proto.advertises(capabilities, provider, proto.EXPLICIT_REPLY_MODE)
+    # Negative control: capability tables are provider-scoped, never global.
+    assert not proto.advertises(capabilities, "gemini", proto.DELIVERY_ONLY_MODE)
+    assert not proto.advertises({"reply_modes": {}}, "claude", proto.DELIVERY_ONLY_MODE)
+    assert proto.advertises(
+        {"reply_modes": {"claude": ["delivery-only"]}},
+        "claude",
+        proto.DELIVERY_ONLY_MODE,
+    )
 
 
 def test_error_frames_use_enumerated_codes():
@@ -332,11 +354,49 @@ def test_canonical_json_sorted_compact_and_unicode_preserved():
     assert proto.canonical_json({"b": 1, "a": "é"}) == '{"a":"é","b":1}'
 
 
-def test_reply_expected_true_refused_with_positive_control():
+def test_reply_expected_true_builds_schema_v2_and_v1_still_refuses_it():
+    record = _record(reply_expected=True)
+    assert record["schema_version"] == proto.SCHEMA_VERSION_REPLY == 2
+    assert record["reply_expected"] is True
+    proto.verify_digest(record)
+    # A v1 record that asks for a reply is still refused exactly as M1 did: the
+    # delivery-only schema keeps one meaning.
+    v1 = dict(record, schema_version=1)
     with pytest.raises(proto.ProtocolError) as excinfo:
-        _record(reply_expected=True)
+        proto.validate_request_record(v1)
     assert excinfo.value.code == proto.ERR_REPLY_NOT_SUPPORTED
     assert _record(reply_expected=False)["reply_expected"] is False
+    assert _record(reply_expected=False)["schema_version"] == 1
+
+
+def test_schema_v2_requires_reply_expected_true_and_nothing_else_changes():
+    record = _record(reply_expected=True)
+    with pytest.raises(proto.ProtocolError) as excinfo:
+        proto.validate_request_record(dict(record, reply_expected=False))
+    assert excinfo.value.code == proto.ERR_INVALID_REQUEST
+    with pytest.raises(proto.ProtocolError):
+        proto.validate_request_record(dict(record, reply_expected="yes"))
+    # Everything else a v2 record may carry is validated by the v1 rules.
+    with pytest.raises(proto.ProtocolError) as excinfo:
+        proto.validate_request_record(dict(record, dest_provider="gemini"))
+    assert excinfo.value.code == proto.ERR_UNSUPPORTED_PROVIDER
+    with pytest.raises(proto.ProtocolError) as excinfo:
+        proto.validate_request_record(dict(record, text="x" * (proto.MAX_TEXT_BYTES + 1)))
+    assert excinfo.value.code == proto.ERR_INVALID_REQUEST
+    with pytest.raises(proto.ProtocolError) as excinfo:
+        proto.validate_request_record(dict(record, new_field=True))
+    assert excinfo.value.code == proto.ERR_INVALID_REQUEST
+
+
+def test_v1_and_v2_digests_differ_for_the_same_payload():
+    v1 = _record()
+    v2 = _record(reply_expected=True)
+    assert v1["request_id"] == v2["request_id"]
+    assert v1["digest"] != v2["digest"]
+    # A v2 record cannot be passed off by a v1 digest.
+    with pytest.raises(proto.ProtocolError) as excinfo:
+        proto.verify_digest(dict(v2, digest=v1["digest"]))
+    assert excinfo.value.code == proto.ERR_DIGEST_MISMATCH
 
 
 def test_unsupported_provider_refused_with_positive_control():
@@ -404,7 +464,7 @@ def test_unknown_record_field_refused_with_positive_control():
 def test_wrong_schema_version_refused_with_positive_control():
     record = _record()
     with pytest.raises(proto.ProtocolError) as excinfo:
-        proto.validate_request_record(dict(record, schema_version=2))
+        proto.validate_request_record(dict(record, schema_version=3))
     assert excinfo.value.code == proto.ERR_UNSUPPORTED_SCHEMA
     with pytest.raises(proto.ProtocolError):
         proto.validate_request_record(dict(record, schema_version=True))

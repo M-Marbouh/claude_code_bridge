@@ -11,11 +11,13 @@ any non-empty ``SSH_ORIGINAL_COMMAND`` (and any extra argument) before reading
 bytes, then loops over length-prefixed UTF-8 JSON frames on stdin/stdout via
 ``lib/remote_protocol.py``.
 
-In T1 only ``hello`` is answered locally. ``list``, ``submit`` and ``status``
-return the enumerated ``unsupported`` error; T2 replaces the single seam
+``hello`` is answered locally. ``list``, ``submit``, ``status`` and (M2)
+``fetch`` are forwarded verb by verb through the single seam
 ``dispatch_remote_operation`` with narrow ``askd_rpc.request_daemon()`` calls
 (lib/askd_rpc.py:100) to the destination askd. This gate never spawns a
-process, never evaluates input, and never logs message text.
+process, never evaluates input, and never logs message text. Replies travel the
+other way: a destination agent runs the destination-local ``ccb-remote reply``,
+so nothing here receives or stores an answer.
 
 Design: docs/plans/cross-machine-ccb-proposal.md sections 3 and 6.
 """
@@ -44,7 +46,8 @@ INTERNAL_ERROR_MESSAGE = "internal error"
 PRINCIPAL_RE = re.compile(r"[a-z0-9_-]{1,64}")
 
 #: Verbs forwarded to the local askd through :func:`dispatch_remote_operation`.
-FORWARDED_VERBS = ("list", "submit", "status")
+#: ``fetch`` (M2) is principal-scoped exactly like ``status``.
+FORWARDED_VERBS = ("list", "submit", "status", "fetch")
 
 
 class _DaemonUnavailable(RuntimeError):
@@ -129,7 +132,7 @@ def _askd_remote_request(op: str, op_id: str, body: dict, principal: str) -> dic
     }
     if op == "submit":
         request["record"] = body
-    elif op == "status":
+    elif op in ("status", "fetch"):
         request["request_id"] = str(body.get("request_id") or "")
 
     try:
@@ -146,7 +149,7 @@ def _askd_remote_request(op: str, op_id: str, body: dict, principal: str) -> dic
 
 
 def dispatch_remote_operation(envelope: dict, *, principal: str) -> dict:
-    """T2 seam: forward an authorized list/submit/status request and map it.
+    """Seam: forward an authorized list/submit/status/fetch request and map it.
 
     The principal comes from the gate's own argv only; the frame cannot change
     it, and the destination askd re-checks it against its config.

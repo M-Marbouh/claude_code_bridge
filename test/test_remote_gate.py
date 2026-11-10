@@ -131,7 +131,7 @@ def test_gate_loops_over_frames_and_stops_on_eof():
     assert frames[1]["error"]["code"] == proto.ERR_DAEMON_UNAVAILABLE
 
 
-@pytest.mark.parametrize("verb", ["list", "submit", "status"])
+@pytest.mark.parametrize("verb", ["list", "submit", "status", "fetch"])
 def test_forwarded_verbs_without_a_daemon_refuse_honestly(verb: str):
     result = _run(["--principal", "bob"], _frame(_envelope(op=verb)), env=_env(CCB_RUN_DIR=str(GATE_TEST_RUN_DIR)))
     assert result.returncode == 0, result.stderr

@@ -1,10 +1,9 @@
-"""Cross-machine CCB wire protocol (Milestone 1: one-way delivery, no reply).
+"""Cross-machine CCB wire protocol (M1 one-way delivery; M2 explicit replies).
 
 Pure module: no filesystem, network, process or clock access beyond the streams
 handed to the framing helpers. The SSH forced-command gate
-(``bin/ccb-remote-gate``) and, from T2 on, the destination askd remote
-operations both use these helpers so framing, identity and validation cannot
-drift apart.
+(``bin/ccb-remote-gate``) and the destination askd remote operations both use
+these helpers so framing, identity and validation cannot drift apart.
 
 Frame layout::
 
@@ -13,12 +12,19 @@ Frame layout::
     +-----------------+-------------------------------+
 
 The envelope is a JSON object with ``proto`` {major, minor}, ``op``
-(hello|list|submit|status), ``op_id``, ``body`` and an optional ``mandatory``
-list of field names the sender requires the receiver to understand.
+(hello|list|submit|status|fetch), ``op_id``, ``body`` and an optional
+``mandatory`` list of field names the sender requires the receiver to
+understand.
 
-Design: docs/plans/cross-machine-ccb-proposal.md section 3 (wire format, verbs)
-and section 6. Milestone plan: docs/plans/cross-machine-m1-plan.md sections
-1-6, 10.
+Schema versions are deliberately separate, one meaning each: version 1 is
+delivery-only and its validation, normalisation and digest are unchanged from
+M1; version 2 is the same record with ``reply_expected=true``. A peer decides
+whether it may send a reply-expected record from the ``hello`` capabilities
+(``explicit-reply`` for that provider), never from a minor version number.
+
+Design: docs/plans/cross-machine-ccb-proposal.md sections 3, 4 and 6.
+Milestone plans: docs/plans/cross-machine-m1-plan.md sections 1-6, 10 and
+docs/plans/cross-machine-m2-plan.md sections 3, 8.
 """
 
 from __future__ import annotations
@@ -30,12 +36,20 @@ import re
 import struct
 
 PROTO_MAJOR = 1
-PROTO_MINOR = 0
+#: 1.1 adds the ``fetch`` verb and the ``explicit-reply`` reply mode. A peer
+#: still negotiates by CAPABILITY: a 1.0 peer is served delivery-only because
+#: it never asks for anything else, not because of this number.
+PROTO_MINOR = 1
 
 HEADER_SIZE = 4
 MAX_FRAME = 256 * 1024
 
-VERBS = ("hello", "list", "submit", "status")
+VERBS = ("hello", "list", "submit", "status", "fetch")
+
+# Reply modes advertised per provider in ``hello``. ``delivery-only`` is M1
+# and stays advertised for every such peer; ``explicit-reply`` is M2.
+DELIVERY_ONLY_MODE = "delivery-only"
+EXPLICIT_REPLY_MODE = "explicit-reply"
 
 #: Envelope fields this build understands. Anything else is ignored unless the
 #: sender lists it in ``mandatory``, which then fails closed.
@@ -71,6 +85,10 @@ ERR_NOT_FOUND = "not_found"
 ERR_DESTINATION_UNAVAILABLE = "destination_unavailable"
 ERR_IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 ERR_JOURNAL_FAILURE = "journal_failure"
+# The answer commit may or may not be on disk (the rename happened but its
+# directory sync did not). Neither success nor failure: retry the SAME answer
+# and the reply digest decides.
+ERR_REPLY_UNKNOWN = "reply_unknown"
 ERR_DAEMON_UNAVAILABLE = "daemon_unavailable"
 ERR_ACCEPTANCE_UNKNOWN = "acceptance_unknown"
 ERR_CONFIG_INVALID = "config_invalid"
@@ -100,6 +118,7 @@ ERROR_CODES = frozenset(
         ERR_DESTINATION_UNAVAILABLE,
         ERR_IDEMPOTENCY_CONFLICT,
         ERR_JOURNAL_FAILURE,
+        ERR_REPLY_UNKNOWN,
         ERR_DAEMON_UNAVAILABLE,
         ERR_ACCEPTANCE_UNKNOWN,
         ERR_CONFIG_INVALID,
@@ -117,8 +136,10 @@ REMOTE_ID_SEPARATOR = "-h"
 _LOCAL_ID_RE = re.compile(LOCAL_ID_PATTERN)
 _HOST_TOKEN_RE = re.compile(HOST_TOKEN_PATTERN)
 
-# Submit record schema (validation only in M1; T2 persists the record).
+# Submit record schema. Version 1 is delivery-only (M1, unchanged); version 2
+# is the same record with ``reply_expected=true`` and nothing else different.
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_REPLY = 2
 
 #: Remote delivery is advertised only for providers whose delivery path is
 #: proven. Claude and Codex use the existing delivery-only peer path.
@@ -370,13 +391,35 @@ def validate_envelope(envelope: dict) -> dict:
 
 
 def capabilities() -> dict:
-    """The ``hello`` capabilities this build advertises (delivery-only)."""
+    """The ``hello`` capabilities this build advertises.
+
+    ``delivery-only`` stays advertised for Claude and Codex, so a shipped M1
+    source still negotiates exactly what it asked for; ``explicit-reply`` and
+    the ``fetch`` verb are additive.
+    """
     return {
-        "verbs": ["hello", "list", "submit", "status"],
-        "reply_modes": {"claude": ["delivery-only"], "codex": ["delivery-only"]},
+        "verbs": list(VERBS),
+        "reply_modes": {
+            provider: [DELIVERY_ONLY_MODE, EXPLICIT_REPLY_MODE]
+            for provider in REMOTE_PROVIDERS
+        },
         "max_frame": MAX_FRAME,
         "proto": {"major": PROTO_MAJOR, "minor": PROTO_MINOR},
     }
+
+
+def reply_modes_for(capabilities: dict, provider: str) -> tuple[str, ...]:
+    """The reply modes a peer advertised for ``provider`` (empty if none)."""
+    modes = capabilities.get("reply_modes") if isinstance(capabilities, dict) else None
+    advertised = modes.get(provider) if isinstance(modes, dict) else None
+    if not isinstance(advertised, list):
+        return ()
+    return tuple(mode for mode in advertised if isinstance(mode, str))
+
+
+def advertises(capabilities: dict, provider: str, mode: str) -> bool:
+    """Capability, not protocol version, decides what a peer may be sent."""
+    return mode in reply_modes_for(capabilities, provider)
 
 
 def hello_response(op_id: str) -> dict:
@@ -463,6 +506,46 @@ def _is_printable_ascii(value: str) -> bool:
 
 
 def validate_request_record(record: dict) -> dict:
+    """Validate a ``submit`` body and return it normalised.
+
+    Any schema version other than exactly 2 goes through the unchanged M1
+    path, so a v1 record (or an unsupported/wrongly-typed version) is judged
+    by byte-for-byte the same rules, codes and normalisation as shipped.
+    """
+    schema_version = record.get("schema_version") if isinstance(record, dict) else None
+    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION_REPLY:
+        return _validate_v1(record)
+    return _validate_v2(record)
+
+
+def _validate_v2(record: dict) -> dict:
+    """Validate a schema v2 record: a v1 record that asks for one reply.
+
+    Every other field is validated and normalised by the v1 path itself; the
+    only difference allowed is ``reply_expected=true``. A v2 record that does
+    not ask for a reply is refused, because one schema must have one meaning
+    (delivery-only records stay v1).
+    """
+    reply_expected = record.get("reply_expected")
+    if reply_expected is not True:
+        if reply_expected is False:
+            raise ProtocolError(
+                ERR_INVALID_REQUEST,
+                "schema v2 means reply_expected=true; use schema 1 for delivery-only",
+            )
+        raise ProtocolError(ERR_INVALID_REQUEST, "reply_expected must be a boolean")
+    # The v1 path refuses reply_expected=true by design, so probe with the flag
+    # cleared and the v1 schema number: all other checks stay exactly as M1.
+    probe = dict(record)
+    probe["schema_version"] = SCHEMA_VERSION
+    probe["reply_expected"] = False
+    normalised = _validate_v1(probe)
+    normalised["schema_version"] = SCHEMA_VERSION_REPLY
+    normalised["reply_expected"] = True
+    return normalised
+
+
+def _validate_v1(record: dict) -> dict:
     """Validate a ``submit`` body and return it normalised.
 
     Refuses unknown fields, a wrong schema version, an unknown/invalid
@@ -577,9 +660,15 @@ def build_request_record(
     dest_session: str | None = None,
     reply_expected: bool = False,
 ) -> dict:
-    """Build and validate a ``submit`` record, with its digest, for M1 (no reply)."""
+    """Build and validate a ``submit`` record, with its digest.
+
+    ``reply_expected=False`` builds the unchanged M1 schema v1 record;
+    ``reply_expected=True`` builds schema v2. The digest covers
+    ``schema_version`` and ``reply_expected``, so the two can never share a
+    digest for the same payload.
+    """
     record = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION_REPLY if reply_expected is True else SCHEMA_VERSION,
         "dest_project": dest_project,
         "dest_provider": dest_provider,
         "text": text,
@@ -594,3 +683,39 @@ def build_request_record(
     normalised = validate_request_record(record)
     normalised["digest"] = compute_digest(normalised)
     return normalised
+
+
+# --------------------------------------------------------------------------- #
+# Reply text (M2)
+# --------------------------------------------------------------------------- #
+
+
+def validate_reply_text(value: object) -> str:
+    """Validate one answer body and return it unchanged.
+
+    Same cap as the ask-side message (``MAX_TEXT_BYTES``); the text is stored
+    and transported verbatim, so it is never stripped or normalised here.
+    """
+    if not isinstance(value, str):
+        raise ProtocolError(ERR_INVALID_REQUEST, "reply text must be a string")
+    if not value.strip():
+        raise ProtocolError(ERR_INVALID_REQUEST, "reply text must be non-empty")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ProtocolError(ERR_INVALID_REQUEST, "reply text is not valid UTF-8") from None
+    if size > MAX_TEXT_BYTES:
+        raise ProtocolError(
+            ERR_INVALID_REQUEST, f"reply text exceeds the {MAX_TEXT_BYTES}-byte cap"
+        )
+    return value
+
+
+def compute_reply_digest(text: str) -> str:
+    """SHA-256 hex over the answer's own UTF-8 bytes.
+
+    The digest is only ever compared within one record, so it identifies the
+    answer itself: a lost acknowledgement is resolved by retrying the SAME
+    text, and any different text is a second answer (refused).
+    """
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()

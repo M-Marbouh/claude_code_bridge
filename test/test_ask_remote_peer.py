@@ -208,7 +208,6 @@ def test_local_bridge_cmd_is_unchanged(monkeypatch):
     "extra",
     [
         ["--reply-to", "20261109-182536-922-2626995"],
-        ["--wait"],
         ["--foreground"],
     ],
 )
@@ -225,6 +224,101 @@ def test_reply_implying_flags_are_refused_for_remote(monkeypatch, capsys, extra)
     err = capsys.readouterr().err
     assert "not available for cross-machine delivery" in err
     assert spy.calls == []
+
+
+def test_wait_and_notify_together_are_refused_as_contradictory(monkeypatch, capsys):
+    ask = _load_ask()
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    spy = _patch_submit(ask, monkeypatch)
+
+    rc = ask.main(["ask", "codex", "--peer", "testhost::example-project", "--wait", "--notify", "hi"])
+
+    assert rc == 1
+    assert "contradict each other" in capsys.readouterr().err
+    assert spy.calls == []
+
+
+def test_wait_submits_reply_expected_and_waits(monkeypatch, capsys):
+    ask = _load_ask()
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    spy = _patch_submit(ask, monkeypatch)
+    waited: list[tuple[str, float]] = []
+
+    import remote_client
+
+    monkeypatch.setattr(
+        remote_client,
+        "wait_for_answer",
+        lambda request_id, timeout_s: waited.append((request_id, timeout_s))
+        or remote_client.EXIT_WAITING,
+    )
+    monkeypatch.setattr(
+        remote_client,
+        "capture_caller_identity",
+        lambda **kwargs: {"pane_id": "%0", "terminal": "tmux", "work_dir": "/home/user/project"},
+    )
+
+    rc = ask.main(["ask", "codex", "--peer", "testhost::example-project", "--wait", "hi"])
+
+    assert rc == remote_client.EXIT_WAITING
+    assert spy.calls and spy.kwargs[-1]["reply_expected"] is True
+    assert spy.kwargs[-1]["intent"] == "wait"
+    assert spy.kwargs[-1]["caller_identity"]["pane_id"] == "%0"
+    assert spy.kwargs[-1]["poll_owner"] == ""
+    assert waited == [("20261109-182536-922-2626995-habc1", 3600.0)]
+
+
+def test_background_registers_the_polling_owner(monkeypatch, capsys):
+    ask = _load_ask()
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    spy = _patch_submit(ask, monkeypatch)
+    registered: list[str] = []
+
+    import remote_client
+
+    monkeypatch.setattr(ask, "_remote_poll_owner", lambda _work_dir: "/home/user/.cache/ccb/projects/0123456789abcdef/askd.json")
+    monkeypatch.setattr(
+        remote_client, "register_watch", lambda request_id: registered.append(request_id) or (True, "")
+    )
+    monkeypatch.setattr(
+        remote_client,
+        "capture_caller_identity",
+        lambda **kwargs: {"pane_id": "%0", "terminal": "tmux", "work_dir": "/home/user/project"},
+    )
+
+    rc = ask.main(["ask", "codex", "--peer", "testhost::example-project", "--background", "hi"])
+
+    assert rc == 0, capsys.readouterr().err
+    assert spy.kwargs[-1]["reply_expected"] is True
+    assert spy.kwargs[-1]["intent"] == "background"
+    assert spy.kwargs[-1]["poll_owner"].endswith("askd.json")
+    assert registered == ["20261109-182536-922-2626995-habc1"]
+    assert "CCB_BACKGROUND_SUBMITTED" in capsys.readouterr().out
+
+
+def test_background_without_a_polling_owner_is_refused_before_submit(monkeypatch, capsys):
+    ask = _load_ask()
+    monkeypatch.setenv("CCB_CALLER", "codex")
+    import remote_client
+
+    spy = _patch_submit(ask, monkeypatch)
+    spy.result = remote_client.RemoteResult(
+        request_id="20261110-113136-582-89163-1-habc1",
+        host="testhost",
+        state=remote_client.STATE_NOT_DELIVERED,
+        exit_code=remote_client.EXIT_NOT_DELIVERED,
+        reason="background replies need CCB running here; use --wait",
+    )
+    monkeypatch.setattr(ask, "_remote_poll_owner", lambda _work_dir: "")
+    monkeypatch.setattr(
+        remote_client, "register_watch", lambda _rid: pytest.fail("must not register")
+    )
+
+    rc = ask.main(["ask", "codex", "--peer", "testhost::example-project", "--background", "hi"])
+
+    assert rc == remote_client.EXIT_NOT_DELIVERED
+    assert spy.kwargs[-1]["reply_expected"] is True
+    assert spy.kwargs[-1]["poll_owner"] == ""
 
 
 def test_remote_refuses_a_provider_that_is_not_claude_or_codex(monkeypatch, capsys):

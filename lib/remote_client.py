@@ -1,4 +1,4 @@
-"""Source side of cross-machine CCB delivery (Milestone 1: one-way, no reply).
+"""Source side of cross-machine CCB delivery (M1 delivery; M2 explicit replies).
 
 Responsibilities, in order:
 
@@ -7,7 +7,9 @@ Responsibilities, in order:
    binds to that key's principal.
 2. A durable OUTBOUND receipt written BEFORE any SSH process is spawned, in a
    persistent per-user directory (local ask receipts live in the system temp
-   dir, ``lib/task_receipts.py:25``, which can be cleared on reboot).
+   dir, ``lib/task_receipts.py:25``, which can be cleared on reboot). For a
+   reply-expected submission the receipt also captures the caller's exact pane
+   identity BEFORE the submit, and holds the answer once it is fetched.
 3. Exactly one SSH call, argv-only (never a shell string), with an isolated
    option set: one identity, no agent, no control connection, strict host-key
    checking against a pinned file, forwarding disabled, and no remote command
@@ -17,6 +19,12 @@ Responsibilities, in order:
    were written but no valid acknowledgement arrived), ``accepted`` (valid
    ack). Nothing is ever resubmitted automatically.
 
+M2 explicit replies are pull-based: the source asks the destination for the
+answer (``fetch``) and never accepts a reverse connection. The answer is
+persisted in the receipt BEFORE any notification; the caller's pane is then
+revalidated against the identity captured before submit and receives the answer
+at most once, or the receipt stays ``fetched`` for ``pend``.
+
 The protocol itself lives in ``lib/remote_protocol.py`` (T1); the destination
 implementations live in ``lib/remote_delivery.py`` (T2). This module never
 decides authorization and never resolves a destination -- it can only name a
@@ -25,6 +33,7 @@ configured host alias and a destination-side project alias.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import queue
@@ -36,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +67,27 @@ STATE_SUBMITTING = "submitting"
 STATE_NOT_DELIVERED = "not-delivered"
 STATE_ACCEPTANCE_UNKNOWN = "acceptance-unknown"
 STATE_ACCEPTED = "accepted"
+
+#: Source-only states for a reply-expected (schema v2) submission. The
+#: destination's own states are mirrored into ``remote_state`` instead; these
+#: describe what the SOURCE has done with an answer.
+#:   answer-available     destination reports `answered`; text not stored yet
+#:   fetched              answer text is durably stored in this receipt
+#:   notified             answer was injected into the captured caller pane
+#:   fetch-unavailable    the last fetch failed / was refused (receipt kept)
+STATE_ANSWER_AVAILABLE = "answer-available"
+STATE_FETCHED = "fetched"
+STATE_NOTIFIED = "notified"
+STATE_FETCH_UNAVAILABLE = "fetch-unavailable"
+
+#: Source states that already hold (or prove the existence of) an answer. A
+#: status refresh may mirror the destination, but must never move a receipt
+#: out of these, and a second fetch must never overwrite the first answer.
+ANSWER_STATES = frozenset({STATE_ANSWER_AVAILABLE, STATE_FETCHED, STATE_NOTIFIED})
+
+#: Bounded polling backoff shared by ``--wait`` and the source daemon's poller.
+REPLY_BACKOFF_START_S = 2.0
+REPLY_BACKOFF_CAP_S = 15.0
 
 #: Deadlines use perf_counter, bound at import: adapter tests simulate
 #: `time.monotonic` through the shared module, and that must not move a
@@ -735,14 +766,162 @@ def save_receipt(record: dict) -> None:
     _write_json_durable(receipt_path(request_id), record)
 
 
-def _transition(record: dict, state: str, reason: str = "", **extra: Any) -> None:
-    """Record the new state best-effort; never raises, never changes the outcome."""
-    record["state"] = state
-    _append_history(record, state, reason, **extra)
+#: Re-entrant per-receipt file lock. Every receipt update -- submit, status,
+#: --wait, the daemon poller and pend -- goes through it, so two processes can
+#: never both transition the same receipt (one notification, one answer).
+_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def _receipt_lock(request_id: str, timeout_s: float = 15.0):
+    proto.parse_remote_id(request_id)
+
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LOCK_STATE.held = held
+    if request_id in held:
+        held[request_id] += 1
+        try:
+            yield
+        finally:
+            held[request_id] -= 1
+            if held[request_id] <= 0:
+                held.pop(request_id, None)
+        return
+
+    _ensure_private_dir(outbound_dir())
+    path = outbound_dir() / f"{request_id}.lock"
     try:
-        save_receipt(record)
+        import fcntl as _fcntl
+    except Exception:  # pragma: no cover - non-POSIX platforms
+        _fcntl = None
+    if _fcntl is None:  # pragma: no cover - non-POSIX platforms
+        held[request_id] = 1
+        try:
+            yield
+        finally:
+            held.pop(request_id, None)
+        return
+
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    deadline = _monotonic() + max(0.0, float(timeout_s))
+    while True:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if _monotonic() >= deadline:
+                os.close(fd)
+                raise RemoteRefusal("the outbound receipt is busy for this request id") from None
+            time.sleep(0.02)
+    held[request_id] = 1
+    try:
+        yield
+    finally:
+        held.pop(request_id, None)
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def update_receipt(request_id: str, mutate: Callable[[dict], Any]) -> dict:
+    """Read-modify-write one receipt under its lock; ``mutate`` returns False to skip.
+
+    Durability is the same same-directory temp + fsync + replace + fsync(dir)
+    used for the initial receipt, so a crash can never leave a half-answer.
+    """
+    with _receipt_lock(request_id):
+        record = read_receipt(request_id)
+        decision = mutate(record)
+        if decision is False:
+            return record
+        _write_json_durable(receipt_path(request_id), record)
+        return record
+
+
+#: Source states that carry (or prove the existence of) an answer, ranked so a
+#: late lifecycle write can never undo one. Lower rank is earlier.
+_ANSWER_STATE_RANK = {
+    STATE_ANSWER_AVAILABLE: 1,
+    STATE_FETCHED: 2,
+    STATE_NOTIFIED: 3,
+}
+
+
+def apply_receipt_state(
+    latest: dict,
+    state: str,
+    reason: str = "",
+    *,
+    remote_state: str | None = None,
+    **extra: Any,
+) -> bool:
+    """Apply one source state under the shared precedence; False = refused.
+
+    This is the ONE place that decides whether a state write is allowed, for
+    every writer (submit ack, status mirror, fetch/poll, notification outcome):
+
+    * an answer-bearing state is sticky against non-answer states;
+    * answer states only move forward (answer-available -> fetched -> notified);
+    * once a notification was attempted, a late lifecycle write may not replace
+      the outcome that attempt owns.
+
+    A refused write changes nothing, not even ``remote_state``, so a late
+    ``accepted-pending`` ack can never hide a fetched answer from ``pend``.
+    """
+    current = str(latest.get("state") or "")
+    current_rank = _ANSWER_STATE_RANK.get(current, 0)
+    new_rank = _ANSWER_STATE_RANK.get(state, 0)
+    if new_rank < current_rank:
+        return False
+    if current_rank and not new_rank:
+        return False
+    if latest.get("notify_attempted_at") and not new_rank:
+        return False
+    latest["state"] = state
+    if remote_state is not None:
+        latest["remote_state"] = remote_state
+    _append_history(latest, state, reason, **extra)
+    return True
+
+
+def _transition(
+    record: dict, state: str, reason: str = "", *, remote_state: str | None = None, **extra: Any
+) -> None:
+    """Record the new state best-effort; never raises, never changes the outcome.
+
+    Uses :func:`apply_receipt_state`, so a lifecycle transition can never
+    downgrade an answer the source daemon already fetched (or notified).
+    """
+    request_id = str(record.get("request_id") or "")
+    applied = {"value": False}
+
+    def mutate(latest: dict) -> bool:
+        applied["value"] = apply_receipt_state(
+            latest, state, reason, remote_state=remote_state, **extra
+        )
+        return applied["value"]
+
+    try:
+        update_receipt(request_id, mutate)
     except Exception as exc:
         print(f"[WARN] outbound receipt not updated ({exc}); state shown is authoritative", file=sys.stderr)
+    # Keep the caller's in-memory copy useful for its own reporting.
+    if applied["value"]:
+        record["state"] = state
+        if remote_state is not None:
+            record["remote_state"] = remote_state
+        _append_history(record, state, reason, **extra)
 
 
 # --------------------------------------------------------------------------- #
@@ -782,6 +961,32 @@ def _require_delivery_only(capabilities: dict, provider: str) -> None:
     if not isinstance(modes_for_provider, list) or "delivery-only" not in modes_for_provider:
         raise SessionError(
             "incompatible", f"the destination does not advertise delivery-only {provider} delivery"
+        )
+
+
+def _advertises_fetch(capabilities: dict) -> bool:
+    verbs = capabilities.get("verbs") if isinstance(capabilities, dict) else None
+    return isinstance(verbs, list) and "fetch" in verbs
+
+
+def _require_explicit_reply(capabilities: dict, provider: str) -> None:
+    """Refuse a reply-expected submit to a peer that cannot serve it (A5).
+
+    Capability, never a minor version number: a 1.0/delivery-only destination
+    keeps working for plain and --notify sends, and this check refuses BEFORE
+    any submit byte is written.
+    """
+    if not proto.advertises(capabilities, provider, proto.EXPLICIT_REPLY_MODE):
+        raise SessionError(
+            "incompatible",
+            f"the destination does not advertise explicit replies for {provider} "
+            "(delivery-only); use --notify or send without --wait/--background",
+        )
+    if not _advertises_fetch(capabilities):
+        raise SessionError(
+            "incompatible",
+            "the destination does not advertise the fetch verb, so an answer could never be "
+            "collected; use --notify or send without --wait/--background",
         )
 
 
@@ -860,14 +1065,27 @@ def submit(
     intent: str = "notify",
     dest_session: str = "",
     caller_claims: dict | None = None,
+    reply_expected: bool = False,
+    caller_identity: dict | None = None,
+    poll_owner: str = "",
     hosts: dict[str, RemoteHost] | None = None,
     session_factory: Callable[[list[str]], SshSession] | None = None,
     out: Any = None,
     err: Any = None,
 ) -> RemoteResult:
-    """Write the receipt, run one SSH call, and report the honest state."""
+    """Write the receipt, run one SSH call, and report the honest state.
+
+    ``reply_expected=True`` (M2) submits schema v2 and additionally requires
+    the destination's ``hello`` to advertise ``explicit-reply`` and ``fetch``
+    BEFORE any submit byte is written. ``poll_owner`` is the source askd state
+    file that will poll for the answer; ``--background`` refuses without it.
+    """
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
+    if reply_expected and intent not in ("wait", "background"):
+        raise RemoteRefusal(
+            "a reply-expected submission must use intent 'wait' or 'background'"
+        )
     host = host_for(host_alias, hosts=hosts)
 
     from ccb_protocol import make_req_id
@@ -881,6 +1099,7 @@ def submit(
         request_id=request_id,
         source_claims=dict(caller_claims or {}),
         dest_session=dest_session or None,
+        reply_expected=reply_expected,
     )
 
     receipt = {
@@ -898,6 +1117,13 @@ def submit(
         "history": [],
         "remote_state": "",
     }
+    if record["schema_version"] == proto.SCHEMA_VERSION_REPLY:
+        # Captured BEFORE the submit: this copy is the authority a later
+        # notification revalidates, never the audit-only `caller` claims.
+        receipt["reply_expected"] = True
+        receipt["caller_identity"] = dict(caller_identity or {})
+        if poll_owner:
+            receipt["poll_owner"] = str(poll_owner)
     _append_history(receipt, STATE_SUBMITTING)
     try:
         save_receipt(receipt)
@@ -905,6 +1131,13 @@ def submit(
         print(f"[ERROR] could not write the outbound receipt; nothing was sent: {exc}", file=err)
         return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
                             reason="outbound receipt could not be written", digest=record["digest"])
+
+    if reply_expected and intent == "background" and not poll_owner:
+        reason = "background replies need CCB running here; use --wait"
+        _transition(receipt, STATE_NOT_DELIVERED, reason)
+        print(f"id={request_id} state={STATE_NOT_DELIVERED} ({reason})", file=err)
+        return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
+                            reason=reason, digest=record["digest"])
 
     factory = session_factory or SshSession
     argv = ssh_argv(host)
@@ -925,6 +1158,8 @@ def submit(
         try:
             capabilities = _hello(session, op_id="hello-1")
             _require_delivery_only(capabilities, provider)
+            if record["schema_version"] == proto.SCHEMA_VERSION_REPLY:
+                _require_explicit_reply(capabilities, provider)
         except SessionError as exc:
             detail = _exit_detail(session, exc)
             _transition(receipt, STATE_NOT_DELIVERED, detail, ssh=str(exc.kind))
@@ -992,10 +1227,13 @@ def submit(
                                     EXIT_ACCEPTANCE_UNKNOWN, reason=reason,
                                     digest=record["digest"])
             remote_state = str(ack.get("state") or "")
-            receipt["remote_state"] = remote_state
             _transition(receipt, STATE_ACCEPTED, "destination accepted the request",
                         remote_state=remote_state)
-            print(f"id={request_id} state={STATE_ACCEPTED} destination={remote_state or '-'}", file=out)
+            expectation = " reply-expected=yes" if reply_expected else ""
+            print(
+                f"id={request_id} state={STATE_ACCEPTED} destination={remote_state or '-'}{expectation}",
+                file=out,
+            )
             return RemoteResult(request_id, host.alias, STATE_ACCEPTED, EXIT_ACCEPTED,
                                 remote_state=remote_state, digest=record["digest"])
 
@@ -1111,16 +1349,59 @@ def status(
 
     remote_state = str(response.get("state") or "")
     history = [entry for entry in (response.get("history") or []) if isinstance(entry, dict)]
+    reply_expected = record.get("reply_expected") is True
+
+    if reply_expected:
+        # A reply-expected receipt's SOURCE state is authoritative for the
+        # answer. A status refresh only mirrors the destination, and can never
+        # move the receipt out of an answer-bearing state or drop a stored
+        # answer / notification.
+        def mutate(latest: dict) -> None:
+            if not remote_state:
+                return
+            latest["remote_state"] = remote_state
+            latest.setdefault("remote_history", []).extend(
+                {"state": str(entry.get("state") or ""), "at": str(entry.get("at") or "")}
+                for entry in history
+                if entry.get("state")
+            )
+            current = str(latest.get("state") or "")
+            if remote_state == "answered" and current not in ANSWER_STATES:
+                if current != STATE_NOT_DELIVERED:
+                    apply_receipt_state(
+                        latest, STATE_ANSWER_AVAILABLE, "destination reports an answer"
+                    )
+
+        try:
+            updated = update_receipt(request_id, mutate)
+        except Exception as exc:
+            print(f"[ERROR] status unavailable: {exc}", file=err)
+            return StatusResult(request_id, host.alias, EXIT_NOT_DELIVERED, reason=str(exc))
+        state = str(updated.get("state") or "")
+        if remote_state:
+            print(f"id={request_id} state={state} destination={remote_state}", file=out)
+        else:
+            print(f"id={request_id} state={state} (no destination state reported)", file=out)
+        return StatusResult(request_id, host.alias, EXIT_ACCEPTED, state=remote_state, history=history)
+
     if remote_state:
-        record["remote_state"] = remote_state
-        record.setdefault("remote_history", []).extend(
-            {"state": str(entry.get("state") or ""), "at": str(entry.get("at") or "")}
-            for entry in history
-            if entry.get("state")
-        )
-        # The receipt mirrors the destination: that is what makes a status
-        # query the recovery path for an acceptance-unknown submission.
-        _transition(record, remote_state, "destination state via status")
+        def mutate(latest: dict) -> None:
+            latest["remote_state"] = remote_state
+            latest.setdefault("remote_history", []).extend(
+                {"state": str(entry.get("state") or ""), "at": str(entry.get("at") or "")}
+                for entry in history
+                if entry.get("state")
+            )
+            # The receipt mirrors the destination: that is what makes a status
+            # query the recovery path for an acceptance-unknown submission.
+            latest["state"] = remote_state
+            _append_history(latest, remote_state, "destination state via status")
+
+        try:
+            update_receipt(request_id, mutate)
+        except Exception as exc:
+            print(f"[ERROR] status unavailable: {exc}", file=err)
+            return StatusResult(request_id, host.alias, EXIT_NOT_DELIVERED, reason=str(exc))
         print(f"id={request_id} state={remote_state} destination={remote_state}", file=out)
     else:
         print(f"id={request_id} state={record.get('state')} (no destination state reported)", file=out)
@@ -1213,3 +1494,652 @@ def caller_claims(*, caller: str, work_dir: str = "", role_assertion: str = "") 
         "role_assertion": role_assertion or "",
         "verified": False,
     }
+
+
+def capture_caller_identity(*, caller: str, work_dir: str = "", role_assertion: str = "") -> dict:
+    """The caller's exact pane identity, captured BEFORE a reply-expected submit.
+
+    Unlike ``caller_claims`` (audit-only, ``verified: false``), this copy is
+    what a later notification revalidates: pane, terminal, work_dir, the
+    launch/session ids CCB exported into the pane, and -- when the caller's own
+    live session can be resolved from the same inventory peer delivery trusts
+    -- its title marker, project id and live id. An unresolved caller leaves
+    those empty, and the notification then fails closed rather than guessing.
+    """
+    from task_receipts import caller_pane, caller_session_id
+
+    pane_id, terminal = caller_pane()
+    identity = {
+        "caller": (caller or "").strip(),
+        "pane_id": pane_id,
+        "terminal": terminal,
+        "session_id": caller_session_id(),
+        "work_dir": work_dir or "",
+        "role_assertion": role_assertion or "",
+        "launch_id": (os.environ.get("CCB_SESSION_ID") or "").strip(),
+        "member_id": (
+            os.environ.get("CCB_MEMBER_ID") or os.environ.get("CCB_LIVE_ID") or ""
+        ).strip(),
+        "live_id": (os.environ.get("CCB_LIVE_ID") or "").strip(),
+        "pane_title_marker": "",
+        "ccb_project_id": "",
+        "pane_pid": "",
+    }
+    if not pane_id:
+        return identity
+    try:
+        from terminal import get_backend_for_session
+
+        backend = get_backend_for_session({"terminal": terminal})
+        if backend is not None and callable(getattr(backend, "pane_pid", None)):
+            identity["pane_pid"] = str(backend.pane_pid(pane_id) or "").strip()
+    except Exception:
+        pass
+    provider = (caller or "").strip().lower()
+    if provider not in proto.REMOTE_PROVIDERS or not work_dir:
+        return identity
+    try:
+        from peer_routing import identify_sender
+
+        resolution = identify_sender(
+            work_dir, provider, pane_id=pane_id, terminal=terminal, check_daemon=False
+        )
+    except Exception:
+        return identity
+    candidate = getattr(resolution, "candidate", None)
+    if candidate is None:
+        return identity
+    identity.update(
+        {
+            "pane_title_marker": str(getattr(candidate, "pane_title_marker", "") or ""),
+            "ccb_project_id": str(getattr(candidate, "ccb_project_id", "") or ""),
+            "live_id": str(getattr(candidate, "live_id", "") or "") or identity["live_id"],
+            "launch_id": str(getattr(candidate, "launch_id", "") or "")
+            or identity["launch_id"],
+            "work_dir": str(getattr(candidate, "work_dir", "") or "") or identity["work_dir"],
+        }
+    )
+    return identity
+
+
+# --------------------------------------------------------------------------- #
+# M2 pulls: fetch, durable answer, fail-closed notification
+# --------------------------------------------------------------------------- #
+
+#: "No reply yet" for a caller that waited past its deadline -- the same code
+#: `pend` uses, and deliberately distinct from a delivery failure.
+EXIT_WAITING = 2
+
+
+@dataclass
+class FetchResult:
+    request_id: str
+    host: str
+    exit_code: int
+    state: str = ""
+    digest: str = ""
+    reply_text: str = ""
+    reply_digest: str = ""
+    reason: str = ""
+    error_code: str = ""
+
+    @property
+    def answered(self) -> bool:
+        return self.state == "answered"
+
+
+def fetch(
+    request_id: str,
+    *,
+    session_factory: Callable[[list[str]], SshSession] | None = None,
+    hosts: dict[str, RemoteHost] | None = None,
+) -> FetchResult:
+    """Ask the receipt's destination for the state, and the answer if answered.
+
+    Read-only on the destination and silent on this side: the caller decides
+    what to do with the result. An answer is only trusted when the destination
+    echoes this request id and the reply digest matches the reply text.
+    """
+    record = read_receipt(request_id)
+    host = host_for(str(record.get("host") or ""), hosts=hosts)
+    factory = session_factory or SshSession
+    op_id = f"fetch-{request_id}"
+    session: SshSession | None = None
+    try:
+        session = factory(ssh_argv(host))
+        capabilities = _hello(session, op_id="hello-1")
+        if not _advertises_fetch(capabilities):
+            return FetchResult(
+                request_id,
+                host.alias,
+                EXIT_NOT_DELIVERED,
+                reason="the destination does not advertise the fetch verb",
+                error_code="incompatible",
+            )
+        session.write_all(
+            proto.encode_frame(
+                {
+                    "proto": {"major": proto.PROTO_MAJOR, "minor": proto.PROTO_MINOR},
+                    "op": "fetch",
+                    "op_id": op_id,
+                    "body": {"request_id": request_id},
+                }
+            )
+        )
+        response = session.read_frame()
+    except SessionError as exc:
+        return FetchResult(
+            request_id, host.alias, EXIT_ACCEPTANCE_UNKNOWN, reason=exc.detail, error_code=exc.kind
+        )
+    except Exception as exc:
+        return FetchResult(
+            request_id, host.alias, EXIT_ACCEPTANCE_UNKNOWN, reason=str(exc), error_code="error"
+        )
+    finally:
+        if session is not None:
+            session.close()
+
+    mismatch = _reject_unexpected_ack(response, op="fetch", op_id=op_id, request_id=request_id)
+    if mismatch:
+        return FetchResult(
+            request_id, host.alias, EXIT_ACCEPTANCE_UNKNOWN, reason=mismatch, error_code="unusable"
+        )
+    if not response.get("ok"):
+        code = _error_code(response)
+        message = _error_message(response)
+        reason = "unknown or not authorised" if code == proto.ERR_NOT_FOUND else (message or code or "refused")
+        return FetchResult(
+            request_id, host.alias, EXIT_NOT_DELIVERED, reason=reason, error_code=code
+        )
+
+    # Bind the answer to THIS request before anything is persisted or
+    # notified: the frame must name our request id and carry the receipt's
+    # request digest. A missing field is a refusal, never "close enough".
+    if response.get("request_id") != request_id:
+        return FetchResult(
+            request_id,
+            host.alias,
+            EXIT_NOT_DELIVERED,
+            reason="the answer does not name this request",
+            error_code="untrusted_reply",
+        )
+    state = str(response.get("state") or "")
+    digest = str(response.get("digest") or "")
+    expected_digest = str(record.get("digest") or "")
+    if (
+        not digest
+        or not expected_digest
+        or not hmac.compare_digest(digest, expected_digest)
+    ):
+        return FetchResult(
+            request_id,
+            host.alias,
+            EXIT_NOT_DELIVERED,
+            reason="the answer is not bound to this request digest",
+            error_code="untrusted_reply",
+        )
+    result = FetchResult(request_id, host.alias, EXIT_ACCEPTED, state=state, digest=digest)
+    if state == "answered":
+        text = response.get("reply_text")
+        reply_digest = str(response.get("reply_digest") or "")
+        if not isinstance(text, str) or not reply_digest:
+            return FetchResult(
+                request_id,
+                host.alias,
+                EXIT_NOT_DELIVERED,
+                reason="the destination reported an answer without text or digest",
+                error_code="untrusted_reply",
+            )
+        if not hmac.compare_digest(reply_digest, proto.compute_reply_digest(text)):
+            return FetchResult(
+                request_id,
+                host.alias,
+                EXIT_NOT_DELIVERED,
+                reason="the answer does not match its digest",
+                error_code="untrusted_reply",
+            )
+        result.reply_text = text
+        result.reply_digest = reply_digest
+    return result
+
+
+def _spool_log(line: str) -> None:
+    print(line, file=sys.stderr)
+
+
+def _same_path(left: str, right: str) -> bool:
+    """Same file, regardless of spelling (relative vs absolute, symlinks)."""
+    if not left or not right:
+        return False
+    try:
+        return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return str(left) == str(right)
+
+
+def watchable(record: dict) -> bool:
+    """True while this receipt still needs a poller/waiter to act on it."""
+    if record.get("reply_expected") is not True:
+        return False
+    state = str(record.get("state") or "")
+    if state in {STATE_NOT_DELIVERED, STATE_NOTIFIED}:
+        return False
+    if state in ANSWER_STATES and record.get("notify_attempted_at"):
+        # At most one notification attempt, ever: left for `pend`.
+        return False
+    return True
+
+
+def watched_receipts(owner: str) -> list[str]:
+    """Receipts this exact daemon owns and still has work for."""
+    owner = str(owner or "").strip()
+    if not owner:
+        return []
+    try:
+        paths = sorted(outbound_dir().glob("*.json"))
+    except OSError:
+        return []
+    request_ids: list[str] = []
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if not _same_path(str(record.get("poll_owner") or ""), owner):
+            continue
+        if not watchable(record):
+            continue
+        request_id = str(record.get("request_id") or "")
+        try:
+            proto.parse_remote_id(request_id)
+        except proto.ProtocolError:
+            continue
+        request_ids.append(request_id)
+    return request_ids
+
+
+def watch_target_ok(request_id: str, owner: str) -> tuple[bool, str]:
+    """Whether this daemon may be registered as the poller for a receipt."""
+    try:
+        record = read_receipt(request_id)
+    except RemoteRefusal as exc:
+        return False, str(exc)
+    if record.get("reply_expected") is not True:
+        return False, "not a reply-expected submission"
+    registered = str(record.get("poll_owner") or "")
+    if not _same_path(registered, str(owner or "")):
+        return False, "this receipt is registered to another polling daemon"
+    return True, ""
+
+
+def register_watch(request_id: str, *, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """Tell the receipt's polling daemon that this id is ready to be watched."""
+    import askd_rpc
+
+    try:
+        record = read_receipt(request_id)
+    except RemoteRefusal as exc:
+        return False, str(exc)
+    owner = str(record.get("poll_owner") or "").strip()
+    if not owner:
+        return False, "this receipt has no polling owner"
+    state = askd_rpc.read_state(Path(owner))
+    if not isinstance(state, dict) or not state.get("token"):
+        return False, "the polling daemon is not running"
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"watch-{request_id}",
+        "token": state["token"],
+        "operation": "remote_watch",
+        "request_id": request_id,
+    }
+    try:
+        response = askd_rpc.request_daemon(
+            state, request, connect_timeout_s=timeout_s, response_timeout_s=timeout_s
+        )
+    except Exception as exc:
+        return False, f"the polling daemon could not be reached ({type(exc).__name__})"
+    if not isinstance(response, dict) or not response.get("ok"):
+        error = response.get("error") if isinstance(response, dict) else None
+        reason = str(error.get("message") or "") if isinstance(error, dict) else ""
+        return False, reason or "the polling daemon refused the registration"
+    return True, ""
+
+
+def notify_text(request_id: str, host_alias: str, reply: str) -> str:
+    """The labelled block injected into the caller's pane."""
+    return (
+        "CCB_REMOTE_REPLY: this is the answer to a request your session sent to "
+        "another machine by CCB.\n"
+        f"CCB_REMOTE_REQUEST_ID: {request_id}\n"
+        f"CCB_REMOTE_SOURCE_HOST: {host_alias}\n"
+        "\n"
+        f"{reply}"
+    )
+
+
+def deliver_to_caller(identity: dict, text: str) -> tuple[bool, str]:
+    """Revalidate the captured caller pane and inject the answer there, once.
+
+    The same criteria peer delivery uses: the pane-injection lock, then a fresh
+    revalidation of the saved endpoint (alive, cwd, marker), plus the captured
+    pane process when there is one. Nothing is ever resolved again, retargeted,
+    or created (`ensure_pane` is never called); any mismatch refuses.
+    """
+    from askd.adapters.base import PeerDestination
+    from pane_lock import PaneLockError, pane_injection_lock
+    from peer_routing import revalidate_peer_destination
+    from terminal import get_backend_for_session
+
+    pane_id = str(identity.get("pane_id") or "").strip()
+    terminal = str(identity.get("terminal") or "").strip()
+    if not pane_id or not terminal:
+        return False, "no caller pane was captured before submit"
+    backend = get_backend_for_session({"terminal": terminal})
+    if backend is None:
+        return False, f"the caller's terminal backend is unavailable: {terminal}"
+    destination = PeerDestination(
+        pane_id=pane_id,
+        terminal=terminal,
+        work_dir=str(identity.get("work_dir") or ""),
+        ccb_project_id=str(identity.get("ccb_project_id") or ""),
+        pane_title_marker=str(identity.get("pane_title_marker") or ""),
+    )
+    captured_pid = str(identity.get("pane_pid") or "").strip()
+    # A backend that can respawn a pane IN PLACE keeps the pane id (and the
+    # marker/cwd), so without the captured process there is no evidence that
+    # this is still the pane that asked. Refuse: the answer stays in the
+    # receipt for `pend`, and nothing is injected anywhere.
+    if not captured_pid and callable(getattr(backend, "respawn_pane", None)):
+        return False, "the caller pane process was not captured, so it cannot be revalidated"
+    try:
+        with pane_injection_lock(backend, pane_id, None):
+            if captured_pid:
+                current = ""
+                try:
+                    current = str(backend.pane_pid(pane_id) or "").strip()
+                except Exception:
+                    current = ""
+                if current != captured_pid:
+                    return False, "the caller pane is now a different process"
+            outcome = revalidate_peer_destination(destination)
+            if not outcome.ok:
+                return False, f"the caller pane is not the captured one ({outcome.error})"
+            backend.send_text(pane_id, text)
+    except PaneLockError as exc:
+        return False, f"the caller pane is busy ({exc})"
+    except Exception as exc:
+        return False, f"the caller pane could not be written ({type(exc).__name__})"
+    return True, ""
+
+
+def _notify_caller(request_id: str, host_alias: str, *, log: Callable[[str], None] | None = None) -> bool:
+    """Notify the captured caller pane at most once; persists before sending."""
+    log = log or _spool_log
+    try:
+        record = read_receipt(request_id)
+    except RemoteRefusal as exc:
+        log(f"[WARN] remote reply receipt is unreadable for {request_id}: {exc}")
+        return False
+    identity = record.get("caller_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    reply = str(record.get("reply_text") or "")
+    if not reply:
+        return False
+
+    claimed = {"value": False}
+
+    def claim(latest: dict) -> bool:
+        if latest.get("notify_attempted_at") or not latest.get("reply_text"):
+            # At-most-once: another actor (poller, pend, a previous run) has
+            # already attempted the one notification this receipt allows.
+            return False
+        latest["notify_attempted_at"] = _now()
+        claimed["value"] = True
+        return True
+
+    try:
+        update_receipt(request_id, claim)
+    except Exception as exc:
+        log(f"[WARN] remote reply notification claim failed for {request_id}: {exc}")
+        return False
+    if not claimed["value"]:
+        return False
+
+    ok, reason = deliver_to_caller(identity, notify_text(request_id, host_alias, reply))
+
+    def settle(latest: dict) -> None:
+        if ok:
+            latest["notified_at"] = _now()
+            apply_receipt_state(
+                latest, STATE_NOTIFIED, "answer injected into the caller pane"
+            )
+        else:
+            latest["notify_refused"] = reason
+            _append_history(
+                latest,
+                str(latest.get("state") or STATE_FETCHED),
+                f"notification not sent: {reason}",
+            )
+
+    try:
+        update_receipt(request_id, settle)
+    except Exception as exc:
+        log(f"[WARN] remote reply notification result not recorded for {request_id}: {exc}")
+    if not ok:
+        log(f"[INFO] remote reply {request_id} left for pend: {reason}")
+    return ok
+
+
+def poll_receipt(
+    request_id: str, *, notify: bool = False, log: Callable[[str], None] | None = None
+) -> dict:
+    """Fetch once, persist the answer durably, and optionally notify.
+
+    Persistence always precedes notification, and a stored answer is never
+    overwritten (a second, different answer is recorded as a conflict and the
+    first is kept). Returns the receipt as it now stands.
+    """
+    record = read_receipt(request_id)
+    if record.get("reply_expected") is not True:
+        raise RemoteRefusal(f"{request_id} is not a reply-expected submission")
+    host_alias = str(record.get("host") or "")
+
+    result = fetch(request_id)
+
+    if result.error_code or not result.state:
+        def unavailable(latest: dict) -> None:
+            latest["last_fetch_error"] = result.reason
+            latest["last_fetch_at"] = _now()
+            apply_receipt_state(latest, STATE_FETCH_UNAVAILABLE, result.reason)
+
+        try:
+            update_receipt(request_id, unavailable)
+        except Exception:
+            pass
+        (log or _spool_log)(f"[WARN] remote fetch failed for {request_id}: {result.reason}")
+        return read_receipt(request_id)
+
+    if not result.answered:
+        def pending(latest: dict) -> None:
+            latest["remote_state"] = result.state
+            latest["last_fetch_at"] = _now()
+            if str(latest.get("state") or "") == STATE_FETCH_UNAVAILABLE:
+                apply_receipt_state(
+                    latest, STATE_ACCEPTED, f"destination state via fetch: {result.state}"
+                )
+
+        try:
+            update_receipt(request_id, pending)
+        except Exception:
+            pass
+        return read_receipt(request_id)
+
+    def store(latest: dict) -> None:
+        latest["remote_state"] = "answered"
+        latest["last_fetch_at"] = _now()
+        stored_digest = str(latest.get("reply_digest") or "")
+        stored_text = str(latest.get("reply_text") or "")
+        stored_valid = bool(stored_text) and hmac.compare_digest(
+            stored_digest, proto.compute_reply_digest(stored_text)
+        )
+        if stored_digest and not stored_valid and hmac.compare_digest(stored_digest, result.reply_digest):
+            # The saved text no longer matches its own digest, but the
+            # destination returned the same, verified answer: repair the text.
+            latest["reply_text"] = result.reply_text
+            _append_history(
+                latest,
+                str(latest.get("state") or STATE_FETCHED),
+                "stored answer text failed its digest check; restored from the destination",
+            )
+            return
+        if stored_digest:
+            if not hmac.compare_digest(stored_digest, result.reply_digest):
+                latest["reply_conflict"] = True
+                _append_history(
+                    latest,
+                    str(latest.get("state") or STATE_FETCHED),
+                    "a second, different answer arrived; the first is kept",
+                )
+            return
+        latest["reply_text"] = result.reply_text
+        latest["reply_digest"] = result.reply_digest
+        latest["answered_at"] = _now()
+        apply_receipt_state(latest, STATE_FETCHED, "answer fetched from the destination")
+
+    update_receipt(request_id, store)
+
+    if notify:
+        _notify_caller(request_id, host_alias, log=log)
+    return read_receipt(request_id)
+
+
+def wait_for_answer(
+    request_id: str,
+    *,
+    timeout_s: float,
+    out: Any = None,
+    err: Any = None,
+) -> int:
+    """Poll until answered or the deadline, persist first, then print exactly one reply."""
+    out = out if out is not None else sys.stdout
+    err = err if err is not None else sys.stderr
+    deadline = _monotonic() + max(0.0, float(timeout_s))
+    delay = REPLY_BACKOFF_START_S
+    while True:
+        try:
+            receipt = poll_receipt(request_id, notify=False)
+        except (RemoteRefusal, RemoteConfigError) as exc:
+            print(f"[ERROR] {exc}", file=err)
+            return EXIT_NOT_DELIVERED
+        state = str(receipt.get("state") or "")
+        text = str(receipt.get("reply_text") or "")
+        if text and state in ANSWER_STATES:
+            out.write(text if text.endswith("\n") else text + "\n")
+            out.flush()
+            print(
+                f"id={request_id} state={state} host={receipt.get('host') or '-'}",
+                file=err,
+            )
+            return EXIT_ACCEPTED
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            print(f"id={request_id} still waiting; use pend {request_id}", file=err)
+            return EXIT_WAITING
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, REPLY_BACKOFF_CAP_S)
+
+
+def remote_pend(request_id: str, *, out: Any = None, err: Any = None) -> int:
+    """Show a remote receipt's answer (fetching it if needed), or its state."""
+    out = out if out is not None else sys.stdout
+    err = err if err is not None else sys.stderr
+    try:
+        record = read_receipt(request_id)
+    except RemoteRefusal as exc:
+        print(f"[ERROR] {exc}", file=err)
+        return EXIT_NOT_DELIVERED
+    if record.get("reply_expected") is not True:
+        print(f"[ERROR] {request_id} is not a reply-expected remote request", file=err)
+        return EXIT_NOT_DELIVERED
+    stored_text = str(record.get("reply_text") or "")
+    stored_digest = str(record.get("reply_digest") or "")
+    stored_answer = bool(stored_text) and bool(stored_digest) and hmac.compare_digest(
+        stored_digest, proto.compute_reply_digest(stored_text)
+    )
+    if stored_answer:
+        # The answer is already durable here: show it even when the host
+        # configuration or the destination is gone. Nothing is re-fetched.
+        receipt = record
+    else:
+        try:
+            receipt = poll_receipt(request_id, notify=False)
+        except (RemoteRefusal, RemoteConfigError, OSError) as exc:
+            print(f"[ERROR] {exc}", file=err)
+            return EXIT_NOT_DELIVERED
+    state = str(receipt.get("state") or "")
+    print(
+        f"id={request_id} state={state} host={receipt.get('host') or '-'} "
+        f"destination={receipt.get('remote_state') or '-'}",
+        file=out,
+    )
+    text = str(receipt.get("reply_text") or "")
+    digest = str(receipt.get("reply_digest") or "")
+    if text and state in ANSWER_STATES and not (
+        digest and hmac.compare_digest(digest, proto.compute_reply_digest(text))
+    ):
+        print(
+            f"[ERROR] the stored answer for {request_id} failed its integrity check and "
+            "could not be restored from the destination; nothing is shown",
+            file=err,
+        )
+        return EXIT_NOT_DELIVERED
+    if text and state in ANSWER_STATES:
+        print("", file=out)
+        out.write(text if text.endswith("\n") else text + "\n")
+        out.flush()
+        return EXIT_ACCEPTED
+    if state == STATE_FETCH_UNAVAILABLE:
+        reason = str(receipt.get("last_fetch_error") or "the destination could not be asked")
+        print(f"[WARN] answer not fetched yet: {reason}", file=err)
+    else:
+        print("[WARN] no answer yet; try pend again later", file=err)
+    return EXIT_WAITING
+
+
+def watch_loop(stop_event, wake_event, *, owner: str, log: Callable[[str], None] | None = None) -> None:
+    """Poll the receipts this daemon owns, with bounded per-receipt backoff.
+
+    Only receipts whose ``poll_owner`` is this daemon are ever touched, so two
+    daemons can never poll (or notify for) the same receipt.
+    """
+    log = log or _spool_log
+    schedule: dict[str, tuple[float, float]] = {}
+    while not stop_event.is_set():
+        now = _monotonic()
+        watched = watched_receipts(owner)
+        for request_id in watched:
+            next_at, delay = schedule.get(request_id, (now, REPLY_BACKOFF_START_S))
+            if next_at > now:
+                continue
+            try:
+                settled = not watchable(poll_receipt(request_id, notify=True, log=log))
+            except Exception as exc:
+                settled = False
+                log(f"[WARN] remote reply poll failed for {request_id}: {exc}")
+            if settled:
+                schedule.pop(request_id, None)
+            else:
+                following = min(max(delay, REPLY_BACKOFF_START_S) * 2, REPLY_BACKOFF_CAP_S)
+                schedule[request_id] = (_monotonic() + following, following)
+        for request_id in list(schedule):
+            if request_id not in watched:
+                schedule.pop(request_id, None)
+        timeout = 5.0 if not schedule else 1.0
+        if schedule:
+            timeout = min(timeout, max(0.05, min(at for at, _ in schedule.values()) - _monotonic()))
+        wake_event.wait(timeout)
+        wake_event.clear()

@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "rig"))
 
 import remote_client  # noqa: E402  (source-side library, used for row 4)
 import remote_protocol as proto  # noqa: E402
-from rig import DEST_PROJECT, REPO, Rig, wait_until  # noqa: E402
+from rig import DEST_PROJECT, DEST_STUB_CONFIG, REPO, Rig, wait_until  # noqa: E402
 
 RIG_ENABLED = os.environ.get("CCB_DOCKER_RIG") == "1"
 #: The real HOME at import time: row 14 re-runs pytest, and some rows isolate
@@ -47,10 +47,34 @@ ROW1_TEXT = (
 ROW1_MARKER = "ROW1-ROUNDTRIP-MARKER-2f4c"
 LOCAL_ID = "20261109-182536-922-2626995"
 
+#: A reply body that exercises the wire: blank lines, unicode, a trailing
+#: newline, and a line that looks like a completion marker.
+ROW15_ANSWER = (
+    "row15 answer, line one\n"
+    "\n"
+    "second — with an em-dash and 🙂 emoji\n"
+    "\n"
+    "CCB_DONE: 20261110-113136-582-89163-1-hmain1\n"
+    "trailing newline follows\n"
+)
+ROW16_ANSWER = "row16 answer ✓ delivered once\n"
+ROW17_ANSWER = "row17 answer after a dropped fetch\n"
+
 
 @pytest.fixture(scope="session")
 def rig():
     instance = Rig()
+    try:
+        instance.start()
+        yield instance
+    finally:
+        instance.stop()
+
+
+@pytest.fixture(scope="session")
+def m1_rig():
+    """A destination installed from the shipped M1 tree (compatibility row)."""
+    instance = Rig(name_suffix="-m1", source_ref="b996fa6")
     try:
         instance.start()
         yield instance
@@ -655,6 +679,380 @@ def test_row13_role_enforcing_destination_refuses_non_lead(rig: Rig):
     assert lead.get("ok") is True, lead
     assert _delivered(rig, lead_id)
     assert rig.stub_log().count("row13 lead delivery") == 1
+
+
+# --------------------------------------------------------------------------- #
+# M2 rows: explicit replies
+# --------------------------------------------------------------------------- #
+
+
+def _wait_record(rig: Rig, request_id: str, states: set[str], timeout: float = 120.0) -> dict | None:
+    return wait_until(
+        lambda: (record := rig.journal_record(request_id)) and record.get("state") in states and record,
+        timeout,
+    )
+
+
+def test_row15_wait_round_trip_and_reply_controls(rig: Rig):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.set_stub_config(mode="reply", answer=ROW15_ANSWER)
+    marker = "ROW15-WAIT-MARKER"
+
+    proc = rig.ask("codex", "--peer", "rig::demo", "--wait", "--timeout", "120",
+                   f"{marker} body", timeout=240)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    # `ask` prints the acceptance line first (M1 behaviour), then the answer
+    # itself byte for byte: unicode, blank lines and the CCB_DONE-looking line
+    # are not reformatted, and the answer appears exactly once.
+    assert proc.stdout.endswith(ROW15_ANSWER), repr(proc.stdout)
+    assert proc.stdout.count(ROW15_ANSWER) == 1
+    assert proc.stdout.splitlines()[0].startswith(f"id={rig.latest_receipt()['request_id']} state=accepted")
+    assert proc.stdout == f"id={rig.latest_receipt()['request_id']} state=accepted destination=accepted-pending reply-expected=yes\n" + ROW15_ANSWER
+
+    receipt = rig.latest_receipt()
+    request_id = receipt["request_id"]
+    assert receipt["state"] == "fetched", receipt
+    assert receipt["reply_text"] == ROW15_ANSWER
+    assert receipt["reply_digest"] == proto.compute_reply_digest(ROW15_ANSWER)
+    assert f"id={request_id} state=fetched" in proc.stderr
+
+    record = _wait_record(rig, request_id, {"answered"})
+    assert record and record["state"] == "answered", rig.journal()
+    assert record["reply_text"] == ROW15_ANSWER
+    assert record["reply_digest"] == receipt["reply_digest"]
+    assert [entry["state"] for entry in record["history"]] == [
+        "accepted-pending", "dispatch-in-progress", "delivered", "answered",
+    ]
+
+    log = rig.stub_log()
+    assert log.count(marker) == 1
+    assert "REPLY-DECISION mode=reply" in log
+    assert f"ccb-remote reply {request_id}" in log
+    assert "REPLY rc=0" in log
+    print("ROW15 answer:", repr(ROW15_ANSWER))
+    print("ROW15 stub:", [line for line in log.splitlines() if line.startswith("REPLY")][-2:])
+
+
+def test_row15_reply_to_a_delivery_only_request_is_refused(rig: Rig):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.clear_stub_config()
+
+    delivery = rig.ask("codex", "--peer", "rig::demo", "--notify", "ROW15-CTRL delivery-only body")
+    assert delivery.returncode == 0, delivery.stderr
+    delivery_id = rig.latest_receipt()["request_id"]
+    assert _delivered(rig, delivery_id)
+    before = rig.journal_record(delivery_id)
+
+    # The stub answers the *delivery-only* id instead of the reply-expected one.
+    rig.set_stub_config(mode="explicit_id", target_id=delivery_id, answer="row15 control answer\n")
+    waited = rig.ask(
+        "codex", "--peer", "rig::demo", "--wait", "--timeout", "15", "ROW15-CTRL reply body",
+        timeout=240,
+    )
+    assert waited.returncode == 2, (waited.returncode, waited.stdout, waited.stderr)
+    assert "still waiting; use pend" in waited.stderr
+    v2_id = rig.latest_receipt()["request_id"]
+    assert v2_id != delivery_id
+
+    log = rig.stub_log()
+    assert f"REPLY-DECISION mode=explicit_id id={delivery_id}" in log
+    assert "REPLY rc=1" in log
+    assert "did not ask for a reply" in log
+    # Neither record changed: the delivery-only one still has no answer, and the
+    # reply-expected one is still waiting.
+    assert rig.journal_record(delivery_id) == before
+    v2_record = rig.journal_record(v2_id)
+    assert v2_record["state"] == "delivered"
+    assert "reply_text" not in v2_record
+    print("ROW15 control stub:", [l for l in log.splitlines() if l.startswith("REPLY")][-2:])
+    print("ROW15 control journals:", before["state"], v2_record["state"])
+
+
+def test_row16_background_injects_the_answer_into_the_caller_pane_once(rig: Rig):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.set_stub_config(mode="reply", answer=ROW16_ANSWER)
+    side = rig.start_source_side(with_askd=True)
+
+    proc = side.ask("codex", "--peer", "rig::demo", "--background", "ROW16 body", timeout=300)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert "CCB_BACKGROUND_SUBMITTED" in proc.stdout
+    request_id = side.latest_receipt()["request_id"]
+    assert side.latest_receipt()["poll_owner"] == str(side.state_file)
+
+    receipt = wait_until(
+        lambda: (r := side.receipt(request_id)) and r.get("state") == "notified" and r, 180
+    )
+    assert receipt and receipt["state"] == "notified", (receipt, side.read_askd_log()[-2000:])
+    assert receipt["notify_attempted_at"] and receipt["notified_at"]
+    assert receipt["reply_text"] == ROW16_ANSWER
+
+    expected = ROW16_ANSWER.rstrip("\n")
+    capture = wait_until(lambda: expected in side.capture_text() and side.capture_text(), 20)
+    assert capture, "the answer never reached the caller pane"
+    assert capture.count(expected) == 1
+    assert f"CCB_REMOTE_REQUEST_ID: {request_id}" in capture
+    record = _wait_record(rig, request_id, {"answered"})
+    assert record and record["state"] == "answered"
+    assert rig.stub_log().count("ROW16 body") == 1
+    print("ROW16 capture:", " | ".join(capture.splitlines()[-3:]))
+    print("ROW16 receipt:", {k: receipt.get(k) for k in ("state", "notify_attempted_at", "notified_at")})
+
+
+def test_row16_replaced_caller_pane_is_not_notified_and_pend_shows_it(rig: Rig):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.set_stub_config(mode="reply", answer="row16 control answer ✓\n", delay=8)
+    side = rig.start_source_side(with_askd=True)
+
+    proc = side.ask("codex", "--peer", "rig::demo", "--background", "ROW16-CTRL body", timeout=300)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    request_id = side.latest_receipt()["request_id"]
+
+    # Replace the caller pane before the destination has answered.
+    side.kill_caller_pane()
+    # "At most once" means the attempt is followed by a recorded outcome; wait
+    # for the outcome (a refusal here), not merely for the attempt marker.
+    receipt = wait_until(
+        lambda: (r := side.receipt(request_id)) and r.get("notify_refused") and r, 240
+    )
+    assert receipt and receipt.get("notify_refused"), (receipt, side.read_askd_log()[-2000:])
+    assert receipt["state"] == remote_client.STATE_FETCHED, receipt
+    assert not receipt.get("notified_at")
+    assert side.capture_text() == ""
+    print("ROW16 control receipt:", {k: receipt.get(k) for k in ("state", "notify_attempted_at", "notified_at")})
+
+    pended = side.pend(request_id)
+    assert pended.returncode == 0, (pended.stdout, pended.stderr)
+    assert "row16 control answer" in pended.stdout
+    assert side.receipt(request_id)["state"] == remote_client.STATE_FETCHED
+    print("ROW16 control refusal:", receipt.get("notify_refused"))
+
+
+def test_row17_lost_fetch_ack_keeps_the_answer_for_pend(rig: Rig, monkeypatch):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.set_stub_config(mode="reply", answer=ROW17_ANSWER)
+    side = rig.start_source_side()
+
+    monkeypatch.setenv("HOME", str(side.home))
+    monkeypatch.setenv("TMPDIR", str(side.home.parent / "tmp"))
+    for name in ("CCB_SSH_BIN", "CCB_REMOTE_OP_TIMEOUT_S", "CCB_PANE_LOCK_DISABLE"):
+        monkeypatch.delenv(name, raising=False)
+
+    result = remote_client.submit(
+        "rig", "demo", "codex", "ROW17 body",
+        reply_expected=True, intent="wait",
+        caller_identity={"pane_id": "", "terminal": ""},
+        out=open(os.devnull, "w"), err=open(os.devnull, "w"),
+    )
+    assert result.state == remote_client.STATE_ACCEPTED, result
+    request_id = result.request_id
+    record = _wait_record(rig, request_id, {"answered"})
+    assert record and record["state"] == "answered"
+
+    # The answer is committed on B; A's fetch response never arrives.
+    real_session = remote_client.SshSession
+
+    class DroppedFetch(real_session):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._reads = 0
+
+        def read_frame(self, timeout_s=None):
+            self._reads += 1
+            if self._reads >= 2:
+                raise remote_client.SessionError(
+                    "eof", "connection closed before the answer arrived"
+                )
+            return super().read_frame(timeout_s)
+
+    monkeypatch.setattr(remote_client, "SshSession", DroppedFetch)
+    receipt = remote_client.poll_receipt(request_id)
+    assert receipt["state"] == remote_client.STATE_FETCH_UNAVAILABLE, receipt
+    assert "eof" in str(receipt.get("last_fetch_error")) or "closed" in str(
+        receipt.get("last_fetch_error")
+    )
+    monkeypatch.setattr(remote_client, "SshSession", real_session)
+
+    pended = side.pend(request_id)
+    assert pended.returncode == 0, (pended.stdout, pended.stderr)
+    assert ROW17_ANSWER.rstrip("\n") in pended.stdout
+    stored = side.receipt(request_id)
+    assert stored["state"] == remote_client.STATE_FETCHED
+    assert stored["reply_text"] == ROW17_ANSWER
+    assert stored["reply_digest"] == record["reply_digest"]
+    assert rig.stub_log().count("ROW17 body") == 1
+    print("ROW17 pend:", " | ".join(pended.stdout.splitlines()[:3]))
+
+
+def test_row18_reply_authority_is_the_accepted_member_and_pane(rig: Rig):
+    rig.reset_destination(providers="codex claude")
+    rig.clear_stub_log()
+
+    # Positive control first: the bound pane's own credential answers.
+    rig.set_stub_config(mode="reply", answer="row18 control answer\n")
+    ok = rig.ask("codex", "--peer", "rig::demo", "--wait", "--timeout", "120",
+                 "ROW18 control body", timeout=240)
+    assert ok.returncode == 0, (ok.stdout, ok.stderr)
+    control_id = rig.latest_receipt()["request_id"]
+    control = _wait_record(rig, control_id, {"answered"})
+    assert control and control["state"] == "answered"
+    assert "REPLY rc=0" in rig.stub_log()
+
+    def _delivered_v2(marker: str) -> str:
+        rig.clear_stub_config()
+        proc = rig.ask(
+            "codex", "--peer", "rig::demo", "--wait", "--timeout", "10", marker, timeout=240
+        )
+        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+        request_id = rig.latest_receipt()["request_id"]
+        assert _delivered(rig, request_id, timeout=60)
+        return request_id
+
+    # 1. A credential from the SAME launch's other pane (sibling provider).
+    other_id = _delivered_v2("ROW18 other-member body")
+    before = rig.journal_record(other_id)
+    rig.set_stub_config(mode="other_member", answer="row18 other member\n")
+    retried = rig.ask(
+        "codex", "--peer", "rig::demo", "--wait", "--timeout", "15", "ROW18 trigger other",
+        timeout=240,
+    )
+    assert retried.returncode == 2
+    log = rig.stub_log()
+    assert "REPLY-DECISION mode=other_member" in log
+    assert "REPLY rc=1" in log
+    assert "not the request's destination member" in log
+    assert rig.journal_record(other_id) == before
+    print("ROW18 other-member stub:", [l for l in log.splitlines() if l.startswith("REPLY")][-2:])
+
+    # 2. A process with no CCB launch credential.
+    no_cred_id = _delivered_v2("ROW18 no-credential body")
+    before = rig.journal_record(no_cred_id)
+    rig.set_stub_config(mode="no_credential", answer="row18 no credential\n")
+    retried = rig.ask(
+        "codex", "--peer", "rig::demo", "--wait", "--timeout", "15", "ROW18 trigger none",
+        timeout=240,
+    )
+    assert retried.returncode == 2
+    log = rig.stub_log()
+    assert "REPLY-DECISION mode=no_credential" in log
+    assert "REPLY rc=1" in log
+    assert "no CCB launch credential" in log
+    assert rig.journal_record(no_cred_id) == before
+    print("ROW18 no-credential stub:", [l for l in log.splitlines() if l.startswith("REPLY")][-2:])
+
+    # 3. The same pane id respawned as a new process, answered by the pane's own
+    #    (unchanged) launch credential: the saved process witness no longer matches.
+    respawn_id = _delivered_v2("ROW18 respawn body")
+    before = rig.journal_record(respawn_id)
+    old_pid = rig.dest(
+        f"tmux display-message -p -t {rig.pane_id} '#{{pane_pid}}'"
+    ).stdout.strip()
+    rig.dest(f"tmux respawn-pane -k -t {rig.pane_id} 'codex'", check=False)
+    wait_until(
+        lambda: rig.dest(
+            f"tmux display-message -p -t {rig.pane_id} '#{{pane_pid}}'", check=False
+        ).stdout.strip() not in ("", old_pid),
+        20,
+    )
+    new_pid = rig.dest(
+        f"tmux display-message -p -t {rig.pane_id} '#{{pane_pid}}'", check=False
+    ).stdout.strip()
+    assert new_pid and new_pid != old_pid
+    member_id, member_token = rig.registry_credential("codex")
+    reply = rig.dest(
+        f"printf %s 'row18 respawned answer' | "
+        f"CCB_MEMBER_ID={member_id} CCB_MEMBER_TOKEN={member_token} "
+        f"/home/b/.local/bin/ccb-remote reply {respawn_id}",
+        check=False,
+    )
+    assert reply.returncode == 1, (reply.returncode, reply.stdout, reply.stderr)
+    assert "not the one the request was delivered to" in reply.stderr
+    assert "pane process could not be confirmed" in reply.stderr
+    assert rig.journal_record(respawn_id) == before
+    print("ROW18 respawn pid:", old_pid, "->", new_pid)
+    print("ROW18 respawn refusal:", reply.stderr.strip())
+
+
+def test_row19_m1_destination_and_m1_source_compatibility(rig: Rig, m1_rig: Rig):
+    # (a) M2 source -> M1 destination: reply-expected refused before submit,
+    #     delivery-only still delivered.
+    m1_rig.reset_destination()
+    m1_rig.clear_stub_log()
+    m1_rig.clear_stub_config()
+    refused = m1_rig.ask(
+        "codex", "--peer", "rig::demo", "--wait", "ROW19 must not arrive", timeout=180
+    )
+    assert refused.returncode == 1, (refused.returncode, refused.stdout, refused.stderr)
+    assert "does not advertise explicit replies" in refused.stderr
+    assert m1_rig.journal_count() == 0
+    assert "ROW19 must not arrive" not in m1_rig.stub_log()
+
+    delivered = m1_rig.ask(
+        "codex", "--peer", "rig::demo", "--notify", "ROW19 delivery only", timeout=180
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    one_way_id = m1_rig.latest_receipt()["request_id"]
+    record = _delivered(m1_rig, one_way_id)
+    assert record and record["state"] == "delivered", m1_rig.journal()
+    assert record["schema_version"] == 1
+    assert record["reply_expected"] is False
+    assert m1_rig.stub_log().count("ROW19 delivery only") == 1
+    print("ROW19 M1 refusal:", (refused.stderr or refused.stdout).strip().splitlines()[-1:])
+    print("ROW19 M1 journal:", record["state"], record["schema_version"])
+
+    # (b) The shipped M1 source client -> M2 destination: delivery-only works.
+    rig.reset_destination()
+    rig.clear_stub_log()
+    m1_source = rig.extract_ref("b996fa6")
+    old = subprocess.run(
+        [sys.executable, str(m1_source / "bin" / "ask"), "codex", "--peer", "rig::demo",
+         "--notify", "ROW19 from the M1 client"],
+        env=rig.source_env(), capture_output=True, text=True, timeout=300, cwd=str(rig.tmp),
+    )
+    assert old.returncode == 0, (old.stdout, old.stderr)
+    old_id = old.stdout.split()[0].split("=", 1)[-1]
+    old_record = _delivered(rig, old_id)
+    assert old_record and old_record["state"] == "delivered", rig.journal()
+    assert old_record["schema_version"] == 1
+    assert rig.stub_log().count("ROW19 from the M1 client") == 1
+    print("ROW19 old client:", old.stdout.strip().splitlines()[0])
+    print("ROW19 M2 journal:", old_record["state"], old_record["schema_version"])
+
+
+def test_row20_unauthorised_principal_fetch_is_identical_not_found(rig: Rig):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.set_stub_config(mode="reply", answer="row20 answer\n")
+
+    proc = rig.ask("codex", "--peer", "rig::demo", "--wait", "--timeout", "120",
+                   "ROW20 body", timeout=240)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    request_id = rig.latest_receipt()["request_id"]
+    assert _wait_record(rig, request_id, {"answered"})
+
+    allowed = rig.probe("fetch", "--host", "rig", "--id", request_id)
+    assert allowed.get("ok") is True, allowed
+    assert allowed["response"]["state"] == "answered"
+    assert allowed["response"]["reply_text"] == "row20 answer\n"
+
+    other = rig.probe("fetch", "--host", "rigx", "--id", request_id)
+    missing = rig.probe(
+        "fetch", "--host", "rigx",
+        "--id", _new_request_id("20260125-143000-123-12345", "rigx1"),
+    )
+    assert other.get("ok") is False and missing.get("ok") is False
+    for response in (other["response"], missing["response"]):
+        response.pop("op_id", None)
+    assert other["response"] == missing["response"], (other, missing)
+    assert other["response"]["error"]["code"] == "not_found"
+    assert "row20 answer" not in json.dumps(other)
+    print("ROW20 allowed:", allowed["response"]["state"], repr(allowed["response"]["reply_text"]))
+    print("ROW20 other/missing identical:", other["response"] == missing["response"],
+          other["response"]["error"])
 
 
 # --------------------------------------------------------------------------- #

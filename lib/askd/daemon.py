@@ -373,6 +373,12 @@ class UnifiedAskDaemon:
         self.registry = registry or ProviderRegistry()
         self.pool = _UnifiedWorkerPool(self.registry)
         self.work_dir = work_dir
+        # M2: this daemon polls the outbound receipts it was registered as the
+        # owner of. The receipts themselves are the durable registration, so a
+        # restart resumes from disk; nothing here crosses daemon ownership.
+        self._watch_stop = threading.Event()
+        self._watch_wake = threading.Event()
+        self._watch_thread: Optional[threading.Thread] = None
 
     def _handle_request(self, msg: dict) -> dict:
         """Handle an incoming request."""
@@ -400,6 +406,12 @@ class UnifiedAskDaemon:
             return self._remote_service().handle_submit(msg)
         if operation == "remote_status":
             return self._remote_service().handle_status(msg)
+        if operation == "remote_fetch":
+            return self._remote_service().handle_fetch(msg)
+        if operation == "remote_reply":
+            return self._remote_service().handle_reply(msg)
+        if operation == "remote_watch":
+            return self._handle_remote_watch(msg)
 
         provider = str(msg.get("provider") or "").strip().lower()
         if not provider:
@@ -798,6 +810,67 @@ class UnifiedAskDaemon:
         except Exception as exc:
             _write_log(f"[WARN] remote journal recovery failed: {exc}")
 
+    # -- M2 source-side reply watcher ------------------------------------ #
+
+    def _handle_remote_watch(self, msg: dict) -> dict:
+        """Register a reply-expected receipt for this daemon's poller.
+
+        The receipt itself is the durable registration (its `poll_owner` names
+        this daemon's state file); this op only validates that and wakes the
+        poller, so a crash between the two costs a poll cycle, never a receipt.
+        """
+        from remote_client import watch_target_ok
+
+        request_id = str(msg.get("request_id") or "").strip()
+        ok, reason = watch_target_ok(request_id, str(self.state_file))
+        if not ok:
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": msg.get("id"),
+                "ok": False,
+                "exit_code": 1,
+                "reply": reason,
+                "error": {"code": "invalid_request", "message": reason},
+            }
+        self._start_reply_watcher()
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": msg.get("id"),
+            "ok": True,
+            "reply": "",
+            "remote": {"request_id": request_id, "watching": True},
+        }
+
+    def _start_reply_watcher(self) -> None:
+        if self._watch_thread is None:
+            self._watch_thread = threading.Thread(
+                target=self._watch_reply_receipts,
+                name="ccb-remote-reply-watch",
+                daemon=True,
+            )
+            self._watch_thread.start()
+        self._watch_wake.set()
+
+    def _watch_reply_receipts(self) -> None:
+        from remote_client import watch_loop
+
+        try:
+            watch_loop(
+                self._watch_stop,
+                self._watch_wake,
+                owner=str(self.state_file),
+                log=_write_log,
+            )
+        except Exception as exc:  # pragma: no cover - the loop is defensive itself
+            _write_log(f"[WARN] remote reply watcher stopped: {exc}")
+
+    def _on_owned(self) -> None:
+        """Runs once this process exclusively owns the daemon."""
+        self._recover_remote_records()
+        self._start_reply_watcher()
+
     def _handle_check_delivery(self, msg: dict) -> dict:
         """Read-only role-policy preflight for an async sender.
 
@@ -1087,6 +1160,8 @@ class UnifiedAskDaemon:
         self.registry.start_all()
 
         def _on_stop() -> None:
+            self._watch_stop.set()
+            self._watch_wake.set()
             self.registry.stop_all()
             self._cleanup_state_file()
 
@@ -1100,9 +1175,10 @@ class UnifiedAskDaemon:
             request_queue_size=128,
             on_stop=_on_stop,
             work_dir=self.work_dir,
-            # Recovery runs only once this process has taken exclusive
-            # ownership of the daemon (see AskDaemonServer._take_ownership).
-            on_owned=self._recover_remote_records,
+            # Recovery and the reply watcher run only once this process has
+            # taken exclusive ownership of the daemon (see
+            # AskDaemonServer._take_ownership).
+            on_owned=self._on_owned,
         )
         return server.serve_forever()
 

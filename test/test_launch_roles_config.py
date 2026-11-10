@@ -442,6 +442,10 @@ def _launcher_for_claims(monkeypatch, tmp_path: Path, providers, roles):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".ccb").mkdir(exist_ok=True)
     monkeypatch.setattr(ccb, "detect_terminal", lambda: "tmux")
+    # This simulates a tmux launch. It must say so itself instead of relying on
+    # the suite being started from inside the caller's live tmux session (the
+    # conftest guard now removes that inherited identity for every test).
+    monkeypatch.setenv("TMUX", "guard-fixture,1,0")
     launcher = ccb.AILauncher(providers=providers, roles=roles)
     launcher.runtime_dir = tmp_path / "runtime"
     launcher.runtime_dir.mkdir(exist_ok=True)

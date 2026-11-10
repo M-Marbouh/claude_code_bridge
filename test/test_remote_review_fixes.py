@@ -609,14 +609,17 @@ def test_recovery_runs_only_after_ownership(tmp_path, monkeypatch):
 
 def test_daemon_wires_recovery_through_the_ownership_hook():
     source = Path("lib/askd/daemon.py").read_text(encoding="utf-8")
-    assert "on_owned=self._recover_remote_records" in source
+    assert "on_owned=self._on_owned" in source
     # `serve_forever` may only ACQUIRE ownership; it must neither call the hook
     # itself nor recover directly (that would run before ownership is held).
     serve = source.split("def serve_forever(self) -> int:", 1)[1]
     # Ownership is taken inside AskDaemonServer.serve_forever(); this daemon only
     # hands the hook over, so nothing here can recover before that.
-    assert "on_owned=self._recover_remote_records" in serve
+    assert "on_owned=self._on_owned" in serve
     assert "self._recover_remote_records()" not in serve
+    # The hook runs recovery first, then starts the M2 reply watcher.
+    hook = source.split("def _on_owned(self) -> None:", 1)[1].split("def ", 1)[0]
+    assert hook.index("self._recover_remote_records()") < hook.index("self._start_reply_watcher()")
 
 
 def test_askd_server_runs_the_hook_after_acquiring_the_lock():

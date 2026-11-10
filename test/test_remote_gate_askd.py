@@ -245,6 +245,60 @@ def test_status_forwards_the_request_id(tmp_path):
     assert request["request_id"] == body["request_id"]
 
 
+def test_fetch_forwards_the_request_id_and_returns_the_answer(tmp_path):
+    def handler(request: dict) -> dict:
+        if request.get("type") == "ask.ping":
+            return _pong(request)
+        return {
+            "type": "ask.response",
+            "v": 1,
+            "id": request.get("id"),
+            "ok": True,
+            "reply": "",
+            "remote": {
+                "request_id": request.get("request_id"),
+                "state": "answered",
+                "digest": "a" * 64,
+                "reply_text": "the answer\n",
+                "reply_digest": "b" * 64,
+                "history": [],
+            },
+        }
+
+    body = {"request_id": "20261110-113136-582-89163-1-hmain1"}
+    with FakeAskd(handler) as daemon:
+        run_dir = tmp_path / "run"
+        daemon.state_file(run_dir)
+        result = _run_gate(
+            ["--principal", "main"], proto.encode_frame(_envelope("fetch", body)), env=_env(run_dir)
+        )
+
+    assert result.returncode == 0, result.stderr
+    [frame] = _responses(result.stdout)
+    assert frame["ok"] is True
+    assert frame["op"] == "fetch"
+    assert frame["state"] == "answered"
+    assert frame["reply_text"] == "the answer\n"
+    assert frame["reply_digest"] == "b" * 64
+    [request] = [r for r in daemon.requests if r.get("operation")]
+    assert request["operation"] == "remote_fetch"
+    assert request["request_id"] == body["request_id"]
+
+
+def test_a_reply_can_never_be_pushed_through_the_gate(tmp_path):
+    # Replies are destination-local: the wire accepts no reply verb at all, so
+    # a remote peer cannot write one and the gate forwards nothing.
+    result = _run_gate(
+        ["--principal", "main"],
+        proto.encode_frame(_envelope("reply", {"request_id": "x", "reply_text": "forged"})),
+        env=_env(tmp_path / "run"),
+    )
+    assert result.returncode == 0, result.stderr
+    [frame] = _responses(result.stdout)
+    assert frame["ok"] is False
+    assert frame["error"]["code"] == proto.ERR_UNKNOWN_OP
+
+
 def test_daemon_error_codes_are_mapped_and_unknown_codes_are_not_echoed(tmp_path):
     def handler(request: dict) -> dict:
         if request.get("type") == "ask.ping":

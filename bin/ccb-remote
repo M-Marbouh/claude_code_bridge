@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
-"""ccb-remote - inspect and recover cross-machine CCB deliveries (M1).
+"""ccb-remote - inspect and recover cross-machine CCB deliveries.
 
     ccb-remote status <host-qualified-id>   destination state for a submission
     ccb-remote list <host>                  allowlisted projects on a host
+    ccb-remote reply <host-qualified-id>    answer a delivered reply-expected request
 
 `status` is the recovery path for a submission whose acknowledgement was lost:
 it reads the outbound receipt (the host comes from the receipt only, never from
 the command line), asks the destination, and records the destination state.
 
-M1 is delivery-only: there is no reply, no wait, and no automatic resubmit.
+`reply` runs on the DESTINATION machine, inside the pane that received the
+request: it reads the answer from stdin (UTF-8, at most the message cap), reads
+the destination journal only to find the daemon that owns the record, and sends
+that daemon one local `remote_reply` operation. It never writes the journal,
+never contacts another machine, and sends exactly one answer.
+
+The M1 command surface is unchanged; delivery-only submissions still have no
+reply path.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -25,19 +34,38 @@ from compat import setup_windows_encoding  # noqa: E402
 
 setup_windows_encoding()
 
+import askd_rpc  # noqa: E402
 import remote_client  # noqa: E402
+import remote_journal  # noqa: E402
 import remote_protocol  # noqa: E402
 from cli_output import EXIT_ERROR, EXIT_OK  # noqa: E402
+
+#: The answer was written to a daemon channel but never confirmed (a lost
+#: response, or a commit whose durability is unconfirmed): retrying the SAME
+#: answer is the safe recovery, so this is distinct from a refusal.
+EXIT_UNCONFIRMED = 2
 
 USAGE = """Usage:
   ccb-remote status <host-qualified-id>   Ask the destination for this request's state
   ccb-remote list <host>                  List the projects this key may address on <host>
+  ccb-remote reply <host-qualified-id>    Answer a delivered request (answer on stdin)
   ccb-remote -h                           Show this help
 
-Cross-machine delivery is one-way in this milestone: no reply is captured and a
-submission is never retried automatically. `status` is the recovery path for a
-delivery whose acknowledgement was lost.
+`reply` runs on the machine that received the request, from the pane that
+received it, and sends exactly one answer:
+
+    ccb-remote reply <host-qualified-id> <<'CCB_REPLY'
+    the answer
+    CCB_REPLY
+
+Cross-machine delivery is pull-based: the source fetches the answer; the
+destination never connects back. `status` is the recovery path for a delivery
+whose acknowledgement was lost.
 """
+
+
+class _ReplyError(RuntimeError):
+    """The answer cannot be sent at all (nothing was written anywhere)."""
 
 
 def _usage(stream=None) -> None:
@@ -65,6 +93,162 @@ def _cmd_list(argv: list[str]) -> int:
     return EXIT_OK if result.exit_code == remote_client.EXIT_ACCEPTED else result.exit_code
 
 
+def _read_reply_stdin() -> str:
+    """The answer from stdin: raw bytes, strict UTF-8, capped, never stripped."""
+    cap = remote_protocol.MAX_TEXT_BYTES
+    try:
+        data = sys.stdin.buffer.read(cap + 1)
+    except (OSError, ValueError) as exc:
+        raise _ReplyError(f"the answer could not be read from stdin: {exc}") from None
+    if len(data) > cap:
+        raise _ReplyError(f"the answer is larger than the {cap}-byte reply cap")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _ReplyError("the answer is not valid UTF-8") from None
+    try:
+        return remote_protocol.validate_reply_text(text)
+    except remote_protocol.ProtocolError as exc:
+        raise _ReplyError(exc.message) from None
+
+
+def _sender_credential() -> tuple[str, str]:
+    """This pane's launch credential, exactly as `ccb-role` reads it."""
+    member_id = (os.environ.get("CCB_MEMBER_ID") or "").strip()
+    member_token = (os.environ.get("CCB_MEMBER_TOKEN") or "").strip()
+    if not member_id or not member_token:
+        # Older launches exported only the pair credential; it names the same
+        # member, so it stays accepted.
+        member_id = member_id or (os.environ.get("CCB_LIVE_ID") or "").strip()
+        member_token = member_token or (os.environ.get("CCB_LIVE_TOKEN") or "").strip()
+    return member_id, member_token
+
+
+def _cmd_reply(argv: list[str]) -> int:
+    """Destination-local: send this pane's one answer to the record's owner."""
+    if len(argv) != 1:
+        print("[ERROR] reply requires exactly one host-qualified request id", file=sys.stderr)
+        return EXIT_ERROR
+    request_id = argv[0]
+    try:
+        remote_protocol.parse_remote_id(request_id)
+    except remote_protocol.ProtocolError:
+        print(
+            "[ERROR] not a host-qualified request id (expected <local-id>-h<token>)",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    try:
+        text = _read_reply_stdin()
+    except _ReplyError as exc:
+        print(f"[ERROR] {exc}; nothing was written", file=sys.stderr)
+        return EXIT_ERROR
+
+    member_id, member_token = _sender_credential()
+    if not member_id or not member_token:
+        print(
+            "[ERROR] This session has no CCB launch credential, so it cannot answer; "
+            "nothing was written",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    # Read-only: the journal is consulted ONLY to find the owning daemon.
+    try:
+        record = remote_journal.RemoteJournal().read(request_id)
+    except remote_journal.JournalError as exc:
+        print(f"[ERROR] The request journal is unreadable ({exc}); nothing was written", file=sys.stderr)
+        return EXIT_ERROR
+    if record is None:
+        print("[ERROR] No such request on this machine; nothing was written", file=sys.stderr)
+        return EXIT_ERROR
+
+    owner_state_file = str(record.get("owner_daemon") or "").strip()
+    if not owner_state_file:
+        print("[ERROR] This request names no owner daemon; nothing was written", file=sys.stderr)
+        return EXIT_ERROR
+    state = askd_rpc.read_state(Path(owner_state_file))
+    if not isinstance(state, dict) or not state.get("token"):
+        print(
+            "[ERROR] The daemon that owns this request is not running; nothing was written",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    request = {
+        "type": "ask.request",
+        "v": 1,
+        "id": f"reply-{request_id}",
+        "token": state["token"],
+        "operation": "remote_reply",
+        "request_id": request_id,
+        "member_id": member_id,
+        "member_token": member_token,
+        "reply_text": text,
+    }
+    try:
+        response = askd_rpc.request_daemon(
+            state, request, connect_timeout_s=5.0, response_timeout_s=30.0
+        )
+    except askd_rpc.DaemonConnectionError:
+        print(
+            "[ERROR] The daemon that owns this request is unreachable; nothing was written",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    except Exception as exc:
+        # The request may have reached the daemon; retrying the SAME answer is
+        # the safe recovery (the digest rule makes it idempotent).
+        print(
+            f"[ERROR] The answer could not be confirmed ({type(exc).__name__}); "
+            "run the same command again with the same answer",
+            file=sys.stderr,
+        )
+        return EXIT_UNCONFIRMED
+
+    if not isinstance(response, dict):
+        print(
+            "[ERROR] The destination daemon returned no usable reply; run the same "
+            "command again with the same answer",
+            file=sys.stderr,
+        )
+        return EXIT_UNCONFIRMED
+
+    if response.get("ok") is True:
+        remote = response.get("remote")
+        remote = remote if isinstance(remote, dict) else {}
+        if str(remote.get("request_id") or "") != request_id or str(
+            remote.get("state") or ""
+        ) != remote_journal.STATE_ANSWERED:
+            print(
+                "[ERROR] The confirmation does not match this request; run the same "
+                "command again with the same answer",
+                file=sys.stderr,
+            )
+            return EXIT_UNCONFIRMED
+        print(f"id={request_id} state={remote_journal.STATE_ANSWERED}")
+        return EXIT_OK
+
+    error = response.get("error")
+    error = error if isinstance(error, dict) else {}
+    code = str(error.get("code") or "")
+    message = " ".join(str(error.get("message") or "").split())
+    if code == remote_protocol.ERR_REPLY_UNKNOWN:
+        print(
+            f"[WARN] The answer may already be recorded ({message or code}); run the same "
+            "command again with the same answer",
+            file=sys.stderr,
+        )
+        return EXIT_UNCONFIRMED
+    print(
+        f"[ERROR] The answer was refused: {message or code or 'no reason given'} "
+        "(nothing was written)",
+        file=sys.stderr,
+    )
+    return EXIT_ERROR
+
+
 def main(argv: list[str]) -> int:
     args = list(argv[1:])
     if not args or args[0] in ("-h", "--help"):
@@ -77,6 +261,8 @@ def main(argv: list[str]) -> int:
             return _cmd_status(rest)
         if command == "list":
             return _cmd_list(rest)
+        if command == "reply":
+            return _cmd_reply(rest)
     except remote_client.RemoteConfigError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return EXIT_ERROR

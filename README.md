@@ -182,16 +182,26 @@ so without receiver-side idempotency could create real duplicates.
 
 ## Cross-machine messaging (preview)
 
-CCB can deliver a one-way message to a Claude or Codex pane in a CCB project on
-another machine over your existing SSH server, with no ports, listeners or
-tunnels added: `ask codex --peer server::demo "hello from the laptop"`, then
+CCB can deliver a message to a Claude or Codex pane in a CCB project on another
+machine over your existing SSH server, with no ports, listeners or tunnels
+added: `ask codex --peer server::demo "hello from the laptop"`, then
 `ccb-remote status <id>` to see whether it reached the pane.
 
-It is preview and deliberately narrow: **one-way only** (no replies yet), Claude
-and Codex only, Linux only, set up by hand once per direction, and role-enforcing
-destinations accept remote messages for `lead` only. A delivered message makes
-that agent act with the destination user's files, tools and credentials — the
-project allow-list limits *where* a message may go, not what the agent can do.
+Ask that agent for exactly one answer by adding `--wait` (foreground: the answer
+is printed when it arrives) or `--background` (CCB running on the sending machine
+writes the answer into the asking pane). Otherwise `pend <id>` fetches it at any
+time, from the host recorded in the receipt. On the destination machine the agent
+answers once with the command printed in the delivered message,
+`ccb-remote reply <id>`, with the answer on stdin. Fetching is pull-based: the
+destination never connects back, and it never re-executes a request to answer it
+again.
+
+It is preview and deliberately narrow: **one reply per message, no follow-ups**,
+Claude and Codex only, Linux only, set up by hand once per direction, and
+role-enforcing destinations accept remote messages for `lead` only. A delivered
+message makes that agent act with the destination user's files, tools and
+credentials — the project allow-list limits *where* a message may go, not what
+the agent can do.
 
 Setup and troubleshooting: [guides/cross-machine.md](guides/cross-machine.md).
 

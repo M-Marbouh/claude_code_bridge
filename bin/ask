@@ -1750,22 +1750,25 @@ def _remote_peer_refusal(
     foreground_explicit: bool,
     resend_seen: bool,
     to_role: str,
+    intent: str = "",
 ) -> str:
     """Why this remote peer request cannot be delivered as asked, else "".
 
-    This milestone is delivery-only, so anything that expects a reply is
-    refused BEFORE a receipt is written or a connection is made.
+    ``--wait`` and ``--background`` are supported (they expect exactly one
+    reply); anything that would make the source block on the destination's own
+    provider turn, or correlate against a local task, is refused BEFORE a
+    receipt is written or a connection is made.
     """
     if provider not in ("claude", "codex"):
         return (
             f"[ERROR] Cross-machine delivery supports claude and codex only, not {provider}"
         )
     if reply_to:
-        return "[ERROR] --reply-to is not available for cross-machine delivery (no reply in this milestone)"
-    if wait_explicit:
-        return "[ERROR] --wait is not available for cross-machine delivery: this milestone is one-way"
+        return "[ERROR] --reply-to is not available for cross-machine delivery"
+    if wait_explicit and intent == "notify":
+        return "[ERROR] --wait and --notify contradict each other for a remote target"
     if foreground_explicit:
-        return "[ERROR] --foreground is not available for cross-machine delivery: this milestone is one-way"
+        return "[ERROR] --foreground is not available for cross-machine delivery; use --wait"
     if resend_seen:
         return "[ERROR] --resend is not available for cross-machine delivery"
     role = (to_role or "").strip().lower()
@@ -1780,11 +1783,28 @@ def _remote_peer_refusal(
     return ""
 
 
+def _remote_poll_owner(sender_work_dir: str) -> str:
+    """The source project's running askd: the daemon that will poll --background."""
+    from askd_runtime import find_running_state_file
+
+    try:
+        state_file = find_running_state_file(
+            "askd.json",
+            protocol_prefix="ask",
+            work_dir=sender_work_dir or Path.cwd(),
+            timeout_s=0.5,
+        )
+    except Exception:
+        return ""
+    return str(state_file) if state_file is not None else ""
+
+
 def _run_remote_peer(
     peer_target: str,
     peer_provider: str,
     message: str,
     *,
+    timeout: float,
     intent: str,
     reply_to: str,
     live_id: str,
@@ -1802,33 +1822,63 @@ def _run_remote_peer(
         foreground_explicit=foreground_explicit,
         resend_seen=resend_seen,
         to_role=to_role,
+        intent=intent,
     )
     if refusal:
         print(refusal, file=sys.stderr)
         return EXIT_ERROR
-    from remote_client import RemoteConfigError, RemoteRefusal, caller_claims, submit
+    from remote_client import (
+        RemoteConfigError,
+        RemoteRefusal,
+        caller_claims,
+        capture_caller_identity,
+        register_watch,
+        submit,
+        wait_for_answer,
+    )
 
     try:
         host, project = _remote_selector(peer_target)
     except RemoteRefusal as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return EXIT_ERROR
+    # Only an EXPLICIT --wait/--background asks for a reply. A remote ask with
+    # no flag (and --notify) keeps M1's delivery-only meaning even though the
+    # parser's local default intent is "wait".
+    if intent == "background":
+        remote_intent, reply_expected = "background", True
+    elif intent == "wait" and wait_explicit:
+        remote_intent, reply_expected = "wait", True
+    else:
+        remote_intent, reply_expected = "notify", False
+    # A reply-expected submission is schema v2 and carries the caller's exact
+    # pane identity, captured BEFORE the submit. Notification later revalidates
+    # this copy; the audit-only `caller` claims stay separate.
+    poll_owner = ""
+    if reply_expected and intent == "background":
+        poll_owner = _remote_poll_owner(sender_work_dir)
     try:
         claims = caller_claims(
             caller=caller, work_dir=sender_work_dir, role_assertion=to_role
+        )
+        identity = (
+            capture_caller_identity(
+                caller=caller, work_dir=sender_work_dir, role_assertion=to_role
+            )
+            if reply_expected
+            else None
         )
         result = submit(
             host,
             project,
             peer_provider,
             message,
-            # Delivery-only contract: a remote message never waits for, or
-            # expects, a reply, so the recorded and labelled intent is always
-            # `notify`. Explicit --wait/--foreground/--reply-to were refused
-            # above; --notify stays accepted and means the same thing here.
-            intent="notify",
+            intent=remote_intent,
             dest_session=live_id,
             caller_claims=claims,
+            reply_expected=reply_expected,
+            caller_identity=identity,
+            poll_owner=poll_owner,
         )
     except RemoteConfigError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -1836,7 +1886,26 @@ def _run_remote_peer(
     except RemoteRefusal as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return EXIT_ERROR
-    return EXIT_OK if result.ok else result.exit_code
+    if not result.ok:
+        return result.exit_code
+    if reply_expected and intent == "background":
+        ok, reason = register_watch(result.request_id)
+        if ok:
+            print(
+                f"[CCB_BACKGROUND_SUBMITTED provider=remote-{peer_provider} "
+                f"intent=background]",
+                file=sys.stdout,
+            )
+        else:
+            print(
+                f"[WARN] the polling daemon is not available ({reason}); "
+                f"use pend {result.request_id} to collect the answer",
+                file=sys.stderr,
+            )
+        return EXIT_OK
+    if reply_expected:
+        return wait_for_answer(result.request_id, timeout_s=timeout)
+    return EXIT_OK
 
 
 def _remote_selector(target: str) -> tuple[str, str]:
@@ -1886,6 +1955,7 @@ def _run_peer_bridge(
             peer_target,
             peer_provider,
             message,
+            timeout=timeout,
             intent=intent,
             reply_to=reply_to,
             live_id=live_id,

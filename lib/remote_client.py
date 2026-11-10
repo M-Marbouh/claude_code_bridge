@@ -1496,6 +1496,62 @@ def caller_claims(*, caller: str, work_dir: str = "", role_assertion: str = "") 
     }
 
 
+def _same_work_dir(left: str | Path, right: str | Path) -> bool:
+    """Resolved-path equality for work_dir evidence.
+
+    Deliberately local rather than imported from ``bin/ask`` (a script, not a
+    module); it reproduces that script's ``_same_work_dir`` semantics.
+    """
+
+    def normalized(value: str | Path | None) -> Path | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        try:
+            return candidate.resolve()
+        except Exception:
+            return candidate.absolute()
+
+    left_path = normalized(left)
+    right_path = normalized(right)
+    return left_path is not None and right_path is not None and left_path == right_path
+
+
+def _legacy_caller_marker(*, work_dir: str, provider: str, pane_id: str) -> tuple[str, str]:
+    """The caller's (pane_title_marker, ccb_project_id) off the legacy registry.
+
+    Only consulted for a launch that publishes no live inventory at all (see
+    ``peer_routing.NO_CANDIDATES``); the same source `bin/ask` falls back to
+    for a legacy sender. Exactly one record -- same provider, same work_dir,
+    same caller pane id -- resolves; zero or several leave both fields empty so
+    the notification fails closed. Stale records are excluded by default.
+    """
+    from ccb_runtime_status import iter_registry_provider_records
+    from project_id import compute_ccb_project_id
+
+    pane = (pane_id or "").strip()
+    if not pane:
+        return "", ""
+    records = iter_registry_provider_records(
+        project_id=compute_ccb_project_id(Path(work_dir))
+    )
+    matches = [
+        record
+        for record in records
+        if record.provider == provider
+        and _same_work_dir(record.work_dir, work_dir)
+        and str(record.provider_entry.get("pane_id") or "").strip() == pane
+    ]
+    if len(matches) != 1:
+        return "", ""
+    entry = matches[0].provider_entry
+    return (
+        str(entry.get("pane_title_marker") or "").strip(),
+        str(matches[0].project_id or "").strip(),
+    )
+
+
 def capture_caller_identity(*, caller: str, work_dir: str = "", role_assertion: str = "") -> dict:
     """The caller's exact pane identity, captured BEFORE a reply-expected submit.
 
@@ -1503,8 +1559,13 @@ def capture_caller_identity(*, caller: str, work_dir: str = "", role_assertion: 
     what a later notification revalidates: pane, terminal, work_dir, the
     launch/session ids CCB exported into the pane, and -- when the caller's own
     live session can be resolved from the same inventory peer delivery trusts
-    -- its title marker, project id and live id. An unresolved caller leaves
-    those empty, and the notification then fails closed rather than guessing.
+    -- its title marker, project id and live id. A launch without a live
+    inventory (NO_CANDIDATES) uses its own legacy registry entry instead, and
+    then only on an exact single match of provider, work_dir and pane id. An
+    unresolved caller leaves those empty, and the notification then fails
+    closed rather than guessing. The marker itself is required only for tmux
+    callers; WezTerm is revalidated on pane id and cwd (see
+    ``revalidate_peer_destination``).
     """
     from task_receipts import caller_pane, caller_session_id
 
@@ -1539,7 +1600,7 @@ def capture_caller_identity(*, caller: str, work_dir: str = "", role_assertion: 
     if provider not in proto.REMOTE_PROVIDERS or not work_dir:
         return identity
     try:
-        from peer_routing import identify_sender
+        from peer_routing import NO_CANDIDATES, identify_sender
 
         resolution = identify_sender(
             work_dir, provider, pane_id=pane_id, terminal=terminal, check_daemon=False
@@ -1548,6 +1609,18 @@ def capture_caller_identity(*, caller: str, work_dir: str = "", role_assertion: 
         return identity
     candidate = getattr(resolution, "candidate", None)
     if candidate is None:
+        # Only the inventory's explicit "nothing to say here" may fall through
+        # to the legacy registry: every other error means the authoritative
+        # inventory WAS consulted and refused, and must leave the fields empty.
+        if getattr(resolution, "error", "") == NO_CANDIDATES:
+            try:
+                marker, project_id = _legacy_caller_marker(
+                    work_dir=work_dir, provider=provider, pane_id=pane_id
+                )
+            except Exception:
+                marker, project_id = "", ""
+            identity["pane_title_marker"] = marker
+            identity["ccb_project_id"] = project_id
         return identity
     identity.update(
         {
@@ -1867,7 +1940,8 @@ def deliver_to_caller(identity: dict, text: str) -> tuple[bool, str]:
                     return False, "the caller pane is now a different process"
             outcome = revalidate_peer_destination(destination)
             if not outcome.ok:
-                return False, f"the caller pane is not the captured one ({outcome.error})"
+                detail = outcome.detail or outcome.error
+                return False, f"the caller pane is not the captured one ({detail})"
             backend.send_text(pane_id, text)
     except PaneLockError as exc:
         return False, f"the caller pane is busy ({exc})"

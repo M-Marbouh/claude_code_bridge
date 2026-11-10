@@ -894,6 +894,298 @@ def test_a_backend_without_in_place_respawn_needs_no_process_witness(
 
 
 # --------------------------------------------------------------------------- #
+# Legacy caller marker fallback (a launch with no live inventory)
+# --------------------------------------------------------------------------- #
+
+LEGACY_PANE_ID = "%0"
+LEGACY_MARKER = "CCB-Claude-f8cc696c"
+LEGACY_PROJECT_ID = "proj-legacy-f8cc696c"
+
+
+class _NoPaneCreationBackend(_PaneBackend):
+    """Records any attempt to create or respawn a pane (never expected)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pane_ops: list[str] = []
+
+    def ensure_pane(self, *args, **kwargs):
+        self.pane_ops.append("ensure_pane")
+
+    def respawn_pane(self, *args, **kwargs):
+        self.pane_ops.append("respawn_pane")
+
+    def split_pane(self, *args, **kwargs):
+        self.pane_ops.append("split_pane")
+
+
+def _legacy_record(
+    work_dir,
+    *,
+    provider: str = "claude",
+    pane_id: str = LEGACY_PANE_ID,
+    marker: str = LEGACY_MARKER,
+    project_id: str = LEGACY_PROJECT_ID,
+):
+    """A registry record shaped like a real legacy (no-inventory) launch."""
+    from ccb_runtime_status import RegistryProviderRecord
+
+    return RegistryProviderRecord(
+        project_id=project_id,
+        work_dir=str(work_dir),
+        provider=provider,
+        provider_entry={"pane_id": pane_id, "pane_title_marker": marker, "terminal": None},
+        registry_record={},
+        updated_at=0,
+        timestamp_stale=False,
+    )
+
+
+def _spy_registry(monkeypatch, records):
+    """Replace the legacy registry reader and record every call's kwargs."""
+    import ccb_runtime_status
+
+    calls: list[dict] = []
+
+    def fake_iter(**kwargs):
+        calls.append(kwargs)
+        return list(records)
+
+    monkeypatch.setattr(ccb_runtime_status, "iter_registry_provider_records", fake_iter)
+    return calls
+
+
+def _sender_resolution(monkeypatch, *, candidate=None, error: str = "", detail: str = ""):
+    import peer_routing
+    from types import SimpleNamespace
+
+    resolution = SimpleNamespace(candidate=candidate, error=error, detail=detail)
+    monkeypatch.setattr(peer_routing, "identify_sender", lambda *a, **kw: resolution)
+    return resolution
+
+
+def _capture_tmux_caller(monkeypatch, work_dir, *, caller: str = "claude"):
+    monkeypatch.setenv("CCB_CALLER_PANE_ID", LEGACY_PANE_ID)
+    monkeypatch.setenv("CCB_CALLER_TERMINAL", "tmux")
+    return remote_client.capture_caller_identity(caller=caller, work_dir=str(work_dir))
+
+
+def test_legacy_registry_entry_supplies_the_callers_marker(tmp_path, pane_backend, monkeypatch):
+    import peer_routing
+    from project_id import compute_ccb_project_id
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    calls = _spy_registry(
+        monkeypatch,
+        [
+            _legacy_record(work_dir),
+            _legacy_record(work_dir, provider="pi", pane_id="%9", marker="CCB-Pi-f8cc696c"),
+            _legacy_record(work_dir, provider="codex", pane_id="%10", marker="CCB-Codex-f8cc696c"),
+        ],
+    )
+    _sender_resolution(
+        monkeypatch, error=peer_routing.NO_CANDIDATES, detail="legacy project without live inventory"
+    )
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    print("legacy capture:", identity["pane_id"], identity["pane_title_marker"], identity["ccb_project_id"])
+    assert identity["pane_title_marker"] == LEGACY_MARKER
+    assert identity["ccb_project_id"] == LEGACY_PROJECT_ID
+    # The lookup is scoped to this project and keeps the reader's default of
+    # excluding stale records.
+    assert calls == [{"project_id": compute_ccb_project_id(work_dir)}]
+
+
+def test_legacy_lookup_never_asks_for_stale_records(tmp_path, pane_backend, monkeypatch):
+    import peer_routing
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    calls = _spy_registry(monkeypatch, [_legacy_record(work_dir)])
+    _sender_resolution(monkeypatch, error=peer_routing.NO_CANDIDATES)
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    assert identity["pane_title_marker"] == LEGACY_MARKER
+    assert [call.get("include_stale") for call in calls] == [None]
+
+
+def test_legacy_lookup_without_an_entry_for_the_caller_pane_stays_empty(
+    tmp_path, pane_backend, monkeypatch
+):
+    import peer_routing
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    _spy_registry(monkeypatch, [_legacy_record(work_dir, pane_id="%9")])
+    _sender_resolution(monkeypatch, error=peer_routing.NO_CANDIDATES)
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    assert identity["pane_title_marker"] == ""
+    assert identity["ccb_project_id"] == ""
+
+
+@pytest.mark.parametrize(
+    "records_kwargs",
+    [
+        pytest.param([{"pane_id": "%9"}], id="wrong-pane"),
+        pytest.param([{"provider": "codex"}], id="wrong-provider"),
+    ],
+)
+def test_legacy_lookup_requires_an_exact_pane_and_provider_match(
+    tmp_path, pane_backend, monkeypatch, records_kwargs
+):
+    import peer_routing
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    _spy_registry(monkeypatch, [_legacy_record(work_dir, **records_kwargs[0])])
+    _sender_resolution(monkeypatch, error=peer_routing.NO_CANDIDATES)
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    assert identity["pane_title_marker"] == ""
+    assert identity["ccb_project_id"] == ""
+
+
+def test_legacy_lookup_ignores_a_record_from_another_work_dir(
+    tmp_path, pane_backend, monkeypatch
+):
+    import peer_routing
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    other = tmp_path / "other-project"
+    other.mkdir()
+    _spy_registry(monkeypatch, [_legacy_record(other)])
+    _sender_resolution(monkeypatch, error=peer_routing.NO_CANDIDATES)
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    assert identity["pane_title_marker"] == ""
+    assert identity["ccb_project_id"] == ""
+
+
+def test_legacy_lookup_with_two_matching_entries_stays_empty(
+    tmp_path, pane_backend, monkeypatch
+):
+    import peer_routing
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    _spy_registry(
+        monkeypatch,
+        [_legacy_record(work_dir), _legacy_record(work_dir, project_id="proj-other")],
+    )
+    _sender_resolution(monkeypatch, error=peer_routing.NO_CANDIDATES)
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    assert identity["pane_title_marker"] == ""
+    assert identity["ccb_project_id"] == ""
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["ambiguous", "invalid_inventory", "unavailable", "launcher_dead", "session_inactive"],
+)
+def test_only_no_candidates_may_fall_through_to_the_legacy_registry(
+    tmp_path, pane_backend, monkeypatch, error
+):
+    """Every other outcome means the inventory WAS consulted and refused."""
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    calls = _spy_registry(monkeypatch, [_legacy_record(work_dir)])
+    _sender_resolution(monkeypatch, error=error, detail="inventory said no")
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    print("inventory error:", error, "registry_calls=", len(calls))
+    assert identity["pane_title_marker"] == ""
+    assert identity["ccb_project_id"] == ""
+    assert calls == []
+
+
+def test_a_live_candidate_wins_over_a_conflicting_legacy_entry(
+    tmp_path, pane_backend, monkeypatch
+):
+    from types import SimpleNamespace
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    calls = _spy_registry(monkeypatch, [_legacy_record(work_dir, marker="CCB-Claude-legacy")])
+    _sender_resolution(
+        monkeypatch,
+        candidate=SimpleNamespace(
+            pane_title_marker="CCB-Claude-live",
+            ccb_project_id="proj-live",
+            live_id="live-1",
+            launch_id="launch-1",
+            work_dir=str(work_dir),
+        ),
+    )
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+
+    assert identity["pane_title_marker"] == "CCB-Claude-live"
+    assert identity["ccb_project_id"] == "proj-live"
+    assert calls == []
+
+
+def test_a_tmux_caller_without_a_marker_gets_an_explicit_refusal(
+    tmp_path, monkeypatch
+):
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    backend = _NoPaneCreationBackend()
+    monkeypatch.setattr(terminal, "get_backend_for_session", lambda _rec: backend)
+    identity = {
+        "caller": "claude",
+        "pane_id": LEGACY_PANE_ID,
+        "terminal": "tmux",
+        "work_dir": str(work_dir),
+        "pane_title_marker": "",
+        "ccb_project_id": "",
+        "pane_pid": "4242",
+    }
+
+    ok, reason = remote_client.deliver_to_caller(identity, "private answer")
+
+    print("marker refusal:", ok, reason, "sends=", len(backend.sent))
+    assert not ok
+    assert "destination has no saved pane marker" in reason
+    assert backend.sent == []
+    assert backend.pane_ops == []
+
+
+def test_a_legacy_captured_caller_receives_the_answer(tmp_path, monkeypatch):
+    import peer_routing
+
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    backend = _NoPaneCreationBackend()
+    monkeypatch.setattr(terminal, "get_backend_for_session", lambda _rec: backend)
+    _spy_registry(monkeypatch, [_legacy_record(work_dir)])
+    _sender_resolution(
+        monkeypatch, error=peer_routing.NO_CANDIDATES, detail="legacy project without live inventory"
+    )
+
+    identity = _capture_tmux_caller(monkeypatch, work_dir)
+    assert identity["pane_title_marker"] == LEGACY_MARKER
+    assert identity["ccb_project_id"] == LEGACY_PROJECT_ID
+
+    ok, reason = remote_client.deliver_to_caller(identity, "the answer")
+
+    print("legacy notify:", ok, reason, "sends=", len(backend.sent))
+    assert ok, reason
+    assert backend.sent == [(LEGACY_PANE_ID, "the answer")]
+    assert backend.pane_ops == []
+
+
+# --------------------------------------------------------------------------- #
 # fetch must be bound to this exact request
 # --------------------------------------------------------------------------- #
 

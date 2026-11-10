@@ -111,7 +111,9 @@ def _mutated(record: dict, **changes) -> dict:
     return base
 
 
-def _service(tmp_path: Path, *, recorder=None, resolver=None, journal=None, owner=OWNER, config=None):
+def _service(
+    tmp_path: Path, *, recorder=None, resolver=None, sessions=None, journal=None, owner=OWNER, config=None
+):
     config_path = tmp_path / "remote" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(config if config is not None else _config_document()), encoding="utf-8")
@@ -123,6 +125,9 @@ def _service(tmp_path: Path, *, recorder=None, resolver=None, journal=None, owne
         journal=journal or RemoteJournal(tmp_path / "remote"),
         config_loader=lambda: load_config(config_path),
         resolver=resolver or (lambda provider, work_dir, session: DESTINATION),
+        # Session choices are read from the host's own inventory; a unit test
+        # supplies them explicitly instead of depending on the real registry.
+        sessions=sessions or (lambda provider, work_dir: []),
     )
     return service, recorder
 
@@ -390,8 +395,20 @@ def test_list_shows_only_the_principals_aliases_with_presence(tmp_path):
             {
                 "alias": "example-project",
                 "providers": [
-                    {"provider": "claude", "present": True},
-                    {"provider": "codex", "present": False},
+                    {
+                        "provider": "claude",
+                        "present": True,
+                        "state": "present",
+                        "reason": "",
+                        "sessions": [],
+                    },
+                    {
+                        "provider": "codex",
+                        "present": False,
+                        "state": "absent",
+                        "reason": "no live codex session",
+                        "sessions": [],
+                    },
                 ],
             }
         ]
@@ -402,6 +419,275 @@ def test_list_shows_only_the_principals_aliases_with_presence(tmp_path):
         response = service.handle_list({"id": "op-3", "principal": principal})
         assert response["ok"] is True
         assert response["remote"]["projects"] == []
+
+
+# --------------------------------------------------------------------------- #
+# list detail (M3 `list_sessions`): availability + exact session choices
+# --------------------------------------------------------------------------- #
+
+
+def _list_providers(service: RemoteDeliveryService) -> dict:
+    response = service.handle_list({"id": "op-list", "principal": "bob"})
+    assert response["ok"] is True
+    providers = response["remote"]["projects"][0]["providers"]
+    return {entry["provider"]: entry for entry in providers}
+
+
+def test_list_reports_present_with_the_exact_session_choices(tmp_path):
+    service, _ = _service(
+        tmp_path, sessions=lambda provider, work_dir: [{"live_id": "live-1", "active": True}]
+    )
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude == {
+        "provider": "claude",
+        "present": True,
+        "state": "present",
+        "reason": "",
+        # The id a sender would pass as --live-id, exactly as the inventory names it.
+        "sessions": [{"live_id": "live-1", "active": True}],
+    }
+
+
+def test_list_reports_absent_with_the_resolver_reason(tmp_path):
+    def resolver(provider, work_dir, session):
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "no live claude session for the destination project",
+            verdict="absent",
+        )
+
+    service, _ = _service(tmp_path, resolver=resolver)
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude["present"] is False
+    assert claude["state"] == "absent"
+    assert claude["reason"] == "no live claude session for the destination project"
+    assert claude["sessions"] == []
+
+
+def test_list_reports_ambiguous_when_two_live_sessions_exist(tmp_path):
+    def resolver(provider, work_dir, session):
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "more than one live claude session for the destination project; "
+            "select one with dest_session",
+            verdict="ambiguous",
+        )
+
+    sessions = lambda provider, work_dir: [
+        {"live_id": "live-a", "active": True},
+        {"live_id": "live-b", "active": True},
+    ]
+    service, _ = _service(tmp_path, resolver=resolver, sessions=sessions)
+
+    claude = _list_providers(service)["claude"]
+
+    # `present` keeps its old meaning: an ambiguous provider is NOT present.
+    assert claude["present"] is False
+    assert claude["state"] == "ambiguous"
+    assert [session["live_id"] for session in claude["sessions"]] == ["live-a", "live-b"]
+
+
+def test_list_reports_ambiguity_even_with_no_usable_session_ids(tmp_path):
+    """The legacy ambiguity case: the verdict decides, not the id count.
+
+    A launch with no real live ids advertises no session choice at all, yet two
+    live sessions still make the provider ambiguous. Counting the surviving ids
+    would have said "absent" here.
+    """
+
+    def resolver(provider, work_dir, session):
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "more than one live claude session for the destination project; "
+            "select one with dest_session",
+            verdict="ambiguous",
+        )
+
+    service, _ = _service(tmp_path, resolver=resolver, sessions=lambda provider, work_dir: [])
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude["present"] is False
+    assert claude["state"] == "ambiguous"
+    assert claude["sessions"] == []
+
+
+def test_a_markerless_refusal_is_never_read_as_ambiguity(tmp_path):
+    """No verdict means no structured answer -- never an inferred one."""
+
+    def resolver(provider, work_dir, session):
+        raise RemoteError(proto.ERR_DESTINATION_UNAVAILABLE, "destination refused")
+
+    sessions = lambda provider, work_dir: [
+        {"live_id": "live-a", "active": True},
+        {"live_id": "live-b", "active": True},
+    ]
+    service, _ = _service(tmp_path, resolver=resolver, sessions=sessions)
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude["state"] == "absent"
+    assert claude["reason"] == "destination refused"
+
+
+def test_list_reports_a_legacy_launch_as_present_without_choices(tmp_path):
+    # A legacy launch has no real live ids, so the resolver accepts its one
+    # pane while there is no session choice to offer.
+    service, _ = _service(tmp_path, sessions=lambda provider, work_dir: [])
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude["present"] is True
+    assert claude["state"] == "present"
+    assert claude["sessions"] == []
+
+
+def test_list_reports_an_invalid_inventory_as_unavailable(tmp_path):
+    def resolver(provider, work_dir, session):
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "destination live-session inventory is invalid; refusing to guess",
+            verdict="invalid_inventory",
+        )
+
+    def sessions(provider, work_dir):
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "destination live-session inventory is invalid",
+            verdict="invalid_inventory",
+        )
+
+    service, _ = _service(tmp_path, resolver=resolver, sessions=sessions)
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude["present"] is False
+    assert claude["state"] == "unavailable"
+    assert claude["reason"] == "destination live-session inventory is invalid"
+    assert claude["sessions"] == []
+
+
+def test_a_session_probe_crash_is_reported_not_raised(tmp_path):
+    def sessions(provider, work_dir):
+        raise RuntimeError(f"boom {work_dir}")
+
+    service, _ = _service(tmp_path, sessions=sessions)
+
+    claude = _list_providers(service)["claude"]
+
+    assert claude["state"] == "unavailable"
+    # Never a raw exception or a path: the reason is a fixed sentence.
+    assert claude["reason"] == "the destination sessions could not be listed"
+
+
+def test_describe_sessions_offers_only_real_live_ids(monkeypatch):
+    import peer_routing
+    from types import SimpleNamespace
+
+    legacy = SimpleNamespace(live_id="legacy:ai-1:claude", active=True)
+    live = SimpleNamespace(live_id="live-1", active=True)
+    calls = []
+
+    def fake_entries(project_id, provider):
+        calls.append((project_id, provider))
+        return [(None, legacy), (None, live)], True
+
+    monkeypatch.setattr(peer_routing, "_live_entries_for_project", fake_entries)
+
+    assert remote_delivery.describe_sessions("claude", "/tmp/example-project") == [
+        {"live_id": "live-1", "active": True}
+    ]
+    # Same inventory reader the submit path uses, scoped to that one project.
+    assert calls and calls[0][1] == "claude"
+
+
+LONG_PREFIX = "s" * 128
+LONG_ID_A = f"{LONG_PREFIX}-a"
+LONG_ID_B = f"{LONG_PREFIX}-b"
+
+
+def _live_session(live_id: str, pane_id: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        live_id=live_id,
+        provider="claude",
+        active=True,
+        pane_id=pane_id,
+        terminal="tmux",
+        work_dir="/tmp/example-project",
+        launch_id="ai-1",
+        pane_title_marker=f"CCB-Claude-{pane_id.strip('%')}",
+        ccb_project_id="proj-1",
+    )
+
+
+def test_describe_sessions_keeps_ids_that_share_a_long_prefix(monkeypatch):
+    import peer_routing
+
+    first = _live_session(LONG_ID_A, "%1")
+    second = _live_session(LONG_ID_B, "%2")
+    monkeypatch.setattr(
+        peer_routing,
+        "_live_entries_for_project",
+        lambda project_id, provider: ([(None, first), (None, second)], True),
+    )
+
+    sessions = remote_delivery.describe_sessions("claude", "/tmp/example-project")
+
+    assert [session["live_id"] for session in sessions] == [LONG_ID_A, LONG_ID_B]
+
+
+def test_describe_sessions_drops_an_oversized_id(monkeypatch):
+    import peer_routing
+
+    oversized = _live_session("x" * (proto.MAX_SESSION_ID_LENGTH + 1), "%3")
+    monkeypatch.setattr(
+        peer_routing,
+        "_live_entries_for_project",
+        lambda project_id, provider: ([(None, oversized)], True),
+    )
+
+    assert remote_delivery.describe_sessions("claude", "/tmp/example-project") == []
+
+
+def test_resolve_destination_selects_the_session_named_by_a_long_id(monkeypatch):
+    """The id a sender was shown addresses exactly that pane, never a prefix."""
+    import peer_routing
+
+    first = _live_session(LONG_ID_A, "%1")
+    second = _live_session(LONG_ID_B, "%2")
+    monkeypatch.setattr(
+        peer_routing,
+        "_live_entries_for_project",
+        lambda project_id, provider: ([(None, first), (None, second)], True),
+    )
+    monkeypatch.setattr(remote_delivery, "_pane_pid", lambda terminal, pane_id: "")
+
+    destination = remote_delivery.resolve_destination(
+        "claude", "/tmp/example-project", LONG_ID_B
+    )
+
+    assert destination.pane_id == "%2"
+    assert destination.live_id == LONG_ID_B
+
+
+def test_describe_sessions_refuses_a_broken_inventory(monkeypatch):
+    import peer_routing
+
+    def broken(project_id, provider):
+        raise peer_routing.InvalidInventoryError("broken")
+
+    monkeypatch.setattr(peer_routing, "_live_entries_for_project", broken)
+
+    with pytest.raises(RemoteError) as excinfo:
+        remote_delivery.describe_sessions("claude", "/tmp/example-project")
+
+    assert "inventory is invalid" in str(excinfo.value)
 
 
 def test_status_returns_state_without_message_content(tmp_path):

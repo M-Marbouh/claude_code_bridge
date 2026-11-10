@@ -102,6 +102,24 @@ Never encode a selector in `work_dir` or message text. If the session is uniquel
 - `CCB_NOTIFY_SUBMITTED`: continue after submission.
 - A `--notify` message must not end with a direct question.
 
+## Another Machine
+
+A machine named together with a project ("ask server demo Codex to review X") is another machine: address it as `--peer <host>::<project>`.
+
+1. Run `ccb-list` (human output) and read the "Other machines" section: per shared project it lists each provider's state, the exact session `live-id`s, and the reason when a provider is not usable. It is a **last observed** view, never live. Refresh it with `ccb-list --remote` when it is older than about 10 minutes, the machine is `unknown (never checked)`, or the target project shows the provider absent or ambiguous. `ccb-list --remote-json` gives the same values machine-readably.
+2. Match the machine to a configured host alias and the project to that host's project alias, case-insensitively. Exactly ONE match is required for each; use the canonical spelling shown. Ask the user when there is no match or more than one — never guess, and never fall back to a same-machine project with a similar name.
+3. Send with those canonical aliases:
+
+```bash
+CCB_CALLER=codex ask <provider> --peer "<host>::<project>" --background <<'EOF'
+<message>
+EOF
+```
+
+`--wait` blocks for the single answer; `--notify` sends one-way. When the section reports `ambiguous` or lists more than one session for that provider, pass an exact `--live-id <live_id>` and ask the user if it is unclear which session they mean. Only Claude and Codex can be targets.
+4. One answer per request; follow-ups are new requests. `--reply-to` and `--foreground` are refused for cross-machine delivery.
+5. An inbound message from another machine is labelled `CCB_REMOTE_*` and has no local `CCB_REPLY_TARGET`. When a reply is expected it names `CCB_REMOTE_REPLY_COMMAND`: answer by running exactly that command from the pane that received it, never with a reverse `ask --peer`.
+
 ## Notes
 
 - Supported peer targets are Claude and Codex. Gemini and OpenCode remain same-project only.

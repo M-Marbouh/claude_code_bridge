@@ -395,7 +395,9 @@ def capabilities() -> dict:
 
     ``delivery-only`` stays advertised for Claude and Codex, so a shipped M1
     source still negotiates exactly what it asked for; ``explicit-reply`` and
-    the ``fetch`` verb are additive.
+    the ``fetch`` verb are additive. ``list_sessions`` (M3) tells a source that
+    ``list`` replies also carry per-provider availability and the live-session
+    choices; a source that does not understand it simply ignores those keys.
     """
     return {
         "verbs": list(VERBS),
@@ -405,6 +407,7 @@ def capabilities() -> dict:
         },
         "max_frame": MAX_FRAME,
         "proto": {"major": PROTO_MAJOR, "minor": PROTO_MINOR},
+        "list_sessions": True,
     }
 
 
@@ -505,6 +508,23 @@ def _is_printable_ascii(value: str) -> bool:
     return all(0x20 <= ord(char) <= 0x7E for char in value)
 
 
+def valid_session_id(value: object) -> bool:
+    """The shape a live-session id must have wherever it travels.
+
+    ``dest_session`` in a submit record and the live ids a ``list`` reply
+    advertises follow the SAME rule (non-empty, printable ASCII, at most
+    ``MAX_SESSION_ID_LENGTH``). An id that fails it is unusable: callers DROP
+    it rather than shortening it, because a shortened id names a different
+    session. The id itself is never rewritten.
+    """
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= MAX_SESSION_ID_LENGTH
+        and _is_printable_ascii(value)
+    )
+
+
 def validate_request_record(record: dict) -> dict:
     """Validate a ``submit`` body and return it normalised.
 
@@ -580,14 +600,8 @@ def _validate_v1(record: dict) -> dict:
         )
 
     session = record.get("dest_session")
-    if session is not None:
-        if (
-            not isinstance(session, str)
-            or not session
-            or len(session) > MAX_SESSION_ID_LENGTH
-            or not _is_printable_ascii(session)
-        ):
-            raise ProtocolError(ERR_INVALID_REQUEST, "dest_session must be a short printable string")
+    if session is not None and not valid_session_id(session):
+        raise ProtocolError(ERR_INVALID_REQUEST, "dest_session must be a short printable string")
 
     text = record.get("text")
     if not isinstance(text, str) or not text:

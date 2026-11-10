@@ -145,6 +145,24 @@ candidate is unique.
 
 When a reverse peer result arrives, incorporate it into the active task. Background mode must not pause the plan while waiting.
 
+## Another Machine
+
+When the user names a machine together with a project ("ask server demo Claude about X"), the target is on another machine and is addressed as `--peer <host>::<project>`.
+
+1. Run `ccb-list` (human output) and read the "Other machines" section: for each shared project it lists every provider's state, the exact session `live-id`s, and the reason when a provider is not usable. It is a **last observed** view, never live: run `ccb-list --remote` first when the listed age is older than about 10 minutes, the machine is `unknown (never checked)`, or the target project shows the provider absent or ambiguous. For machine-readable exact values use `ccb-list --remote-json`.
+2. Match the machine to a configured host alias and the project to that host's project alias, case-insensitively. There must be exactly ONE match for each; use the canonical spelling shown. Zero or several matches, or a name that only resembles a local project: ask the user. Never guess, and never fall back to a same-machine project of a similar name.
+3. Send with the canonical aliases:
+
+```bash
+ask <provider> --peer "<host>::<project>" --background <<'EOF'
+<message>
+EOF
+```
+
+Use `--wait` only when the current task cannot proceed without the answer and `--notify` for a one-way message. When the listed provider state is `ambiguous` or it shows more than one session, pass an exact `--live-id <live_id>` from that section, and ask the user when it is unclear which session they mean. Cross-machine targets support Claude and Codex only.
+4. Constraints: one answer per request; a follow-up is a new request. `--reply-to` and `--foreground` are refused for cross-machine delivery, and `--live-id` cannot be combined with `--reply-to`.
+5. Inbound message from another machine: it is labelled `CCB_REMOTE_*` and carries no local `CCB_REPLY_TARGET`. When a reply is expected it names `CCB_REMOTE_REPLY_COMMAND`; answer by running exactly that command from the pane that received it — never send a reverse `ask --peer`.
+
 ## Examples
 
 User: "Ask BSA Claude if the discount validation logic is thread-safe"

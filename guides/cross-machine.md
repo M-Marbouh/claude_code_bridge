@@ -330,6 +330,20 @@ demo	codex=present, claude=absent
 If you see `no destinations authorized on this host`, the principal, token or
 alias rules do not line up — compare Step 3/4 on B with Step 6 on A.
 
+Every successful `list` is remembered on A, so `ccb-list` prints an "Other
+machines" section after your local projects (your local list always goes out
+first and is never delayed by a remote one). It is the **last observed** view
+with its age, never live: for each shared project it shows every provider's
+state, the exact session `live-id`s a sender may pass, and the reason when a
+provider is not usable. `ccb-list --remote` refreshes each host first, under one
+total deadline (`CCB_REMOTE_LIST_TOTAL_TIMEOUT_S`, default 15 s) with at most
+`min(8 s, time left)` per host (`CCB_REMOTE_LIST_TIMEOUT_S`); a host the deadline
+never reached keeps its last observation and is marked `not refreshed (overall
+deadline)`, and a failed refresh is shown next to the last good one.
+`ccb-list --json` is unchanged; `ccb-list --remote-json` and
+`ccb-remote list server --json` give the machine-readable view. Agents use this
+section to turn "ask server demo" into `--peer server::demo`.
+
 ## 9. Send a message
 
 ```bash

@@ -21,6 +21,8 @@ reply path.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -47,7 +49,7 @@ EXIT_UNCONFIRMED = 2
 
 USAGE = """Usage:
   ccb-remote status <host-qualified-id>   Ask the destination for this request's state
-  ccb-remote list <host>                  List the projects this key may address on <host>
+  ccb-remote list <host> [--json]         List the projects this key may address on <host>
   ccb-remote reply <host-qualified-id>    Answer a delivered request (answer on stdin)
   ccb-remote -h                           Show this help
 
@@ -86,10 +88,33 @@ def _cmd_status(argv: list[str]) -> int:
 
 
 def _cmd_list(argv: list[str]) -> int:
-    if len(argv) != 1:
+    as_json = False
+    rest = list(argv)
+    if "--json" in rest:
+        as_json = True
+        rest.remove("--json")
+    if len(rest) != 1:
         print("[ERROR] list requires exactly one configured host alias", file=sys.stderr)
         return EXIT_ERROR
-    result = remote_client.list_projects(argv[0])
+    captured = io.StringIO()
+    result = remote_client.list_projects(rest[0], out=captured, err=sys.stderr)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "host": result.host,
+                    "state": "ok"
+                    if result.exit_code == remote_client.EXIT_ACCEPTED
+                    else "failed",
+                    "reason": result.reason,
+                    "projects": result.projects,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        sys.stdout.write(captured.getvalue())
     return EXIT_OK if result.exit_code == remote_client.EXIT_ACCEPTED else result.exit_code
 
 

@@ -203,6 +203,9 @@ def test_hello_advertises_delivery_only_and_explicit_reply():
         },
         "max_frame": 256 * 1024,
         "proto": {"major": 1, "minor": 1},
+        # M3: `list` replies also carry per-provider availability and the
+        # live-session choices; a sender that predates this ignores the key.
+        "list_sessions": True,
     }
     # No provider beyond Claude/Codex may be advertised.
     assert set(response["capabilities"]["reply_modes"]) == {"claude", "codex"}

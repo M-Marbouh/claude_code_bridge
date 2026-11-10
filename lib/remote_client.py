@@ -51,6 +51,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import remote_discovery
 import remote_protocol as proto
 
 SSH_BIN_ENV = "CCB_SSH_BIN"
@@ -140,6 +141,9 @@ _PROVEN_PRE_ACCEPTANCE_CODES = frozenset(
 _ACCEPTED_DESTINATION_STATES = frozenset(
     {"accepted-pending", "dispatch-in-progress", "delivered"}
 )
+
+#: Provider availability states a `list` reply may report (M3 `list_sessions`).
+_PROVIDER_STATES = frozenset({"present", "absent", "ambiguous", "unavailable"})
 
 _HOST_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _SSH_TARGET_RE = re.compile(r"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -672,6 +676,50 @@ class SshSession:
                 self._proc.wait(timeout=5)
             except Exception:
                 pass
+        self._close_streams()
+
+    #: How long `abort()` may spend confirming a killed child is reaped.
+    ABORT_POLL_S = 0.1
+
+    def abort(self) -> None:
+        """Kill this ssh process NOW; never wait for a graceful shutdown.
+
+        `close()` is right for an ordinary call and wrong for a caller that is
+        already past its deadline: it waits up to 5 s for the process to exit
+        and another 5 s after a kill. Abort therefore closes stdin, issues the
+        kill immediately and spends at most `ABORT_POLL_S` confirming it; the
+        reaping (waitpid plus closing the pipes) is handed to a daemon thread,
+        so no zombie and no leaked pipe is left behind even when the child is
+        slow to die. Never raises.
+        """
+        self._closing = True
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=self.ABORT_POLL_S)
+        except Exception:
+            threading.Thread(
+                target=self._reap, name="ccb-ssh-abort-reap", daemon=True
+            ).start()
+            return
+        self._close_streams()
+
+    def _reap(self) -> None:
+        """Collect a killed child on a daemon thread; never blocks a caller."""
+        try:
+            self._proc.wait(timeout=30)
+        except Exception:
+            pass
+        self._close_streams()
+
+    def _close_streams(self) -> None:
         for stream in (self._proc.stdout, self._proc.stderr):
             try:
                 if stream is not None:
@@ -1408,6 +1456,82 @@ def status(
     return StatusResult(request_id, host.alias, EXIT_ACCEPTED, state=remote_state, history=history)
 
 
+def _advertises_list_sessions(capabilities: dict) -> bool:
+    """Whether the destination's `list` reply carries per-session detail."""
+    return isinstance(capabilities, dict) and capabilities.get("list_sessions") is True
+
+
+def _normalize_provider(item: dict, *, detailed: bool) -> dict:
+    """One provider row as THIS build understands it.
+
+    `provider`/`present` keep the pre-M3 shape exactly. `state`, `reason` and
+    `sessions` are copied only when the destination advertised `list_sessions`
+    -- an older receiver's reply therefore produces the same entry a shipped
+    sender always produced, and an older sender simply ignores the extra keys.
+
+    A session id is kept EXACTLY as reported and only when it passes the
+    protocol's own rule (`proto.valid_session_id`, the same check a submit
+    applies to `dest_session`). An id that fails it is dropped, never
+    shortened: the value is what the destination matches on, so a trimmed copy
+    would name a different session.
+    """
+    entry = {
+        "provider": str(item.get("provider") or ""),
+        "present": bool(item.get("present")),
+    }
+    if not detailed:
+        return entry
+    state = str(item.get("state") or "").strip().lower()
+    entry["state"] = state if state in _PROVIDER_STATES else ""
+    entry["reason"] = " ".join(str(item.get("reason") or "").split())[:200]
+    sessions = []
+    for session in item.get("sessions") if isinstance(item.get("sessions"), list) else []:
+        if not isinstance(session, dict):
+            continue
+        live_id = session.get("live_id")
+        if not proto.valid_session_id(live_id):
+            continue
+        sessions.append({"live_id": live_id, "active": bool(session.get("active"))})
+    entry["sessions"] = sessions
+    return entry
+
+
+def _normalize_list_projects(projects: list, capabilities: dict) -> list[dict]:
+    """The `list` reply reduced to this build's own fields."""
+    detailed = _advertises_list_sessions(capabilities)
+    normalized: list[dict] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        providers = [
+            _normalize_provider(item, detailed=detailed)
+            for item in (project.get("providers") if isinstance(project.get("providers"), list) else [])
+            if isinstance(item, dict)
+        ]
+        normalized.append({"alias": str(project.get("alias") or ""), "providers": providers})
+    return normalized
+
+
+def _default_commit(host: RemoteHost) -> Callable[[str, Any], None]:
+    """The cache commit `list_projects` uses when the caller does not supply one.
+
+    ``("success", projects)`` or ``("failure", reason)``; a cache problem never
+    fails a list. `remote_discovery.refresh` substitutes its own commit so that
+    a refresh whose deadline has passed cannot write anything.
+    """
+
+    def commit(kind: str, payload: Any) -> None:
+        try:
+            if kind == "success":
+                remote_discovery.write_success(host, payload)
+            else:
+                remote_discovery.record_failure(host, str(payload))
+        except Exception:
+            pass
+
+    return commit
+
+
 def list_projects(
     host_alias: str,
     *,
@@ -1415,16 +1539,32 @@ def list_projects(
     hosts: dict[str, RemoteHost] | None = None,
     out: Any = None,
     err: Any = None,
+    timeout_s: float | None = None,
+    commit: Callable[[str, Any], None] | None = None,
 ) -> ListResult:
+    """List the projects this key may address on `host_alias`.
+
+    `timeout_s` bounds the per-operation socket waits (the caller may need a
+    tighter budget than the default); the tool itself is unchanged. A
+    successful reply is cached for `ccb-list`, and a failure records why -- the
+    last good observation is never erased by an outage.
+
+    `commit` is the single place an observation becomes durable: it receives
+    ``("success", projects)`` or ``("failure", reason)``. The default writes the
+    discovery cache; `remote_discovery.refresh` supplies one that refuses to
+    write once its deadline has expired.
+    """
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
     host = host_for(host_alias, hosts=hosts)
-    factory = session_factory or SshSession
+    commit = commit or _default_commit(host)
+    factory = session_factory or (lambda argv: SshSession(argv, timeout_s=timeout_s))
     op_id = "list-1"
     session: SshSession | None = None
+    capabilities: dict = {}
     try:
         session = factory(ssh_argv(host))
-        _hello(session, op_id="hello-1")
+        capabilities = _hello(session, op_id="hello-1")
         session.write_all(
             proto.encode_frame(
                 {
@@ -1438,9 +1578,11 @@ def list_projects(
         response = session.read_frame()
     except SessionError as exc:
         print(f"[ERROR] list unavailable: {exc.detail}", file=err)
+        commit("failure", exc.detail)
         return ListResult(host.alias, EXIT_NOT_DELIVERED, reason=exc.detail, error_code=exc.kind)
     except Exception as exc:
         print(f"[ERROR] list unavailable: {exc}", file=err)
+        commit("failure", str(exc))
         return ListResult(host.alias, EXIT_NOT_DELIVERED, reason=str(exc))
     finally:
         if session is not None:
@@ -1448,30 +1590,33 @@ def list_projects(
 
     if response.get("op_id") != op_id:
         print("[ERROR] unusable list reply: it does not match this request", file=err)
+        commit("failure", "unusable list reply")
         return ListResult(host.alias, EXIT_NOT_DELIVERED, reason="unusable list reply")
     if not response.get("ok"):
         code = _error_code(response)
         if code == proto.ERR_NOT_FOUND:
+            # The destination answered, but this principal may address nothing
+            # here: an unobserved host, not an observation of "no projects".
             print("no destinations authorized on this host", file=out)
+            commit("failure", "no destinations authorized for this key")
             return ListResult(host.alias, EXIT_NOT_DELIVERED, reason="not authorized", error_code=code)
         reason = _error_message(response) or code or "refused"
         print(f"[ERROR] list refused: {reason}", file=err)
+        commit("failure", reason)
         return ListResult(host.alias, EXIT_NOT_DELIVERED, reason=reason, error_code=code)
 
-    projects = response.get("projects") if isinstance(response.get("projects"), list) else []
+    raw_projects = response.get("projects") if isinstance(response.get("projects"), list) else []
+    projects = _normalize_list_projects(raw_projects, capabilities)
     if not projects:
         print("no destinations authorized on this host", file=out)
     for project in projects:
-        if not isinstance(project, dict):
-            continue
         alias = str(project.get("alias") or "")
-        providers = project.get("providers") if isinstance(project.get("providers"), list) else []
         rendered = ", ".join(
             f"{item.get('provider')}={'present' if item.get('present') else 'absent'}"
-            for item in providers
-            if isinstance(item, dict)
+            for item in project.get("providers") or []
         )
         print(f"{alias}\t{rendered}", file=out)
+    commit("success", projects)
     return ListResult(host.alias, EXIT_ACCEPTED, projects=projects)
 
 

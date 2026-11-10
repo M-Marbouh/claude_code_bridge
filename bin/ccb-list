@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,8 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 import askd_rpc
+import remote_client
+import remote_discovery
 from askd_runtime import find_running_state_file
 from compat import setup_windows_encoding
 from ccb_runtime_status import is_project_askd_online
@@ -819,10 +823,154 @@ def _print_human(entries: list[dict[str, Any]]) -> None:
                 print(f"          {provider:<14} pane:{pane_id}  {dot} {state}{suffix}")
 
 
+def _format_age(seconds: Any) -> str:
+    """A short, human age. Never a claim that anything is live."""
+    if not isinstance(seconds, int) or seconds < 0:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _provider_line(item: dict[str, Any]) -> str:
+    """One provider's cached availability, its exact live ids, and its reason.
+
+    Ids are printed WHOLE -- they are the value `--live-id` takes, so shortening
+    one for display would hand back a different session. Only the reason is
+    bounded, and only because the sender already bounds it (200 chars).
+    """
+    provider = str(item.get("provider") or "")
+    state = str(item.get("state") or "").strip().lower()
+    if state not in ("present", "absent", "ambiguous", "unavailable"):
+        # An older receiver reported presence only; say exactly that.
+        state = "present" if item.get("present") else "absent"
+    sessions = item.get("sessions") if isinstance(item.get("sessions"), list) else []
+    ids = [
+        session.get("live_id")
+        for session in sessions
+        if isinstance(session, dict) and isinstance(session.get("live_id"), str)
+    ]
+    line = f"        {provider}  {state}"
+    if ids:
+        count = len(ids)
+        line += f" ({count} session{'s' if count != 1 else ''})  live-id {', '.join(ids)}"
+    reason = " ".join(str(item.get("reason") or "").split())
+    if reason:
+        line += f"  reason: {reason}"
+    return line
+
+
+def _print_remote_section(
+    views: list[dict[str, Any]], skipped: dict[str, str] | None = None
+) -> None:
+    """What each configured host last reported -- never a live claim.
+
+    The header and every host line say `last observed`. A host that was never
+    queried (or whose configured connection changed) is `unknown`; a failed
+    refresh is its own line, so a temporary outage never erases the last good
+    observation above it. A host the overall deadline never reached keeps its
+    last observation and says it was not refreshed.
+    """
+    skipped = skipped or {}
+    print("Other machines (last observed, not live):")
+    for view in views:
+        alias = str(view.get("alias") or "")
+        if view.get("status") == "known":
+            print(
+                f"  {alias}  last observed {_format_age(view.get('age_seconds'))} "
+                f"({view.get('observed_at') or 'unknown time'})"
+            )
+            projects = view.get("projects") if isinstance(view.get("projects"), list) else []
+            if not projects:
+                print("      (no projects shared)")
+            for project in projects:
+                if not isinstance(project, dict):
+                    continue
+                print(f"      {project.get('alias') or ''}")
+                providers = [
+                    item for item in project.get("providers") or [] if isinstance(item, dict)
+                ]
+                if not providers:
+                    print("        (no providers shared)")
+                for item in providers:
+                    print(_provider_line(item))
+        else:
+            print(f"  {alias}  unknown (never checked)")
+        failure = view.get("last_refresh_failure")
+        if isinstance(failure, dict) and failure:
+            print(
+                f"      last refresh failed {_format_age(failure.get('age_seconds'))}: "
+                f"{failure.get('reason') or 'no reason given'}"
+            )
+        if alias in skipped:
+            print(f"      {skipped[alias]}")
+
+
+def _remote_views(hosts: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        remote_discovery.cache_view(alias, host=host)
+        for alias, host in hosts.items()
+    ]
+
+
+def _refresh_remote(hosts: dict[str, Any]) -> dict[str, str]:
+    """Refresh every configured host under ONE total deadline.
+
+    Per host the budget is `min(per-host, remaining)` (`CCB_REMOTE_LIST_TIMEOUT_S`,
+    default 8 s), all of it inside one total budget
+    (`CCB_REMOTE_LIST_TOTAL_TIMEOUT_S`, default 15 s). Hosts the deadline never
+    reached are returned as "not refreshed" markers: their last observation
+    stays, and the caller prints the marker next to it. The list client's own
+    output is captured -- a failure is shown as `last refresh failed ...`, never
+    as stray stdout -- and nothing here can change the local output or the exit
+    code.
+    """
+    per_host = remote_discovery.refresh_timeout_s()
+    deadline = time.monotonic() + remote_discovery.total_refresh_timeout_s()
+    skipped: dict[str, str] = {}
+    for alias, host in hosts.items():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            skipped[alias] = "not refreshed (overall deadline)"
+            continue
+        budget = min(per_host, remaining)
+        try:
+            remote_discovery.refresh(host, timeout_s=budget, out=io.StringIO(), err=io.StringIO())
+        except Exception as exc:
+            remote_discovery.record_failure(host, f"refresh failed: {exc}")
+    return skipped
+
+
+def _configured_hosts() -> dict[str, Any]:
+    """Configured remote hosts, or an empty mapping when there is none.
+
+    No hosts config (or an unusable one) is not an error for `ccb-list`: there
+    is simply nothing to append. It must never fail local discovery either.
+    """
+    try:
+        return remote_client.load_hosts()
+    except Exception:
+        return {}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="List active CCB projects and provider panes.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--stale", action="store_true", help="Include projects with only stale panes.")
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Refresh the other-machines section live before printing (one total deadline).",
+    )
+    parser.add_argument(
+        "--remote-json",
+        action="store_true",
+        help="Print local projects plus the cached other-machines view as JSON.",
+    )
     parser.add_argument("--direct", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -838,10 +986,41 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     else:
         entries = _session_entries(include_stale=args.stale)
-    if args.json:
+
+    # `--json` keeps its exact contract: the local entries array, nothing else.
+    # The remote section is opt-in through `--remote-json` (and live refresh
+    # only through `--remote`).
+    wants_remote = bool(args.remote_json) or not bool(args.json)
+    hosts = _configured_hosts() if wants_remote else {}
+
+    if args.json and not args.remote_json:
         print(json.dumps(entries, ensure_ascii=False, indent=2))
-    else:
-        _print_human(entries)
+        return 0
+
+    if args.remote_json:
+        skipped = _refresh_remote(hosts) if (args.remote and hosts) else {}
+        views = _remote_views(hosts) if hosts else []
+        for view in views:
+            if view.get("alias") in skipped:
+                view["not_refreshed"] = skipped[view["alias"]]
+        print(
+            json.dumps(
+                {
+                    "local": entries,
+                    "remote": {str(view.get("alias")): view for view in views},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    # The local list goes out FIRST and unconditionally: a slow or unreachable
+    # machine can never delay it, hide it, or change the exit code.
+    _print_human(entries)
+    if hosts:
+        skipped = _refresh_remote(hosts) if args.remote else {}
+        _print_remote_section(_remote_views(hosts), skipped)
     return 0
 
 

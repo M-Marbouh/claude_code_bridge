@@ -75,12 +75,18 @@ from remote_journal import (
 
 
 class RemoteError(RuntimeError):
-    """A refusal with a protocol error code and a sender-safe message."""
+    """A refusal with a protocol error code and a sender-safe message.
 
-    def __init__(self, code: str, message: str):
+    ``verdict`` is a structured, closed marker for the few resolver outcomes a
+    caller must act on (``ambiguous``, ``absent``, ``invalid_inventory``,
+    ``unusable``). Callers switch on it; nobody matches on message text.
+    """
+
+    def __init__(self, code: str, message: str, *, verdict: str = ""):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.verdict = verdict
 
 
 @dataclass(frozen=True)
@@ -133,7 +139,9 @@ def resolve_destination(provider: str, work_dir: str, dest_session: str = "") ->
     try:
         project_id = compute_ccb_project_id(Path(work_dir))
     except Exception as exc:
-        raise RemoteError(proto.ERR_DESTINATION_UNAVAILABLE, "destination project is unusable") from exc
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE, "destination project is unusable", verdict="unusable"
+        ) from exc
 
     try:
         entries, _present = _live_entries_for_project(project_id, provider)
@@ -141,6 +149,7 @@ def resolve_destination(provider: str, work_dir: str, dest_session: str = "") ->
         raise RemoteError(
             proto.ERR_DESTINATION_UNAVAILABLE,
             "destination live-session inventory is invalid; refusing to guess",
+            verdict="invalid_inventory",
         ) from None
 
     sessions = [
@@ -160,17 +169,27 @@ def resolve_destination(provider: str, work_dir: str, dest_session: str = "") ->
             f"no live {provider} session"
             + (" with that session id" if dest_session else "")
             + " for the destination project",
+            verdict="absent",
         )
     if len(sessions) > 1:
+        # The ONE refusal a sender must be told about: several live sessions
+        # exist, and the choice is theirs. A legacy launch reaches this with no
+        # usable live ids at all, so the verdict -- never a count of the ids
+        # that survived filtering -- is what the listing reports.
         raise RemoteError(
             proto.ERR_DESTINATION_UNAVAILABLE,
             f"more than one live {provider} session for the destination project; "
             "select one with dest_session",
+            verdict="ambiguous",
         )
     entry_record, session = sessions[0]
     pane_id = str(getattr(session, "pane_id", "") or "").strip()
     if not pane_id:
-        raise RemoteError(proto.ERR_DESTINATION_UNAVAILABLE, "the destination session has no pane id")
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "the destination session has no pane id",
+            verdict="unusable",
+        )
     terminal = str(getattr(session, "terminal", "") or "tmux")
     return Destination(
         provider=provider,
@@ -184,6 +203,54 @@ def resolve_destination(provider: str, work_dir: str, dest_session: str = "") ->
         member_id=_member_id_for_session(entry_record, provider, pane_id),
         pane_pid=_pane_pid(terminal, pane_id),
     )
+
+
+def describe_sessions(provider: str, work_dir: str) -> list[dict]:
+    """The live-session choices a sender could name for this provider/project.
+
+    Read from the SAME authoritative inventory `resolve_destination` uses, so
+    a listed choice is one a submit can actually address. A session without a
+    real live id is omitted on purpose: a legacy launch's derived
+    ``legacy:<launch>:<provider>`` id names a provider slot, not a pane
+    incarnation, so it is never offered as a choice (`present` can still be
+    true there when the resolver accepts that one legacy pane).
+
+    An id is advertised EXACTLY as the inventory holds it, and only when the
+    protocol's own session-id rule accepts it (``proto.valid_session_id``, the
+    same check a submit applies to ``dest_session``); an id that fails it is
+    dropped, never shortened -- a shortened id names a different session.
+
+    Raises `RemoteError` when the inventory is present but broken: that is a
+    refusal to describe the project, not "nothing registered".
+    """
+    from pathlib import Path
+
+    from peer_routing import InvalidInventoryError, _live_entries_for_project
+    from project_id import compute_ccb_project_id
+
+    try:
+        project_id = compute_ccb_project_id(Path(work_dir))
+    except Exception as exc:
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE, "destination project is unusable", verdict="unusable"
+        ) from exc
+    try:
+        entries, _present = _live_entries_for_project(project_id, provider)
+    except InvalidInventoryError:
+        raise RemoteError(
+            proto.ERR_DESTINATION_UNAVAILABLE,
+            "destination live-session inventory is invalid",
+            verdict="invalid_inventory",
+        ) from None
+    sessions = []
+    for _record, session in entries:
+        live_id = getattr(session, "live_id", "")
+        if not isinstance(live_id, str) or live_id.startswith("legacy:"):
+            continue
+        if not proto.valid_session_id(live_id):
+            continue
+        sessions.append({"live_id": live_id, "active": bool(getattr(session, "active", True))})
+    return sessions
 
 
 def _member_id_for_session(record: Any, provider: str, pane_id: str) -> str:
@@ -601,6 +668,7 @@ class RemoteDeliveryService:
         journal: Optional[RemoteJournal] = None,
         config_loader: Optional[Callable[[], RemoteConfig]] = None,
         resolver: Optional[Callable[[str, str, str], Destination]] = None,
+        sessions: Optional[Callable[[str, str], list[dict]]] = None,
         log: Callable[[str], None] = _log_noop,
     ):
         self.registry = registry
@@ -615,6 +683,7 @@ class RemoteDeliveryService:
         self._requeued: set[str] = set()
         self._config_loader = config_loader or (lambda: load_config())
         self._resolver = resolver or (lambda provider, work_dir, session: resolve_destination(provider, work_dir, session))
+        self._sessions = sessions or describe_sessions
         self._log = log
 
     # -- plumbing ------------------------------------------------------- #
@@ -681,6 +750,15 @@ class RemoteDeliveryService:
     # -- verbs ---------------------------------------------------------- #
 
     def handle_list(self, msg: dict) -> dict:
+        """Each alias this principal may address, with per-provider detail.
+
+        Two reads decide a provider's row, in this precedence: `present` is the
+        RESOLVER's own verdict (unchanged since M1), and `state`/`reason` add
+        the structured verdict plus the session choices. `present` always wins
+        where they overlap: a provider the resolver accepted is reported
+        `present`, and `state` can lag behind a registry that changed between
+        the two reads -- the resolver remains the only authority for delivery.
+        """
         principal = str(msg.get("principal") or "").strip()
         try:
             config = self._config()
@@ -694,20 +772,64 @@ class RemoteDeliveryService:
             for provider in alias.providers:
                 if provider not in proto.REMOTE_PROVIDERS:
                     continue
-                providers.append(
-                    {"provider": provider, "present": self._present(provider, alias.work_dir)}
-                )
+                providers.append(self._provider_view(provider, alias.work_dir))
             projects.append({"alias": alias_name, "providers": providers})
         return self._ok(msg, {"projects": projects})
 
-    def _present(self, provider: str, work_dir: str) -> bool:
+    def _provider_view(self, provider: str, work_dir: str) -> dict:
+        """One provider's presence plus its availability and session choices.
+
+        ``present`` keeps EXACTLY its old meaning (the resolver accepted this
+        provider for the alias), so a source that predates `list_sessions`
+        reads the same value it always did. The additive fields answer the
+        question a sender has to ask next: why it is not usable, and which
+        exact live session to name. Both come from the same inventory
+        `resolve_destination` reads -- this never opens a second source, and a
+        legacy launch (no real live ids) simply lists no session choices.
+        """
+        view = {
+            "provider": provider,
+            "present": False,
+            "state": "absent",
+            "reason": "",
+            "sessions": [],
+        }
+        reason = ""
+        verdict = ""
         try:
             self._resolver(provider, work_dir, "")
-            return True
-        except RemoteError:
-            return False
+            view["present"] = True
+        except RemoteError as exc:
+            reason = " ".join(str(exc.message or "").split())[:200]
+            verdict = str(getattr(exc, "verdict", "") or "")
         except Exception:
-            return False
+            reason = "the destination session could not be resolved"
+        try:
+            sessions = self._sessions(provider, work_dir)
+        except RemoteError as exc:
+            view["state"] = "unavailable"
+            view["reason"] = " ".join(str(exc.message or "").split())[:200]
+            return view
+        except Exception:
+            view["state"] = "unavailable"
+            view["reason"] = "the destination sessions could not be listed"
+            return view
+        view["sessions"] = sessions
+        if view["present"]:
+            view["state"] = "present"
+            return view
+        # The resolver's structured verdict decides, never a count of the ids
+        # that survived filtering: a legacy launch reports `ambiguous` while
+        # advertising no session choice at all, and must still say so.
+        state = {
+            "ambiguous": "ambiguous",
+            "invalid_inventory": "unavailable",
+            "unusable": "unavailable",
+            "absent": "absent",
+        }.get(verdict, "absent")
+        view["state"] = state
+        view["reason"] = reason or f"no live {provider} session"
+        return view
 
     def handle_status(self, msg: dict) -> dict:
         principal = str(msg.get("principal") or "").strip()

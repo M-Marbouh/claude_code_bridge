@@ -282,6 +282,98 @@ def cache_view(alias: str, *, host: Any = None, now: datetime | None = None) -> 
 
 
 # --------------------------------------------------------------------------- #
+# Rendering ("Other machines" section, shared by ccb-list and `pair`)
+# --------------------------------------------------------------------------- #
+
+PROVIDER_STATES = ("present", "absent", "ambiguous", "unavailable")
+
+
+def format_age(seconds: Any) -> str:
+    """A short, human age. Never a claim that anything is live."""
+    if not isinstance(seconds, int) or seconds < 0:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def provider_line(item: dict) -> str:
+    """One provider's cached availability, its exact live ids, and its reason.
+
+    Ids are printed WHOLE -- they are the value `--live-id` takes, so shortening
+    one for display would hand back a different session.
+    """
+    provider = str(item.get("provider") or "")
+    state = str(item.get("state") or "").strip().lower()
+    if state not in PROVIDER_STATES:
+        # An older receiver reported presence only; say exactly that.
+        state = "present" if item.get("present") else "absent"
+    sessions = item.get("sessions") if isinstance(item.get("sessions"), list) else []
+    ids = [
+        session.get("live_id")
+        for session in sessions
+        if isinstance(session, dict) and isinstance(session.get("live_id"), str)
+    ]
+    line = f"        {provider}  {state}"
+    if ids:
+        count = len(ids)
+        line += f" ({count} session{'s' if count != 1 else ''})  live-id {', '.join(ids)}"
+    reason = " ".join(str(item.get("reason") or "").split())
+    if reason:
+        line += f"  reason: {reason}"
+    return line
+
+
+def section_lines(views: list[dict], skipped: dict[str, str] | None = None) -> list[str]:
+    """The "Other machines (last observed, not live)" block, as printed lines.
+
+    The header and every host line say `last observed`. A host that was never
+    queried (or whose configured connection changed) is `unknown`; a failed
+    refresh is its own line, so a temporary outage never erases the last good
+    observation above it. A host the overall deadline never reached keeps its
+    last observation and says it was not refreshed.
+    """
+    skipped = skipped or {}
+    lines = ["Other machines (last observed, not live):"]
+    for view in views:
+        alias = str(view.get("alias") or "")
+        if view.get("status") == "known":
+            lines.append(
+                f"  {alias}  last observed {format_age(view.get('age_seconds'))} "
+                f"({view.get('observed_at') or 'unknown time'})"
+            )
+            projects = view.get("projects") if isinstance(view.get("projects"), list) else []
+            if not projects:
+                lines.append("      (no projects shared)")
+            for project in projects:
+                if not isinstance(project, dict):
+                    continue
+                lines.append(f"      {project.get('alias') or ''}")
+                providers = [
+                    item for item in project.get("providers") or [] if isinstance(item, dict)
+                ]
+                if not providers:
+                    lines.append("        (no providers shared)")
+                for item in providers:
+                    lines.append(provider_line(item))
+        else:
+            lines.append(f"  {alias}  unknown (never checked)")
+        failure = view.get("last_refresh_failure")
+        if isinstance(failure, dict) and failure:
+            lines.append(
+                f"      last refresh failed {format_age(failure.get('age_seconds'))}: "
+                f"{failure.get('reason') or 'no reason given'}"
+            )
+        if alias in skipped:
+            lines.append(f"      {skipped[alias]}")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
 # Writing
 # --------------------------------------------------------------------------- #
 

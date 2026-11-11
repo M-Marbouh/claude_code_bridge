@@ -32,14 +32,18 @@ transport, and one fixed command runs on the destination.
   below limits *where* a message may go. It does not limit *what* the receiving
   agent can do, and it is not a sandbox.
 - **Use a dedicated key per direction**, held only for this purpose. Do not reuse
-  your login key or an agent-forwarded identity.
+  your login key or an agent-forwarded identity. The key `ccb-remote pair`
+  installs can only run the CCB gate; the setup verbs (`ccb-remote pairing ...`)
+  are reachable over your **normal** SSH login and are deliberately refused by
+  the gate, so the restricted key can never re-pair or revoke anything.
 - **Restrict the key line** with `restrict,command="…"` (below). That is what
   makes the key unable to run anything except the CCB gate: no shell, no PTY, no
   port forwarding, no SFTP.
 - **A relayed message is a request, never an approval.** Whatever the text says
   about permissions, the destination's own rules still apply.
 - **Pin the destination host key and check the fingerprint** before your first
-  message (Step 5). Without that check, SSH would happily talk to an impostor.
+  message (Step 5a, or `ccb-remote pair`, which refuses until the machine is
+  verified). Without that check, SSH would happily talk to an impostor.
 
 ---
 
@@ -127,7 +131,84 @@ TOKEN=alice1
 
 ---
 
-## 2. On the laptop (A): make a dedicated key
+## 2. Quick setup: `ccb-remote pair`
+
+One guided command on A replaces the manual steps 2a-6a below. It writes the
+same artefacts, in this order, and shows you the exact change for **both**
+machines before writing anything:
+
+```bash
+# on A, with normal SSH access to B already working
+ccb-remote pair server
+```
+
+- It uses **your own ssh login** on B (the restricted key does not exist yet),
+  and refuses to continue unless it can verify B's host key: either B is
+  already in your `~/.ssh/known_hosts`, or you pass
+  `--fingerprint SHA256:...` with a value you verified out of band. Nothing is
+  written before that check.
+- It reads B's CCB projects (read-only) and lets you pick which this machine may
+  address, under which alias, and with which providers. Defaults are the folder
+  name and `claude,codex`.
+- Then it shows the concrete diff — the `authorized_keys` line and config
+  entries for B, the key, host-key pin and `hosts.json` entry for A — and waits
+  for you to type `yes`.
+- Afterwards it runs `ccb-remote list <alias>`, which also fills the
+  "Other machines" section of `ccb-list`, and prints an example `ask` line.
+- Re-running it is safe and is the recovery path: it reuses the same key,
+  principal and token from its own pairing record
+  (`~/.ccb/remote/pairings/<alias>.json`), adds only what is missing, and tells
+  you exactly which steps are done if it stops halfway. `--yes` only skips the
+  prompts — trust, conflict and "the machine changed" checks always run.
+- On B it commits the **grant before the key line**, so an interrupted run
+  leaves a principal that cannot log in yet (denied) rather than a key with no
+  grant; a retry finishes it. On A it merges both `known_hosts` and
+  `hosts.json` under a lock, so a second pairing never loses the first one's
+  entries.
+- It reports `paired` only after that machine answers `hello` + `list`. If it
+  stops earlier, the pairing is written but unverified — start CCB there and
+  run `ccb-remote list <alias>`.
+- If your ssh config uses a ProxyJump/ProxyCommand, a ControlMaster socket or a
+  `HostName` rewrite for that machine, pairing refuses: those change which
+  machine or which key check is in play. Connect directly (or use the manual
+  steps) and try again.
+- A host key that is already pinned differently is never replaced silently: if
+  the machine was deliberately re-keyed, verify the new fingerprint out of band
+  and pass `--rotate-pin`.
+
+Flags exist for every prompt (`--destination`, `--port`, `--principal`,
+`--token`, `--key`, `--share ALIAS[=WORK_DIR]`, `--shares-json`,
+`--remote-ccb`, `--yes`). Two of them are for machines whose ssh setup is not
+the default: `--known-hosts PATH` names the known_hosts file that verifies B
+(when yours is not `~/.ssh/known_hosts`), and `--pairing-identity PATH` picks
+the login key for the pairing connection (when your ssh would not). When A
+cannot reach B at all, `ccb-remote pair <alias> --print-remote-steps` prints the
+exact JSON and command to run on B by hand, and still prepares A. That mode
+still needs a normal ssh login to B for its read-only inspection; if you have
+none, use [Manual setup](#manual-setup) below instead of `pair`.
+
+Removing a pairing works the same way, from A:
+
+```bash
+ccb-remote unpair server
+```
+
+It asks B to remove **only** this pairing's key line and principal grant
+(shared aliases stay; so does a key or pin another host entry still uses), after
+proving it is the same pairing by principal, key and issuer token against a
+freshly read state. Then it forgets the key, the pin for that endpoint, the
+`hosts.json` entry, the pairing record and the cached discovery here. If B cannot be reached it
+says **remote revocation PENDING**, prints the exact command to run there, and
+exits non-zero; it never claims success from local deletion alone
+(`--local-only` forgets the local half while still reporting the pending grant).
+
+The manual steps below produce exactly the same state if you prefer to do each
+one yourself, need the hardened separate-account profile, or have no normal ssh
+login to B (the mode `pair` needs even for its read-only inspection).
+
+## Manual setup
+
+### 2a. On the laptop (A): make a dedicated key
 
 ```bash
 mkdir -p ~/.ccb/remote/keys
@@ -146,7 +227,7 @@ for you (`~/.ccb/remote/keys/server` works); other shell syntax
 
 ---
 
-## 3. On the server (B): install the restricted key line
+### 3a. On the server (B): install the restricted key line
 
 Find the gate's absolute path **on B** and create the `authorized_keys` line:
 
@@ -180,7 +261,7 @@ restrict,command="/home/bob/.local/share/codex-dual/bin/ccb-remote-gate --princi
 `restrict` turns off PTY, agent/X11 forwarding, port forwarding and `~/.ssh/rc`
 for this key; `command=` fixes what the key can run. Nothing else is exposed.
 
-## 4. On the server (B): the destination config
+### 4a. On the server (B): the destination config
 
 B needs to know which principal may reach which project. Create
 `~/.ccb/remote/config.json`:
@@ -217,7 +298,7 @@ chmod 600 ~/.ccb/remote/config.json
 To give another machine access later, add a second principal and its own key
 line — never share the first key.
 
-## 5. On the laptop (A): pin the server's host key, with verification
+### 5a. On the laptop (A): pin the server's host key, with verification
 
 Do **not** let SSH trust on first use: `ssh-keyscan` is unauthenticated, so the
 only thing that makes the pinned key trustworthy is comparing its fingerprint
@@ -246,43 +327,73 @@ The two fingerprints must be identical, character for character. If they differ,
 stop: something is intercepting the connection.
 
 Step 3 — only then install the pin and clean up (`ssh-keyscan -p` already prints
-the `[host]:port` form a non-default port needs):
+the `[host]:port` form a non-default port needs). **Merge, do not copy**: this
+file holds the pins for *every* machine you send to, so replacing it would
+silently drop another host's pin. Append only this endpoint's lines and remove
+any older line for the same endpoint first:
 
 ```bash
 # on A
 mkdir -p ~/.ccb/remote && chmod 700 ~/.ccb/remote
-cp "$PIN/hostkey" ~/.ccb/remote/known_hosts
-chmod 600 ~/.ccb/remote/known_hosts
-cat ~/.ccb/remote/known_hosts       # server.example.com ssh-ed25519 AAAA...  ([host]:port on a non-22 port)
+KNOWN="$HOME/.ccb/remote/known_hosts"
+touch "$KNOWN" && chmod 600 "$KNOWN"
+# drop only THIS endpoint's old line(s), keep every other host:
+grep -v -F -e "$HOST " -e "[$HOST]:$PORT " "$KNOWN" > "$KNOWN.new" || true
+cat "$PIN/hostkey" >> "$KNOWN.new"
+mv "$KNOWN.new" "$KNOWN"
+chmod 600 "$KNOWN"
+cat "$KNOWN"                        # every host you are paired with
 rm -rf "$PIN"
 ```
 
 This file is the only host-key source that cross-machine delivery uses; the
 user's `~/.ssh/config` and global known-hosts files are deliberately ignored.
 
-## 6. On the laptop (A): the host config
+### 6a. On the laptop (A): the host config
 
 `~/.ccb/remote/hosts.json` names the host alias you will type, and the key,
-token and pinned host key to use for it:
+token and pinned host key to use for it. **Merge, do not overwrite** — this file
+holds an entry for *every* machine you send to, so `cat >` would silently drop
+the others:
 
 ```bash
 mkdir -p ~/.ccb/remote && chmod 700 ~/.ccb/remote
-cat > ~/.ccb/remote/hosts.json <<JSON
+python3 -c 'import json, os, pathlib
+path = pathlib.Path.home() / ".ccb" / "remote" / "hosts.json"
+document = json.loads(path.read_text()) if path.exists() else {"hosts": {}}
+document.setdefault("hosts", {})[os.environ["CCB_HOST"]] = {
+    "ssh_target": os.environ["DEST_USER"] + "@" + os.environ["HOST"],
+    "port": int(os.environ["PORT"]),
+    "identity_file": str(pathlib.Path.home() / ".ccb/remote/keys/server"),
+    "known_hosts": str(pathlib.Path.home() / ".ccb/remote/known_hosts"),
+    "issuer_token": os.environ["TOKEN"],
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(document, indent=2) + "\n")
+path.chmod(0o600)'
+cat ~/.ccb/remote/hosts.json
+```
+
+The entry it adds (or replaces, for that alias only) is:
+
+```json
 {
   "hosts": {
-    "$CCB_HOST": {
-      "ssh_target": "$DEST_USER@$HOST",
-      "port": $PORT,
-      "identity_file": "~/.ccb/remote/keys/server",
-      "known_hosts": "~/.ccb/remote/known_hosts",
-      "issuer_token": "$TOKEN"
+    "server": {
+      "ssh_target": "bob@server.example.com",
+      "port": 22,
+      "identity_file": "/home/alice/.ccb/remote/keys/server",
+      "known_hosts": "/home/alice/.ccb/remote/known_hosts",
+      "issuer_token": "alice1"
     }
   }
 }
-JSON
-chmod 600 ~/.ccb/remote/hosts.json
-cat ~/.ccb/remote/hosts.json
 ```
+
+To edit by hand, load the file, set `hosts[<alias>]`, and write it back — never
+start from an empty document. To remove one machine later, delete only its
+entry, or use `ccb-remote unpair <alias>`, which also revokes the grant on the
+other side.
 
 (`$HOST` must be the resolvable name or IP — not an `~/.ssh/config` alias — and
 `port` must be explicit, because CCB runs `ssh -F /dev/null`.)
@@ -328,7 +439,7 @@ demo	codex=present, claude=absent
 ```
 
 If you see `no destinations authorized on this host`, the principal, token or
-alias rules do not line up — compare Step 3/4 on B with Step 6 on A.
+alias rules do not line up — compare Step 3a/4a on B with Step 6a on A.
 
 Every successful `list` is remembered on A, so `ccb-list` prints an "Other
 machines" section after your local projects (your local list always goes out
@@ -588,13 +699,13 @@ reason" in §11); `ccb-remote status` itself prints the state only.
 
 | What you see | What it means | What to do |
 | --- | --- | --- |
-| `state=not-delivered (ssh exited 255: bob@server: Permission denied (publickey).)` | SSH refused the login. The sender shows ssh's own last lines, so this is the real cause. | Check, in order: the `authorized_keys` line (Step 3) and the key path in `hosts.json`; the shell (`getent passwd bob` → not `nologin`/`false`); the account's lock state (`sudo passwd -S bob`); and `AllowUsers`/`AllowGroups` (`sudo sshd -T \| grep -i allow`). B's auth log names the cause: `account is locked`, `not listed in AllowUsers`, or `Failed publickey`. Only for a key-only account, `sudo usermod -p '*' bob` clears the lock (it replaces the password hash — see Step 1). |
-| `state=not-delivered (ssh exited 255: … Host key for [host]:port has changed … \| Host key verification failed.)` | The pinned host key does not match. | Re-verify out-of-band (Step 5) before touching `known_hosts`. Never "just" delete the line. |
+| `state=not-delivered (ssh exited 255: bob@server: Permission denied (publickey).)` | SSH refused the login. The sender shows ssh's own last lines, so this is the real cause. | Check, in order: the `authorized_keys` line (Step 3a) and the key path in `hosts.json`; the shell (`getent passwd bob` → not `nologin`/`false`); the account's lock state (`sudo passwd -S bob`); and `AllowUsers`/`AllowGroups` (`sudo sshd -T \| grep -i allow`). B's auth log names the cause: `account is locked`, `not listed in AllowUsers`, or `Failed publickey`. Only for a key-only account, `sudo usermod -p '*' bob` clears the lock (it replaces the password hash — see Step 1). |
+| `state=not-delivered (ssh exited 255: … Host key for [host]:port has changed … \| Host key verification failed.)` | The pinned host key does not match. | Re-verify out-of-band (Step 5a) before touching `known_hosts`. Never "just" delete the line. |
 | `state=not-delivered (ssh exited 255: ssh: connect to host … port …: Connection refused)` | SSH is not reachable. | No bytes were sent. Fix SSH or the port, retry. |
 | `state=not-delivered (malformed response: frame_too_large \| response text: This account is currently not available.)` | The account's shell is `nologin`/`false`; its notice arrives on the protocol stream instead of the forced command. | Give B's account a real login shell (Step 1), e.g. `sudo usermod -s /bin/bash bob`. |
 | `state=not-delivered (the destination closed the connection without a response)` (no `ssh exited` part) | ssh was still running when the connection dropped, so there is no exit status to quote. | Fall back to plain SSH to see the whole picture: `ssh -v -i ~/.ccb/remote/keys/server -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ccb/remote/known_hosts -o StrictHostKeyChecking=yes -p "$PORT" "$DEST_USER@$HOST"`. |
 | `[WARN] CCB_CALLER not set; using 'manual'.` | You ran `ask` outside a CCB pane. | Harmless for delivery (the caller is recorded as an audit claim), or run it from a CCB pane / set `CCB_CALLER=claude` (or `codex`). |
-| `state=not-delivered (the destination refused the request: unauthorized (…))` | The principal, token or alias did not line up. | Compare the principal name and `issuer_token` in Step 3/4 on B with Step 6 on A, and that the alias is in `allowed_aliases`. |
+| `state=not-delivered (the destination refused the request: unauthorized (…))` | The principal, token or alias did not line up. | Compare the principal name and `issuer_token` in Step 3a/4a on B with Step 6a on A, and that the alias is in `allowed_aliases`. |
 | `… unsupported_provider (provider is not allowed for that destination)` | The alias does not list that provider. | Add it to `aliases.<alias>.providers` on B. |
 | `state=not-delivered (… daemon_unavailable …)` | B has no reachable CCB daemon. | Start CCB on B in the project (Step 7). |
 | `state=not-delivered (… destination_unavailable (no live codex session for the destination project))` | The project has no live session for that provider. | Start that provider on B. |
@@ -627,7 +738,20 @@ reason" in §11); `ccb-remote status` itself prints the state only.
 
 ## 13. Turning it off
 
-Do this on B, in two steps, and understand what each one covers:
+If you paired with `ccb-remote pair`, turn it off from A:
+
+```bash
+ccb-remote unpair server
+```
+
+That asks B to remove this pairing's key line and principal grant, then removes
+the key, the pin for that endpoint, the `hosts.json` entry and the cached
+discovery here. It keeps shared aliases, and if B cannot be reached it reports
+**remote revocation PENDING** with the exact command to run there and exits
+non-zero.
+
+Without the command, do this on B, in two steps, and understand what each one
+covers:
 
 1. **Remove the key line** from the destination account's
    `~/.ssh/authorized_keys` — delete the one line that begins
@@ -667,7 +791,8 @@ Not yet, by design of this preview:
 - **Pull-based.** B never connects back: A fetches the answer (`--wait`,
   `--background` via its own CCB daemon, or `pend`). If A is offline, B keeps the
   answer and A collects it later.
-- **No setup command.** Manual steps (this guide) only.
+- **No hardened pairing profile.** `ccb-remote pair` implements the generic
+  same-user setup; the separate-account profile stays manual (below).
 - **No retention or cleanup policy.** Journal records and receipts stay until you
   remove them; a request is never replayed automatically.
 - **No cancellation.** Once delivered, the receiving agent may already have acted.

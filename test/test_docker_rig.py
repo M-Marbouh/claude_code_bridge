@@ -1060,6 +1060,140 @@ def test_row20_unauthorised_principal_fetch_is_identical_not_found(rig: Rig):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# M3 W3 rows: guided pairing against a real sshd
+# --------------------------------------------------------------------------- #
+
+PAIR_ALIAS = "paired"
+PAIR_PRINCIPAL = "rig-paired"
+PAIR_TOKEN = "rigp1"
+PAIR_REMOTE_CCB = "/home/b/.local/share/codex-dual/bin/ccb-remote"
+ROW21_ANSWER = "row21 answer from a paired machine\n"
+
+
+def _pair(rig: Rig, *extra: str, timeout: float = 300):
+    return rig.remote(
+        "pair", PAIR_ALIAS,
+        "--destination", "b@127.0.0.1",
+        "--port", str(rig.port),
+        "--principal", PAIR_PRINCIPAL,
+        "--token", PAIR_TOKEN,
+        "--share", f"demo={DEST_PROJECT}",
+        "--remote-ccb", PAIR_REMOTE_CCB,
+        # The pairing channel is the user's normal ssh login; the rig names the
+        # verified host key and the login key explicitly (its HOME is isolated,
+        # and ssh expands `~` from the passwd entry, not $HOME).
+        "--known-hosts", rig.pairing_known_hosts(),
+        "--pairing-identity", rig.pairing_identity(),
+        "--yes", *extra, timeout=timeout,
+    )
+
+
+def _dest_config(rig: Rig) -> dict:
+    return json.loads(rig.dest_file("/home/b/.ccb/remote/config.json") or "{}")
+
+
+def test_row21_pair_end_to_end_then_ask_succeeds(rig: Rig):
+    rig.reset_destination()
+    rig.clear_stub_log()
+    rig.set_stub_config(mode="reply", answer=ROW21_ANSWER)
+
+    paired = _pair(rig)
+
+    assert paired.returncode == 0, (paired.stdout, paired.stderr)
+    assert "paired." in paired.stdout
+    # Destination side: the new restricted line sits beside the existing ones.
+    keys = rig.dest_file("/home/b/.ssh/authorized_keys")
+    assert f"--principal {PAIR_PRINCIPAL}" in keys
+    assert "--principal rig-a" in keys  # untouched
+    config = _dest_config(rig)
+    grant = dict(config["principals"][PAIR_PRINCIPAL])
+    assert grant.pop("pubkey_sha256")  # B5 ownership evidence
+    assert grant == {
+        "issuer_token": PAIR_TOKEN,
+        "allowed_aliases": ["demo"],
+    }
+    assert config["aliases"]["demo"]["work_dir"] == DEST_PROJECT
+    # Source side: key, pin, host entry -- all written where CCB looks.
+    home = rig.remote_home()
+    hosts = json.loads((home / ".ccb" / "remote" / "hosts.json").read_text())
+    entry = hosts["hosts"][PAIR_ALIAS]
+    assert entry["ssh_target"] == "b@127.0.0.1" and entry["port"] == rig.port
+    assert entry["issuer_token"] == PAIR_TOKEN
+    assert Path(entry["identity_file"]).is_file()
+    # The other configured hosts survived the merge.
+    assert {"rig", "rigx", "rigb", "badkey"} <= set(hosts["hosts"])
+    pin = (home / ".ccb" / "remote" / "known_hosts").read_text()
+    assert f"[127.0.0.1]:{rig.port}" in pin
+    assert (home / ".ccb" / "remote" / "pairings" / f"{PAIR_ALIAS}.json").is_file()
+
+    # And the pairing actually carries a reply-expected message end to end.
+    marker = "ROW21-PAIRED-MARKER"
+    waited = rig.ask(
+        "codex", "--peer", f"{PAIR_ALIAS}::demo", "--wait", "--timeout", "120",
+        f"{marker} body", timeout=300,
+    )
+    assert waited.returncode == 0, (waited.stdout, waited.stderr)
+    assert waited.stdout.endswith(ROW21_ANSWER)
+    receipt = rig.latest_receipt()
+    assert receipt["state"] == "fetched", receipt
+    assert receipt["reply_text"] == ROW21_ANSWER
+    record = _wait_record(rig, receipt["request_id"], {"answered"})
+    assert record and record["state"] == "answered", rig.journal()
+    assert rig.stub_log().count(marker) == 1
+    print("ROW21 pair+ask ok:", receipt["request_id"], repr(ROW21_ANSWER))
+
+
+def test_row22_pair_repeat_is_a_noop(rig: Rig):
+    home = rig.remote_home()
+    keys_before = rig.dest_bytes("/home/b/.ssh/authorized_keys")
+    config_before = rig.dest_bytes("/home/b/.ccb/remote/config.json")
+    key_before = (home / ".ccb" / "remote" / "keys" / PAIR_ALIAS).read_bytes()
+    hosts_before = (home / ".ccb" / "remote" / "hosts.json").read_text()
+
+    again = _pair(rig)
+
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    assert "reused key" in again.stdout
+    assert rig.dest_bytes("/home/b/.ssh/authorized_keys") == keys_before
+    assert rig.dest_bytes("/home/b/.ccb/remote/config.json") == config_before
+    assert (home / ".ccb" / "remote" / "keys" / PAIR_ALIAS).read_bytes() == key_before
+    assert (home / ".ccb" / "remote" / "hosts.json").read_text() == hosts_before
+    assert rig.dest_file("/home/b/.ssh/authorized_keys").count(f"--principal {PAIR_PRINCIPAL}") == 1
+    print("ROW22 repeat is a no-op")
+
+
+def test_row23_unpair_revokes_its_grant_and_ask_is_refused(rig: Rig):
+    home = rig.remote_home()
+
+    removed = rig.remote(
+        "unpair", PAIR_ALIAS,
+        "--pairing-identity", rig.pairing_identity(),
+        "--yes", timeout=300,
+    )
+
+    assert removed.returncode == 0, (removed.stdout, removed.stderr)
+    keys = rig.dest_file("/home/b/.ssh/authorized_keys")
+    assert f"--principal {PAIR_PRINCIPAL}" not in keys
+    assert "--principal rig-a" in keys  # another principal's line survives
+    config = _dest_config(rig)
+    assert PAIR_PRINCIPAL not in config["principals"]
+    assert "rig-a" in config["principals"]
+    # The shared alias stays: it serves the other principal too.
+    assert config["aliases"]["demo"]["work_dir"] == DEST_PROJECT
+    # Local state is gone: host entry, key, this endpoint's pin, discovery cache.
+    hosts = json.loads((home / ".ccb" / "remote" / "hosts.json").read_text())
+    assert PAIR_ALIAS not in hosts["hosts"]
+    assert not (home / ".ccb" / "remote" / "keys" / PAIR_ALIAS).exists()
+    assert f"[127.0.0.1]:{rig.port}" not in (home / ".ccb" / "remote" / "known_hosts").read_text()
+    assert not (home / ".ccb" / "remote" / "discovery" / f"{PAIR_ALIAS}.json").exists()
+
+    refused = rig.ask("codex", "--peer", f"{PAIR_ALIAS}::demo", "--notify", "row23 after unpair")
+    assert refused.returncode != 0, (refused.stdout, refused.stderr)
+    assert PAIR_ALIAS in (refused.stderr or refused.stdout)
+    print("ROW23 unpair ok:", removed.stdout.strip().splitlines()[:2])
+
+
 def test_row14_rig_is_skipped_without_the_environment_variable(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "CCB_DOCKER_RIG"}
     if _REAL_HOME:

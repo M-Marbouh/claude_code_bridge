@@ -51,6 +51,9 @@ USAGE = """Usage:
   ccb-remote status <host-qualified-id>   Ask the destination for this request's state
   ccb-remote list <host> [--json]         List the projects this key may address on <host>
   ccb-remote reply <host-qualified-id>    Answer a delivered request (answer on stdin)
+  ccb-remote pair [<alias>]               Guided setup: let this machine reach another one
+  ccb-remote unpair <alias>               Remove that pairing and revoke its grant
+  ccb-remote pairing <verb>               Destination side, JSON on stdin (used by `pair`)
   ccb-remote -h                           Show this help
 
 `reply` runs on the machine that received the request, from the pane that
@@ -274,6 +277,216 @@ def _cmd_reply(argv: list[str]) -> int:
     return EXIT_ERROR
 
 
+def _cmd_pairing(argv: list[str]) -> int:
+    """Destination side of `pair`: one JSON request in, one JSON result out.
+
+    Runs over the user's NORMAL ssh login (the restricted key cannot run this),
+    so it must never prompt and never print anything but its JSON result. Any
+    failure -- including a bug -- becomes `{"ok": false, ...}` rather than a
+    traceback on the protocol stream.
+    """
+    import remote_pairing
+
+    verb = argv[0] if len(argv) == 1 else ""
+    if verb not in ("inspect", "apply", "revoke"):
+        print(json.dumps({"ok": False, "error": "pairing needs exactly one of: inspect, apply, revoke"}))
+        return EXIT_ERROR
+    try:
+        raw = sys.stdin.read()
+        request = json.loads(raw) if raw.strip() else {}
+        if not isinstance(request, dict):
+            request = {}
+    except ValueError:
+        print(json.dumps({"ok": False, "error": "the pairing request is not valid JSON"}))
+        return EXIT_ERROR
+
+    gate = Path(__file__).resolve().parent / "ccb-remote-gate"
+    try:
+        if verb == "inspect":
+            result = remote_pairing.inspect_destination(
+                gate_path=gate,
+                lookup_principal=str(request.get("lookup_principal") or ""),
+                lookup_pubkey=str(request.get("lookup_pubkey") or ""),
+            )
+        elif verb == "apply":
+            result = remote_pairing.apply_destination(request, gate_path=gate)
+        else:
+            result = remote_pairing.revoke_destination(request, gate_path=gate)
+    except remote_pairing.PairingError as exc:
+        payload = {"ok": False, "error": str(exc)}
+        if getattr(exc, "refused", False):
+            # B4: a refusal that provably happened before any write may be
+            # promised as "nothing was written". A failure after a write
+            # started (or a bug) carries no such promise, because it does not
+            # know what is on disk.
+            payload["refused"] = True
+        if getattr(exc, "stale", False):
+            # The machine moved under this approval: the approved scope is
+            # still good, so the source keeps its half and the retry resumes.
+            payload["stale"] = True
+        print(json.dumps(payload))
+        return EXIT_ERROR
+    except Exception as exc:  # a bug must not leak a traceback to the caller
+        print(json.dumps({"ok": False, "error": f"pairing failed ({type(exc).__name__})"}))
+        return EXIT_ERROR
+    print(json.dumps(result))
+    return EXIT_OK
+
+
+def _cmd_pair(argv: list[str]) -> int:
+    import argparse
+
+    import remote_pair_cli
+    import remote_pairing
+
+    parser = argparse.ArgumentParser(
+        prog="ccb-remote pair",
+        description="Guided setup: let this machine send to another machine's CCB projects.",
+    )
+    parser.add_argument("alias", nargs="?", default="", help="host alias to type (for example: server)")
+    parser.add_argument("--destination", default="", help="ssh destination [user@]host")
+    parser.add_argument("--port", type=int, default=22, help="ssh port (default 22)")
+    parser.add_argument("--principal", default="", help="principal name this machine gets on the other side")
+    parser.add_argument("--token", default="", help="issuer token (a label, shared with the other side)")
+    parser.add_argument("--key", default="", help="identity file (default ~/.ccb/remote/keys/<alias>)")
+    parser.add_argument(
+        "--fingerprint",
+        default="",
+        help="verified host-key fingerprint (SHA256:...) when this machine has not connected before",
+    )
+    parser.add_argument(
+        "--remote-ccb",
+        default="",
+        help="ccb-remote path on the other machine (default ~/.local/bin/ccb-remote)",
+    )
+    parser.add_argument(
+        "--known-hosts",
+        default="",
+        help="the known_hosts file that verifies that machine (default: your ssh's own)",
+    )
+    parser.add_argument(
+        "--pairing-identity",
+        default="",
+        help="login identity for the pairing connection (default: what your ssh picks)",
+    )
+    parser.add_argument(
+        "--share",
+        action="append",
+        default=[],
+        metavar="ALIAS[=WORK_DIR]",
+        help="project to share, repeatable (default: choose from the list)",
+    )
+    parser.add_argument(
+        "--shares-json",
+        default="",
+        help='exact shares as JSON: {"demo": {"work_dir": "/srv/demo", "providers": ["claude"]}}',
+    )
+    parser.add_argument(
+        "--providers", default="claude,codex", help="default providers for shared projects"
+    )
+    parser.add_argument("--yes", action="store_true", help="no prompts (for scripts and tests)")
+    parser.add_argument(
+        "--print-remote-steps",
+        action="store_true",
+        help=(
+            "print the exact command to run on the other machine instead of applying it "
+            "there (the read-only inspect still uses your ssh login; with no login there, "
+            "follow the guide's 'Manual setup' section)"
+        ),
+    )
+    parser.add_argument(
+        "--rotate-pin",
+        action="store_true",
+        help="replace a DIFFERENT existing host key pin for that machine (after verifying it)",
+    )
+    parsed = parser.parse_args(argv)
+
+    shares: dict[str, dict] = {}
+    share_specs: list[str] = []
+    for spec in parsed.share:
+        # ALIAS=WORK_DIR pins an explicit directory now; a bare ALIAS is
+        # resolved against the projects found on the other machine later.
+        alias_part, _, work_dir = spec.partition("=")
+        alias = alias_part.strip()
+        if not alias:
+            print("[ERROR] --share needs an alias", file=sys.stderr)
+            return EXIT_ERROR
+        try:
+            entry_alias = remote_pairing.validate_alias(alias, "project alias")
+            if work_dir.strip():
+                shares[entry_alias] = {
+                    "alias": entry_alias,
+                    "work_dir": remote_pairing.validate_work_dir(work_dir),
+                    "providers": list(remote_pairing.validate_providers(parsed.providers)),
+                }
+            else:
+                share_specs.append(f"{entry_alias}=")
+        except remote_pairing.PairingError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    options = remote_pair_cli.PairOptions(
+        alias=parsed.alias,
+        destination=parsed.destination,
+        port=parsed.port,
+        principal=parsed.principal,
+        token=parsed.token,
+        key_path=parsed.key,
+        fingerprint=parsed.fingerprint,
+        remote_ccb=parsed.remote_ccb,
+        known_hosts=parsed.known_hosts,
+        identity=parsed.pairing_identity,
+        providers=tuple(remote_pairing.validate_providers(parsed.providers)),
+        shares=shares,
+        shares_json=parsed.shares_json,
+        yes=parsed.yes,
+        print_remote_steps=parsed.print_remote_steps,
+        rotate_pin=parsed.rotate_pin,
+        share_specs=share_specs,
+    )
+    return remote_pair_cli.pair(options)
+
+
+def _cmd_unpair(argv: list[str]) -> int:
+    import argparse
+
+    import remote_pair_cli
+
+    parser = argparse.ArgumentParser(
+        prog="ccb-remote unpair",
+        description="Remove a pairing on this machine and revoke its grant on the other one.",
+    )
+    parser.add_argument("alias", nargs="?", default="", help="host alias to remove")
+    parser.add_argument("--principal", default="", help="principal used by that pairing")
+    parser.add_argument("--destination", default="", help="ssh destination [user@]host")
+    parser.add_argument("--port", type=int, default=22, help="ssh port")
+    parser.add_argument("--remote-ccb", default="", help="ccb-remote path on the other machine")
+    parser.add_argument(
+        "--known-hosts", default="", help="the known_hosts file that verifies that machine"
+    )
+    parser.add_argument(
+        "--pairing-identity", default="", help="login identity for the pairing connection"
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="forget it here even if the remote revocation could not be confirmed",
+    )
+    parser.add_argument("--yes", action="store_true", help="no prompts (for scripts and tests)")
+    parsed = parser.parse_args(argv)
+    options = remote_pair_cli.UnpairOptions(
+        alias=parsed.alias,
+        local_only=parsed.local_only,
+        principal=parsed.principal,
+        destination=parsed.destination,
+        port=parsed.port,
+        remote_ccb=parsed.remote_ccb,
+        known_hosts=parsed.known_hosts,
+        identity=parsed.pairing_identity,
+        yes=parsed.yes,
+    )
+    return remote_pair_cli.unpair(options)
+
+
 def main(argv: list[str]) -> int:
     args = list(argv[1:])
     if not args or args[0] in ("-h", "--help"):
@@ -288,6 +501,12 @@ def main(argv: list[str]) -> int:
             return _cmd_list(rest)
         if command == "reply":
             return _cmd_reply(rest)
+        if command == "pairing":
+            return _cmd_pairing(rest)
+        if command == "pair":
+            return _cmd_pair(rest)
+        if command == "unpair":
+            return _cmd_unpair(rest)
     except remote_client.RemoteConfigError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return EXIT_ERROR

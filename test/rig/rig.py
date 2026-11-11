@@ -143,7 +143,7 @@ class Rig:
         (self.tmp / "known_hosts").write_text(f"[127.0.0.1]:{self.port} {key}\n", encoding="utf-8")
 
     def _make_keys(self) -> None:
-        for name in ("a", "x", "b2", "bad"):
+        for name in ("a", "x", "b2", "bad", "login"):
             _run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.tmp / f"id_{name}")])
 
     def _copy_repo_and_install(self) -> None:
@@ -179,7 +179,9 @@ class Rig:
         self.dest("test -x " + GATE_IN_CONTAINER + " && test -x " + ASK_IN_CONTAINER)
 
     def _write_authorized_keys(self) -> None:
-        lines = []
+        # One unrestricted line: pairing logs in with the USER'S NORMAL ssh,
+        # before (and without) the restricted key it installs.
+        lines = [(self.tmp / "id_login.pub").read_text().strip()]
         for principal in PRINCIPALS:
             key = (self.tmp / f"id_{'a' if principal == 'rig-a' else principal.split('-')[1]}.pub").read_text().strip()
             command = f"{GATE_IN_CONTAINER} --principal {principal}"
@@ -514,6 +516,31 @@ class Rig:
             [sys.executable, str(REPO / "bin" / "ccb-remote"), *args],
             env=self.source_env(**extra_env), timeout=timeout, check=False, cwd=str(self.tmp),
         )
+
+    def remote_home(self) -> Path:
+        """A-side HOME for the default (isolated) source environment."""
+        return self.tmp / "home"
+
+    def home_file(self, relative: str) -> Path:
+        return self.remote_home() / relative
+
+    #: The pairing rows pass these two explicitly: ssh expands `~` from the
+    #: passwd entry, not from $HOME, so an isolated HOME cannot supply them.
+    def pairing_known_hosts(self) -> str:
+        return str(self.tmp / "known_hosts")
+
+    def pairing_identity(self) -> str:
+        return str(self.tmp / "id_login")
+
+    def dest_file(self, path: str) -> str:
+        return self.dest(f"cat {path} 2>/dev/null", check=False).stdout
+
+    def dest_bytes(self, path: str) -> bytes:
+        out = subprocess.run(
+            ["docker", "exec", "-u", "b", self.container, "cat", path],
+            capture_output=True, timeout=120,
+        )
+        return out.stdout
 
     def probe(self, *args: str, timeout: float = 180, **extra_env: str) -> dict:
         proc = _run(

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from pi_comm import PiSessionError, classify_pane_screen, describe_pane_screen, load_session
+from pi_comm import PiSessionError, classify_pane_screen, describe_pane_screen, load_session, screen_context
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "pi"
@@ -683,3 +683,46 @@ def test_describe_keeps_a_busy_screen_that_quotes_a_dialog_marker_busy() -> None
     reason = describe_pane_screen(screen)
     assert "dialog" not in reason
     assert reason == "activity shown in the input box border (pane is busy)"
+
+
+# Pi's footer may add one extension-status line below the stats line (footer.js: extension
+# statuses joined on a single line). Real capture from a pane running an LSP package.
+def test_real_idle_screen_with_extension_status_line_is_idle() -> None:
+    screen = (FIXTURES / "screen-idle-extension-status.txt").read_text()
+    assert screen.splitlines()[-1].strip() == "LSP Inactive Ready"
+    assert classify_pane_screen(screen) == "idle"
+    assert describe_pane_screen(screen) == "input box is empty and idle"
+
+
+def test_extension_status_line_keeps_busy_and_draft_detection() -> None:
+    footer = ["<CCB_CWD> (master)", "0.3%/1.0M (auto)", "LSP Inactive Ready"]
+    busy = ["", " Working", "────────────────────", "", "────────────────────", *footer]
+    draft = ["", "", "────────────────────", "unsent text", "────────────────────", *footer]
+    assert classify_pane_screen("\n".join(busy)) == "busy"
+    assert classify_pane_screen("\n".join(draft)) == "unknown"
+
+
+def test_more_than_one_line_below_stats_is_not_idle() -> None:
+    screen = "\n".join([
+        "", "", "────────────────────", "", "────────────────────",
+        "<CCB_CWD> (master)", "0.3%/1.0M (auto)", "LSP Inactive Ready", "another line",
+    ])
+    assert classify_pane_screen(screen) == "unknown"
+
+
+def test_extension_line_does_not_change_repaint_context() -> None:
+    plain = "\n".join(["older", "reply", "────────────────────", "", "────────────────────",
+                       "<CCB_CWD> (master)", "0.3%/1.0M (auto)"])
+    assert screen_context(plain + "\nLSP Inactive Ready") == screen_context(plain)
+
+
+@pytest.mark.parametrize("prompt", [
+    "$ echo done", "user@host:~/project$", "user@box:/srv# ls", "% ", "~/project ❯", "➜  project git:(main)",
+    "PS C:\\work> ",
+])
+def test_shell_prompt_right_below_stats_is_never_dropped(prompt: str) -> None:
+    screen = "\n".join([
+        "", "", "────────────────────", "", "────────────────────",
+        "<CCB_CWD> (master)", "0.3%/1.0M (auto)", prompt,
+    ])
+    assert classify_pane_screen(screen) == "unknown"

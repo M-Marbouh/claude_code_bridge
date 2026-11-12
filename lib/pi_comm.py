@@ -416,7 +416,7 @@ def capture_screen_state(backend: Any, pane_id: str) -> tuple[str, str | None]:
 
 def screen_context(screen: str) -> tuple[str, ...] | None:
     """The two lines above the last editor rule; a repaint moves them."""
-    lines = screen.splitlines()
+    lines = _footer_lines(screen)
     for index in range(len(lines) - 4, -1, -1):
         if lines[index].startswith("─"):
             return tuple(lines[max(0, index - 2):index])
@@ -594,10 +594,32 @@ _RULE_LINE = re.compile(r"^\s*─{8,}\s*$")
 _EDITOR_LINE = re.compile(r"^\s*(?:›\s*)?$")
 _CWD_LINE = re.compile(r"^\s*(?:/|~/|<CCB_CWD>).*\s*$")
 _OVERFLOW_LABEL = re.compile(r"↑\s*\d+\s+more")
+# A shell prompt character standing alone or ending a word ("user@host:~/x$", "$ cmd", "❯").
+_SHELL_PROMPT = re.compile(r"(?:^|[\s\w:~/)\]])[$#%>❯➜λ»](?:\s|$)")
 _LOADER_LINE = re.compile(
     r"^\s*(?:.*\s)?(?:Working|Retrying \(|Compacting context|Auto-compacting|"
     r"Context overflow detected|Summarizing branch)"
 )
+
+
+def _footer_lines(screen: str) -> list[str]:
+    """Screen lines ending at the stats line.
+
+    Pi's footer (footer.js) may add ONE extension-status line below the stats line (for example
+    "LSP Inactive Ready" from an LSP package). Drop it only when the line above it is the stats
+    line, so the editor-box parse below sees the same layout either way. A line that looks like a
+    shell prompt is never dropped: after Pi exits, the shell prompt lands right below the old
+    footer, and that pane must not read as idle (typing into it would run commands).
+    """
+    lines = screen.splitlines()
+    if (
+        len(lines) >= 2
+        and not _STATS_LINE.match(lines[-1])
+        and _STATS_LINE.match(lines[-2])
+        and not _SHELL_PROMPT.search(lines[-1])
+    ):
+        return lines[:-1]
+    return lines
 
 
 def classify_pane_screen(screen: str) -> str:
@@ -628,7 +650,7 @@ def describe_pane_screen(screen: str | None) -> str:
     """
     if screen is None:
         return "pane capture unavailable"
-    lines = screen.splitlines()
+    lines = _footer_lines(screen)
     width = max((len(line.rstrip()) for line in lines), default=0)
     width_note = f", pane ~{width} cols wide" if width else ""
     if len(lines) < 5:
@@ -666,7 +688,7 @@ def describe_pane_screen(screen: str | None) -> str:
 
 def _classify_pane_structure(screen: str) -> str:
     """Structural editor-box parse; "unknown" means no recognised editor box."""
-    lines = screen.splitlines()
+    lines = _footer_lines(screen)
     if len(lines) < 5 or not _STATS_LINE.match(lines[-1]):
         return "unknown"
     if not _CWD_LINE.fullmatch(lines[-2]) or not _RULE_LINE.fullmatch(lines[-3]):

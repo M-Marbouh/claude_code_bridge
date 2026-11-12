@@ -1,12 +1,24 @@
+# This repo puts lib/ on sys.path at runtime (test/conftest.py) and ships no pyright
+# configuration, so the workspace-rooted analyzer cannot see these flat imports.
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from pi_comm import PiSessionError, classify_pane_screen, describe_pane_screen, load_session, screen_context
+from pi_comm import (
+    PiSessionError,
+    confirm_pi_ready,
+    load_session,
+    read_pi_state,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "pi"
@@ -209,253 +221,6 @@ def test_completion_controls_reject_wrong_id_user_toolcall_and_nonabort_error(tm
     assistant["message"]["content"] = [{"type": "thinking", "thinking": "CCB_DONE: synthetic"}]
     session_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     assert load_session(tmp_path, session_id).exchange("synthetic").state == "incomplete"
-
-
-def test_screen_classifier_handles_observed_dialog_busy_and_footer() -> None:
-    assert classify_pane_screen((FIXTURES / "screen-tree-selector.txt").read_text()) == "dialog"
-    assert classify_pane_screen((FIXTURES / "screen-busy.txt").read_text()) == "busy"
-    assert classify_pane_screen((FIXTURES / "screen-idle.txt").read_text()) == "idle"
-    assert classify_pane_screen("/work (main)\ndeepseek-flash • high") == "unknown"
-    assert classify_pane_screen("blank terminal") == "unknown"
-
-
-@pytest.mark.parametrize("reply", [
-    "see this working copy", "the editor was Working well", "the WORKING marker appeared",
-    "tests are Running now", "we are running tests",
-    "it is Retrying (after timeout) in the log", "compacting context appeared in the report",
-    "we enabled Auto-compacting yesterday", "the output was summarizing branch details",
-    "this working copy is clean",
-])
-def test_screen_reply_words_do_not_make_idle_pane_busy(reply: str) -> None:
-    screen = (FIXTURES / "screen-idle.txt").read_text().replace("Already at this point", f"{reply}\nwith another line")
-    assert classify_pane_screen(screen) == "idle"
-
-
-@pytest.mark.parametrize("border", [
-    "── ⠙ Reticulating splines ───",
-    "───⠙──────",
-    "── ⠋ Retrying (1/3) in 2s... (esc to cancel) ───",
-    "── * Working ───",
-])
-def test_screen_editor_border_activity_is_busy(border: str) -> None:
-    lines = (FIXTURES / "screen-idle.txt").read_text().splitlines()
-    width = len(lines[3].rstrip())
-    padded_border = border + "─" * (width - len(border))
-    screen = "\n".join([lines[0], padded_border, *lines[2:]])
-    assert classify_pane_screen(screen) == "busy"
-
-
-@pytest.mark.parametrize("loader", [
-    " X Working", " >>> Working", " [=====] Working", " Working", " >> >> Working", " ( o o ) Retrying (1/3)",
-])
-def test_non_embedded_loader_above_plain_editor_box_is_busy(loader: str) -> None:
-    screen = "\n".join([
-        "", loader, "────────────────────", "", "────────────────────",
-        "<CCB_CWD> (master)", "0.3%/1.0M (auto)",
-    ])
-    assert classify_pane_screen(screen) == "busy"
-
-
-def test_plain_working_paragraph_above_box_is_refuse_safe_busy() -> None:
-    screen = "\n".join([
-        "", "Working tree clean", "────────────────────", "", "────────────────────",
-        "<CCB_CWD> (master)", "0.3%/1.0M (auto)",
-    ])
-    assert classify_pane_screen(screen) == "busy"
-
-
-def test_editor_draft_is_unknown_even_with_overflow_label() -> None:
-    screen = (FIXTURES / "screen-idle.txt").read_text().replace("─" * 8, "─── ↑ 3 more ───", 1)
-    screen = screen.replace("\n\n────────────────", "\ndraft\n────────────────", 1)
-    assert classify_pane_screen(screen) == "unknown"
-
-
-def test_short_rule_and_multiline_draft_are_not_idle() -> None:
-    screen = "\n".join([
-        "reply", "──────", "draft", "", "────────────────────",
-        "<CCB_CWD> (master)", "model • high",
-    ])
-    assert classify_pane_screen(screen) == "unknown"
-
-
-def test_one_character_top_border_is_not_idle() -> None:
-    screen = "\n".join([
-        "reply", "─", "", "────────────────────",
-        "<CCB_CWD> (master)", "model • high",
-    ])
-    assert classify_pane_screen(screen) == "unknown"
-
-
-def _idle_marker_rule_index(lines: list[str]) -> int:
-    return max(index for index, line in enumerate(lines) if line.startswith("─" * 8))
-
-
-def test_real_trust_dialog_screen_is_dialog() -> None:
-    screen = (FIXTURES / "screen-trust-dialog.txt").read_text()
-    assert "Trust project folder?" in screen
-    assert classify_pane_screen(screen) == "dialog"
-
-
-def test_real_idle_screen_quoting_a_dialog_marker_stays_idle() -> None:
-    screen = (FIXTURES / "screen-idle-quoting-marker.txt").read_text()
-    assert "does not require project trust" in screen
-    assert classify_pane_screen(screen) == "idle"
-
-
-def test_real_busy_screen_quoting_a_dialog_marker_stays_busy() -> None:
-    screen = (FIXTURES / "screen-busy-quoting-marker.txt").read_text()
-    assert "does not require project trust" in screen
-    assert classify_pane_screen(screen) == "busy"
-
-
-def test_editor_draft_with_quoted_dialog_marker_is_not_idle() -> None:
-    lines = (FIXTURES / "screen-idle-quoting-marker.txt").read_text().splitlines()
-    lines[_idle_marker_rule_index(lines) - 1] = "draft text"
-    assert classify_pane_screen("\n".join(lines)) != "idle"
-
-
-REAL_CAPTURES = (
-    "real-idle-28cols-tail.txt",
-    "real-idle-40cols-tail.txt",
-    "real-idle-56cols-tail.txt",
-    "real-idle-106cols-tail.txt",
-    "real-idle-105cols-model-tail.txt",
-)
-
-
-def _idle_screen() -> str:
-    return (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-
-
-def _with_status_line(status: str) -> str:
-    lines = _idle_screen().splitlines()
-    lines[-1] = status
-    return "\n".join(lines)
-
-
-_IDLE_STATS = "↑2.6k ↓179 R5.6k CH92.5% $0.001 0.3%/1.0M (auto)"
-
-
-def _with_footer_right(right: str) -> str:
-    return _with_status_line(f"{_IDLE_STATS}    {right}".rstrip())
-
-
-@pytest.mark.parametrize("capture", REAL_CAPTURES)
-def test_real_idle_captures_at_every_width_read_idle(capture: str) -> None:
-    screen = (FIXTURES / capture).read_text(encoding="utf-8")
-    assert "<CCB_CWD>" in screen and "─" in screen
-    assert classify_pane_screen(screen) == "idle"
-
-
-@pytest.mark.parametrize("right", [
-    "deepseek-flash • xhigh",
-    "deepseek-flash • thinking off",
-    "deepseek-flash",
-    "deepseek-v4.1-fla",
-    "",
-])
-def test_synthetic_idle_footer_variants_read_idle(right: str) -> None:
-    assert classify_pane_screen(_with_footer_right(right)) == "idle"
-
-
-@pytest.mark.parametrize("status", [
-    "↑2.6k ↓179 R5.6...",
-    "$0.011 3.6%/1.0M (auto)",
-    "?/1.0M (auto)",
-    "↑34k ↓7.9k R328k CH98.7% $0.011 3.6%/1.0M (auto)",
-    "W1.2M",
-])
-def test_synthetic_stats_prefixes_read_idle(status: str) -> None:
-    assert classify_pane_screen(_with_status_line(status)) == "idle"
-
-
-@pytest.mark.parametrize("status", [
-    "",
-    "waiting for instructions",
-    "$ ",
-    "R2D2 is here",
-    "3% done",
-])
-def test_negative_status_controls_are_not_idle(status: str) -> None:
-    assert classify_pane_screen(_with_status_line(status)) == "unknown"
-
-
-def test_shell_prompt_below_the_footer_is_not_idle() -> None:
-    screen = _idle_screen().rstrip("\n") + "\n$ echo done"
-    assert classify_pane_screen(screen) == "unknown"
-
-
-def test_footer_shifted_by_a_prompt_in_the_cwd_row_is_not_idle() -> None:
-    lines = _idle_screen().splitlines()
-    lines[-2] = "$ echo done"
-    assert classify_pane_screen("\n".join(lines)) == "unknown"
-
-
-def test_one_row_overlay_over_the_status_line_reads_dialog() -> None:
-    # Ratifier regression: a focused one-row overlay that keeps the box and covers only the
-    # status row must never read idle, or input would reach the overlay.
-    screen = _with_status_line(" Select a session")
-    assert classify_pane_screen(screen) == "dialog"
-
-
-def test_draft_in_the_editor_of_a_real_narrow_capture_is_not_idle() -> None:
-    lines = (FIXTURES / "real-idle-28cols-tail.txt").read_text(encoding="utf-8").splitlines()
-    lines[len(lines) - 4] = "draft"
-    assert classify_pane_screen("\n".join(lines)) == "unknown"
-
-
-def test_describe_names_a_missing_capture_or_box() -> None:
-    assert describe_pane_screen(None) == "pane capture unavailable"
-    assert describe_pane_screen("blank terminal") == "no input box on screen"
-
-
-def test_describe_reports_unrecognised_status_lines_with_pane_width() -> None:
-    lines = (FIXTURES / "real-idle-28cols-tail.txt").read_text(encoding="utf-8").splitlines()
-    lines[-1] = "waiting for input"
-    assert describe_pane_screen("\n".join(lines)) == "status lines not recognised, pane ~28 cols wide"
-
-
-def test_describe_reports_each_structural_step() -> None:
-    lines = _idle_screen().splitlines()
-
-    shifted_cwd = list(lines)
-    shifted_cwd[-2] = "$ echo done"
-    assert describe_pane_screen("\n".join(shifted_cwd)).startswith(
-        "working-directory line above the status lines not recognised"
-    )
-
-    missing_bottom_rule = list(lines)
-    missing_bottom_rule[-3] = ""
-    assert describe_pane_screen("\n".join(missing_bottom_rule)).startswith(
-        "input box bottom border not recognised"
-    )
-
-    no_top_rule = ["reply", "", "────────────────────", "<CCB_CWD> (master)", "0.3%/1.0M (auto)"]
-    assert describe_pane_screen("\n".join(no_top_rule)).startswith("input box top border not found")
-
-    narrow_top_rule = list(lines)
-    narrow_top_rule[3] = "─" * 8
-    assert describe_pane_screen("\n".join(narrow_top_rule)).startswith("input box borders differ in width")
-
-    draft = list(lines)
-    draft[2] = "draft text"
-    assert describe_pane_screen("\n".join(draft)) == "input box has unsent text"
-
-    border_activity = list(lines)
-    border_prefix = "── ⠙ Working "
-    border_activity[1] = border_prefix + "─" * (len(lines[1].rstrip()) - len(border_prefix))
-    assert describe_pane_screen("\n".join(border_activity)) == (
-        "activity shown in the input box border (pane is busy)"
-    )
-
-    loader = list(lines)
-    loader[1:1] = ["", "Working"]
-    assert describe_pane_screen("\n".join(loader)) == "activity message above the input box (pane is busy)"
-
-    dialog = (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8")
-    assert describe_pane_screen(dialog).startswith("a dialog is on screen, pane ~")
-
-    assert describe_pane_screen(_idle_screen()) == "input box is empty and idle"
 
 
 REQ = "r4-retry"
@@ -677,52 +442,334 @@ def test_failed_turn_with_custom_message_flush_stays_errored_then_retries(tmp_pa
     assert "CCB_DONE: " + REQ in completed.reply
 
 
-def test_describe_keeps_a_busy_screen_that_quotes_a_dialog_marker_busy() -> None:
-    screen = (FIXTURES / "screen-busy-quoting-marker.txt").read_text(encoding="utf-8")
-    assert classify_pane_screen(screen) == "busy"
-    reason = describe_pane_screen(screen)
-    assert "dialog" not in reason
-    assert reason == "activity shown in the input box border (pane is busy)"
+# --------------------------------------------------------------------------- #
+# Pi readiness comes from Pi's own state file (lib/pi_extension/ccb-state.ts)
+# --------------------------------------------------------------------------- #
+
+BINDING_FIXTURE = "binding-real.json"
+SNAPSHOT_FIXTURE = "pi-state-real.json"
 
 
-# Pi's footer may add one extension-status line below the stats line (footer.js: extension
-# statuses joined on a single line). Real capture from a pane running an LSP package.
-def test_real_idle_screen_with_extension_status_line_is_idle() -> None:
-    screen = (FIXTURES / "screen-idle-extension-status.txt").read_text()
-    assert screen.splitlines()[-1].strip() == "LSP Inactive Ready"
-    assert classify_pane_screen(screen) == "idle"
-    assert describe_pane_screen(screen) == "input box is empty and idle"
+def _binding(tmp_path: Path, **overrides) -> dict:
+    """The real binding's key set, pointed at this test's own state file and session dir."""
+    data = json.loads((FIXTURES / BINDING_FIXTURE).read_text(encoding="utf-8"))
+    runtime = tmp_path / "rt"
+    runtime.mkdir(mode=0o700, exist_ok=True)
+    data["pi_state_file"] = str(runtime / "pi-state.json")
+    data["runtime_dir"] = str(runtime)
+    data["pi_session_dir"] = str(tmp_path / "sessions")
+    data["work_dir"] = str(tmp_path)
+    data.update(overrides)
+    return data
 
 
-def test_extension_status_line_keeps_busy_and_draft_detection() -> None:
-    footer = ["<CCB_CWD> (master)", "0.3%/1.0M (auto)", "LSP Inactive Ready"]
-    busy = ["", " Working", "────────────────────", "", "────────────────────", *footer]
-    draft = ["", "", "────────────────────", "unsent text", "────────────────────", *footer]
-    assert classify_pane_screen("\n".join(busy)) == "busy"
-    assert classify_pane_screen("\n".join(draft)) == "unknown"
+def _snapshot(**overrides) -> dict:
+    """The captured real snapshot, re-stamped so it describes this test's moment and pid."""
+    data = json.loads((FIXTURES / SNAPSHOT_FIXTURE).read_text(encoding="utf-8"))
+    data["pid"] = os.getpid()
+    data["updated_at"] = int(time.time() * 1000)
+    data["seq"] = 1
+    data.update(overrides)
+    return data
 
 
-def test_more_than_one_line_below_stats_is_not_idle() -> None:
-    screen = "\n".join([
-        "", "", "────────────────────", "", "────────────────────",
-        "<CCB_CWD> (master)", "0.3%/1.0M (auto)", "LSP Inactive Ready", "another line",
-    ])
-    assert classify_pane_screen(screen) == "unknown"
+def _write_state(binding: dict, snapshot: dict | None = None, *, raw: str | None = None) -> Path:
+    path = Path(binding["pi_state_file"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if raw is not None:
+        path.write_text(raw, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(snapshot if snapshot is not None else _snapshot()), encoding="utf-8")
+    return path
 
 
-def test_extension_line_does_not_change_repaint_context() -> None:
-    plain = "\n".join(["older", "reply", "────────────────────", "", "────────────────────",
-                       "<CCB_CWD> (master)", "0.3%/1.0M (auto)"])
-    assert screen_context(plain + "\nLSP Inactive Ready") == screen_context(plain)
+def _read(binding: dict, **kwargs):
+    """Readiness for a binding as the production call sites ask for it."""
+    return read_pi_state(binding, **kwargs)
 
 
-@pytest.mark.parametrize("prompt", [
-    "$ echo done", "user@host:~/project$", "user@box:/srv# ls", "% ", "~/project ❯", "➜  project git:(main)",
-    "PS C:\\work> ",
+def _dead_pid() -> int:
+    """A pid that has lived and exited, so liveness says no (not a reused live pid)."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=30)
+    return child.pid
+
+
+def test_fixtures_are_a_real_binding_and_a_real_snapshot() -> None:
+    binding = json.loads((FIXTURES / BINDING_FIXTURE).read_text(encoding="utf-8"))
+    snapshot = json.loads((FIXTURES / SNAPSHOT_FIXTURE).read_text(encoding="utf-8"))
+    assert set(binding) == {
+        "active", "ccb_launch_caller", "ccb_launch_provider", "ccb_managed_launch", "ccb_project_id",
+        "pane_id", "pane_title_marker", "pi_launch_token", "pi_session_dir", "pi_session_id",
+        "pi_state_file", "runtime_dir", "session_id", "start_cmd", "start_dir", "started_at",
+        "terminal", "tmux_session", "work_dir",
+    }
+    # Captured from a throwaway Pi 1.5.2 launched with CCB's extension: a real TUI startup.
+    assert snapshot["v"] == 1 and snapshot["mode"] == "tui" and snapshot["has_ui"] is True
+    assert set(snapshot) == {
+        "v", "launch_token", "runtime_instance_id", "pid", "mode", "has_ui", "idle",
+        "editor_empty", "prompt_open", "seq", "updated_at",
+    }
+
+
+def test_a_real_snapshot_for_its_binding_is_ready(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"]))
+    state = _read(binding)
+    assert (state.status, state.reason) == ("ready", "")
+
+
+def test_a_missing_state_file_is_absent_with_the_restart_hint(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    state = _read(binding)
+    assert state.status == "absent"
+    assert state.reason == "CCB's Pi extension is not reporting; restart CCB"
+
+
+@pytest.mark.parametrize("raw", [
+    "",
+    "not json",
+    json.dumps({"v": 2}),
+    json.dumps([1, 2, 3]),
+    json.dumps({"v": 1}),
 ])
-def test_shell_prompt_right_below_stats_is_never_dropped(prompt: str) -> None:
-    screen = "\n".join([
-        "", "", "────────────────────", "", "────────────────────",
-        "<CCB_CWD> (master)", "0.3%/1.0M (auto)", prompt,
-    ])
-    assert classify_pane_screen(screen) == "unknown"
+def test_unreadable_or_unversioned_state_is_absent(tmp_path: Path, raw: str) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, raw=raw or " ")
+    assert _read(binding).status == "absent"
+
+
+def test_a_newer_snapshot_version_is_not_read_as_version_one(tmp_path: Path) -> None:
+    # A complete, well-typed snapshot from a future extension version is not this contract.
+    binding = _binding(tmp_path)
+    _write_state(binding, {**_snapshot(launch_token=binding["pi_launch_token"]), "v": 2})
+    state = _read(binding)
+    assert state.status == "absent"
+    assert "restart CCB" in state.reason
+
+
+def test_every_required_value_has_the_type_the_extension_writes(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"]))
+    # The control for the malformed cases below: the captured shape itself reads ready.
+    assert _read(binding).status == "ready"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"launch_token": ""},
+    {"launch_token": 5},
+    {"runtime_instance_id": ""},
+    {"runtime_instance_id": None},
+    {"pid": "123"},
+    {"pid": True},
+    {"pid": None},
+    {"seq": -1},
+    {"seq": "3"},
+    {"seq": None},
+    {"mode": 5},
+    {"mode": None},
+    {"has_ui": "yes"},
+    {"idle": None},
+    {"editor_empty": 0},
+    {"prompt_open": None},
+    {"prompt_open": "false"},
+    {"updated_at": "now"},
+    {"updated_at": True},
+])
+def test_a_snapshot_with_a_malformed_value_is_absent(tmp_path: Path, overrides: dict) -> None:
+    binding = _binding(tmp_path)
+    snapshot = _snapshot(launch_token=binding["pi_launch_token"])
+    snapshot.update(overrides)
+    _write_state(binding, snapshot)
+    state = _read(binding)
+    # Key presence is not enough: a value the extension cannot have written is not a report.
+    assert state.status == "absent"
+    assert "restart CCB" in state.reason
+
+
+def test_a_pre_upgrade_binding_without_a_state_channel_is_absent(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    del binding["pi_launch_token"]
+    _write_state(binding)
+    state = _read(binding)
+    assert state.status == "absent"
+    assert "restart CCB" in state.reason
+
+
+def test_state_from_another_launch_is_mismatch(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"] + "-other"))
+    state = _read(binding)
+    assert state.status == "mismatch"
+    assert "different launch" in state.reason
+
+
+def test_a_dead_pi_process_is_stale(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(pid=_dead_pid(), launch_token=binding["pi_launch_token"]))
+    state = _read(binding)
+    assert state.status == "stale"
+    assert "no longer running" in state.reason
+
+
+def test_old_and_future_timestamps_are_stale(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    now_ms = int(time.time() * 1000)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], updated_at=now_ms - 4000))
+    old = _read(binding)
+    assert old.status == "stale" and "stopped updating" in old.reason
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], updated_at=now_ms + 3000))
+    future = _read(binding)
+    assert future.status == "stale" and "future" in future.reason
+
+
+def test_a_timestamp_in_milliseconds_is_the_unit_that_is_read(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    # The extension publishes Date.now(); a seconds value is not silently reinterpreted.
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], updated_at=int(time.time())))
+    state = _read(binding)
+    assert state.status == "stale" and "stopped updating" in state.reason
+
+
+@pytest.mark.parametrize("overrides", [
+    {"mode": "rpc"},
+    {"mode": "json"},
+    {"mode": "print"},
+    {"has_ui": False},
+])
+def test_a_non_interactive_pi_is_not_ready(tmp_path: Path, overrides: dict) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], **overrides))
+    state = _read(binding)
+    assert state.status == "mismatch"
+    assert "interactive" in state.reason
+
+
+def test_prompt_busy_and_draft_are_distinguished(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    token = binding["pi_launch_token"]
+    _write_state(binding, _snapshot(launch_token=token, prompt_open=True, idle=False))
+    assert _read(binding).status == "prompt"
+    _write_state(binding, _snapshot(launch_token=token, idle=False, editor_empty=False))
+    assert _read(binding).status == "busy"
+    _write_state(binding, _snapshot(launch_token=token, idle=True, editor_empty=False))
+    state = _read(binding)
+    assert state.status == "draft"
+    assert "unsent text" in state.reason
+    _write_state(binding, _snapshot(launch_token=token, idle=True, editor_empty=True))
+    assert _read(binding).status == "ready"
+
+
+def test_confirmation_needs_a_second_ready_snapshot(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], seq=5))
+
+    def advance(_seconds: float) -> None:
+        _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], seq=6))
+
+    monkeypatch.setattr(time, "sleep", advance)
+    assert confirm_pi_ready(binding).status == "ready"
+
+
+def test_a_snapshot_that_never_advances_is_not_confirmed(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], seq=5))
+    ticks = iter([0.0, 0.0, 5.0])
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 5.0))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    state = confirm_pi_ready(binding)
+    assert state.status == "stale"
+    assert "did not report twice" in state.reason
+
+
+def test_a_snapshot_that_does_not_advance_is_never_ready_inside_the_budget(monkeypatch, tmp_path: Path) -> None:
+    # A static snapshot is read again and again inside the ~2 s window; without the sequence
+    # comparison that first repeat would confirm a runtime that never published again.
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"], seq=5))
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+    monkeypatch.setattr(time, "sleep", lambda seconds: now.__setitem__("t", now["t"] + seconds))
+
+    state = confirm_pi_ready(binding)
+
+    assert state.status == "stale"
+    assert "did not report twice" in state.reason
+    assert now["t"] == pytest.approx(2.0, abs=0.2)
+
+
+def test_the_second_snapshot_must_still_be_ready(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    token = binding["pi_launch_token"]
+    _write_state(binding, _snapshot(launch_token=token, seq=5))
+
+    def advance(_seconds: float) -> None:
+        _write_state(binding, _snapshot(launch_token=token, seq=6, idle=False))
+
+    monkeypatch.setattr(time, "sleep", advance)
+    assert confirm_pi_ready(binding).status == "busy"
+
+
+def test_a_busy_or_draft_first_read_returns_without_waiting(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    token = binding["pi_launch_token"]
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: slept.append(seconds))
+    _write_state(binding, _snapshot(launch_token=token, idle=False))
+    assert confirm_pi_ready(binding).status == "busy"
+    _write_state(binding, _snapshot(launch_token=token, editor_empty=False))
+    assert confirm_pi_ready(binding).status == "draft"
+    assert slept == []
+
+
+def test_a_runtime_replacement_during_confirmation_needs_its_own_second_read(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    token = binding["pi_launch_token"]
+    _write_state(binding, _snapshot(launch_token=token, seq=5, runtime_instance_id="instance-a"))
+    step = {"n": 0}
+
+    def advance(_seconds: float) -> None:
+        step["n"] += 1
+        if step["n"] == 1:
+            # A new runtime took the pane: same binding, new instance, fresh sequence.
+            _write_state(binding, _snapshot(launch_token=token, seq=1, runtime_instance_id="instance-b"))
+        else:
+            _write_state(binding, _snapshot(launch_token=token, seq=2, runtime_instance_id="instance-b"))
+
+    monkeypatch.setattr(time, "sleep", advance)
+    assert confirm_pi_ready(binding).status == "ready"
+    assert step["n"] == 2
+
+
+def test_confirmation_respects_the_request_deadline(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    _write_state(binding, _snapshot(launch_token=binding["pi_launch_token"]))
+    now = {"t": 10.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+    # A clock the poll advances, so a missing deadline clamp finishes late instead of hanging.
+    monkeypatch.setattr(time, "sleep", lambda seconds: now.__setitem__("t", now["t"] + seconds))
+    state = confirm_pi_ready(binding, deadline=10.0)
+    assert state.status == "stale"
+    # Already at the deadline: the ~2 s confirmation budget must not extend the request.
+    assert now["t"] == 10.0
+
+
+def test_a_confirmation_that_would_answer_after_the_deadline_is_not_ready(monkeypatch, tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    token = binding["pi_launch_token"]
+    _write_state(binding, _snapshot(launch_token=token, seq=5))
+    now = {"t": 0.0}
+    waits: list[float] = []
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+
+    def overshoot(seconds: float) -> None:
+        waits.append(seconds)
+        now["t"] += 0.5  # the read takes far longer than the 10 ms left
+        _write_state(binding, _snapshot(launch_token=token, seq=6))
+
+    monkeypatch.setattr(time, "sleep", overshoot)
+    state = confirm_pi_ready(binding, deadline=0.01)
+    # The second read IS ready, but it landed past the caller's deadline: not ready.
+    assert state.status == "stale"
+    # The poll is clamped to the budget left instead of sleeping the full poll interval.
+    assert waits == [pytest.approx(0.01)]

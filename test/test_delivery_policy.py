@@ -8,6 +8,11 @@ field names and provider/pane topology are unchanged; credential values
 are deterministic test tokens, and each test relocates the record to its
 own project/pid so discovery exercises real files.
 """
+
+# This repo puts lib/ on sys.path at runtime (test/conftest.py) and ships no pyright
+# configuration, so the workspace-rooted analyzer cannot see these flat imports.
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import importlib.machinery
@@ -23,6 +28,7 @@ import pytest
 
 import delivery_policy as dp
 from askd.adapters.base import PeerDestination, ProviderRequest, QueuedTask, ResolvedRoute
+from pi_comm import PiState
 from project_id import compute_ccb_project_id
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -707,11 +713,6 @@ class _FakeBackend:
     def find_pane_by_title_marker(self, _marker, _cwd):
         return "%13"
 
-    def get_pane_content(self, _pane, lines=40):
-        return (Path(__file__).parent / "fixtures" / "pi" / "screen-idle.txt").read_text(
-            encoding="utf-8"
-        )
-
     def send_text(self, pane, text):
         self.sent.append((pane, text))
 
@@ -734,6 +735,9 @@ def test_pi_adapter_recheck_refuses_with_zero_sends(tmp_path, monkeypatch):
     backend = _FakeBackend()
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
+    # Pi reports ready; this test proves the role-policy recheck still refuses before any send.
+    monkeypatch.setattr("askd.adapters.pi._read_pi_state", lambda *_a, **_k: PiState("ready"))
+    monkeypatch.setattr("askd.adapters.pi._confirm_pi_ready", lambda *_a, **_k: PiState("ready"))
     adapter = PiAdapter()
     monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
 
@@ -1471,8 +1475,6 @@ def _install_gemini_binding(record: dict, tmp_path: Path, *, subdir: Path) -> No
         ),
         encoding="utf-8",
     )
-    monkeypatch_wd = subdir
-    return monkeypatch_wd
 
 
 def test_client_guard_follows_the_binding_from_a_subdirectory(tmp_path, monkeypatch, capsys):

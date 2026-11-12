@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ccb_protocol import done_line_re, find_done_line, is_done_text
 
@@ -356,13 +356,14 @@ class PiCommunicator:
     """Pane and exact-session health probe used by ccb-ping."""
 
     def ping(self, display: bool = True) -> tuple[bool, str]:
-        backend, pane_id, _data, error = _verify_pane(Path.cwd(), os.environ.get("CCB_SESSION_FILE"))
+        _backend, _pane_id, binding, error = _verify_pane(
+            Path.cwd(), os.environ.get("CCB_SESSION_FILE")
+        )
         if error:
             return False, error
-        screen = backend.get_pane_content(pane_id, lines=40)
-        state = classify_pane_screen(screen or "")
-        if state != "idle":
-            return False, f"Pi pane is {state}: {describe_pane_screen(screen)}; input is not verified idle"
+        state = confirm_pi_ready(binding or {})
+        if state.status != "ready":
+            return False, f"Pi pane is {state.status}: {state.reason}; input is not verified idle"
         return True, "Pi pane and session are ready"
 
 
@@ -371,8 +372,9 @@ def _verify_pane(
 ) -> tuple[Any, str, dict[str, Any] | None, str]:
     """The ccb-ping readiness evidence: (backend, pane_id, binding, error).
 
-    Identical checks and messages to `PiCommunicator.ping`, minus the idle screen read, so callers that
-    must act on the pane (ccb-ping refuses, autonew sends) share one destination verification.
+    Identical checks and messages to `PiCommunicator.ping`, minus the readiness confirmation, so
+    callers that must act on the pane (ccb-ping refuses, autonew sends) share one destination
+    verification and each applies the readiness report itself.
     """
     from terminal import get_backend_for_session
 
@@ -403,42 +405,228 @@ def _verify_pane(
     return backend, pane_id, data, ""
 
 
-def capture_screen_state(backend: Any, pane_id: str) -> tuple[str, str | None]:
-    """Classify one pane capture; ("unknown", None) when the capture is unavailable."""
-    try:
-        screen = backend.get_pane_content(pane_id, lines=40)
-    except Exception:
-        return "unknown", None
-    if screen is None:
-        return "unknown", None
-    return classify_pane_screen(screen), screen
+PI_STATE_FILENAME = "pi-state.json"
+PI_STATE_MISSING_HINT = "CCB's Pi extension is not reporting; restart CCB"
+PI_STATE_CONFIRM_TIMEOUT_S = 2.0
+PI_STATE_CONFIRM_POLL_S = 0.1
+# Pi rewrites its snapshot every 500 ms; three seconds without one means the runtime is gone even
+# if a pid still exists, and a timestamp in the future cannot be trusted either.
+PI_STATE_MAX_AGE_S = 3.0
+PI_STATE_MAX_FUTURE_S = 2.0
 
 
-def screen_context(screen: str) -> tuple[str, ...] | None:
-    """The two lines above the last editor rule; a repaint moves them."""
-    lines = _footer_lines(screen)
-    for index in range(len(lines) - 4, -1, -1):
-        if lines[index].startswith("─"):
-            return tuple(lines[max(0, index - 2):index])
+@dataclass(frozen=True)
+class PiState:
+    """Pi's own readiness report for one binding: status plus the words to show a caller.
+
+    status is one of ready | busy | draft | prompt | stale | absent | mismatch. Only "ready" may
+    be typed into; every other value refuses, for its own reason.
+
+    Known limitation (documented, not fixed here): Pi's BUILT-IN selectors (/tree, the model
+    picker) replace the editor without emitting a ui_prompt_start event, so an open selector is
+    reported as idle unless the user has typed into it. A prompt sent then lands in the selector
+    as input and its trailing Enter can also confirm a selection. Only prompts opened through
+    Pi's prompt API (project trust, extension dialogs) raise `prompt_open`.
+    """
+
+    status: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class _Reading:
+    """One snapshot read: the public state plus the runtime identity confirmation compares."""
+
+    state: PiState
+    launch_token: str = ""
+    instance_id: str = ""
+    seq: int = -1
+
+
+def _pi_state_path(binding: Mapping[str, Any]) -> Path | None:
+    explicit = str(binding.get("pi_state_file") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    runtime = str(binding.get("runtime_dir") or "").strip()
+    if runtime:
+        return Path(runtime).expanduser() / PI_STATE_FILENAME
     return None
 
 
-def capture_confirmed_state(backend: Any, pane_id: str) -> str:
-    """Double capture: "idle" only when two reads agree the pane is idle.
+def _coerce_int(value: Any) -> int | None:
+    """An int from JSON; booleans are not ints here, and numeric strings are not guessed."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
-    Shared by the askd adapter (pre-send readiness, retry idle window) and autonew (a reset must never
-    land on a busy pane or concatenate with an editor draft).
+
+def _coerce_epoch_seconds(value: Any) -> float | None:
+    """The snapshot's `Date.now()` milliseconds as epoch seconds; None when unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number / 1000.0 if number > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates the target on Windows: probe with OpenProcess instead.
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_pi_reading(
+    binding: Mapping[str, Any],
+    *,
+    now: float | None = None,
+) -> _Reading:
+    """Read and validate one snapshot against `binding`; never guesses."""
+    moment = time.time() if now is None else now
+    state_path = _pi_state_path(binding)
+    token = str(binding.get("pi_launch_token") or "").strip()
+    if state_path is None or not token:
+        return _Reading(PiState("absent", PI_STATE_MISSING_HINT))
+    try:
+        raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _Reading(PiState("absent", PI_STATE_MISSING_HINT))
+    if not isinstance(raw, dict) or raw.get("v") != 1:
+        return _Reading(PiState("absent", PI_STATE_MISSING_HINT))
+
+    launch_token = str(raw.get("launch_token") or "")
+    instance_id = str(raw.get("runtime_instance_id") or "")
+    seq = _coerce_int(raw.get("seq"))
+    reading = _Reading(
+        PiState("absent", PI_STATE_MISSING_HINT),
+        launch_token=launch_token,
+        instance_id=instance_id,
+        seq=-1 if seq is None else seq,
+    )
+
+    def refused(status: str, reason: str) -> _Reading:
+        return _Reading(PiState(status, reason), launch_token=launch_token,
+                        instance_id=instance_id, seq=reading.seq)
+
+    # Every field is then read with its own type check: a missing key fails that check, so key
+    # presence needs no separate test - the values the extension can write are the contract.
+    updated_raw = raw.get("updated_at")
+    if (
+        not isinstance(raw.get("launch_token"), str) or not launch_token.strip()
+        or not isinstance(raw.get("runtime_instance_id"), str) or not instance_id.strip()
+        or _coerce_int(raw.get("pid")) is None
+        or seq is None or seq < 0
+        or not isinstance(raw.get("mode"), str)
+        or any(not isinstance(raw.get(key), bool) for key in ("has_ui", "idle", "editor_empty", "prompt_open"))
+        or isinstance(updated_raw, bool)
+        or not isinstance(updated_raw, (int, float))
+    ):
+        return _Reading(PiState("absent", PI_STATE_MISSING_HINT))
+
+    # The launch token is the pane association: it only exists in the environment of the Pi this
+    # launch started, so a snapshot from another pane can never be accepted here.
+    if launch_token != token:
+        return refused("mismatch", "Pi state belongs to a different launch")
+    pid = _coerce_int(raw.get("pid"))
+    if pid is None or not _pid_alive(pid):
+        return refused("stale", "Pi is no longer running in this pane")
+    updated = _coerce_epoch_seconds(updated_raw)
+    if updated is None:
+        return refused("absent", PI_STATE_MISSING_HINT)
+    if moment - updated > PI_STATE_MAX_AGE_S:
+        return refused("stale", "Pi's state stopped updating")
+    if updated - moment > PI_STATE_MAX_FUTURE_S:
+        return refused("stale", "Pi's state is dated in the future")
+    if str(raw.get("mode") or "") != "tui" or raw.get("has_ui") is not True:
+        return refused("mismatch", "Pi is not running an interactive session")
+    if raw.get("prompt_open") is True:
+        return refused("prompt", "Pi is waiting for a decision in its pane")
+    if raw.get("idle") is not True:
+        return refused("busy", "Pi is working on a request")
+    if raw.get("editor_empty") is not True:
+        return refused("draft", "Pi has unsent text in its editor")
+    return _Reading(
+        PiState("ready"),
+        launch_token=launch_token,
+        instance_id=instance_id,
+        seq=reading.seq,
+    )
+
+
+def read_pi_state(
+    binding: Mapping[str, Any],
+    *,
+    now: float | None = None,
+) -> PiState:
+    """Pi's own readiness report for this binding: ready | busy | draft | prompt | stale | absent | mismatch."""
+    return _read_pi_reading(binding, now=now).state
+
+
+def confirm_pi_ready(
+    binding: Mapping[str, Any],
+    deadline: float | None = None,
+    *,
+    timeout_s: float = PI_STATE_CONFIRM_TIMEOUT_S,
+    poll_s: float = PI_STATE_CONFIRM_POLL_S,
+    now: float | None = None,
+) -> PiState:
+    """Ready only when a SECOND snapshot from the same runtime also reads ready.
+
+    Two reads with a strictly greater sequence number from the same launch/runtime replace the old
+    double screen capture: one sample can catch Pi between a prompt submission and the agent
+    actually starting, and a snapshot that never advances means the runtime stopped publishing.
+    Waiting is bounded by `deadline` (a monotonic request deadline) and ~2 s.
     """
-    first_state, first_screen = capture_screen_state(backend, pane_id)
-    if first_screen is None or first_state != "idle":
-        return first_state
-    time.sleep(0.2)
-    second_state, second_screen = capture_screen_state(backend, pane_id)
-    if second_screen is None:
-        return "unknown"
-    if screen_context(first_screen) != screen_context(second_screen):
-        return "busy"
-    return second_state
+    baseline = _read_pi_reading(binding, now=now)
+    if baseline.state.status != "ready":
+        return baseline.state
+    end = time.monotonic() + max(0.0, timeout_s)
+    if deadline is not None:
+        end = min(end, deadline)
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return PiState("stale", "Pi did not report twice in a row")
+        # Never sleep past the deadline: the caller's budget is the hard bound, not the poll.
+        time.sleep(min(poll_s, remaining))
+        reading = _read_pi_reading(binding, now=now)
+        if reading.launch_token != baseline.launch_token or reading.instance_id != baseline.instance_id:
+            # A different runtime owns the pane now: it needs its own second read.
+            if reading.state.status != "ready":
+                return reading.state
+            baseline = reading
+            continue
+        if time.monotonic() >= end:
+            # The read itself can spend the last of the budget; a ready answer from here would
+            # reach the caller after its deadline.
+            return PiState("stale", "Pi did not report twice in a row")
+        if reading.seq <= baseline.seq:
+            continue
+        if reading.state.status != "ready":
+            return reading.state
+        return PiState("ready")
 
 
 @dataclass(frozen=True)
@@ -550,9 +738,9 @@ def reset_destination(work_dir: Path) -> tuple[Any, str, str]:
     sessions, inventory_error = live_pi_sessions(project_id)
     if inventory_error:
         return None, "", inventory_error
-    if not sessions:
-        return None, "", "no live Pi session for this project; refusing to send /new"
-    if len(sessions) > 1:
+    if len(sessions) != 1:
+        if not sessions:
+            return None, "", "no live Pi session for this project; refusing to send /new"
         return None, "", f"{len(sessions)} live Pi sessions for this project; refusing to pick one"
     backend, pane_id, binding, error = _verify_pane(work_dir)
     if error:
@@ -570,146 +758,7 @@ def reset_destination(work_dir: Path) -> tuple[Any, str, str]:
         disagree.append(f"live pane {sole.pane_id or '<none>'} is not binding pane {pane_id or '<none>'}")
     if disagree:
         return None, "", "Pi destination disagrees with its binding: " + "; ".join(disagree)
-    state = capture_confirmed_state(backend, pane_id)
-    if state != "idle":
-        return None, "", f"Pi pane is {state}; refusing to send /new"
+    state = confirm_pi_ready(bound)
+    if state.status != "ready":
+        return None, "", f"Pi pane is {state.status}: {state.reason}; refusing to send /new"
     return backend, pane_id, ""
-
-_DIALOG_MARKERS = (
-    "Project trust",
-    "Session Tree",
-    "Type to search:",
-    "Summarize with custom prompt",
-    "Summarize branch?",
-    "navigate  enter select",
-    "enter select  escape/ctrl+c cancel",
-    "Select a session",
-)
-# The stats line (footer.js:150-178) always starts with a usage figure and survives right-side
-# truncation: ↑/↓/R/W token counts, the cost, the context percentage, or the unknown-context "?/".
-_STATS_LINE = re.compile(
-    r"^\s*(?:[↑↓RW]\d+(?:\.\d+)?[kM]?(?=\s|\.\.\.|$)|\$\d|\d+(?:\.\d+)?%/|\?/)"
-)
-_RULE_LINE = re.compile(r"^\s*─{8,}\s*$")
-_EDITOR_LINE = re.compile(r"^\s*(?:›\s*)?$")
-_CWD_LINE = re.compile(r"^\s*(?:/|~/|<CCB_CWD>).*\s*$")
-_OVERFLOW_LABEL = re.compile(r"↑\s*\d+\s+more")
-# A shell prompt character standing alone or ending a word ("user@host:~/x$", "$ cmd", "❯").
-_SHELL_PROMPT = re.compile(r"(?:^|[\s\w:~/)\]])[$#%>❯➜λ»](?:\s|$)")
-_LOADER_LINE = re.compile(
-    r"^\s*(?:.*\s)?(?:Working|Retrying \(|Compacting context|Auto-compacting|"
-    r"Context overflow detected|Summarizing branch)"
-)
-
-
-def _footer_lines(screen: str) -> list[str]:
-    """Screen lines ending at the stats line.
-
-    Pi's footer (footer.js) may add ONE extension-status line below the stats line (for example
-    "LSP Inactive Ready" from an LSP package). Drop it only when the line above it is the stats
-    line, so the editor-box parse below sees the same layout either way. A line that looks like a
-    shell prompt is never dropped: after Pi exits, the shell prompt lands right below the old
-    footer, and that pane must not read as idle (typing into it would run commands).
-    """
-    lines = screen.splitlines()
-    if (
-        len(lines) >= 2
-        and not _STATS_LINE.match(lines[-1])
-        and _STATS_LINE.match(lines[-2])
-        and not _SHELL_PROMPT.search(lines[-1])
-    ):
-        return lines[:-1]
-    return lines
-
-
-def classify_pane_screen(screen: str) -> str:
-    """Classify pane readiness from visible dialogs, activity, and editor box.
-
-    The editor-box structure decides first; the dialog-marker scan only runs when the
-    structure is unrecognised, so transcript text quoting a marker cannot fake a dialog.
-    The status line is recognised by its stats prefix, not by the model/thinking suffix:
-    that suffix changes with pane width, model type and thinking level.
-    Accepted limitation: an extension overlay that draws a built-in dialog title while
-    leaving the editor box visible now classifies as "idle" (the marker scan used to
-    catch it). Built-in selectors replace the editor box entirely, so they are unaffected.
-    """
-    text = screen or ""
-    state = _classify_pane_structure(text)
-    if state in ("idle", "busy"):
-        return state
-    if any(marker.casefold() in text.casefold() for marker in _DIALOG_MARKERS):
-        return "dialog"
-    return "unknown"
-
-
-def describe_pane_screen(screen: str | None) -> str:
-    """Plain words for why a capture is not a confirmed idle input box.
-
-    Walks the same structural steps as `_classify_pane_structure` and names the first one
-    that failed, with an approximate pane width taken from the longest captured line.
-    """
-    if screen is None:
-        return "pane capture unavailable"
-    lines = _footer_lines(screen)
-    width = max((len(line.rstrip()) for line in lines), default=0)
-    width_note = f", pane ~{width} cols wide" if width else ""
-    if len(lines) < 5:
-        return "no input box on screen"
-    if _classify_pane_structure(screen) == "unknown" and any(
-        marker.casefold() in screen.casefold() for marker in _DIALOG_MARKERS
-    ):
-        return f"a dialog is on screen{width_note}"
-    if not _STATS_LINE.match(lines[-1]):
-        return f"status lines not recognised{width_note}"
-    if not _CWD_LINE.fullmatch(lines[-2]):
-        return f"working-directory line above the status lines not recognised{width_note}"
-    if not _RULE_LINE.fullmatch(lines[-3]):
-        return f"input box bottom border not recognised{width_note}"
-    editor_end = len(lines) - 3
-    top_index = editor_end - 1
-    while top_index >= 0 and not lines[top_index].startswith("─"):
-        top_index -= 1
-    if top_index < 0:
-        return f"input box top border not found{width_note}"
-    if len(lines[top_index].rstrip()) != len(lines[-3].rstrip()):
-        return f"input box borders differ in width{width_note}"
-    border = _OVERFLOW_LABEL.sub("", lines[top_index])
-    if re.sub(r"[─\s]", "", border):
-        return "activity shown in the input box border (pane is busy)"
-    if not _RULE_LINE.fullmatch(border):
-        return f"input box top border not recognised{width_note}"
-    if top_index >= 2 and not lines[top_index - 2].strip() and _LOADER_LINE.match(lines[top_index - 1]):
-        return "activity message above the input box (pane is busy)"
-    editor = lines[top_index + 1:editor_end]
-    if len(editor) == 1 and _EDITOR_LINE.fullmatch(editor[0]):
-        return "input box is empty and idle"
-    return "input box has unsent text"
-
-
-def _classify_pane_structure(screen: str) -> str:
-    """Structural editor-box parse; "unknown" means no recognised editor box."""
-    lines = _footer_lines(screen)
-    if len(lines) < 5 or not _STATS_LINE.match(lines[-1]):
-        return "unknown"
-    if not _CWD_LINE.fullmatch(lines[-2]) or not _RULE_LINE.fullmatch(lines[-3]):
-        return "unknown"
-    editor_end = len(lines) - 3
-    top_index = editor_end - 1
-    while top_index >= 0 and not lines[top_index].startswith("─"):
-        top_index -= 1
-    if top_index < 0:
-        return "unknown"
-    if len(lines[top_index].rstrip()) != len(lines[-3].rstrip()):
-        return "unknown"
-    border = _OVERFLOW_LABEL.sub("", lines[top_index])
-    if re.sub(r"[─\s]", "", border):
-        return "busy"
-    if not _RULE_LINE.fullmatch(border):
-        return "unknown"
-    # Built-in messages only: coverage is the embedded default editor (any frames/message) plus non-embedded loaders showing a built-in message. An extension editor with a custom message is detected only by the best-effort animation check above.
-    if top_index >= 2 and not lines[top_index - 2].strip() and _LOADER_LINE.match(lines[top_index - 1]):
-        return "busy"
-    editor = lines[top_index + 1:editor_end]
-    if len(editor) == 1 and _EDITOR_LINE.fullmatch(editor[0]):
-        return "idle"
-    return "unknown"

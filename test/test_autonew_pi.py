@@ -1,48 +1,51 @@
+# This repo puts lib/ on sys.path at runtime (test/conftest.py) and ships no pyright
+# configuration, so the workspace-rooted analyzer cannot see these flat imports.
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from pi_comm import PiState
 from project_id import compute_ccb_project_id
 
-FIXTURES = Path(__file__).parent / "fixtures" / "pi"
 PANE = "%77"
 MARKER = "Pi-autonew-marker"
 SESSION_ID = "2c8ab895-d0ab-49c6-86c1-0f7ff9fb6e8e"
+
+# Pi's own readiness report, as CCB's Pi extension publishes it. These tests script the report in
+# place of the old screen captures: the signal is swapped, each test's decision is not.
+READY = PiState("ready")
+BUSY = PiState("busy", "Pi is working on a request")
+DRAFT = PiState("draft", "Pi has unsent text in its editor")
+PROMPT = PiState("prompt", "Pi is waiting for a decision in its pane")
+ABSENT = PiState("absent", "CCB's Pi extension is not reporting; restart CCB")
 
 
 def _autonew():
     path = Path(__file__).resolve().parents[1] / "bin" / "autonew"
     loader = importlib.machinery.SourceFileLoader("autonew_under_test", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
 
 
-def _screen(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
-
-
-def _draft_screen() -> str:
-    lines = _screen("screen-idle.txt").splitlines()
-    rule = max(index for index, line in enumerate(lines) if line.startswith("─" * 8))
-    lines[rule - 1] = "draft text"
-    return "\n".join(lines)
-
-
 class FakePiBackend:
-    """Pane backend whose captures come from a script (repeats the last screen)."""
+    """Pane backend whose Pi readiness reports come from a script (repeats the last state)."""
 
-    def __init__(self, screens: list[str] | None = None, *, capture_error: bool = False):
-        self.screens = list(screens or [])
-        self.capture_error = capture_error
+    def __init__(self, states: list[PiState] | None = None):
+        self.states = list(states or [READY])
         self.sent: list[tuple[str, str]] = []
         self.marker_pane = PANE
         self.markers = {MARKER: PANE, "Codex-marker": "%90", "Record-marker": "%15"}
@@ -56,12 +59,10 @@ class FakePiBackend:
             return self.marker_pane
         return self.markers.get(marker, "")
 
-    def get_pane_content(self, _pane: str, lines: int = 40) -> str:
-        if self.capture_error:
-            raise RuntimeError("capture unavailable")
-        if not self.screens:
-            raise RuntimeError("no screen scripted")
-        return self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
+    def next_state(self) -> PiState:
+        if not self.states:
+            raise RuntimeError("no state scripted")
+        return self.states.pop(0) if len(self.states) > 1 else self.states[0]
 
     def send_text(self, pane: str, text: str) -> None:
         self.sent.append((pane, text))
@@ -93,6 +94,17 @@ def _use_backend(monkeypatch: pytest.MonkeyPatch, backend: FakePiBackend) -> Non
     # pi_comm imports the backend factory lazily, pane_registry binds it at import time.
     monkeypatch.setattr("terminal.get_backend_for_session", lambda _data: backend)
     monkeypatch.setattr("pane_registry.get_backend_for_session", lambda _data: backend)
+
+    def _state(*_args, **_kwargs) -> PiState:
+        return backend.next_state()
+
+    def _confirm(*_args, **_kwargs) -> PiState:
+        # Mirrors the production rule: a ready first read needs a second, also-ready read.
+        first = backend.next_state()
+        return first if first.status != "ready" else backend.next_state()
+
+    monkeypatch.setattr("pi_comm.read_pi_state", _state)
+    monkeypatch.setattr("pi_comm.confirm_pi_ready", _confirm)
 
 
 def _write_launch(
@@ -145,7 +157,7 @@ def test_pi_is_a_supported_provider_with_slash_new(capsys) -> None:
 
 def test_idle_pi_sends_new_once_and_leaves_the_binding_untouched(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path)
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
     binding = project / ".ccb" / ".pi-session"
     before = hashlib.sha256(binding.read_bytes()).hexdigest()
@@ -159,14 +171,10 @@ def test_idle_pi_sends_new_once_and_leaves_the_binding_untouched(monkeypatch, ca
     assert hashlib.sha256(binding.read_bytes()).hexdigest() == before
 
 
-@pytest.mark.parametrize("screen_name,make_screen", [
-    ("busy", lambda: _screen("screen-busy.txt")),
-    ("trust-dialog", lambda: _screen("screen-trust-dialog.txt")),
-    ("draft", _draft_screen),
-])
-def test_non_idle_pi_screen_refuses_with_zero_sends(monkeypatch, capsys, tmp_path: Path, screen_name, make_screen) -> None:
+@pytest.mark.parametrize("state", [BUSY, PROMPT, DRAFT], ids=lambda s: s.status)
+def test_non_ready_pi_refuses_with_zero_sends(monkeypatch, capsys, tmp_path: Path, state: PiState) -> None:
     project = _project(tmp_path)
-    backend = FakePiBackend([make_screen()])
+    backend = FakePiBackend([state])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -174,19 +182,15 @@ def test_non_idle_pi_screen_refuses_with_zero_sends(monkeypatch, capsys, tmp_pat
     assert code == 1
     assert backend.sent == []
     assert out == ""
+    assert f"Pi pane is {state.status}" in err
     assert "refusing to send /new" in err
     assert len([line for line in err.splitlines() if line.strip()]) == 1
 
 
-@pytest.mark.parametrize("second_screen", ["busy", "dialog", "draft"])
-def test_pane_that_changes_between_captures_refuses(monkeypatch, capsys, tmp_path: Path, second_screen: str) -> None:
+@pytest.mark.parametrize("second_read", [BUSY, PROMPT, DRAFT], ids=lambda s: s.status)
+def test_a_second_read_that_is_not_ready_refuses(monkeypatch, capsys, tmp_path: Path, second_read: PiState) -> None:
     project = _project(tmp_path)
-    follow = {
-        "busy": _screen("screen-busy.txt"),
-        "dialog": _screen("screen-trust-dialog.txt"),
-        "draft": _draft_screen(),
-    }[second_screen]
-    backend = FakePiBackend([_screen("screen-idle.txt"), follow])
+    backend = FakePiBackend([READY, second_read])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -196,22 +200,23 @@ def test_pane_that_changes_between_captures_refuses(monkeypatch, capsys, tmp_pat
     assert "refusing to send /new" in err
 
 
-def test_capture_failure_refuses_with_zero_sends(monkeypatch, capsys, tmp_path: Path) -> None:
+def test_a_missing_extension_report_refuses_with_zero_sends(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path)
-    backend = FakePiBackend(capture_error=True)
+    backend = FakePiBackend([ABSENT])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
 
     assert code == 1
     assert backend.sent == []
-    assert "Pi pane is unknown; refusing to send /new" in err
+    assert "Pi pane is absent: CCB's Pi extension is not reporting; restart CCB" in err
+    assert "refusing to send /new" in err
 
 
 def test_two_live_pi_sessions_in_one_launch_refuse(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-a", project, panes=(PANE, "%78"), markers=(MARKER, "Record-marker-1"))
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     backend.markers["Record-marker-1"] = "%78"
     backend.alive_panes = {PANE, "%78"}
     _use_backend(monkeypatch, backend)
@@ -227,7 +232,7 @@ def test_two_launches_for_the_project_refuse(monkeypatch, capsys, tmp_path: Path
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-a", project, panes=(PANE,))
     _write_launch(Path.home(), "launch-b", project, panes=("%79",), marker="Record-marker-1")
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     backend.markers["Record-marker-1"] = "%79"
     backend.alive_panes = {PANE, "%79"}
     _use_backend(monkeypatch, backend)
@@ -248,7 +253,7 @@ def test_broken_pi_inventory_refuses(monkeypatch, capsys, tmp_path: Path) -> Non
         "work_dir": str(project), "updated_at": int(time.time()), "terminal": "tmux",
         "live_sessions": "not-a-list",
     }))
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -272,7 +277,7 @@ def test_unverifiable_destination_refuses(monkeypatch, capsys, tmp_path: Path, c
         binding.pop("pi_session_id")
         binding.pop("pi_session_dir")
     project = _project(tmp_path, binding=binding)
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     if case == "marker-mismatch":
         backend.marker_pane = "%99"
     _use_backend(monkeypatch, backend)
@@ -289,7 +294,7 @@ def test_unverifiable_destination_refuses(monkeypatch, capsys, tmp_path: Path, c
 def test_codex_path_is_unchanged_and_still_sends_blindly(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path)
     _write_launch(Path.home(), "launch-a", project, panes=(PANE,), inventory=False)
-    backend = FakePiBackend([_screen("screen-busy.txt")])
+    backend = FakePiBackend([BUSY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project, provider="codex")
@@ -301,7 +306,7 @@ def test_codex_path_is_unchanged_and_still_sends_blindly(monkeypatch, capsys, tm
 
 def test_no_live_pi_session_refuses(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path, launch=False)
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -314,7 +319,7 @@ def test_no_live_pi_session_refuses(monkeypatch, capsys, tmp_path: Path) -> None
 def test_empty_inventory_refuses(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-1", project, panes=())
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -333,7 +338,7 @@ def test_counted_session_on_another_pane_than_the_binding_refuses(monkeypatch, c
     }
     project = _project(tmp_path, binding=binding, launch=False)
     _write_launch(Path.home(), "launch-1", project, panes=("%15",), marker="Record-marker")
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     backend.marker_pane = "%99"
     backend.alive_panes = {PANE, "%99", "%15"}
     _use_backend(monkeypatch, backend)
@@ -348,7 +353,7 @@ def test_counted_session_on_another_pane_than_the_binding_refuses(monkeypatch, c
 def test_record_from_a_different_launch_refuses(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-2", project, panes=(PANE,))
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -361,7 +366,7 @@ def test_record_from_a_different_launch_refuses(monkeypatch, capsys, tmp_path: P
 def test_record_from_a_different_terminal_backend_refuses(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-1", project, panes=(PANE,), terminal="wezterm")
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -374,7 +379,7 @@ def test_record_from_a_different_terminal_backend_refuses(monkeypatch, capsys, t
 def test_stale_record_is_not_counted(monkeypatch, capsys, tmp_path: Path) -> None:
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-1", project, panes=(PANE,), updated_at=int(time.time()) - 30 * 24 * 60 * 60)
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -389,7 +394,7 @@ def test_dead_pane_record_is_not_counted(monkeypatch, capsys, tmp_path: Path) ->
     project = _project(tmp_path, launch=False)
     _write_launch(Path.home(), "launch-a", project, panes=("%15",))
     _write_launch(Path.home(), "launch-b", project, panes=("%16",))
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     backend.alive_panes = {PANE}
     _use_backend(monkeypatch, backend)
 
@@ -409,7 +414,7 @@ def test_one_live_session_survives_an_unqualified_record(monkeypatch, capsys, tm
         Path.home(), "launch-decoy", project, panes=(dead_pane if decoy == "dead-pane" else PANE,),
         updated_at=int(time.time()) - 30 * 24 * 60 * 60 if decoy == "stale" else None,
     )
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
 
     code, out, err = _run(monkeypatch, capsys, project)
@@ -425,7 +430,7 @@ def test_live_pi_sessions_reports_only_qualified_entries(monkeypatch, tmp_path: 
     project = _project(tmp_path)
     _write_launch(Path.home(), "launch-stale", project, panes=(PANE,), updated_at=int(time.time()) - 30 * 24 * 60 * 60)
     _write_launch(Path.home(), "launch-dead", project, panes=("%16",))
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     backend.alive_panes = {PANE}
     _use_backend(monkeypatch, backend)
 
@@ -439,7 +444,7 @@ def test_live_pi_sessions_reports_only_qualified_entries(monkeypatch, tmp_path: 
 def test_help_anywhere_prints_usage_and_sends_nothing(monkeypatch, capsys, tmp_path: Path, args) -> None:
     project = _project(tmp_path)
     _write_launch(Path.home(), "launch-a", project, panes=(PANE,), inventory=False)
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
     monkeypatch.chdir(project)
 
@@ -454,7 +459,7 @@ def test_help_anywhere_prints_usage_and_sends_nothing(monkeypatch, capsys, tmp_p
 def test_extra_arguments_refuse_and_send_nothing(monkeypatch, capsys, tmp_path: Path, provider: str) -> None:
     project = _project(tmp_path)
     _write_launch(Path.home(), "launch-a", project, panes=(PANE,), inventory=False)
-    backend = FakePiBackend([_screen("screen-idle.txt")])
+    backend = FakePiBackend([READY])
     _use_backend(monkeypatch, backend)
     monkeypatch.chdir(project)
 

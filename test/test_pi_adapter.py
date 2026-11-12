@@ -1,15 +1,23 @@
+# This repo puts lib/ on sys.path at runtime (test/conftest.py) and ships no pyright
+# configuration, so the workspace-rooted analyzer cannot see these flat imports.
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
+import time
 from itertools import count
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
 from askd.adapters.base import ProviderRequest, QueuedTask
 from askd.adapters.pi import PiAdapter
-from pi_comm import load_session
+from pi_comm import PiState, load_session
 
 FIXTURES = Path(__file__).parent / "fixtures" / "pi"
 
@@ -45,6 +53,42 @@ def _scripted_clock(values, *, step: float = 0.05):
     return clock
 
 
+# Pi's own readiness report, as CCB's Pi extension publishes it. These tests script the report in
+# place of the old screen captures: the signal is swapped, each test's decision logic is not.
+READY = PiState("ready")
+BUSY = PiState("busy", "Pi is working on a request")
+DRAFT = PiState("draft", "Pi has unsent text in its editor")
+PROMPT = PiState("prompt", "Pi is waiting for a decision in its pane")
+ABSENT = PiState("absent", "CCB's Pi extension is not reporting; restart CCB")
+
+
+def _script_states(monkeypatch, script) -> None:
+    """Answer readiness from a script instead of Pi's state file.
+
+    Each read consumes one entry and the last entry repeats; a callable entry is called per read
+    (for tests whose state depends on their own clock). `_confirm_pi_ready` mirrors the production
+    rule: a ready first read needs a second, also-ready read.
+    """
+
+    import askd.adapters.pi as adapter_module
+
+    pending = list(script) or [READY]
+
+    def take() -> PiState:
+        item = pending.pop(0) if len(pending) > 1 else pending[0]
+        return item() if callable(item) else item
+
+    def _read(*_args, **_kwargs) -> PiState:
+        return take()
+
+    def _confirm(*_args, **_kwargs) -> PiState:
+        first = take()
+        return first if first.status != "ready" else take()
+
+    monkeypatch.setattr(adapter_module, "_read_pi_state", _read)
+    monkeypatch.setattr(adapter_module, "_confirm_pi_ready", _confirm)
+
+
 class FakeBackend:
     sent: list[tuple[str, str]]
 
@@ -56,9 +100,6 @@ class FakeBackend:
 
     def find_pane_by_title_marker(self, _marker, _cwd):
         return "%12"
-
-    def get_pane_content(self, _pane, lines=40):
-        return (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
 
     def send_text(self, pane, text):
         self.sent.append((pane, text))
@@ -137,21 +178,22 @@ def test_existing_anchor_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
     assert backend.sent == []
 
 
-def test_tree_selector_refuses_before_send(monkeypatch, tmp_path: Path):
+def test_an_open_prompt_refuses_before_send(monkeypatch, tmp_path: Path):
     session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, session_id)
     backend = FakeBackend()
-    backend.get_pane_content = lambda _pane, lines=40: (FIXTURES / "screen-tree-selector.txt").read_text()
+    _script_states(monkeypatch, [PROMPT])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     adapter = PiAdapter()
     monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
 
-    result = adapter.handle_task(_task(tmp_path, "selector-test"))
+    result = adapter.handle_task(_task(tmp_path, "prompt-test"))
     assert result.exit_code == 1
-    assert "selector decision" in result.reply
+    assert "waiting for a decision" in result.reply
+    assert "state: prompt" in result.reply
     assert backend.sent == []
 
 
@@ -174,6 +216,7 @@ def test_parked_abort_deadline_expires(monkeypatch, tmp_path: Path):
         session_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
     backend.send_text = send
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 1.0, 62.0]))
@@ -205,6 +248,7 @@ def test_parked_abort_releases_queue_when_actionable_work_waits(monkeypatch, tmp
         session_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
     backend.send_text = send
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     ticks = count(0, 1)
@@ -252,6 +296,7 @@ def test_raw_continuation_clears_parked_deadline(monkeypatch, tmp_path: Path):
 
     backend.send_text = send
     backend.is_alive = is_alive
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.0, 1.0).__next__)
@@ -273,6 +318,7 @@ def test_missing_anchor_fails_fast_and_does_not_resend(monkeypatch, tmp_path: Pa
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, session_id)
     backend = FakeBackend()
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     ticks = iter([0.0, 0.0, 0.1, 13.0])
@@ -303,14 +349,9 @@ def test_completed_reply_strips_trailing_done_marker(monkeypatch, tmp_path: Path
         target.write_text(content, encoding="utf-8")
 
     backend.send_text = accept
-    capture_calls = count()
-
-    def capture(_pane, lines=40):
-        if next(capture_calls) >= 2:
-            raise RuntimeError("terminal capture unavailable")
-        return (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-
-    backend.get_pane_content = capture
+    # Readiness holds for the send; the follow-up reads find no reporting extension, which must
+    # not stop the transcript from delivering the completion.
+    _script_states(monkeypatch, [READY, READY, ABSENT])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
@@ -324,89 +365,102 @@ def test_completed_reply_strips_trailing_done_marker(monkeypatch, tmp_path: Path
     assert result.reply.strip() == "PANEB"
 
 
-def _refuse_with_screen(monkeypatch, tmp_path: Path, screen: str, req_id: str):
+def _refuse_with_state(monkeypatch, tmp_path: Path, state: PiState, req_id: str):
     session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, session_id)
     backend = FakeBackend()
-    backend.get_pane_content = lambda *_args, **_kwargs: screen
+    _script_states(monkeypatch, [state])
     adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     return adapter.handle_task(_task(tmp_path, req_id)), backend
 
 
-def test_real_trust_dialog_screen_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
-    screen = (FIXTURES / "screen-trust-dialog.txt").read_text(encoding="utf-8")
-    result, backend = _refuse_with_screen(monkeypatch, tmp_path, screen, "trust-dialog-screen")
+def test_an_open_prompt_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
+    result, backend = _refuse_with_state(monkeypatch, tmp_path, PROMPT, "prompt-open")
     assert result.exit_code == 1
-    assert "project-trust or selector decision" in result.reply
+    assert "waiting for a decision" in result.reply
+    assert "state: prompt" in result.reply
     assert backend.sent == []
 
 
-def test_editor_draft_with_quoted_marker_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
-    lines = (FIXTURES / "screen-idle-quoting-marker.txt").read_text(encoding="utf-8").splitlines()
-    rules = [index for index, line in enumerate(lines) if line.startswith("\u2500" * 8)]
-    lines[max(rules) - 1] = "draft text"
-    result, backend = _refuse_with_screen(monkeypatch, tmp_path, "\n".join(lines), "draft-marker-screen")
-    # An unrecognised editor region still falls back to the marker scan (ratified amendment 1),
-    # so the draft screen is refused as a dialog; what matters is that nothing is sent.
+def test_a_draft_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
+    result, backend = _refuse_with_state(monkeypatch, tmp_path, DRAFT, "draft-in-editor")
     assert result.exit_code == 1
-    assert "selector decision" in result.reply
+    assert "unsent text in its editor" in result.reply
+    assert "state: draft" in result.reply
     assert backend.sent == []
 
 
-def test_capture_failure_before_send_refuses_without_sending(monkeypatch, tmp_path: Path):
+def _real_state_binding(monkeypatch, tmp_path: Path, **state_overrides) -> tuple[PiAdapter, FakeBackend, dict]:
+    """A binding whose readiness is read from a REAL state file (no scripted states)."""
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    runtime = tmp_path / "rt"
+    runtime.mkdir(mode=0o700)
+    state_file = runtime / "pi-state.json"
+    binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
+    binding.update({"pi_state_file": str(state_file), "runtime_dir": str(runtime), "pi_launch_token": "canary-token"})
+    snapshot = {
+        "v": 1, "launch_token": "canary-token", "runtime_instance_id": f"{os.getpid()}-instance",
+        "pid": os.getpid(), "mode": "tui", "has_ui": True, "idle": True, "editor_empty": True,
+        "prompt_open": False, "seq": 3, "updated_at": int(time.time() * 1000),
+    }
+    snapshot.update(state_overrides)
+    state_file.write_text(json.dumps(snapshot), encoding="utf-8")
+    backend = FakeBackend()
+    adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    return adapter, backend, snapshot
+
+
+@pytest.mark.parametrize("overrides", [
+    {"prompt_open": None},
+    {"prompt_open": "false"},
+    {"runtime_instance_id": ""},
+    {"runtime_instance_id": 7},
+    {"idle": None},
+    {"pid": "1"},
+    {"seq": -1},
+    {"updated_at": "now"},
+], ids=lambda overrides: "-".join(f"{key}={value!r}" for key, value in overrides.items()))
+def test_a_malformed_snapshot_refuses_before_any_send(monkeypatch, tmp_path: Path, overrides: dict):
+    # The values are validated, not just the keys: a null flag or an empty identity is not a report,
+    # and the adapter must refuse it exactly like a missing extension.
+    adapter, backend, _snapshot = _real_state_binding(monkeypatch, tmp_path, **overrides)
+
+    result = adapter.handle_task(_task(tmp_path, "malformed-state"))
+
+    assert result.exit_code == 1
+    assert "readiness could not be verified" in result.reply
+    assert "state: absent" in result.reply and "restart CCB" in result.reply
+    assert backend.sent == []
+
+
+def test_no_reporting_extension_refuses_without_sending(monkeypatch, tmp_path: Path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    backend.get_pane_content = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("capture failed"))
+    _script_states(monkeypatch, [ABSENT])
     adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
 
-    result = adapter.handle_task(_task(tmp_path, "capture-failed-before-send"))
+    result = adapter.handle_task(_task(tmp_path, "state-absent-before-send"))
     assert result.exit_code == 1 and "readiness could not be verified" in result.reply
+    assert "restart CCB" in result.reply
     assert backend.sent == []
 
 
-@pytest.mark.parametrize("second_capture", [
-    "dialog", "draft", "raises", "short_draft", "short_border",
-])
-def test_confirmed_pre_send_capture_refuses_unstable_or_uncertain_screen(monkeypatch, tmp_path: Path, second_capture: str):
+@pytest.mark.parametrize("second_read", [PROMPT, DRAFT, ABSENT], ids=lambda s: s.status)
+def test_confirmation_refuses_a_second_read_that_is_not_ready(monkeypatch, tmp_path: Path, second_read: PiState):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    idle_screen = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    if second_capture == "dialog":
-        next_screen = (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8")
-    elif second_capture == "draft":
-        lines = idle_screen.splitlines()
-        lines[2] = "draft text"
-        next_screen = "\n".join(lines)
-    elif second_capture == "short_draft":
-        lines = idle_screen.splitlines()
-        lines[2:3] = ["draft text", "──────", ""]
-        next_screen = "\n".join(lines)
-    elif second_capture == "short_border":
-        lines = idle_screen.splitlines()
-        lines[1] = "─"
-        next_screen = "\n".join(lines)
-    else:
-        next_screen = ""
-    capture_calls = count()
-
-    def capture(_pane, lines=40):
-        if next(capture_calls) == 0:
-            return idle_screen
-        if second_capture == "raises":
-            raise RuntimeError("second capture failed")
-        return next_screen
-
-    backend.get_pane_content = capture
+    _script_states(monkeypatch, [READY, second_read])
     adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
 
-    result = adapter.handle_task(_task(tmp_path, f"unstable-{second_capture}"))
+    result = adapter.handle_task(_task(tmp_path, f"unstable-{second_read.status}"))
     assert result.exit_code == 1
     assert backend.sent == []
 
@@ -432,12 +486,13 @@ def test_resumed_session_anchor_is_tracked_without_rewriting_binding(monkeypatch
     binding["start_dir"] = str(start_dir)
     backend = FakeBackend()
 
-    def accept(pane, _text):
-        backend.sent.append((pane, _text))
+    def accept(pane, text):
+        backend.sent.append((pane, text))
         with target.open("a", encoding="utf-8") as handle:
             handle.write("".join(json.dumps(row) + "\n" for row in rows[anchor_index:]))
 
     backend.send_text = accept
+    _script_states(monkeypatch, [READY])
     adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     original_binding = binding_path.read_bytes()
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.1, 0.2]))
@@ -473,6 +528,7 @@ def test_bound_session_from_subdirectory_launch_is_still_a_candidate(monkeypatch
             handle.write("".join(json.dumps(row) + "\n" for row in rows))
 
     backend.send_text = accept
+    _script_states(monkeypatch, [READY])
     adapter, _binding_path = _adapter_with_real_binding(monkeypatch, work_dir, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
@@ -500,15 +556,14 @@ def test_unchanged_candidate_session_is_parsed_once_across_polls(monkeypatch, tm
         return original_load(path, session_id)
 
     monkeypatch.setattr(pi_comm, "_load_session_path", count_parse)
-    screens = iter([
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        "blank terminal", "blank terminal",
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+    _script_states(monkeypatch, [
+        READY,
+        READY,
+        ABSENT, ABSENT,
+        READY,
+        READY,
+        READY,
     ])
-    backend.get_pane_content = lambda _pane, lines=40: next(screens)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02, 0.03, 0.04]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
@@ -523,12 +578,11 @@ def test_dialog_after_anchor_deadline_fails_with_dialog_message(monkeypatch, tmp
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    screens = iter([
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8"),
+    _script_states(monkeypatch, [
+        READY,
+        READY,
+        PROMPT,
     ])
-    backend.get_pane_content = lambda _pane, lines=40: next(screens)
     adapter, _binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02]))
@@ -585,6 +639,7 @@ def test_invalid_or_foreign_candidate_is_ignored(monkeypatch, tmp_path: Path, in
     binding = _binding(tmp_path, session_dir, bound_id)
     backend = FakeBackend()
     adapter, binding_path = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.1]))
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
@@ -599,15 +654,14 @@ def test_busy_then_idle_without_anchor_reports_unlocated_activity(monkeypatch, t
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    screens = iter([
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
+    _script_states(monkeypatch, [
+        READY,
+        READY,
+        BUSY,
+        READY,
+        READY,
+        READY,
     ])
-    backend.get_pane_content = lambda _pane, lines=40: next(screens)
     adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     monkeypatch.setattr("askd.adapters.pi.ANCHOR_TIMEOUT_S", 0.01)
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", _scripted_clock([0.0, 0.0, 0.02, 0.03]))
@@ -618,25 +672,12 @@ def test_busy_then_idle_without_anchor_reports_unlocated_activity(monkeypatch, t
     assert result.reply == "Pi showed activity, but CCB could not locate this request in its session folder."
 
 
-def test_unknown_screen_after_anchor_deadline_allows_late_completion(monkeypatch, tmp_path: Path):
+def test_unknown_state_after_anchor_deadline_allows_late_completion(monkeypatch, tmp_path: Path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    screens = iter([
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8"),
-        "blank terminal", "blank terminal",
-    ])
-    original_get = backend.get_pane_content
-
-    def get_screen(_pane, lines=40):
-        screen = next(screens)
-        if screen == "blank terminal":
-            return screen
-        return original_get(_pane, lines)
-
-    backend.get_pane_content = get_screen
+    _script_states(monkeypatch, [READY, READY, ABSENT, ABSENT])
     adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     original_find = __import__("pi_comm").load_candidate_sessions
     calls = count()
@@ -664,35 +705,41 @@ def test_completion_landing_during_deadline_confirmation_is_delivered(monkeypatc
     req_id = "pi-late-confirm"
     binding = _binding(tmp_path, session_dir, session_id)
     backend = FakeBackend()
+    _script_states(monkeypatch, [READY])
 
-    def sleep(seconds):
-        # The anchored completion is persisted while the deadline idle check confirms.
-        if backend.sent and seconds == pytest.approx(0.2) and not target.exists():
+    import askd.adapters.pi as adapter_module
+
+    confirms = {"calls": 0}
+
+    def confirm(*_args, **_kwargs) -> PiState:
+        confirms["calls"] += 1
+        # The anchored completion is persisted while the deadline readiness check confirms.
+        if confirms["calls"] == 2 and backend.sent and not target.exists():
             content = source.read_text(encoding="utf-8").replace("<SCRATCH>/work", str(tmp_path), 1).replace("s8-b", req_id)
             target.write_text(content, encoding="utf-8")
+        return READY
 
+    monkeypatch.setattr(adapter_module, "_confirm_pi_ready", confirm)
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 1.0).__next__)
-    monkeypatch.setattr("askd.adapters.pi.time.sleep", sleep)
+    monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _seconds: None)
     adapter = PiAdapter()
     monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
 
     result = adapter.handle_task(_task(tmp_path, req_id, timeout_s=60))
     assert result.exit_code == 0
     assert result.status == "completed"
+    assert confirms["calls"] == 2
     assert len(backend.sent) == 1
 
 
-def test_spaced_custom_loader_frame_is_never_injected(monkeypatch, tmp_path: Path):
+def test_a_busy_report_is_waited_for_never_injected(monkeypatch, tmp_path: Path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8").splitlines()
-    top = len(idle) - 5
-    screen = "\n".join(idle[:top - 1] + ["", " >> >> Working"] + idle[top:])
-    backend.get_pane_content = lambda _pane, lines=40: screen
+    _script_states(monkeypatch, [BUSY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.0, 1.0).__next__)
@@ -700,8 +747,8 @@ def test_spaced_custom_loader_frame_is_never_injected(monkeypatch, tmp_path: Pat
     adapter = PiAdapter()
     monkeypatch.setattr(adapter, "_finish", lambda _task, result, **_kwargs: result)
 
-    # A busy-looking frame is waited for now, never refused into a send: it times out unsent.
-    result = adapter.handle_task(_task(tmp_path, "spaced-frame", timeout_s=2))
+    # A busy report is waited for, never refused into a send: it times out unsent.
+    result = adapter.handle_task(_task(tmp_path, "busy-frame", timeout_s=2))
     assert result.exit_code == 2 and result.status == "incomplete"
     assert backend.sent == []
 
@@ -752,6 +799,8 @@ def _adapt_with_session(monkeypatch, tmp_path: Path, session_id: str, session_pa
         _write_session(session_path, tmp_path, session_id, first_rows)
 
     backend.send_text = send
+    # The pane's readiness report is a fixture here: these tests exercise reply tracking.
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     adapter = PiAdapter()
@@ -823,10 +872,8 @@ def test_retrying_idle_window_resets_on_activity(monkeypatch, tmp_path: Path):
         monkeypatch, tmp_path, session_id, session_path, backend,
         [_anchor_row(req_id), _error_session_row("err1", "user1"), _retry_edit_row("edit1", "err1", "err1")],
     )
-    idle_screen = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy_screen = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
     clock = _Clock(monkeypatch, [0.0, 0.0, 0.0, 29.9, 30.0, 59.9, 90.1, 120.2])
-    backend.get_pane_content = lambda _pane, lines=40: busy_screen if 30.0 <= clock.now < 60.0 else idle_screen
+    _script_states(monkeypatch, [lambda: BUSY if 30.0 <= clock.now < 60.0 else READY])
 
     result = adapter.handle_task(_task(tmp_path, req_id))
     assert result.exit_code == 2
@@ -987,13 +1034,13 @@ def test_errored_state_without_an_entry_id_still_expires_after_grace(monkeypatch
     assert clock.now == 10.1
 
 
-def _retrying_adapter(monkeypatch, tmp_path: Path, req_id: str, screen):
+def _retrying_adapter(monkeypatch, tmp_path: Path, req_id: str, state):
     session_id = "8a18f4e0-1b8f-4d3b-8588-c741a703bc75"
     session_dir = tmp_path / "sessions"
     session_dir.mkdir(exist_ok=True)
     binding = _binding(tmp_path, session_dir, session_id)
     backend = FakeBackend()
-    backend.get_pane_content = lambda _pane, lines=40: screen()
+    _script_states(monkeypatch, [state])
     loads = []
 
     def load(req):
@@ -1009,8 +1056,8 @@ def _retrying_adapter(monkeypatch, tmp_path: Path, req_id: str, screen):
 
 def test_pre_send_retry_becomes_idle_and_sends_exactly_once(monkeypatch, tmp_path: Path):
     req_id = "narrow-retry"
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    idle = READY
+    busy = BUSY
     screens = iter([busy, idle, idle, idle])
     adapter, backend, _loads = _retrying_adapter(
         monkeypatch, tmp_path, req_id, lambda: next(screens, idle),
@@ -1037,26 +1084,26 @@ def test_pre_send_retry_becomes_idle_and_sends_exactly_once(monkeypatch, tmp_pat
 
 def test_pre_send_dialog_refusal_budget_exhaustion_names_state_and_reason(monkeypatch, tmp_path: Path):
     # A dialog (unlike a busy pane) still spends the retry budget and is refused, not waited for.
-    dialog = (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8")
+    dialog = PROMPT
     adapter, backend, loads = _retrying_adapter(monkeypatch, tmp_path, "still-dialog", lambda: dialog)
     monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 0.0)
 
     result = adapter.handle_task(_task(tmp_path, "still-dialog"))
     assert result.exit_code == 1 and result.status == "failed"
-    assert "project-trust or selector decision" in result.reply
-    assert "state: dialog" in result.reply
+    assert "waiting for a decision in its pane" in result.reply
+    assert "state: prompt" in result.reply
     # Initial attempt plus PRE_SEND_RETRY_LIMIT retries.
     assert len(loads) == 1 + 3
     assert backend.sent == []
 
 
 def test_pre_send_dialog_refusal_never_widens_the_request_timeout(monkeypatch, tmp_path: Path):
-    dialog = (FIXTURES / "screen-tree-selector.txt").read_text(encoding="utf-8")
+    dialog = PROMPT
     adapter, backend, loads = _retrying_adapter(monkeypatch, tmp_path, "short-timeout", lambda: dialog)
     monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 20.0)
 
     result = adapter.handle_task(_task(tmp_path, "short-timeout", timeout_s=5))
-    assert result.exit_code == 1 and "state: dialog" in result.reply
+    assert result.exit_code == 1 and "state: prompt" in result.reply
     assert len(loads) == 1
     assert backend.sent == []
 
@@ -1065,8 +1112,8 @@ def test_busy_pre_send_waits_past_the_retry_limit_then_sends_exactly_once(monkey
     # Busy waits never spend the dialog retry budget: more than PRE_SEND_RETRY_LIMIT+1 busy
     # polls still deliver once the pane goes idle (real record: request C behind a running turn).
     req_id = "busy-then-idle"
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    idle = READY
+    busy = BUSY
     screens = iter([busy] * 5 + [idle])
     adapter, backend, loads = _retrying_adapter(
         monkeypatch, tmp_path, req_id, lambda: next(screens, idle),
@@ -1095,7 +1142,7 @@ def test_busy_pre_send_waits_past_the_retry_limit_then_sends_exactly_once(monkey
 
 
 def test_busy_pre_send_until_the_deadline_times_out_without_sending(monkeypatch, tmp_path: Path):
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    busy = BUSY
     adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "busy-until-deadline", lambda: busy)
     now = {"t": 0.0}
     waits: list[float] = []
@@ -1125,7 +1172,7 @@ def test_cancel_during_a_busy_pre_send_wait_sends_nothing(monkeypatch, tmp_path:
             self.checks += 1
             return self.checks >= 2
 
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    busy = BUSY
     adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "cancel-in-wait", lambda: busy)
     monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
 
@@ -1142,11 +1189,10 @@ def test_pre_send_retry_rereads_a_binding_that_changed_during_the_wait(monkeypat
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, session_id)
     rebound = dict(binding, pane_id="%99")
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
-    screens = iter([busy, idle, idle, idle])
+    idle = READY
+    busy = BUSY
+    _script_states(monkeypatch, [busy, idle])
     backend = FakeBackend()
-    backend.get_pane_content = lambda _pane, lines=40: next(screens, idle)
     loads: list[int] = []
     bindings = [binding, rebound]
 
@@ -1173,8 +1219,8 @@ def test_pre_send_retry_rereads_a_binding_that_changed_during_the_wait(monkeypat
 
 
 def test_policy_refusal_after_a_wait_sends_nothing(monkeypatch, tmp_path: Path):
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    idle = READY
+    busy = BUSY
     screens = iter([busy, idle, idle])
     adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "policy-after-wait", lambda: next(screens, idle))
     monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 1.0)
@@ -1187,15 +1233,6 @@ def test_policy_refusal_after_a_wait_sends_nothing(monkeypatch, tmp_path: Path):
     assert backend.sent == []
 
 
-def test_one_row_overlay_over_the_status_line_refuses_with_zero_sends(monkeypatch, tmp_path: Path):
-    lines = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8").splitlines()
-    lines[-1] = " Select a session"
-    result, backend = _refuse_with_screen(monkeypatch, tmp_path, "\n".join(lines), "overlay-status-screen")
-    assert result.exit_code == 1
-    assert "state: dialog" in result.reply
-    assert backend.sent == []
-
-
 def test_real_narrow_idle_capture_sends_once(monkeypatch, tmp_path: Path):
     # The reported bug: a 28-col idle pane read "unknown" and was refused before any send.
     req_id = "narrow-28cols"
@@ -1203,9 +1240,8 @@ def test_real_narrow_idle_capture_sends_once(monkeypatch, tmp_path: Path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, session_id)
-    screen = (FIXTURES / "real-idle-28cols-tail.txt").read_text(encoding="utf-8")
     backend = FakeBackend()
-    backend.get_pane_content = lambda _pane, lines=40: screen
+    _script_states(monkeypatch, [READY])
 
     def send(pane, text):
         backend.sent.append((pane, text))
@@ -1221,7 +1257,7 @@ def test_real_narrow_idle_capture_sends_once(monkeypatch, tmp_path: Path):
 
 
 def test_pre_send_retry_binding_that_disappears_during_the_wait_sends_nothing(monkeypatch, tmp_path: Path):
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    busy = BUSY
     adapter, backend, loads = _retrying_adapter(monkeypatch, tmp_path, "binding-gone", lambda: busy)
     binding = _binding(tmp_path, tmp_path / "sessions", "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
 
@@ -1243,7 +1279,7 @@ def test_pre_send_retry_binding_that_disappears_during_the_wait_sends_nothing(mo
 def test_pre_send_wait_that_crosses_the_deadline_is_never_injected(monkeypatch, tmp_path: Path):
     # The wait fits inside the budget when it starts, but the deadline has passed when it
     # returns; a timed-out request must still never be injected.
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    busy = BUSY
     adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "wait-crosses-deadline", lambda: busy)
     now = {"t": 0.0}
     waits = []
@@ -1276,8 +1312,8 @@ class _CancelFlag:
 def test_pre_send_cancel_during_the_idle_recheck_sends_nothing(monkeypatch, tmp_path: Path):
     # The cancellation lands during the readiness re-check that follows a wait, so the
     # post-wait guard passes but the post-re-check guard must still refuse.
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    idle = READY
+    busy = BUSY
     cancel = _CancelFlag()
     captures = {"count": 0}
 
@@ -1298,8 +1334,8 @@ def test_pre_send_cancel_during_the_idle_recheck_sends_nothing(monkeypatch, tmp_
 
 
 def test_pre_send_deadline_passing_during_the_idle_recheck_sends_nothing(monkeypatch, tmp_path: Path):
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
-    busy = (FIXTURES / "screen-busy.txt").read_text(encoding="utf-8")
+    idle = READY
+    busy = BUSY
     now = {"t": 0.0}
     captures = {"count": 0}
 
@@ -1328,7 +1364,7 @@ def test_first_attempt_idle_is_not_blocked_by_the_post_wait_guard(monkeypatch, t
         def is_set(self):
             return True
 
-    idle = (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
+    idle = READY
     adapter, backend, _loads = _retrying_adapter(monkeypatch, tmp_path, "first-attempt-idle", lambda: idle)
 
     result = adapter.handle_task(_task(tmp_path, "first-attempt-idle", cancel_event=AlwaysCancelled()))
@@ -1361,6 +1397,7 @@ def test_post_injection_cancel_still_delivers_the_later_completion(monkeypatch, 
             _write_completed_session(session_dir, tmp_path, session_id, req_id)
 
     backend.send_text = send
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.5).__next__)
@@ -1392,6 +1429,7 @@ def test_post_injection_cancel_without_a_reply_ends_at_the_adapter_deadline(monk
         cancel.set()
 
     backend.send_text = send
+    _script_states(monkeypatch, [READY])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.0, 1.0).__next__)

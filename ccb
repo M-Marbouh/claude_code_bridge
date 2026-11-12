@@ -750,6 +750,10 @@ class AILauncher:
         if member[0] and member[1]:
             env["CCB_MEMBER_ID"] = member[0]
             env["CCB_MEMBER_TOKEN"] = member[1]
+        if prov == "pi":
+            state_file, launch_token = self._pi_state_settings()
+            env["CCB_PI_STATE_FILE"] = str(state_file)
+            env["CCB_PI_LAUNCH_TOKEN"] = launch_token
         return env
 
     def _member_credential(self, provider: str) -> tuple[str, str]:
@@ -2476,13 +2480,21 @@ class AILauncher:
             command = ShellAgentCommand(prelude="", agent_command="hermes --cli --no-restore-cwd")
         elif provider == "pi":
             session_id, session_dir = self._pi_binding()
-            command = ShellAgentCommand(
-                prelude="",
-                agent_command=(
-                    f"pi --no-approve --session-id {shlex.quote(session_id)} "
-                    f"--session-dir {shlex.quote(str(session_dir))}"
-                ),
+            agent_command = (
+                f"pi --no-approve --session-id {shlex.quote(session_id)} "
+                f"--session-dir {shlex.quote(str(session_dir))}"
             )
+            extension = self._pi_extension_path()
+            if extension.is_file():
+                # Pi reports its own readiness through this extension; CCB refuses a Pi pane
+                # without it (see lib/pi_comm.py read_pi_state).
+                agent_command += f" --extension {shlex.quote(str(extension))}"
+            else:
+                print(
+                    f"⚠️ Pi state extension missing: {extension} (Pi readiness will refuse)",
+                    file=sys.stderr,
+                )
+            command = ShellAgentCommand(prelude="", agent_command=agent_command)
         else:
             command = ShellAgentCommand(prelude="", agent_command="")
         # Append per-provider launch_args from config.
@@ -2997,6 +3009,37 @@ class AILauncher:
         self._auto_prune_session_records()
         return True
 
+    def _pi_extension_path(self) -> Path:
+        """The installed CCB Pi extension, shipped with the rest of lib/."""
+        return self.script_dir / "lib" / "pi_extension" / "ccb-state.ts"
+
+    def _pi_state_settings(self) -> tuple[Path, str]:
+        """(snapshot path, per-launch token), created once per launcher and reused.
+
+        The snapshot lives in Pi's runtime dir (mode 0700) and the token only exists in the
+        environment of the Pi this launch starts, so a snapshot can never be attributed to a
+        different pane's Pi.
+        """
+        cached_path = getattr(self, "_pi_state_file", None)
+        cached_token = getattr(self, "_pi_launch_token", "")
+        if cached_path and cached_token:
+            return Path(cached_path), str(cached_token)
+        runtime = self._provider_runtime("pi")
+        runtime.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(runtime, 0o700)
+        except OSError:
+            pass
+        state_file = runtime / "pi-state.json"
+        try:
+            if state_file.exists():
+                state_file.unlink()
+        except OSError:
+            pass
+        self._pi_state_file = state_file
+        self._pi_launch_token = uuid.uuid4().hex
+        return state_file, str(self._pi_launch_token)
+
     def _pi_binding(self) -> tuple[str, Path]:
         session_id = getattr(self, "_pi_session_id", "")
         session_dir = getattr(self, "_pi_session_dir", None)
@@ -3018,6 +3061,7 @@ class AILauncher:
             print(f"💡 Fix: {fix}", file=sys.stderr)
             return False
         pi_session_id, pi_session_dir = self._pi_binding()
+        state_file, launch_token = self._pi_state_settings()
         work_dir = self.project_root
         data = {
             "session_id": self.session_id,
@@ -3034,6 +3078,8 @@ class AILauncher:
             "start_cmd": str(start_cmd) if start_cmd else "pi --no-approve",
             "pi_session_id": pi_session_id,
             "pi_session_dir": str(pi_session_dir),
+            "pi_state_file": str(state_file),
+            "pi_launch_token": launch_token,
             "ccb_managed_launch": True,
             "ccb_launch_caller": "pi",
             "ccb_launch_provider": "pi",

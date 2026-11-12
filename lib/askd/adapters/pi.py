@@ -19,12 +19,10 @@ from pane_registry import validate_route
 from pi_comm import (
     PiExchange,
     PiSessionError,
-    capture_confirmed_state,
-    capture_screen_state,
-    classify_pane_screen,
-    describe_pane_screen,
+    PiState,
+    confirm_pi_ready,
     load_candidate_sessions,
-    screen_context,
+    read_pi_state,
 )
 from project_id import compute_ccb_project_id
 from providers import PI_SPEC
@@ -109,10 +107,10 @@ def _check_pane(data: dict[str, Any], work_dir: Path):
     return backend, ""
 
 
-# The capture helpers live in pi_comm so autonew's Pi gate and this adapter share one implementation.
-_capture_screen_state = capture_screen_state
-_screen_context = screen_context
-_capture_confirmed_state = capture_confirmed_state
+# The state reader lives in pi_comm so autonew's Pi gate and this adapter share one implementation:
+# Pi's own extension reports readiness, and no part of CCB reads the terminal screen for it.
+_read_pi_state = read_pi_state
+_confirm_pi_ready = confirm_pi_ready
 
 
 def _wait_before_retry(task: QueuedTask, seconds: float) -> bool:
@@ -252,10 +250,10 @@ class PiAdapter(BaseProviderAdapter):
                     status=COMPLETION_STATUS_INCOMPLETE if ambiguous else COMPLETION_STATUS_FAILED,
                 ))
 
-            screen_state = _capture_confirmed_state(backend, pane_id)
-            if screen_state == "idle":
+            pane_state = _confirm_pi_ready(session, deadline)
+            if pane_state.status == "ready":
                 break
-            if screen_state == "busy":
+            if pane_state.status == "busy":
                 # Busy is not a refusal: Pi may be busy outside CCB's tracking (the user is
                 # typing, or an earlier request is still running past its own wait). Wait for
                 # the pane instead of spending the dialog retry budget, so queued work is
@@ -287,10 +285,10 @@ class PiAdapter(BaseProviderAdapter):
             if retries_left <= 0 or (
                 deadline is not None and time.monotonic() + PRE_SEND_RETRY_WAIT_S > deadline
             ):
-                return self._refuse_screen(task, session_key, backend, pane_id, screen_state)
+                return self._refuse_state(task, session_key, pane_state)
             _write_log(
                 f"[INFO] pre-send retry provider=pi req_id={task.req_id} "
-                f"state={screen_state} retries_left={retries_left}"
+                f"state={pane_state.status} retries_left={retries_left}"
             )
             if not _wait_before_retry(task, PRE_SEND_RETRY_WAIT_S):
                 return self._finish(task, self._not_sent(task, session_key))
@@ -369,8 +367,8 @@ class PiAdapter(BaseProviderAdapter):
                     anchor_ms=anchor_ms, status=COMPLETION_STATUS_INCOMPLETE,
                 )
                 break
-            screen_state, _screen = _capture_screen_state(backend, str(session["pane_id"]))
-            saw_busy = saw_busy or screen_state == "busy"
+            pane_state = _read_pi_state(session)
+            saw_busy = saw_busy or pane_state.status == "busy"
             try:
                 found, exchange, lookup_error, candidates = _find_request_session(
                     session_dir, work_dir, task.req_id, bound_session_id=bound_session_id,
@@ -448,7 +446,7 @@ class PiAdapter(BaseProviderAdapter):
                     # Pi retries on its own: watch the pane instead of the parked deadline.
                     # Unknown reads reset the timer, so an operator draft here waits for the overall
                     # timeout just like pending; that residual is unchanged from today.
-                    if _capture_confirmed_state(backend, str(session["pane_id"])) == "idle":
+                    if _confirm_pi_ready(session, deadline).status == "ready":
                         if retry_idle_at is None:
                             retry_idle_at = now
                         elif now - retry_idle_at >= RETRY_IDLE_S:
@@ -474,17 +472,17 @@ class PiAdapter(BaseProviderAdapter):
                     )
                     break
             if not anchor_seen and now >= anchor_deadline:
-                deadline_state = screen_state
-                if deadline_state == "idle":
-                    deadline_state = _capture_confirmed_state(backend, str(session["pane_id"]))
-                if deadline_state in {"idle", "dialog"} and _anchor_landed(
+                deadline_state = pane_state.status
+                if deadline_state == "ready":
+                    deadline_state = _confirm_pi_ready(session, deadline).status
+                if deadline_state in {"ready", "prompt"} and _anchor_landed(
                     session_dir, work_dir, task.req_id, bound_session_id=bound_session_id,
                     start_dir=session.get("start_dir"), cache=session_cache,
                 ):
                     # The request reached Pi's transcript during confirmation; let the
                     # next poll track it instead of reporting a lost request.
                     continue
-                if deadline_state == "idle":
+                if deadline_state == "ready":
                     if saw_busy:
                         result = ProviderResult(
                             exit_code=1,
@@ -501,7 +499,7 @@ class PiAdapter(BaseProviderAdapter):
                             log_path=transcript_path or None,
                         )
                     break
-                if deadline_state == "dialog":
+                if deadline_state == "prompt":
                     result = ProviderResult(
                         exit_code=1, reply="Pi did not accept the request (Pi is showing a dialog).",
                         req_id=task.req_id, session_key=session_key, done_seen=False,
@@ -544,20 +542,20 @@ class PiAdapter(BaseProviderAdapter):
             )
         return None
 
-    def _refuse_screen(
-        self, task: QueuedTask, session_key: str, backend: Any, pane_id: str, state: str,
+    def _refuse_state(
+        self, task: QueuedTask, session_key: str, state: PiState,
     ) -> ProviderResult:
-        """Refuse a non-idle pre-send pane, naming the state and why it is not idle."""
-        _state, screen = _capture_screen_state(backend, pane_id)
-        reason = describe_pane_screen(screen)
-        if state == "dialog":
-            lead = "Pi is waiting for a project-trust or selector decision in its pane."
-        elif state == "busy":
+        """Refuse a pane Pi does not report ready, naming its state and why."""
+        if state.status == "prompt":
+            lead = "Pi is waiting for a decision in its pane; refusing to send into the prompt."
+        elif state.status == "busy":
             lead = "Pi pane is busy; refusing to send to avoid steering an active turn."
+        elif state.status == "draft":
+            lead = "Pi has unsent text in its editor; refusing to send to avoid concatenating with it."
         else:
             lead = "Pi pane readiness could not be verified; refusing to send."
         return self._finish(task, ProviderResult(
-            exit_code=1, reply=f"{lead} (state: {state}; {reason})", req_id=task.req_id,
+            exit_code=1, reply=f"{lead} (state: {state.status}; {state.reason})", req_id=task.req_id,
             session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
         ))
 

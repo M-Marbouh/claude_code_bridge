@@ -1,6 +1,10 @@
 """Fix 6: routed adapters take the pane-injection lock BEFORE their final
 identity/role-policy check, and keep `send_text` re-entrant inside it."""
 
+# This repo puts lib/ on sys.path at runtime (test/conftest.py) and ships no pyright
+# configuration, so the workspace-rooted analyzer cannot see these flat imports.
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import threading
@@ -10,6 +14,7 @@ import pytest
 
 import pane_lock
 from askd.adapters.base import ProviderRequest, QueuedTask
+from pi_comm import PiState
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "test" / "fixtures" / "pi"
@@ -59,9 +64,6 @@ class _FakeBackend:
 
     def find_pane_by_title_marker(self, _marker, _cwd):
         return "%12"
-
-    def get_pane_content(self, _pane, lines=40):
-        return (FIXTURES / "screen-idle.txt").read_text(encoding="utf-8")
 
     def send_text(self, pane, text):
         self.sent.append((pane, text))
@@ -113,6 +115,9 @@ def _run_pi(monkeypatch, tmp_path, backend, *, probe=None, refusal=""):
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.PRE_SEND_RETRY_WAIT_S", 0.0)
     monkeypatch.setattr("askd.adapters.pi.time.sleep", lambda _s: None)
+    # This file proves lock/policy ordering: the pane always reports ready.
+    monkeypatch.setattr("askd.adapters.pi._read_pi_state", lambda *_a, **_k: PiState("ready"))
+    monkeypatch.setattr("askd.adapters.pi._confirm_pi_ready", lambda *_a, **_k: PiState("ready"))
 
     if probe is not None:
         def policy(*_args, **_kwargs):

@@ -1,0 +1,21 @@
+{
+  "active": true,
+  "ccb_launch_caller": "pi",
+  "ccb_launch_provider": "pi",
+  "ccb_managed_launch": true,
+  "ccb_project_id": "8f14e45fceea167a5a36dedd4bea2543c3a1b2c3",
+  "pane_id": "%12",
+  "pane_title_marker": "CCB-Pi-neutral",
+  "pi_session_dir": "<PI_SESSIONS>",
+  "pi_session_id": "11111111-1111-4111-8111-111111111111",
+  "pi_state_file": "<RUNTIME>/pi-state.json",
+  "pi_launch_token": "0123456789abcdef0123456789abcdef",
+  "runtime_dir": "<RUNTIME>",
+  "session_id": "ai-1-launch",
+  "start_cmd": "pi --no-approve --extension <CCB_LIB>/pi_extension/ccb-state.ts",
+  "start_dir": "<SCRATCH>/work",
+  "started_at": "2026-01-01 00:00:00",
+  "terminal": "tmux",
+  "tmux_session": null,
+  "work_dir": "<SCRATCH>/work"
+}

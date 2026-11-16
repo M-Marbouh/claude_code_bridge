@@ -193,6 +193,35 @@ def roles_skipped_for_launch(data: dict, providers: list[str]) -> list[tuple[str
     return skipped
 
 
+def solo_role_note(data: dict, providers: list[str]) -> str:
+    """The launch note for a solo launch whose single provider is roled.
+
+    Roles exist for agents working together, so a launch that starts exactly
+    one agent session applies none from ccb.config (see
+    `resolve_roles_for_providers`). The dropped role is named once, instead of
+    the skipped-roles note, so the user is not surprised by a plain session and
+    knows how to ask for a role inside it. Empty for every other launch, and
+    for a solo launch whose provider the config did not role.
+    """
+    if len(providers) != 1:
+        return ""
+    raw = data.get("roles")
+    if not isinstance(raw, dict):
+        return ""
+    provider = providers[0]
+    roles = raw.get(provider)
+    if not isinstance(roles, list):
+        return ""
+    assigned = [role for role in roles if role]
+    if not assigned:
+        return ""
+    return (
+        f"ℹ️ Starting {provider} alone, so its ccb.config role "
+        f"({', '.join(assigned)}) is not applied. Run 'ccb-role set <role>' "
+        f"inside it if you want one."
+    )
+
+
 def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[str], str]:
     """Map ccb.config roles onto the launch's effective providers.
 
@@ -204,6 +233,11 @@ def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[
     for a duplicate provider without occurrence identities are all refused. A
     role for a provider the config lists but this launch does not start is
     skipped, and `roles_skipped_for_launch` reports it for the launch note.
+
+    A launch that starts exactly one agent session applies no role at all: the
+    config's shape is still validated above, but its roles are dropped, so
+    `solo_role_note` can say so once. The cmd pane is not an agent and never
+    counts towards either side of that rule.
     """
     error = str(data.get("roles_error") or "")
     if error:
@@ -233,6 +267,11 @@ def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[
             # The config does list this provider; this launch just does not
             # start it. Its role is skipped, never guessed onto another pane.
             continue
+        if len(providers) == 1:
+            # One agent starts, alone: no role applies, so the per-launch count
+            # and duplicate checks below have nothing to protect. The shape
+            # checks above still refused a broken config.
+            continue
         count = providers.count(provider)
         if len(roles) != count:
             return [], (
@@ -242,6 +281,11 @@ def resolve_roles_for_providers(data: dict, providers: list[str]) -> tuple[list[
         if count > 1 and providers.count("codex") != 2:
             # Per-occurrence credentials exist only for the Codex pair.
             return [], f"per-session roles for duplicate {provider} are not supported"
+
+    if len(providers) == 1:
+        # A solo launch takes no role from ccb.config; `solo_role_note` explains
+        # the one it dropped, and `ccb-role set` can assign one inside the session.
+        return [""], ""
 
     seen: dict[str, int] = {}
     for index, provider in enumerate(providers):

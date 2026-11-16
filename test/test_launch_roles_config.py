@@ -175,18 +175,18 @@ def test_provider_tokens_without_a_role_do_not_conflict_with_roles(tmp_path: Pat
     [
         # Plain text: `pi` is an unannotated occurrence, so it adds a blank
         # entry that says nothing about that provider.
-        "claude=lead, pi\n",
+        "claude=lead, pi, codex\n",
         # The equivalent JSON says the same thing without any token for `pi`.
-        json.dumps({"providers": ["claude", "pi"], "roles": {"claude": "lead"}}),
+        json.dumps({"providers": ["claude", "pi", "codex"], "roles": {"claude": "lead"}}),
     ],
 )
 def test_dropping_an_unassigned_provider_by_cli_override_is_not_an_error(
     tmp_path: Path, config_text
 ) -> None:
     data = _load_config(tmp_path, config_text)
-    assignments, error = resolve_roles_for_providers(data, ["claude"])
+    assignments, error = resolve_roles_for_providers(data, ["claude", "codex"])
     assert error == ""
-    assert assignments == ["lead"]
+    assert assignments == ["lead", ""]
 
 
 @pytest.mark.parametrize(
@@ -277,9 +277,12 @@ def test_a_config_without_a_provider_list_uses_the_default_providers() -> None:
 
 def test_a_role_count_mismatch_for_a_started_provider_is_still_refused() -> None:
     pair_roles = normalize_start_config_data(
-        {"providers": ["codex", "codex"], "roles": {"codex": ["ratifier", "implementer"]}}
+        {
+            "providers": ["codex", "codex", "claude"],
+            "roles": {"codex": ["ratifier", "implementer"]},
+        }
     )
-    assignments, error = resolve_roles_for_providers(pair_roles, ["codex"])
+    assignments, error = resolve_roles_for_providers(pair_roles, ["codex", "claude"])
     assert assignments == []
     assert "one role per codex session (1), got 2" in error
 
@@ -348,9 +351,11 @@ def test_cmd_start_accepts_a_cli_override_that_drops_an_unassigned_provider(
     monkeypatch, tmp_path, capsys
 ) -> None:
     ccb = _load_ccb_module()
-    result, constructed = _cmd_start(monkeypatch, tmp_path, "claude=lead, pi\n", ["claude"], ccb)
+    result, constructed = _cmd_start(
+        monkeypatch, tmp_path, "claude=lead, pi, codex\n", ["claude", "codex"], ccb
+    )
     assert result == 0
-    assert constructed and constructed[0]["roles"] == ["lead"]
+    assert constructed and constructed[0]["roles"] == ["lead", ""]
     assert capsys.readouterr().err == ""
 
 
@@ -358,13 +363,13 @@ def test_cmd_start_skips_a_roled_provider_the_cli_omits(monkeypatch, tmp_path, c
     ccb = _load_ccb_module()
     config_text = json.dumps(
         {
-            "providers": ["claude", "pi"],
+            "providers": ["claude", "pi", "codex"],
             "roles": {"claude": "lead", "pi": "implementer"},
         }
     )
-    result, constructed = _cmd_start(monkeypatch, tmp_path, config_text, ["claude"], ccb)
+    result, constructed = _cmd_start(monkeypatch, tmp_path, config_text, ["claude", "codex"], ccb)
     assert result == 0
-    assert constructed and constructed[0]["roles"] == ["lead"]
+    assert constructed and constructed[0]["roles"] == ["lead", ""]
     err = capsys.readouterr().err
     assert "Not starting pi (implementer)" in err
     assert "skipped for this launch" in err
@@ -374,7 +379,7 @@ def test_cmd_start_skips_a_roled_provider_the_cli_omits(monkeypatch, tmp_path, c
 @pytest.mark.parametrize(
     ("cli_providers", "expected_roles", "skipped_needle", "skipped_absent"),
     [
-        (["pi"], ["implementer"], "Not starting codex (ratifier), claude (lead)", "pi"),
+        (["pi", "claude"], ["implementer", "lead"], "Not starting codex (ratifier)", "pi,"),
         (["claude", "codex"], ["lead", "ratifier"], "Not starting pi (implementer)", "claude"),
     ],
 )

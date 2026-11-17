@@ -202,6 +202,53 @@ says **remote revocation PENDING**, prints the exact command to run there, and
 exits non-zero; it never claims success from local deletion alone
 (`--local-only` forgets the local half while still reporting the pending grant).
 
+### Both directions
+
+A pairing works in one direction: after `ccb-remote pair server` on A, agents on
+A can start conversations with B. B's agents can already **answer** A's
+reply-expected requests (§10 — A pulls the answer), but they cannot start a
+request of their own to A. For that, run `pair` **on B**, against A, as a second
+and completely separate pairing. A then needs an SSH server, and B needs a
+normal ssh login to A for the duration of that setup.
+
+The two pairings are independent: each has its own key, principal, host-key pin
+and pairing record. `ccb-remote unpair server` on A removes only A→B; to remove
+B→A as well, run `ccb-remote unpair <A's alias>` on B. That unpair needs B's
+normal login to A **again** (reopen an agent-forwarded session, or supply
+another authorized login with `--pairing-identity`): the restricted CCB key
+cannot revoke its own grant. Without a login, unpair reports **remote revocation
+PENDING** and tells you what to run on A.
+
+If B is a headless machine you reach from A, you can do B's half without leaving
+A. Two ways to give B that temporary login to A:
+
+- **Agent forwarding** (`ssh -A`). A's private login key is never copied to B,
+  but while this one session is open, anyone with root on B can use your agent
+  to log in as you. Use it only for a machine you trust, and close the session
+  when `pair` finishes. With this route B keeps no login credential for A
+  afterwards — only the restricted key the pairing creates, which can run
+  nothing but the CCB gate.
+
+  ```bash
+  # on A — a real ssh destination (user@host or a ~/.ssh/config Host entry);
+  # a CCB host alias alone does not define one
+  ssh -A you@server.example
+  # now on B, in that session
+  ccb-remote pair laptop --destination you@laptop.example
+  exit
+  ```
+
+  The transport rules above apply to **B's ssh configuration for A**: if B
+  reaches A through a ProxyJump/ProxyCommand, a ControlMaster/ControlPath socket
+  or a `HostName` rewrite, pairing refuses. Agent forwarding only supplies
+  authentication; B still needs its own direct route to A.
+
+- **A temporary key** (when agent forwarding is off or unwanted). Create a key on
+  B, authorize its public half in A's `~/.ssh/authorized_keys`, run `pair` on B
+  with `--pairing-identity` pointing at it, then remove **both** that line from
+  A's `authorized_keys` and the temporary key from B. Until you do, B holds a
+  full login to A.
+
 The manual steps below produce exactly the same state if you prefer to do each
 one yourself, need the hardened separate-account profile, or have no normal ssh
 login to B (the mode `pair` needs even for its read-only inspection).

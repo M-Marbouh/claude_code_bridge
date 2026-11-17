@@ -46,6 +46,10 @@ def _config_document() -> dict:
             "bob": {"issuer_token": "abc1", "allowed_aliases": ["example-project"]},
             "eve": {"issuer_token": "xyz9", "allowed_aliases": ["other-project"]},
             "nobody": {"issuer_token": "noac", "allowed_aliases": []},
+            # The 2026-11-17 two-way canary shape, genericised: the principal
+            # (`laptop`) and its free-label token (`laptop1`) differ, and only
+            # the principal is a name.
+            "laptop": {"issuer_token": "laptop1", "allowed_aliases": ["example-project"]},
         },
         "aliases": {
             "example-project": {"work_dir": "/tmp/example-project", "providers": ["claude", "codex"]},
@@ -161,7 +165,10 @@ def test_submit_accepts_records_and_enqueues_exactly_once(tmp_path):
     assert request.peer_destination.terminal == "tmux"
     assert f"CCB_REQ_ID: {REQUEST_ID}" not in request.message  # wrapper is applied at send time
     assert "CCB_REPLY_EXPECTED: no" in request.message
-    assert "CCB_REMOTE_SOURCE_HOST: abc1" in request.message
+    # The source line names the principal that submitted (the gate's
+    # `--principal`), not the issuer token `abc1` the request id carries.
+    assert "CCB_REMOTE_SOURCE_HOST: bob\n" in request.message
+    assert "CCB_REMOTE_SOURCE_HOST: abc1" not in request.message
     assert "unverified" in request.message
     assert request.message.rstrip().endswith("hello from the other machine")
 
@@ -174,6 +181,35 @@ def test_submit_accepts_records_and_enqueues_exactly_once(tmp_path):
     assert stored["reply_expected"] is False
     assert stored["source_claims"] == {"sender": "host-a", "note": "unverified"}
     assert [entry["state"] for entry in stored["history"]] == [STATE_ACCEPTED]
+
+
+CANARY_REQUEST_ID = "20261117-133406-362-2231722-1-hlaptop1"
+
+
+def test_the_source_label_is_the_principal_not_the_issuer_token(tmp_path):
+    """The canary's label said `laptop1` (the token); it must say `laptop`."""
+    service, recorder = _service(tmp_path)
+    response = service.handle_submit(
+        _submit_msg(
+            _record(request_id=CANARY_REQUEST_ID, intent="notify"),
+            principal="laptop",
+        )
+    )
+
+    assert response["ok"] is True, response
+    _provider, request, _record_id = recorder.calls[0]
+    assert "CCB_REMOTE_SOURCE_HOST: laptop\n" in request.message
+    assert "CCB_REMOTE_SOURCE_HOST: laptop1" not in request.message
+    # Nothing else in the label moved.
+    assert f"CCB_REMOTE_REQUEST_ID: {CANARY_REQUEST_ID}\n" in request.message
+    assert "CCB_REMOTE_INTENT: notify\n" in request.message
+
+
+def test_a_record_stored_without_a_principal_falls_back_to_the_token():
+    """A legacy record has no principal; the label keeps its old token text."""
+    message = remote_delivery.build_remote_message(_record(), issuer_token="laptop1")
+
+    assert "CCB_REMOTE_SOURCE_HOST: laptop1\n" in message
 
 
 def test_ack_does_not_wait_for_or_require_delivery(tmp_path):

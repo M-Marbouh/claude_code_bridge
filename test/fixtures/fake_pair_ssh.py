@@ -18,6 +18,8 @@ Environment knobs (all optional):
     CCB_FAKE_PAIR_EXTRA_HOSTKEY "; "-separated extra keys the machine also reports
     CCB_FAKE_PAIR_GATE         replace the reported gate path
     CCB_FAKE_PAIR_NO_GATE      "1" -> report the gate as missing
+    CCB_FAKE_PAIR_PROBE_MODE   unreachable -> the key probe writes nothing and
+                               reports a timed-out connection (exit 255)
 """
 
 import json
@@ -70,6 +72,14 @@ def _probe_host_key(argv: list[str]) -> int:
     """`PreferredAuthentications=none`: write the host key, authenticate nothing."""
     known = _option(argv, "UserKnownHostsFile")
     if not known:
+        return 255
+    probe_mode = (os.environ.get("CCB_FAKE_PAIR_PROBE_MODE") or "").strip()
+    if probe_mode == "unreachable":
+        # Nothing listens: no host key is presented at all, and the words are
+        # the ones a firewall or a stopped sshd really produces.
+        sys.stderr.write(
+            "ssh: connect to host server.example port 22: Connection timed out\n"
+        )
         return 255
     host_key = (os.environ.get("CCB_FAKE_PAIR_HOSTKEY") or "").strip()
     if not host_key:

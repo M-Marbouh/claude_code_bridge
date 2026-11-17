@@ -1469,3 +1469,84 @@ def test_the_real_revoke_handler_knows_this_machines_gate(tmp_path):
     assert payload["ok"] is False and payload["refused"] is True
     assert "did not write" in payload["error"]
     assert _paths(home)["authorized_keys"].read_text() == line + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# The no-authentication host-key probe (F3: reachability vs. key problems)
+# --------------------------------------------------------------------------- #
+
+PROBE_SSH = '''#!/usr/bin/env python3
+"""Fake `ssh` for the key probe: write a key and/or say why nothing was read."""
+import sys
+
+KEY = {key!r}
+STDERR = {stderr!r}
+
+argv = sys.argv[1:]
+known = ""
+for item in argv:
+    if item.startswith("UserKnownHostsFile="):
+        known = item.split("=", 1)[1]
+if KEY and known:
+    port = argv[argv.index("-p") + 1] if "-p" in argv else "22"
+    destination = argv[-2] if len(argv) >= 2 else "127.0.0.1"
+    _user, _, host = destination.rpartition("@")
+    name = host if port == "22" else "[%s]:%s" % (host, port)
+    with open(known, "a", encoding="utf-8") as handle:
+        handle.write("%s %s\\n" % (name, KEY))
+sys.stderr.write(STDERR)
+# A successful probe exits 255 too: nothing authenticated, so ssh always ends
+# in "Permission denied". The exit code alone says nothing about the probe.
+sys.exit(255)
+'''
+
+
+def _probe_ssh(tmp_path: Path, *, key: str = "", stderr: str = "") -> Path:
+    script = tmp_path / "fake-probe-ssh"
+    script.write_text(PROBE_SSH.format(key=key, stderr=stderr), encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+DESTINATION = "b@server.example"
+PORT = 2222
+
+
+def test_the_probe_reports_an_unreachable_machine_as_unreachable(tmp_path):
+    """A firewall timeout must not read as "that machine's host key" trouble."""
+    ssh = _probe_ssh(
+        tmp_path,
+        stderr="ssh: connect to host server.example port 22: Connection timed out\n",
+    )
+
+    with pytest.raises(remote_pairing.PairingError) as excinfo:
+        remote_pairing.probe_presented_host_keys(
+            DESTINATION, PORT, known_hosts=tmp_path / "known_hosts", ssh_bin=str(ssh)
+        )
+
+    message = str(excinfo.value)
+    assert "Connection timed out" in message
+    assert "could not be reached" in message
+    assert "nothing was written" in message
+    assert "without authenticating" not in message
+    assert "\n" not in message  # one line, safe to print as an error
+
+
+def test_a_key_followed_by_permission_denied_is_still_a_successful_probe(tmp_path):
+    """The control: ssh exits 255 on every probe, so only "no key" is a failure."""
+    ssh = _probe_ssh(
+        tmp_path,
+        key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIhosthosthosthosthosthosthosthosthostho1",
+        stderr="Permission denied (publickey).\n",
+    )
+
+    keys = remote_pairing.probe_presented_host_keys(
+        DESTINATION, PORT, known_hosts=tmp_path / "known_hosts", ssh_bin=str(ssh)
+    )
+
+    assert keys == [
+        {
+            "type": "ssh-ed25519",
+            "key": "AAAAC3NzaC1lZDI1NTE5AAAAIhosthosthosthosthosthosthosthosthostho1",
+        }
+    ]

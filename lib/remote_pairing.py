@@ -1400,6 +1400,15 @@ def verified_endpoint(
     return effective_host, effective_port
 
 
+def _last_line(text: str, limit: int = 200) -> str:
+    """A command's last non-empty output line, on one line and bounded."""
+    for line in reversed((text or "").splitlines()):
+        collapsed = " ".join(line.split())
+        if collapsed:
+            return collapsed[-limit:]
+    return ""
+
+
 def probe_presented_host_keys(
     destination: str,
     port: int,
@@ -1414,6 +1423,13 @@ def probe_presented_host_keys(
     no command runs. With `StrictHostKeyChecking=accept-new` into a file THIS
     process owns, the accepted line is the presented key -- so a supplied
     fingerprint can be compared before anything authenticated happens.
+
+    ssh exits 255 even on a SUCCESSFUL probe (nothing authenticates, so it ends
+    in "Permission denied"), so the exit code says nothing about reachability.
+    Only "no key was read" is a failure, and only then is ssh's own last line
+    quoted: a timed-out connection, a refused one and a machine that is not an
+    SSH server all land here, and "the host key could not be read" would send
+    the user looking for a key problem they do not have.
     """
     argv = [
         ssh_bin or pairing_ssh_bin(),
@@ -1429,14 +1445,14 @@ def probe_presented_host_keys(
         "true",
     ]
     try:
-        subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PairingError(f"could not reach that machine to read its host key: {exc}") from None
     host, _user = pairing_ssh_target_parts(destination)
     try:
         text = known_hosts.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return []
+        text = ""
     entries = known_hosts_entries(text, host, port)
     # Only real key entries count; duplicates are collapsed by type+key.
     seen: set[tuple[str, str]] = set()
@@ -1447,6 +1463,16 @@ def probe_presented_host_keys(
             continue
         seen.add(marker)
         unique.append({"type": entry["type"], "key": entry["key"]})
+    if not unique:
+        # No key was read: the machine was not reached or the key exchange never
+        # completed. ssh's own last line is the only useful evidence.
+        detail = _last_line(completed.stderr or "")
+        raise PairingError(
+            "that machine could not be reached or did not complete the host key exchange, so "
+            "the supplied fingerprint cannot be checked"
+            + (f" ({detail})" if detail else "")
+            + "; check the address, port, SSH server and firewall; nothing was written."
+        )
     return unique
 
 

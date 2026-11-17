@@ -28,7 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import remote_client
 import remote_discovery
@@ -550,16 +550,10 @@ def _bootstrap_trust(
         expected = normalize_fingerprint(supplied)
         scratch = pin_file_from_keys([], host=host, port=port)
         try:
-            probe_presented_host_keys(destination, port, known_hosts=scratch)
-            presented = [
-                {"type": entry["type"], "key": entry["key"]}
-                for entry in known_hosts_entries(read_text_or_empty(scratch), host, port)
-            ]
-            if not presented:
-                raise PairingError(
-                    "that machine's host key could not be read without authenticating, so the "
-                    "supplied fingerprint cannot be checked; nothing was written"
-                )
+            # The probe reads, and refuses on, "no key was read at all": the
+            # machine was unreachable or the key exchange never completed, which
+            # is not a fingerprint problem and is said in its own words there.
+            presented = probe_presented_host_keys(destination, port, known_hosts=scratch)
             matched = [
                 item
                 for item in presented
@@ -1240,7 +1234,14 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
         )
 
         # B7: "paired" is only claimed once that machine answers hello + list.
-        verified = _verify_and_report(alias, out=out, err=err, example_project=sorted(shares)[0])
+        example_project = sorted(shares)[0]
+        verified = _verify_and_report(
+            alias,
+            out=out,
+            err=err,
+            example_project=example_project,
+            providers=shares[example_project].get("providers") or (),
+        )
         if not verified:
             _progress(
                 err,
@@ -1468,7 +1469,12 @@ def _print_remote_steps(
 
 
 def _verify_and_report(
-    alias: str, *, out, err, example_project: str = "PROJECT"
+    alias: str,
+    *,
+    out,
+    err,
+    example_project: str = "PROJECT",
+    providers: Sequence[str] | None = None,
 ) -> bool:
     """Run the real delivery check; True only when that machine answered hello + list."""
     import io
@@ -1498,7 +1504,13 @@ def _verify_and_report(
         print(line, file=out)
     print("", file=out)
     print("Send a message with, for example:", file=out)
-    print(f'  ask codex --peer "{alias}::{example_project}" --wait "hello from here"', file=out)
+    # A provider the destination does not share would be refused, so the example
+    # names the first one THIS share lists (already canonicalised by
+    # `validate_providers`). Nothing is known only for a legacy caller.
+    provider = next(
+        (str(name).strip() for name in (providers or ()) if str(name).strip()), ""
+    ) or "codex"
+    print(f'  ask {provider} --peer "{alias}::{example_project}" --wait "hello from here"', file=out)
     return True
 
 

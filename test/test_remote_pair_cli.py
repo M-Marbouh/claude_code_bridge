@@ -220,9 +220,57 @@ def test_pair_prints_the_connection_check_and_an_example(env, monkeypatch):
 
     assert code == 0
     assert "That machine answers as:" in out
-    assert "ask codex --peer \"server::demo\"" in out
+    # SHARES asks for ["codex", "claude"], which `validate_providers`
+    # canonicalises to that provider order [...]: the example names the first
+    # provider the RESOLVED share lists (`claude`). Both providers are shared
+    # here, so this checks canonical ordering only; the claude-only test covers
+    # an example that would otherwise be refused (`unsupported_provider`).
+    assert "ask claude --peer \"server::demo\"" in out
+    assert "ask codex" not in out
     # The discovery cache the section uses was populated by that check.
     assert remote_discovery.read_cache("server") is not None
+
+
+def test_pair_example_names_a_provider_the_share_lists_and_the_machine_has(env):
+    """A share of `claude` only must not print an `ask codex` example."""
+    shares = {"demo": {"alias": "demo", "work_dir": "/srv/demo", "providers": ["claude"]}}
+
+    code, out, err = _run_pair(_options(shares=shares))
+
+    assert code == 0, err
+    assert "ask claude --peer \"server::demo\"" in out
+    assert "ask codex" not in out
+
+
+def test_the_example_helper_keeps_the_order_it_is_handed(monkeypatch):
+    """Only a caller that hands the helper providers directly sees its order."""
+    class _Answered:
+        exit_code = remote_client.EXIT_ACCEPTED
+        reason = ""
+
+    monkeypatch.setattr(
+        remote_client, "list_projects", lambda alias, out=None, err=None: _Answered()
+    )
+    out, err = io.StringIO(), io.StringIO()
+
+    assert remote_pair_cli._verify_and_report(
+        "server", out=out, err=err, example_project="demo", providers=["codex", "claude"]
+    )
+    assert 'ask codex --peer "server::demo"' in out.getvalue()
+
+
+def test_the_example_falls_back_only_when_no_provider_is_known(monkeypatch):
+    class _Answered:
+        exit_code = remote_client.EXIT_ACCEPTED
+        reason = ""
+
+    monkeypatch.setattr(
+        remote_client, "list_projects", lambda alias, out=None, err=None: _Answered()
+    )
+    out, err = io.StringIO(), io.StringIO()
+
+    assert remote_pair_cli._verify_and_report("server", out=out, err=err, example_project="demo")
+    assert 'ask codex --peer "server::demo"' in out.getvalue()
 
 
 def test_pair_reuses_key_token_and_principal_on_a_rerun(env):
@@ -266,6 +314,26 @@ def test_pair_accepts_a_supplied_fingerprint_when_the_host_is_unknown(env):
     assert code == 0, err
     assert "supplied fingerprint" in out
     assert f"ssh-ed25519 {HOST_KEY}" in env.pin_file.read_text()
+
+
+def test_pair_says_the_machine_could_not_be_reached_not_that_a_key_was_unreadable(env):
+    """The canary's firewall timeout used to be reported as a host-key problem."""
+    env.monkeypatch.setenv("CCB_FAKE_PAIR_PROBE_MODE", "unreachable")
+    good = remote_pairing.fingerprint(HOST_KEY)
+
+    code, _out, err = _run_pair(_options(fingerprint=good))
+
+    assert code == remote_pair_cli.EXIT_REFUSED
+    assert "Connection timed out" in err
+    assert "could not be reached" in err
+    assert "nothing was written" in err
+    assert "without authenticating" not in err
+    # Nothing was written: no key, no pin, no host entry, no pairing record, and
+    # not even the read-only inspection reached that machine.
+    assert not env.key.exists() and not env.hosts_json.exists() and not env.pin_file.exists()
+    assert not env.record.exists()
+    assert env.verbs() == []
+    assert env.remote_state() == (b"", b"")
 
 
 def test_pair_refuses_a_fingerprint_mismatch_with_zero_writes(env):

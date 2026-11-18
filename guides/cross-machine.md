@@ -11,8 +11,9 @@ It is **preview** software, and deliberately narrow:
   `ccb-remote reply <id>`, and A fetches that answer; B never connects back
   (§10). Follow-up exchanges are not supported.
 - **Delivery only to Claude and Codex.** No other provider is advertised.
-- **No `ccb remote setup` yet.** You set it up by hand, once per direction, with
-  the steps below.
+- **Guided setup first, manual steps when you need them.** `ccb-remote setup`
+  walks both machines through the prerequisites and stops before `pair`; the
+  manual steps below remain for the profiles it does not cover.
 - **Linux only.**
 - **Each direction is a separate opt-in.** Enabling laptop → server does not let
   the server send anything to the laptop.
@@ -252,6 +253,153 @@ A. Two ways to give B that temporary login to A:
 The manual steps below produce exactly the same state if you prefer to do each
 one yourself, need the hardened separate-account profile, or have no normal ssh
 login to B (the mode `pair` needs even for its read-only inspection).
+
+## Guided setup: `ccb-remote setup`
+
+`ccb-remote setup` is the starting point for a new pair. Run it on **each**
+machine, one direction at a time. It checks and explains prerequisites only:
+project sharing, host-key pinning verification and the pairing record stay in
+[`ccb-remote pair`](#2-quick-setup-ccb-remote-pair), which the wizard ends by
+printing (or running, after one confirmation).
+
+It **never runs `sudo`** and **never writes the other machine's sshd
+configuration or `authorized_keys`**. System changes are printed for you to
+run at that machine's local console, and the wizard then verifies the result.
+The only writes it performs are on the sending machine, at user level, after
+one confirmation that names the key, the destination account and whether the
+login grant persists.
+
+### Start on the machine that will receive
+
+```bash
+# on the receiving machine
+ccb-remote setup
+#  1) Receive requests here (this machine accepts messages)
+#  2) Send requests from here (this machine sends messages)
+```
+
+Choose **Receive requests here**. The receiver then:
+
+1. Confirms `ccb-remote` and `ccb-remote-gate` are installed.
+2. Confirms the account has a real login shell (not `nologin`/`false`).
+3. Confirms sshd is running and answers on the port, locally.
+4. Prints the **read-only** effective-config command and asks you to paste its
+   output back:
+
+   ```bash
+   sudo sshd -T -C user=DEST_USER,host=SENDER,addr=SENDER_IP,laddr=LOCAL_ADDR,lport=PORT
+   ```
+
+   `sshd -T -C` expands `Match` blocks for the actual user, source address,
+   this machine's local address (`laddr`) and local listening port (`lport`;
+   there is no `port` keyword in the connection spec). The wizard asks for the
+   local address the sending machine connects to and requires a **single
+   numeric IPv4 or IPv6 address** without a zone identifier (`fe80::1%eth0` is
+   rejected): sshd matches `Match LocalAddress` by numeric address, so a
+   hostname would skip the rule. The paste is the check: a file
+   that *looks* configured, or an empty
+   drop-in behind an `Include`, cannot pass if the effective answer still
+   allows password or keyboard-interactive login. A "done" answer alone never
+   passes. The supported key-only profile requires **both**
+   `PasswordAuthentication no` and `KbdInteractiveAuthentication no`.
+5. Checks the local firewall when it can read it. If ufw is active, it says
+   whether the SSH port is allowed. `ufw status` may need root; when it cannot
+   be read, the wizard asks you to paste the output of `sudo ufw status`. A
+   status other than exactly `active` or `inactive` is unknown and fails
+   closed. Any suggested ufw rule is scoped to a validated single numeric
+   sending-machine IP address; hostnames, `any` and wildcards print an
+   instruction instead of a command, never a rule open to every source. A
+   firewall elsewhere on the path cannot be seen from here; the sending
+   machine's real connection is the authority.
+6. Prints this machine's **host fingerprint** and the command to run on the
+   sending machine. Compare that fingerprint there before the first login.
+
+The login key must exist before sshd is hardened, so the receiver does **not**
+require a completed login to continue. After the sending machine prints its
+public key, stage it in this account's `~/.ssh/authorized_keys` **at this
+machine's local console**. The receiver re-checks that a login key is present.
+The restricted CCB gate key is not staged here: `pair` installs it after you
+approve the project share.
+
+Only then does the receiver print the show-and-verify hardening commands
+(key-only authentication, `sshd -t`, reload). Run them yourself at the local
+console, keep a working local session open in case you need to undo them, and
+paste the fresh `sshd -T -C ...` output back. That fresh effective answer is
+what finishes the receiver side. The receiver then prints a copy block that
+begins with one `connection: user=… host=… addr=… laddr=… lport=…` line and
+continues with the validated `sshd -T` output. Copy that whole block to the
+sending machine's wizard, unchanged: the label binds the result to the exact
+connection that was checked.
+
+### Then run it on the machine that sends
+
+```bash
+# on the sending machine
+ccb-remote setup
+```
+
+Choose **Send requests from here**. The sender then:
+
+1. Confirms CCB and an ssh client are installed.
+2. Makes a real TCP+SSH connection to the receiving `host:port` — the
+   authoritative firewall and reachability test.
+3. Compares the host key it is presented with against the fingerprint the
+   receiver displayed, and **refuses on a mismatch before any authenticated
+   connection**.
+4. Selects an existing login key or creates a new one, then asks one
+   confirmation naming the key, the destination account and whether the login
+   grant persists. `ssh-add` runs only after that confirmation.
+5. Prints the login public key and the instruction to stage it in the receiving
+   account's `authorized_keys` at the receiving machine's local console.
+6. After you confirm it is staged, makes a **fresh** login with that key:
+   password and keyboard-interactive fallback disabled, connection reuse
+   disabled, so it cannot silently pass through an old session or a password.
+7. Confirms the receiver now **refuses** password and keyboard-interactive
+   login. This refusal probe is supplemental: the wizard offers only those
+   methods and reads the server's refusal list. If either is still advertised,
+   it stops before the pairing command and tells you to finish the receiver's
+   hardening step.
+8. Asks you to paste the whole copy block from the receiving machine's wizard,
+   unchanged. The successful key login prints the receiving machine's own
+   `SSH_CONNECTION` report, and the wizard checks the block against those
+   OBSERVED facts: `addr` must be the observed client address, `laddr` the
+   observed server address, and `lport` the observed server port; `user` must
+   match too. A block without the `connection:` line, or one describing a
+   different listener, fails and names the block and observed values. It then
+   validates the `sshd -T` directives. A non-directive paste or a result that
+   still allows password or keyboard-interactive login stops before the pairing
+   command.
+9. Prints the exact pairing command, passing the same destination, port,
+   verified fingerprint and login identity:
+
+   ```bash
+   ccb-remote pair ALIAS --destination DEST_USER@HOST --port PORT \
+     --fingerprint SHA256:... \
+     --pairing-identity ~/.ccb/remote/keys/ALIAS-login
+   ```
+
+   It offers to run that command, but does not replace it: `pair` still asks
+   for its own approval, previews the project share and verifies the host key
+   again.
+
+### What the wizard can fix for you
+
+Remediation commands are printed only for combinations that have been tested:
+**apt-based systems with ufw**, and the **no-firewall** case. Anything else
+(for example firewalld, or a firewall on another host) prints a plain-language
+description of what is wrong and points at
+[Troubleshooting](#12-troubleshooting) — never a guessed command.
+
+### One direction at a time
+
+The wizard sets up prerequisites for one direction. After `pair` completes,
+run `ccb-remote setup` on the other machine too if it should be able to start
+requests in the reverse direction; that is a second, independent pairing (see
+[Both directions](#both-directions)).
+
+If you prefer to do every step yourself, need the hardened separate-account
+profile, or have no normal ssh login at all, the manual steps below produce the
+same state.
 
 ## Manual setup
 

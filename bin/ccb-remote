@@ -4,6 +4,7 @@
     ccb-remote status <host-qualified-id>   destination state for a submission
     ccb-remote list <host>                  allowlisted projects on a host
     ccb-remote reply <host-qualified-id>    answer a delivered reply-expected request
+    ccb-remote setup [--role receive|send]  guided prerequisites for cross-machine pairing
 
 `status` is the recovery path for a submission whose acknowledgement was lost:
 it reads the outbound receipt (the host comes from the receipt only, never from
@@ -51,7 +52,8 @@ USAGE = """Usage:
   ccb-remote status <host-qualified-id>   Ask the destination for this request's state
   ccb-remote list <host> [--json]         List the projects this key may address on <host>
   ccb-remote reply <host-qualified-id>    Answer a delivered request (answer on stdin)
-  ccb-remote pair [<alias>]               Guided setup: let this machine reach another one
+  ccb-remote setup [--role receive|send]  Guided prerequisites for pairing (run on each machine)
+  ccb-remote pair [<alias>]               Pair this machine with another one (after `setup`)
   ccb-remote unpair <alias>               Remove that pairing and revoke its grant
   ccb-remote pairing <verb>               Destination side, JSON on stdin (used by `pair`)
   ccb-remote -h                           Show this help
@@ -446,6 +448,61 @@ def _cmd_pair(argv: list[str]) -> int:
     return remote_pair_cli.pair(options)
 
 
+def _cmd_setup(argv: list[str]) -> int:
+    import argparse
+
+    import remote_setup_wizard
+
+    parser = argparse.ArgumentParser(
+        prog="ccb-remote setup",
+        description=(
+            "Guided prerequisite setup for cross-machine pairing. Run it on EACH machine; "
+            "it never runs sudo and never writes the other machine's sshd config or "
+            "authorized_keys."
+        ),
+    )
+    parser.add_argument(
+        "--role",
+        choices=("receive", "send"),
+        default="",
+        help="'receive' on the destination machine, 'send' on the source machine",
+    )
+    parser.add_argument("--host", default="", help="receiving machine's hostname or IP (sender side)")
+    parser.add_argument("--port", type=int, default=22, help="ssh port (default 22)")
+    parser.add_argument("--user", default="", help="destination account on the receiving machine")
+    parser.add_argument(
+        "--sender",
+        default="",
+        help="the sending machine's address as the receiver sees it (receiver side)",
+    )
+    parser.add_argument(
+        "--key",
+        default="",
+        help="login key to use or create on the sender (default ~/.ccb/remote/keys/<alias>-login)",
+    )
+    parser.add_argument(
+        "--fingerprint",
+        default="",
+        help="the fingerprint the receiving machine displayed (SHA256:...)",
+    )
+    parser.add_argument("--alias", default="", help="CCB host alias for the receiving machine")
+    parser.add_argument("--yes", action="store_true", help="no prompts (for scripts and tests)")
+    parsed = parser.parse_args(argv)
+
+    options = remote_setup_wizard.SetupOptions(
+        role=parsed.role,
+        host=parsed.host,
+        port=parsed.port,
+        user=parsed.user,
+        sender=parsed.sender,
+        key_path=parsed.key,
+        fingerprint=parsed.fingerprint,
+        alias=parsed.alias,
+        yes=parsed.yes,
+    )
+    return remote_setup_wizard.run_setup(options)
+
+
 def _cmd_unpair(argv: list[str]) -> int:
     import argparse
 
@@ -503,6 +560,8 @@ def main(argv: list[str]) -> int:
             return _cmd_reply(rest)
         if command == "pairing":
             return _cmd_pairing(rest)
+        if command == "setup":
+            return _cmd_setup(rest)
         if command == "pair":
             return _cmd_pair(rest)
         if command == "unpair":

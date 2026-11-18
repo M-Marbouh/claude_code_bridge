@@ -674,6 +674,7 @@ def live_pi_sessions(project_id: str) -> tuple[tuple[LivePiSession, ...], str]:
         _iter_registry_files,
         _load_registry_file,
         _provider_pane_alive,
+        _registry_owner_alive,
         read_inventory_for_record,
     )
     from project_id import compute_ccb_project_id
@@ -694,6 +695,12 @@ def live_pi_sessions(project_id: str) -> tuple[tuple[LivePiSession, ...], str]:
             except Exception:
                 record_project = ""
         if not wanted or record_project != wanted:
+            continue
+        # A record is evidence only while the launch that wrote it is still running. tmux renumbers
+        # panes from %0 when its server restarts, so a stale unexpired record can hold the live
+        # pane's id and pass the marker rule (2026-11-18). Only an explicit dead verdict excludes a
+        # record: no owner identity (None) keeps today's behaviour.
+        if _registry_owner_alive(record) is False:
             continue
         launch_id = str(record.get("ccb_session_id") or "").strip()
         record_terminal = str(record.get("terminal") or "").strip().lower()

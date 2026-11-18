@@ -7,6 +7,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -105,6 +106,58 @@ def _use_backend(monkeypatch: pytest.MonkeyPatch, backend: FakePiBackend) -> Non
 
     monkeypatch.setattr("pi_comm.read_pi_state", _state)
     monkeypatch.setattr("pi_comm.confirm_pi_ready", _confirm)
+
+
+def _unused_pid() -> int:
+    """A pid number no task on this host can hold, so the launcher derived from it is dead.
+
+    Linux allocates pids only in 1..pid_max, so `pid_max + 1` can never name a process: the
+    deterministic form of the plan's `ai-1794770389-999999` fixture. Without /proc the
+    launcher check degrades to bare-pid liveness, and a value past any real pid is dead there
+    too.
+    """
+    try:
+        pid_max = int(Path("/proc/sys/kernel/pid_max").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid_max = 999_999
+    return pid_max + 1
+
+
+def _live_launch_id() -> str:
+    """A launch id naming THIS test process, so its launcher is provably alive.
+
+    The epoch is the process's own start time, not `time.time()`: `launcher_alive` compares the
+    launch-id epoch with the pid's creation time inside a 60 s window, and a long full-suite run
+    can put process start minutes behind the wall clock. Deriving the epoch from the process
+    makes the True verdict deterministic instead of a race with the clock.
+    """
+    from launcher_identity import process_start_epoch
+
+    started = process_start_epoch(os.getpid())
+    epoch = int(started) if started is not None else int(time.time())
+    return f"ai-{epoch}-{os.getpid()}"
+
+
+def _launch_record(launch_id: str) -> dict:
+    path = Path.home() / ".ccb" / "run" / f"ccb-session-{launch_id}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _owner_verdict(launch_id: str):
+    """The launcher verdict the gate reads for this fixture: True / False / None."""
+    from pane_registry import _registry_owner_alive
+
+    return _registry_owner_alive(_launch_record(launch_id))
+
+
+def _write_broken_inventory(home: Path, launch_id: str, project: Path) -> None:
+    registry = home / ".ccb" / "run"
+    registry.mkdir(parents=True, exist_ok=True)
+    (registry / f"ccb-session-{launch_id}.json").write_text(json.dumps({
+        "ccb_session_id": launch_id, "ccb_project_id": compute_ccb_project_id(project),
+        "work_dir": str(project), "updated_at": int(time.time()), "terminal": "tmux",
+        "live_sessions": "not-a-list",
+    }), encoding="utf-8")
 
 
 def _write_launch(
@@ -419,6 +472,141 @@ def test_one_live_session_survives_an_unqualified_record(monkeypatch, capsys, tm
 
     code, out, err = _run(monkeypatch, capsys, project)
 
+    assert code == 0
+    assert backend.sent == [(PANE, "/new")]
+    assert err == ""
+
+
+def test_dead_launches_on_a_reused_pane_are_not_counted(monkeypatch, tmp_path: Path) -> None:
+    """2026-11-18: the tmux server restarted, so old records now hold the live pane's id.
+
+    Both record shapes are covered — an inventory record and a legacy providers-map record —
+    and each fixture's launcher verdict is asserted, so the count cannot pass by accident.
+    """
+    from pi_comm import live_pi_sessions
+
+    dead_pid = _unused_pid()
+    inventory_stale = f"ai-1794770389-{dead_pid}"
+    legacy_stale = f"ai-1794827454-{dead_pid}"
+    survivor = _live_launch_id()
+    project = _project(tmp_path, launch=False)
+    _write_launch(Path.home(), inventory_stale, project, panes=(PANE,))
+    _write_launch(Path.home(), legacy_stale, project, panes=(PANE,), inventory=False)
+    _write_launch(Path.home(), survivor, project, panes=(PANE,))
+    backend = FakePiBackend([READY])
+    _use_backend(monkeypatch, backend)
+
+    assert _owner_verdict(inventory_stale) is False
+    assert _owner_verdict(legacy_stale) is False
+    assert _owner_verdict(survivor) is True
+
+    sessions, error = live_pi_sessions(compute_ccb_project_id(project))
+
+    assert error == ""
+    assert [(s.launch_id, s.pane_id, s.terminal) for s in sessions] == [(survivor, PANE, "tmux")]
+
+
+def test_a_record_without_launch_identity_is_still_counted(monkeypatch, tmp_path: Path) -> None:
+    """A record whose launcher pid cannot be derived keeps today's behaviour (verdict None)."""
+    from pi_comm import live_pi_sessions
+
+    project = _project(tmp_path)
+    backend = FakePiBackend([READY])
+    _use_backend(monkeypatch, backend)
+
+    assert _owner_verdict("launch-1") is None
+
+    sessions, error = live_pi_sessions(compute_ccb_project_id(project))
+
+    assert error == ""
+    assert [(s.launch_id, s.pane_id, s.terminal) for s in sessions] == [("launch-1", PANE, "tmux")]
+
+
+def test_a_record_whose_launcher_still_runs_is_counted(monkeypatch, tmp_path: Path) -> None:
+    """The gate only excludes proven-dead launchers, never a live one."""
+    from pi_comm import live_pi_sessions
+
+    survivor = _live_launch_id()
+    project = _project(tmp_path, launch=False)
+    _write_launch(Path.home(), survivor, project, panes=(PANE,))
+    backend = FakePiBackend([READY])
+    _use_backend(monkeypatch, backend)
+
+    assert _owner_verdict(survivor) is True
+
+    sessions, error = live_pi_sessions(compute_ccb_project_id(project))
+
+    assert error == ""
+    assert [(s.launch_id, s.pane_id) for s in sessions] == [(survivor, PANE)]
+
+
+@pytest.mark.parametrize("launcher", ["dead", "unknown"], ids=["dead-launcher", "unknown-owner"])
+def test_broken_inventory_blocks_only_when_its_launcher_may_be_live(
+    monkeypatch, capsys, tmp_path: Path, launcher: str,
+) -> None:
+    """The owner gate runs before the inventory check: a dead launch cannot refuse on it."""
+    from pi_comm import live_pi_sessions
+
+    project = _project(tmp_path, launch=False)
+    launch_id = f"ai-1795036347-{_unused_pid()}" if launcher == "dead" else "launch-broken"
+    _write_broken_inventory(Path.home(), launch_id, project)
+    backend = FakePiBackend([READY])
+    _use_backend(monkeypatch, backend)
+
+    sessions, error = live_pi_sessions(compute_ccb_project_id(project))
+    code, out, err = _run(monkeypatch, capsys, project)
+
+    assert code == 1
+    assert backend.sent == []
+    if launcher == "dead":
+        assert _owner_verdict(launch_id) is False
+        assert (sessions, error) == ((), "")
+        assert "broken Pi inventory" not in err
+        assert "no live Pi session for this project" in err
+    else:
+        assert _owner_verdict(launch_id) is None
+        assert "broken Pi inventory" in error
+        assert "broken Pi inventory" in err
+
+
+def test_autonew_pi_sends_once_although_dead_launches_share_the_live_pane(
+    monkeypatch, capsys, tmp_path: Path,
+) -> None:
+    """The production flip (amendment 7), with the binding on the SURVIVING launch.
+
+    Pre-fix, this test fails exactly as the incident did: `live_pi_sessions` reports 3 sessions
+    and autonew sends nothing with "3 live Pi sessions for this project". Post-fix it sends once
+    to the surviving pane.
+    """
+    from pi_comm import live_pi_sessions
+
+    dead_pid = _unused_pid()
+    survivor = _live_launch_id()
+    binding = {
+        "active": True, "terminal": "tmux", "work_dir": str(tmp_path / "project"),
+        "start_dir": str(tmp_path / "project"), "session_id": survivor,
+        "pi_session_id": SESSION_ID, "pi_session_dir": str(tmp_path / "project" / "sessions"),
+        "pane_id": PANE, "pane_title_marker": MARKER,
+    }
+    project = _project(tmp_path, binding=binding, launch=False)
+    _write_launch(Path.home(), f"ai-1794770389-{dead_pid}", project, panes=(PANE,))
+    _write_launch(Path.home(), f"ai-1794827454-{dead_pid}", project, panes=(PANE,))
+    _write_launch(Path.home(), survivor, project, panes=(PANE,))
+    backend = FakePiBackend([READY])
+    _use_backend(monkeypatch, backend)
+
+    assert _owner_verdict(f"ai-1794770389-{dead_pid}") is False
+    assert _owner_verdict(f"ai-1794827454-{dead_pid}") is False
+    assert _owner_verdict(survivor) is True
+
+    sessions, error = live_pi_sessions(compute_ccb_project_id(project))
+
+    assert error == ""
+    assert [(s.launch_id, s.pane_id) for s in sessions] == [(survivor, PANE)]
+
+    code, out, err = _run(monkeypatch, capsys, project)
+
+    assert "3 live Pi sessions for this project" not in err
     assert code == 0
     assert backend.sent == [(PANE, "/new")]
     assert err == ""

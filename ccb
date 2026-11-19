@@ -2480,6 +2480,7 @@ class AILauncher:
             command = ShellAgentCommand(prelude="", agent_command="hermes --cli --no-restore-cwd")
         elif provider == "pi":
             session_id, session_dir = self._pi_binding()
+            self._report_pi_resume(session_id)
             agent_command = (
                 f"pi --no-approve --session-id {shlex.quote(session_id)} "
                 f"--session-dir {shlex.quote(str(session_dir))}"
@@ -3040,11 +3041,109 @@ class AILauncher:
         self._pi_launch_token = uuid.uuid4().hex
         return state_file, str(self._pi_launch_token)
 
+    def _resume_pi_binding(self) -> tuple[str, Path] | None:
+        """The recorded Pi session, when Pi would really continue it.
+
+        Pi creates a new session whenever its id lookup misses, so neither the recorded
+        directory nor a filename-shaped transcript proves anything: the transcript's header has
+        to name this session and this launch directory. Anything short of a full match is
+        discarded, and the reason is kept for one status line in `_get_start_cmd`. Never raises:
+        a recorded path that cannot even be inspected is treated as a stale binding.
+        """
+        from pi_comm import matching_session_files
+
+        self._pi_resume_note = ""
+        session_file = self._project_session_file(".pi-session")
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Nothing recorded, or nothing readable: there is no recorded id worth naming.
+            return None
+        if not isinstance(data, dict):
+            return None
+        recorded_id = str(data.get("pi_session_id") or "")
+        recorded_dir = str(data.get("pi_session_dir") or "")
+        if not recorded_id or not recorded_dir:
+            return None
+        prefix = recorded_id[:8]
+        if str(data.get("work_dir") or "") != str(self.project_root) or str(
+            data.get("ccb_project_id") or ""
+        ) != compute_ccb_project_id(self.project_root):
+            self._pi_resume_note = f"{prefix} (recorded for another project)"
+            return None
+        try:
+            uuid.UUID(recorded_id)
+        except (ValueError, TypeError, AttributeError):
+            self._pi_resume_note = f"{prefix} (not a valid session id)"
+            return None
+        session_dir = Path(recorded_dir)
+        try:
+            if not session_dir.is_dir():
+                self._pi_resume_note = f"{prefix} (session directory is gone)"
+                return None
+            transcripts = matching_session_files(session_dir, recorded_id)
+            if len(transcripts) != 1:
+                self._pi_resume_note = f"{prefix} (no single transcript for it)"
+                return None
+            if not self._pi_transcript_matches(transcripts[0], recorded_id):
+                self._pi_resume_note = f"{prefix} (transcript header does not match)"
+                return None
+        except (OSError, ValueError, RuntimeError):
+            # An unusable recorded path is a stale binding, never a reason to abort the launch.
+            self._pi_resume_note = f"{prefix} (session directory is unreadable)"
+            return None
+        return recorded_id, session_dir
+
+    def _pi_transcript_matches(self, path: Path, session_id: str) -> bool:
+        """Whether Pi's own session lookup would open this transcript for `session_id`.
+
+        Pi keys that lookup on the file's first-row header, not on its name, so a
+        filename-shaped match with a foreign header would still make Pi start a new session.
+        """
+        try:
+            with path.open("rb") as handle:
+                header = json.loads(handle.readline())
+        except (OSError, ValueError):
+            return False
+        if not isinstance(header, dict):
+            return False
+        if header.get("type") != "session" or header.get("id") != session_id:
+            return False
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            return False
+        try:
+            return Path(cwd).expanduser().resolve() == Path(self.project_root).expanduser().resolve()
+        except (OSError, ValueError, RuntimeError):
+            return False
+
+    def _report_pi_resume(self, session_id: str) -> None:
+        """One resume line per launch: the binding is resolved again when it is written."""
+        if getattr(self, "_pi_resume_reported", False):
+            return
+        if not getattr(self, "resume", False) and not getattr(self, "_pi_resumed", False):
+            return
+        self._pi_resume_reported = True
+        if getattr(self, "_pi_resumed", False):
+            print(f"🔁 {t('resuming_session', provider='Pi', session_id=session_id[:8])}")
+            return
+        note = getattr(self, "_pi_resume_note", "")
+        if note:
+            print(f"ℹ️ Pi: discarding recorded session {note}; starting fresh")
+        else:
+            print(f"ℹ️ {t('no_history_fresh', provider='Pi')}")
+
     def _pi_binding(self) -> tuple[str, Path]:
         session_id = getattr(self, "_pi_session_id", "")
         session_dir = getattr(self, "_pi_session_dir", None)
         if session_id and session_dir:
             return session_id, Path(session_dir)
+        if getattr(self, "resume", False):
+            recorded = self._resume_pi_binding()
+            if recorded is not None:
+                self._pi_resumed = True
+                self._pi_session_id, self._pi_session_dir = recorded
+                return recorded
         session_id = str(uuid.uuid4())
         agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR") or (Path.home() / ".pi" / "agent")).expanduser()
         project_id = compute_ccb_project_id(self.project_root)
@@ -5927,7 +6026,7 @@ def main():
         nargs="*",
         help="Backends to start (space or comma separated): codex, gemini, opencode, claude, hermes, pi (codex may appear twice; add cmd for a shell pane)",
     )
-    start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context (unique-provider launches only)")
+    start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context (refused for a Codex pair)")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")
     start_parser.add_argument(
         "--role-policy",

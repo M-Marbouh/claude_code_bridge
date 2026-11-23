@@ -760,8 +760,11 @@ def test_queued_expiry_records_and_notifies_an_unsent_request(monkeypatch) -> No
 
     response = daemon._handle_request(_expiry_message())
 
-    # The client contract is unchanged: exit 2 with an empty reply.
-    assert response["exit_code"] == 2 and response["reply"] == ""
+    # ITEM 1 (fix 2): the expiry is FINALISED, so the caller gets exit 2 WITH
+    # the "not sent" sentence. This used to be an empty reply, which is exactly
+    # the silent-loss path the review found.
+    assert response["exit_code"] == 2
+    assert "not sent" in response["reply"].lower()
     # The expiry won the claim, so the adapter never touched the request.
     assert adapter.started == []
     assert task.cancelled is True and task.cancel_event.is_set()
@@ -829,7 +832,11 @@ def test_worker_wins_the_claim_and_gets_the_cancel_event_as_before(monkeypatch) 
 
     response = daemon._handle_request(_expiry_message())
 
-    assert response["exit_code"] == 2 and response["reply"] == ""
+    # ITEM 1 (fix 2): a non-empty reply even here. The task was CLAIMED, so it
+    # is not recorded as "not sent" (see below), but the caller is still told
+    # something instead of receiving silence.
+    assert response["exit_code"] == 2
+    assert response["reply"], "the caller is never left with an empty reply"
     assert task.cancelled is True and task.cancel_event.is_set()
     # A started task is never recorded as "not sent".
     assert calls == []

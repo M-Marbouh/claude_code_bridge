@@ -75,7 +75,11 @@ PI_SPEC = ProviderDaemonSpec(
 # These providers expose transcript progress when the caller leaves the wait
 # budget implicit. Keep the capability separate from provider identity and
 # preserve Codex's established timeout defaults.
-PROGRESS_MODE_PROVIDERS = frozenset({"codex", "hermes"})
+#
+# Pi joins them: a long Pi turn keeps writing its session JSONL, so waiting on
+# transcript growth (plus its own busy signal) is exactly what Codex does. An
+# explicit --timeout keeps wall-clock semantics for every provider.
+PROGRESS_MODE_PROVIDERS = frozenset({"codex", "hermes", "pi"})
 
 
 LASKD_SPEC = ProviderDaemonSpec(

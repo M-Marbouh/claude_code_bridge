@@ -56,7 +56,7 @@ from askd.adapters.base import (
     parse_route_mapping,
     route_session_key,
 )
-from askd_timeout import codex_idle_timeout_s, codex_max_wait_s
+from askd_timeout import idle_timeout_s, max_wait_s
 from cli_output import EXIT_ERROR, EXIT_OK
 from ccb_runtime_status import (
     ProviderRuntimeStatus,
@@ -715,9 +715,11 @@ def _send_via_unified_daemon(
         req["sender_member_token"] = sender_member_token
     from providers import PROGRESS_MODE_PROVIDERS
     progress_mode = provider in PROGRESS_MODE_PROVIDERS and not timeout_explicit and not delivery_only
-    progress_max_wait = codex_max_wait_s() if progress_mode else None
+    # B2: each provider states its own budgets. Codex keeps CCB_CODEX_*; Pi
+    # sends CCB_PI_*, so neither machine's tuning can silently change the other.
+    progress_max_wait = max_wait_s(provider) if progress_mode else None
     if progress_mode:
-        req["idle_timeout_s"] = codex_idle_timeout_s()
+        req["idle_timeout_s"] = idle_timeout_s(provider)
         req["max_wait_s"] = progress_max_wait
     # Async callers create the durable task ID before entering foreground mode.
     # Preserve it as the provider request ID so receipts, CCB_REQ_ID, completion
@@ -776,10 +778,18 @@ def _send_via_unified_daemon(
                 state,
                 req,
                 connect_timeout_s=5.0,
+                # F2 is a PI fix: its daemon runs TWO phases -- a queue wait,
+                # then a turn allowance counted from the claim -- so the caller's
+                # socket budget must cover BOTH plus margin. Every other
+                # provider keeps the single-budget formula it always had.
                 response_timeout_s=(
-                    progress_max_wait + 10
-                    if progress_mode
-                    else (timeout + 10 if timeout > 0 else None)
+                    (progress_max_wait * 2) + 30
+                    if (progress_mode and provider == "pi")
+                    else (
+                        progress_max_wait + 10
+                        if progress_mode
+                        else (timeout + 10 if timeout > 0 else None)
+                    )
                 ),
             )
             exit_code = int(resp.get("exit_code") or 0)

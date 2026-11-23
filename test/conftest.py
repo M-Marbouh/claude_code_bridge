@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -81,14 +82,156 @@ if _GUARD_DIR:
     os.environ["PATH"] = _GUARD_DIR + os.pathsep + os.environ.get("PATH", "")
 
 
-def pytest_configure() -> None:
+def pytest_configure(config) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     lib_dir = repo_root / "lib"
     sys.path.insert(0, str(lib_dir))
+    # Registered here (not in a second `pytest_configure`, which would silently
+    # replace this one) so `@pytest.mark.long_test` is a known marker.
+    if hasattr(config, "addinivalue_line"):
+        config.addinivalue_line(
+            "markers",
+            f"{LONG_TEST_MARKER}: test legitimately needs longer than CCB_TEST_TIMEOUT_S",
+        )
 
 
 def pytest_sessionfinish(*_args, **_kwargs) -> None:
     shutil.rmtree(_TMUX_SOCKET_BASE, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# F1: a per-test wall-clock limit, so a hung test can never stall a night run
+# --------------------------------------------------------------------------- #
+#
+# Background: one adapter test spun for two hours (a fake clock advanced only
+# from a callback that the hung loop never reached, with `time.sleep` patched
+# out). Nothing in the suite bounded a single test, so the whole run stalled and
+# the work queued behind it died.
+#
+# Rules, deliberately conservative:
+#   * POSIX + MAIN THREAD only -- signal.alarm is per-process and the main
+#     thread owns it, so a worker-thread test is left to the outer watchdog;
+#   * the override is VALIDATED (a bad CCB_TEST_TIMEOUT_S falls back to the
+#     default instead of silently disabling the guard);
+#   * the previous SIGALRM handler and the previous timer are restored in
+#     `finally`, so this can never eat another tool's alarm;
+#   * expiry dumps every thread's stack (faulthandler) before failing the test,
+#     which is the evidence a hung run needs.
+
+#: Seconds a single test may run. Override with CCB_TEST_TIMEOUT_S.
+DEFAULT_TEST_TIMEOUT_S = 120.0
+
+#: Opt-out marker for a test that legitimately needs longer than the guard.
+LONG_TEST_MARKER = "long_test"
+
+
+class TestTimeout(BaseException):
+    """Raised into a test that outlived its limit.
+
+    Deliberately a ``BaseException``, not an ``Exception``: production code and
+    test helpers are full of ``except Exception`` loops, and a one-shot
+    ``TimeoutError`` thrown into one of those was swallowed -- the test kept
+    looping and the guard silently did nothing. Only ``BaseException`` reaches
+    every enclosing handler.
+    """
+
+
+def test_timeout_s() -> float | None:
+    """The validated per-test limit in seconds, or None when the guard is off.
+
+    ``CCB_TEST_TIMEOUT_S=0`` (or a negative/unparseable value) means the same as
+    the default: a guard you can accidentally disable by typo is worse than no
+    guard, so only an explicit zero disables it.
+    """
+    raw = (os.environ.get("CCB_TEST_TIMEOUT_S") or "").strip()
+    if not raw:
+        return DEFAULT_TEST_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TEST_TIMEOUT_S
+    if value != value or value in (float("inf"), float("-inf")):
+        return DEFAULT_TEST_TIMEOUT_S
+    # ONLY an explicit zero turns the guard off. A negative value is a mistake,
+    # not an instruction: it keeps the default rather than silently disabling
+    # the very thing that exists to stop a hung run.
+    if value == 0:
+        return None
+    if value < 0:
+        return DEFAULT_TEST_TIMEOUT_S
+    return value
+
+
+def _request_marks(request) -> set[str]:
+    try:
+        return {mark.name for mark in request.node.iter_markers()}
+    except Exception:
+        return set()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """Bound ONE test's call phase; restore the alarm state afterwards."""
+    import faulthandler
+    import signal
+    import threading
+
+    limit = test_timeout_s()
+    if limit is None or os.name != "posix" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    if LONG_TEST_MARKER in {mark.name for mark in item.iter_markers()}:
+        yield
+        return
+
+    state: dict = {}
+
+    def _expired(_signum, _frame):
+        state["expired"] = True
+        state["hits"] = state.get("hits", 0) + 1
+        # The stack dump IS the diagnosis: a hung test that only times out tells
+        # you nothing about where it was stuck.
+        with contextlib.suppress(Exception):
+            faulthandler.dump_traceback()
+        # RE-ARM before raising. One injection can be caught somewhere on the
+        # stack, so the deadline is kept live until the test actually unwinds:
+        # every later slice re-raises, and the outermost handler cannot eat all
+        # of them.
+        with contextlib.suppress(Exception):
+            signal.setitimer(signal.ITIMER_REAL, 0.25)
+        raise TestTimeout(
+            f"test exceeded its {limit:g}s limit (CCB_TEST_TIMEOUT_S); "
+            "mark it with @pytest.mark.long_test if it needs longer"
+        )
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, _expired)
+    signal.setitimer(signal.ITIMER_REAL, limit)
+    try:
+        outcome = yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        # Put back whatever timer was already armed for someone else.
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+    # A hookwrapper that just yields SWALLOWS the exception raised inside the
+    # wrapped call. The expiry has to be re-raised as this hook's own failure,
+    # or a hung test would be reported as passing.
+    if state.get("expired"):
+        # `outcome.excinfo` is an `ExceptionInfo` in newer pytest and a plain
+        # (type, value, tb) tuple in older ones; take the value from either.
+        cause = None
+        exc = getattr(outcome, "excinfo", None)
+        if exc is not None:
+            cause = getattr(exc, "value", None)
+            if cause is None and isinstance(exc, tuple) and len(exc) >= 2:
+                cause = exc[1]
+        raise TestTimeout(
+            f"test exceeded its {limit:g}s limit (CCB_TEST_TIMEOUT_S); "
+            "mark it with @pytest.mark.long_test if it needs longer"
+        ) from (cause if isinstance(cause, BaseException) else None)
 
 
 @pytest.fixture(autouse=True)

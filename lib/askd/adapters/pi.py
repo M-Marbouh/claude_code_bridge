@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask, route_session_key
+from askd.unsent import PI_UNSENT_REPLY
 from askd.completion_delivery import persist_and_notify
+from askd_timeout import codex_idle_timeout_s, codex_max_wait_s, positive_timeout_s
 from askd_runtime import log_path, write_log
 from ccb_protocol import strip_done_text, wrap_codex_prompt
 from completion_hook import (
@@ -22,6 +24,7 @@ from pi_comm import (
     PiState,
     confirm_pi_ready,
     load_candidate_sessions,
+    load_session_path,
     read_pi_state,
 )
 from project_id import compute_ccb_project_id
@@ -41,9 +44,14 @@ PRE_SEND_RETRY_LIMIT = 3
 # A busy pre-send wait is logged once, then at most this often.
 BUSY_LOG_INTERVAL_S = 60.0
 # A request stopped before injection was never delivered; its reply says so plainly.
-PRE_SEND_NOT_SENT_REPLY = "Pi request was not sent: CCB stopped waiting before Pi was free."
+#: The agreed sentence for a request CCB never injected. Shared with the unsent
+#: finalizer so both paths cannot drift apart.
+PRE_SEND_NOT_SENT_REPLY = PI_UNSENT_REPLY
 # Cancellation is polled in slices this short while waiting to retry.
 PRE_SEND_WAIT_POLL_S = 0.25
+# Progress mode never sleeps longer than this, so a growing transcript and a
+# change of pane state are both noticed promptly.
+PROGRESS_POLL_S = 0.25
 
 
 def _write_log(line: str) -> None:
@@ -144,6 +152,32 @@ def _anchor_landed(
     return found is not None or lookup_error == "ambiguous"
 
 
+def _read_bound_exchange(
+    session_dir: Path,
+    work_dir: Path,
+    req_id: str,
+    *,
+    bound_transcript: Path | None,
+    bound_session_id: str,
+    start_dir: str | Path | None,
+    cache: dict,
+) -> PiExchange | None:
+    """The request's exchange read from the ANCHORED transcript alone (B5).
+
+    Returns None when nothing is usable -- no proven transcript, an unreadable
+    one, or a session error -- so the caller keeps its "expired" verdict rather
+    than guessing. This is the drain the adapter performs once, at expiry, so a
+    CCB_DONE written in the final poll gap is not lost.
+    """
+    if bound_transcript is None or not bound_session_id:
+        return None
+    try:
+        session = load_session_path(bound_transcript, bound_session_id)
+    except (PiSessionError, OSError):
+        return None
+    return session.exchange(req_id)
+
+
 def _find_request_session(
     session_dir: Path,
     work_dir: Path,
@@ -193,7 +227,46 @@ class PiAdapter(BaseProviderAdapter):
         req = task.request
         started = time.monotonic()
         work_dir = Path(req.work_dir).expanduser().resolve()
-        deadline = None if float(req.timeout_s) < 0 else started + float(req.timeout_s)
+        # B2: a supplied idle budget is REQUIRED, so an older client that never
+        # sent one keeps today's wall clock. The daemon already enforces this;
+        # the adapter does not trust its input for a decision this expensive.
+        progress_mode = (
+            not req.timeout_explicit
+            and not req.delivery_only
+            and req.idle_timeout_s is not None
+        )
+        # F2 (B3): in progress mode the turn's budget is counted from the CLAIM
+        # and SHARED by the pre-send readiness wait and the turn itself. A long
+        # queue wait therefore cannot consume it, and a short cap cannot be
+        # exhausted before injection. `deadline` remains the nominal wall clock
+        # used by every non-progress path (explicit --timeout / legacy client).
+        worker_cap_deadline: float | None = None
+        if progress_mode:
+            # The DAEMON announces this task's turn cap before it can be claimed
+            # (the same number its own wait uses). Prefer it over re-deriving
+            # one from the request, so the adapter and the daemon can never
+            # disagree about how long the turn may run.
+            announced_cap = getattr(task, "worker_cap_s", None)
+            cap_s = positive_timeout_s(
+                announced_cap if announced_cap is not None else req.max_wait_s,
+                codex_max_wait_s(),
+            )
+            claimed_at = getattr(task, "claimed_at", None)
+            worker_cap_deadline = (claimed_at if claimed_at is not None else started) + cap_s
+            # ITEM 3: in progress mode the worker deadline governs the WHOLE
+            # phase throughout -- pre-send included. Widening it to the nominal
+            # timeout (as an earlier version did) let a short cap expire while
+            # the pane was still busy, and the request was then injected
+            # anyway. Non-progress paths keep their own wall clock below.
+            deadline = worker_cap_deadline
+        else:
+            deadline = None if float(req.timeout_s) < 0 else started + float(req.timeout_s)
+        progress_idle_s = (
+            positive_timeout_s(req.idle_timeout_s, codex_idle_timeout_s())
+            if progress_mode
+            else None
+        )
+        progress_cap_deadline = worker_cap_deadline
         retries_left = PRE_SEND_RETRY_LIMIT
         busy_since: float | None = None
         busy_logged_at: float | None = None
@@ -217,7 +290,7 @@ class PiAdapter(BaseProviderAdapter):
 
             # A cancelled or expired request is never injected. This guard runs on EVERY
             # pass, including the first idle attempt, so zero sends happen after a stop.
-            stop = self._pre_send_stop(task, session_key, deadline)
+            stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
             if stop is not None:
                 return self._finish(task, stop)
 
@@ -251,6 +324,18 @@ class PiAdapter(BaseProviderAdapter):
                 ))
 
             pane_state = _confirm_pi_ready(session, deadline)
+            # A3: judge EXPIRY before the readiness VERDICT. The confirmation
+            # above polls (up to ~2 s) and can itself spend the last of the
+            # budget; branching on `stale`/`draft` first would then report a
+            # generic readiness failure for a request whose real outcome is
+            # "CCB stopped waiting and never sent it". A ready pane still wins,
+            # because an accepted read means the request is deliverable.
+            if pane_state.status != "ready":
+                stop = self._pre_send_stop(
+                    task, session_key, deadline, unsent=progress_mode
+                )
+                if stop is not None:
+                    return self._finish(task, stop)
             if pane_state.status == "ready":
                 break
             if pane_state.status == "busy":
@@ -261,7 +346,7 @@ class PiAdapter(BaseProviderAdapter):
                 now = time.monotonic()
                 remaining = None if deadline is None else deadline - now
                 if remaining is not None and remaining <= 0:
-                    stop = self._pre_send_stop(task, session_key, deadline)
+                    stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
                     if stop is not None:
                         return self._finish(task, stop)
                     return self._finish(task, ProviderResult(
@@ -297,7 +382,7 @@ class PiAdapter(BaseProviderAdapter):
         # The readiness re-check after a wait can itself consume the last of the budget or see a
         # cancellation; this guard is the LAST step before the policy gate, so nothing is sent
         # for a stopped request.
-        stop = self._pre_send_stop(task, session_key, deadline)
+        stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
         if stop is not None:
             return self._finish(task, stop)
 
@@ -308,8 +393,41 @@ class PiAdapter(BaseProviderAdapter):
         from delivery_policy import refusal_for_request
         from pane_lock import PaneLockError, pane_injection_lock
 
+        # A1: bound the lock ACQUISITION.
+        #
+        # PROGRESS MODE ONLY. The wait is min(configured lock timeout, whatever
+        # is left of the worker budget); when no budget is left the lock is not
+        # even attempted and the request ends UNSENT. Every EXPLICIT/legacy
+        # request keeps `pane_lock.default_timeout_s()` exactly as it always
+        # had -- their `deadline` is a turn budget, not a lock budget, and
+        # narrowing it here once made a 3 s configured lock wait look like a
+        # 50 s one (and vice versa).
+        from pane_lock import default_timeout_s as _lock_default_timeout_s
+
+        if progress_mode:
+            configured_lock_s = _lock_default_timeout_s()
+            remaining_budget_s = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining_budget_s is not None and remaining_budget_s <= 0:
+                return self._finish(task, self._not_sent(task, session_key))
+            lock_budget_s: float | None = (
+                configured_lock_s
+                if remaining_budget_s is None
+                else min(configured_lock_s, remaining_budget_s)
+            )
+        else:
+            lock_budget_s = _lock_default_timeout_s()
+
         try:
-            with pane_injection_lock(backend, pane_id, None):
+            with pane_injection_lock(backend, pane_id, lock_budget_s):
+                # F2: the lock wait itself can consume the budget (it serialises
+                # every injection into this pane). Re-check expiry HERE, after
+                # the wait and immediately before injection, so a stopped
+                # request is never sent just because the guard ran earlier.
+                stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
+                if stop is not None:
+                    return self._finish(task, stop)
                 refusal = refusal_for_request(
                     req, self.key, expected_pane=pane_id, session=session
                 )
@@ -321,6 +439,14 @@ class PiAdapter(BaseProviderAdapter):
                         exit_code=1, reply=refusal, req_id=task.req_id, session_key=session_key,
                         done_seen=False, status=COMPLETION_STATUS_FAILED,
                     ))
+                # ITEM 3: evaluating the policy can itself take time (it reads
+                # the destination session). Re-check expiry ONCE MORE here, the
+                # last possible moment before the keystrokes go out, so a cap
+                # that ran out during the wait or the policy check means ZERO
+                # sends rather than an injected request nobody is waiting for.
+                stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
+                if stop is not None:
+                    return self._finish(task, stop)
                 try:
                     backend.send_text(pane_id, wrap_codex_prompt(req.message, task.req_id))
                 except Exception as exc:
@@ -329,10 +455,14 @@ class PiAdapter(BaseProviderAdapter):
                         session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
                     ))
         except PaneLockError as exc:
-            # No injection happened: this IS proven non-delivery.
+            # No injection happened: this IS proven non-delivery. When the cap
+            # expired while waiting for the lock, report the explicit unsent
+            # outcome (the agreed Pi sentence) rather than a generic failure.
             _write_log(
                 f"[WARN] pane injection lock unavailable provider=pi req_id={task.req_id}: {exc}"
             )
+            if progress_mode and deadline is not None and time.monotonic() >= deadline:
+                return self._finish(task, self._not_sent(task, session_key))
             return self._finish(task, ProviderResult(
                 exit_code=1, reply=f"Pane injection lock unavailable: {exc}", req_id=task.req_id,
                 session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
@@ -349,17 +479,30 @@ class PiAdapter(BaseProviderAdapter):
         transcript_path = ""
         caller_stopped_logged = False
         result = None
+        # Progress bookkeeping. `bound_transcript` is the transcript the REQUEST
+        # ANCHOR was proven in: only its growth counts as activity (B5), never a
+        # neighbouring session's. `last_activity_at` is refreshed by provable
+        # progress only -- a growing bound transcript, or the pane reading busy.
+        bound_transcript: Path | None = None
+        #: The session id PROVEN at the anchor. The drain trusts this, never the
+        #: header the file carries later (B5).
+        bound_transcript_session_id = ""
+        last_transcript_size: int | None = None
+        last_activity_at: float | None = None
         while True:
             now = time.monotonic()
-            if task.cancel_event and task.cancel_event.is_set():
-                # The only production setter is the daemon's wait expiry, i.e. the caller stopped
-                # waiting -- not an abort of Pi. Keep tracking to this adapter's deadline and
-                # report the real outcome, so an already-injected turn is never lost.
-                if not caller_stopped_logged:
-                    caller_stopped_logged = True
-                    _write_log(
-                        f"[INFO] caller stopped waiting; still tracking provider=pi req_id={task.req_id}"
-                    )
+            # The only production setter is the daemon's wait expiry, i.e. the caller stopped
+            # waiting -- not an abort of Pi. Keep tracking to this adapter's deadline and
+            # report the real outcome, so an already-injected turn is never lost.
+            if (
+                task.cancel_event
+                and task.cancel_event.is_set()
+                and not caller_stopped_logged
+            ):
+                caller_stopped_logged = True
+                _write_log(
+                    f"[INFO] caller stopped waiting; still tracking provider=pi req_id={task.req_id}"
+                )
             if not backend.is_alive(str(session["pane_id"])):
                 result = ProviderResult(
                     exit_code=2, reply="Pi pane died during the request.", req_id=task.req_id,
@@ -393,6 +536,36 @@ class PiAdapter(BaseProviderAdapter):
                 anchor_seen = exchange.state not in {"missing"}
                 if anchor_seen and anchor_ms is None:
                     anchor_ms = int((now - started) * 1000)
+                if anchor_seen:
+                    # B5: bind the transcript ONCE, at the anchor, and let only
+                    # that file prove activity from then on.
+                    if bound_transcript is None:
+                        source = found if found is not None else bound_session
+                        if source is not None:
+                            bound_transcript = Path(source.path)
+                            bound_transcript_session_id = str(source.session_id)
+                            try:
+                                last_transcript_size = bound_transcript.stat().st_size
+                            except OSError:
+                                last_transcript_size = None
+                            last_activity_at = now
+                    elif bound_transcript is not None:
+                        try:
+                            grown = bound_transcript.stat().st_size
+                        except OSError:
+                            grown = last_transcript_size
+                        if grown is not None and (
+                            last_transcript_size is None or grown > last_transcript_size
+                        ):
+                            last_transcript_size = grown
+                            last_activity_at = now
+                    # B1: a BUSY pane is activity -- Pi is visibly working even
+                    # while its transcript is momentarily static. `prompt` (an
+                    # open dialog) is classified BEFORE busy by pi_comm and is
+                    # deliberately NOT activity: a stuck dialog must not keep a
+                    # request alive for ever.
+                    if pane_state.status == "busy":
+                        last_activity_at = now
                 if exchange.state == "completed":
                     result = ProviderResult(
                         exit_code=0, reply=strip_done_text(exchange.reply, task.req_id), req_id=task.req_id,
@@ -446,7 +619,10 @@ class PiAdapter(BaseProviderAdapter):
                     # Pi retries on its own: watch the pane instead of the parked deadline.
                     # Unknown reads reset the timer, so an operator draft here waits for the overall
                     # timeout just like pending; that residual is unchanged from today.
-                    if _confirm_pi_ready(session, deadline).status == "ready":
+                    active_deadline = (
+                        progress_cap_deadline if (progress_mode and anchor_seen) else deadline
+                    )
+                    if _confirm_pi_ready(session, active_deadline).status == "ready":
                         if retry_idle_at is None:
                             retry_idle_at = now
                         elif now - retry_idle_at >= RETRY_IDLE_S:
@@ -509,7 +685,82 @@ class PiAdapter(BaseProviderAdapter):
                     break
                 if deadline_state == "busy":
                     saw_busy = True
-            if deadline is not None and now >= deadline:
+            live_progress = progress_mode and anchor_seen
+            if live_progress:
+                # The absolute cap applies even under CONTINUOUS busy (B1): a
+                # hung tool can publish fresh busy snapshots for ever, so no
+                # amount of "activity" may outlive it.
+                expired_reason = ""
+                if progress_cap_deadline is not None and now >= progress_cap_deadline:
+                    expired_reason = "cap"
+                elif (
+                    progress_idle_s is not None
+                    and last_activity_at is not None
+                    and now - last_activity_at >= progress_idle_s
+                ):
+                    expired_reason = "idle"
+                if expired_reason:
+                    # B5: drain the PROVEN transcript once before giving up. A
+                    # CCB_DONE written in the last poll gap must still win.
+                    size_before = last_transcript_size
+                    drain = _read_bound_exchange(
+                        session_dir, work_dir, task.req_id,
+                        bound_transcript=bound_transcript,
+                        bound_session_id=bound_transcript_session_id,
+                        start_dir=session.get("start_dir"),
+                        cache=session_cache,
+                    )
+                    if drain is not None and drain.state == "completed":
+                        result = ProviderResult(
+                            exit_code=0, reply=strip_done_text(drain.reply, task.req_id),
+                            req_id=task.req_id, session_key=session_key, done_seen=True,
+                            anchor_seen=True, anchor_ms=anchor_ms,
+                            done_ms=int((now - started) * 1000), log_path=transcript_path,
+                            status=COMPLETION_STATUS_COMPLETED,
+                            extra={"destination_transcript_path": transcript_path, "destination_conversation_id": pi_session_id},
+                        )
+                        break
+                    # The CAP always ends the turn (B1): a hung tool keeps
+                    # publishing fresh busy snapshots, so no amount of activity
+                    # may outlive it.
+                    if expired_reason == "cap":
+                        result = ProviderResult(
+                            exit_code=2,
+                            reply="Pi request reached its maximum wait without a terminal CCB_DONE.",
+                            req_id=task.req_id, session_key=session_key, done_seen=False,
+                            anchor_seen=anchor_seen, anchor_ms=anchor_ms, log_path=transcript_path,
+                            status=COMPLETION_STATUS_INCOMPLETE,
+                            extra={"destination_transcript_path": transcript_path, "destination_conversation_id": pi_session_id},
+                        )
+                        break
+                    # IDLE: only REAL transcript growth during the drain grants
+                    # another round. A busy pane does not, or a stuck tool would
+                    # hold the request open for ever.
+                    grew = False
+                    if bound_transcript is not None:
+                        try:
+                            current_size = bound_transcript.stat().st_size
+                        except OSError:
+                            current_size = size_before
+                        grew = (
+                            current_size is not None
+                            and size_before is not None
+                            and current_size > size_before
+                        )
+                        if grew:
+                            last_transcript_size = current_size
+                            last_activity_at = now
+                    if grew:
+                        continue
+                    result = ProviderResult(
+                        exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
+                        req_id=task.req_id, session_key=session_key, done_seen=False,
+                        anchor_seen=anchor_seen, anchor_ms=anchor_ms, log_path=transcript_path,
+                        status=COMPLETION_STATUS_INCOMPLETE,
+                        extra={"destination_transcript_path": transcript_path, "destination_conversation_id": pi_session_id},
+                    )
+                    break
+            elif deadline is not None and now >= deadline:
                 result = ProviderResult(
                     exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
                     req_id=task.req_id, session_key=session_key, done_seen=False,
@@ -518,7 +769,7 @@ class PiAdapter(BaseProviderAdapter):
                     extra={"destination_transcript_path": transcript_path, "destination_conversation_id": pi_session_id},
                 )
                 break
-            time.sleep(0.25)
+            time.sleep(PROGRESS_POLL_S)
         return self._finish(task, result, transcript_path=transcript_path, conversation_id=pi_session_id)
 
     def _not_sent(self, task: QueuedTask, session_key: str) -> ProviderResult:
@@ -529,12 +780,26 @@ class PiAdapter(BaseProviderAdapter):
         )
 
     def _pre_send_stop(
-        self, task: QueuedTask, session_key: str, deadline: float | None,
+        self,
+        task: QueuedTask,
+        session_key: str,
+        deadline: float | None,
+        *,
+        unsent: bool = False,
     ) -> ProviderResult | None:
-        """Cancelled or expired before injection: the terminal result, else None."""
+        """Cancelled or expired before injection: the terminal result, else None.
+
+        `unsent` selects the wording for an expiry that happened while CCB was
+        still trying to inject (progress mode): NOTHING was sent, so "timed out
+        before a terminal CCB_DONE" would be a lie about a request Pi never saw.
+        The agreed sentence ("Pi request was not sent: CCB stopped waiting before
+        Pi was free.") is used instead.
+        """
         if task.cancel_event and task.cancel_event.is_set():
             return self._not_sent(task, session_key)
         if deadline is not None and time.monotonic() >= deadline:
+            if unsent:
+                return self._not_sent(task, session_key)
             return ProviderResult(
                 exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
                 req_id=task.req_id, session_key=session_key, done_seen=False,

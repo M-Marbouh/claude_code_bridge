@@ -5,6 +5,8 @@ import threading
 import time
 from typing import Callable, Generic, Optional, Protocol, TypeVar
 
+from askd.unsent import finalize_unsent
+
 
 ResultT = TypeVar("ResultT")
 
@@ -68,10 +70,38 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
             claim_lock = getattr(task, "claim_lock", None)
             if claim_lock is not None:
                 with claim_lock:
+                    # F2: the SAME lock the daemon's queue-expiry takes, so
+                    # "skipped" and "started" are decided exactly once. A task
+                    # whose queue deadline already passed is never injected,
+                    # and a claimed task records WHEN, because its turn budget
+                    # is counted from the claim rather than from submission.
                     if getattr(task, "cancelled", False):
                         task.done_event.set()
                         continue
-                    task.started = True
+                    queue_deadline = getattr(task, "queue_deadline", None)
+                    if queue_deadline is not None and time.monotonic() >= queue_deadline:
+                        # Expired while still queued: nothing was ever sent, so
+                        # this is a PROVEN pre-dispatch refusal.
+                        #
+                        # Mark it cancelled UNDER the lock, then RELEASE it and
+                        # finalize OUTSIDE. `finalize_unsent` takes this same
+                        # non-reentrant lock, so calling it here would deadlock
+                        # the worker forever (and block the daemon's expiry
+                        # behind it).
+                        task.cancelled = True
+                        if task.cancel_event:
+                            task.cancel_event.set()
+                        expired = True
+                    else:
+                        expired = False
+                        task.started = True
+                        if getattr(task, "worker_cap_s", None) is not None:
+                            task.claimed_at = time.monotonic()
+                if expired:
+                    # Outside the lock: record + publish exactly once, and give
+                    # the caller a real reply instead of a silent None.
+                    finalize_unsent(task, getattr(task, "provider_key", "") or "request")
+                    continue
             elif hasattr(task, 'cancelled') and task.cancelled:
                 # Tasks without a claim lock keep the pre-claim behaviour exactly.
                 task.done_event.set()

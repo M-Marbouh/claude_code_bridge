@@ -27,8 +27,13 @@ from askd.adapters.base import (
     route_session_key,
 )
 from askd.completion_delivery import persist_and_notify
+from askd.unsent import finalize_unsent
 from askd.registry import ProviderRegistry
-from askd_timeout import codex_idle_timeout_s, codex_max_wait_s, positive_timeout_s
+from askd_timeout import (
+    idle_timeout_s as provider_idle_timeout_s,
+    max_wait_s as provider_max_wait_s,
+    positive_timeout_s,
+)
 from askd_runtime import log_path, random_token, state_file_path, write_log
 from ccb_protocol import make_req_id
 from completion_hook import COMPLETION_STATUS_FAILED
@@ -190,6 +195,8 @@ class _UnifiedWorkerPool:
         *,
         remote_record_id: str = "",
         remote_owner: str = "",
+        worker_cap_s: float | None = None,
+        queue_deadline: float | None = None,
     ) -> Optional[QueuedTask]:
         adapter = self._registry.get(provider)
         if not adapter:
@@ -206,6 +213,11 @@ class _UnifiedWorkerPool:
             cancel_event=cancel_event,
             remote_record_id=remote_record_id,
             remote_owner=remote_owner,
+            provider_key=provider,
+            # ITEM 2: attached HERE, before `worker.enqueue` below, so a worker
+            # that claims the task immediately already sees its budgets.
+            worker_cap_s=worker_cap_s,
+            queue_deadline=queue_deadline,
         )
 
         if request.route.present:
@@ -313,40 +325,52 @@ def _queue_entries(
     return entries
 
 
-def _record_unsent_request(task: QueuedTask, provider: str, budget_s: float | None = None) -> None:
-    """Record and notify a request that expired while still waiting in line.
+def _record_unsent_request(
+    task: QueuedTask, provider: str, budget_s: float | None = None
+) -> None:
+    """Deprecated shim. `askd.unsent.finalize_unsent` is the ONE finalizer.
 
-    The client already stopped waiting (that is why the expiry fired), so the result is
-    delivered the same way an adapter's `_finish` delivers one: receipt first, then the
-    completion hook -- unless the request asked for no hook, was delivery-only, or was a
-    peer reply, which are persisted without notifying.
+    Kept because it is a documented, test-visible entry point; it now delegates
+    so there can never be two implementations that disagree.
     """
-    request = task.request
-    # The budget the caller actually waited: max_wait for implicit progress-mode requests.
-    timeout_s = float(request.timeout_s) if budget_s is None else float(budget_s)
-    reply = (
-        f"Not sent: this request waited in line behind earlier {provider} requests "
-        f"for its whole timeout ({int(timeout_s)} s). Resend it if still needed."
+    finalize_unsent(task, provider, budget_s=budget_s)
+
+
+def _progress_budgets(
+    provider: str, request: ProviderRequest
+) -> tuple[bool, float | None, float | None]:
+    """Decide, once and BEFORE enqueueing, how long each phase may run.
+
+    Returns ``(two_phase, worker_cap_s, wait_for_result_s)``:
+
+    * ``two_phase`` is true only for Pi in progress mode. It is the ONLY
+      provider whose request is split into a queue phase and a turn phase, so
+      Codex/Hermes/explicit-timeout timings are untouched.
+    * ``worker_cap_s`` is the turn allowance counted from the CLAIM. It is also
+      attached to the task before enqueueing, so a worker that claims
+      immediately still sees it.
+    * ``wait_for_result_s`` is how long the daemon waits for the queue phase.
+    """
+    progress_budget = (
+        provider in PROGRESS_MODE_PROVIDERS
+        and not request.timeout_explicit
+        and not request.delivery_only
+        and request.idle_timeout_s is not None
     )
-    result = ProviderResult(
-        exit_code=2,
-        reply=reply,
-        req_id=task.req_id,
-        session_key=route_session_key(provider, request.route) if request.route.present else f"{provider}:unknown",
-        done_seen=False,
-        status=COMPLETION_STATUS_FAILED,
+    if progress_budget and provider == "pi":
+        max_wait = positive_timeout_s(request.max_wait_s, provider_max_wait_s(provider))
+        return True, max_wait, max_wait + 5.0
+    if progress_budget:
+        # Codex/Hermes: one budget, unchanged.
+        return False, None, positive_timeout_s(
+            request.max_wait_s, provider_max_wait_s(provider)
+        ) + 5.0
+    # Explicit timeout / legacy client / non-progress provider: ONE wall clock.
+    return (
+        False,
+        None,
+        None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0),
     )
-    _write_log(
-        f"[WARN] queued request expired unsent provider={provider} req_id={task.req_id} "
-        f"timeout_s={int(timeout_s)}"
-    )
-    persist_and_notify(
-        provider, request, req_id=task.req_id, reply=result.reply, status=result.status,
-        done_seen=False,
-        notify=not (request.delivery_only or request.peer_destination.present),
-    )
-    # The client contract is unchanged: the waiting caller still gets exit 2 with no reply.
-    task.done_event.set()
 
 
 class UnifiedAskDaemon:
@@ -483,6 +507,44 @@ class UnifiedAskDaemon:
         to_role = str(msg.get("to_role") or "").strip().lower()
         reply_to = str(msg.get("reply_to") or "").strip()
 
+        # Progress budgets, resolved per provider (B2).
+        #
+        # Codex and Hermes keep their ESTABLISHED rule byte-for-byte: a missing
+        # idle/max field is filled from Codex's values, so an older client that
+        # omits them still gets the same request object it always did.
+        #
+        # Pi is stricter, because its progress mode is new: it enters progress
+        # mode only when the caller SUPPLIED an idle budget AND left the timeout
+        # implicit AND wants a reply. A caller that sends no idle_timeout_s is
+        # an older client and keeps wall-clock semantics for Pi.
+        request_idle_timeout_s = None
+        request_max_wait_s = None
+        if provider in PROGRESS_MODE_PROVIDERS:
+            supplied_idle = msg.get("idle_timeout_s")
+            supplied_implicit = not _request_bool(msg.get("timeout_explicit", True))
+            supplied_reply = not bool(
+                msg.get("delivery_only") or msg.get("no_reply_wait") or False
+            )
+            if provider == "pi":
+                if supplied_idle is not None and supplied_implicit and supplied_reply:
+                    request_idle_timeout_s = positive_timeout_s(
+                        supplied_idle, provider_idle_timeout_s(provider)
+                    )
+                    request_max_wait_s = positive_timeout_s(
+                        msg.get("max_wait_s"), provider_max_wait_s(provider)
+                    )
+            else:
+                # Codex and Hermes keep the ESTABLISHED rule exactly: a missing
+                # idle/max field is filled from that provider's values, with no
+                # implicit/reply gating at all. Changing this would alter the
+                # request object an older client produces today.
+                request_idle_timeout_s = positive_timeout_s(
+                    supplied_idle, provider_idle_timeout_s(provider)
+                )
+                request_max_wait_s = positive_timeout_s(
+                    msg.get("max_wait_s"), provider_max_wait_s(provider)
+                )
+
         try:
             request = ProviderRequest(
                 client_id=str(msg.get("id") or ""),
@@ -492,16 +554,8 @@ class UnifiedAskDaemon:
                 message=str(msg.get("message") or ""),
                 caller=caller,
                 timeout_explicit=_request_bool(msg.get("timeout_explicit", True)),
-                idle_timeout_s=(
-                    positive_timeout_s(msg.get("idle_timeout_s"), codex_idle_timeout_s())
-                    if provider in PROGRESS_MODE_PROVIDERS
-                    else None
-                ),
-                max_wait_s=(
-                    positive_timeout_s(msg.get("max_wait_s"), codex_max_wait_s())
-                    if provider in PROGRESS_MODE_PROVIDERS
-                    else None
-                ),
+                idle_timeout_s=request_idle_timeout_s,
+                max_wait_s=request_max_wait_s,
                 output_path=str(msg.get("output_path")) if msg.get("output_path") else None,
                 req_id=str(msg.get("req_id")) if msg.get("req_id") else None,
                 no_wrap=bool(msg.get("no_wrap") or False),
@@ -561,7 +615,25 @@ class UnifiedAskDaemon:
                 "accepted": False,
             }
 
-        task = self.pool.submit(provider, request)
+        # ITEM 2: the budget fields must exist BEFORE the task is enqueued.
+        # `pool.submit` hands the task straight to a worker, which may claim it
+        # immediately -- and the async path returns before any later assignment
+        # could run. So the budgets are computed here and passed INTO submit,
+        # where they are set on the QueuedTask before `worker.enqueue`.
+        two_phase, worker_cap_s, wait_timeout = _progress_budgets(provider, request)
+        queue_deadline = (
+            time.monotonic() + worker_cap_s if two_phase and worker_cap_s else None
+        )
+
+        # Only a two-phase (Pi progress-mode) request carries these, so every
+        # other provider's submit call is byte-for-byte what it always was --
+        # including for pool doubles that predate the two-phase budget.
+        submit_budget: dict = (
+            {"worker_cap_s": worker_cap_s, "queue_deadline": queue_deadline}
+            if two_phase
+            else {}
+        )
+        task = self.pool.submit(provider, request, **submit_budget)
         if not task:
             return {
                 "type": "ask.response",
@@ -605,12 +677,32 @@ class UnifiedAskDaemon:
                 "accepted": True,
             }
 
-        if provider in PROGRESS_MODE_PROVIDERS and not request.timeout_explicit and not request.delivery_only:
-            wait_timeout = positive_timeout_s(request.max_wait_s, codex_max_wait_s()) + 5.0
-        else:
-            wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
+        # `two_phase`, `worker_cap_s` and `wait_timeout` were decided BEFORE the
+        # task was enqueued (see `_progress_budgets`), so a worker can never
+        # claim a task whose budget fields are still unset.
         task.done_event.wait(timeout=wait_timeout)
         result = task.result
+
+        # F2: the queue phase ended without a result. If a worker CLAIMED the
+        # task, the turn is still legitimately running -- give it the turn
+        # allowance measured from the claim, and never the blanket 10 s. The
+        # claim lock decides "skipped" vs "started" exactly once.
+        if not result and not task.done_event.is_set() and worker_cap_s is not None:
+            claim_lock = getattr(task, "claim_lock", None)
+            claimed_at = None
+            if claim_lock is not None:
+                with claim_lock:
+                    if getattr(task, "started", False):
+                        claimed_at = getattr(task, "claimed_at", None) or time.monotonic()
+            if claimed_at is not None:
+                remaining_turn = (claimed_at + worker_cap_s) - time.monotonic()
+                _write_log(
+                    f"[INFO] post-claim turn allowance provider={provider} "
+                    f"req_id={task.req_id} remaining_s={int(max(0.0, remaining_turn))}"
+                )
+                if remaining_turn > 0:
+                    task.done_event.wait(timeout=remaining_turn + 5.0)
+                    result = task.result
 
         # If timeout occurred and task is still running, mark it as cancelled. A task the
         # worker never claimed was never sent at all: record and notify that explicitly
@@ -634,12 +726,39 @@ class UnifiedAskDaemon:
                     task.cancel_event.set()
 
         if unsent:
-            _record_unsent_request(
+            # ONE finalizer for both expiry paths (worker and daemon). It
+            # records + publishes exactly once and RETURNS the result, so the
+            # direct reply below is the same honest sentence the caller would
+            # have got from a receipt -- never an empty reply.
+            result = finalize_unsent(
                 task, provider,
                 budget_s=(wait_timeout - 5.0) if wait_timeout is not None else None,
             )
+        elif result is None and not getattr(task, "started", False):
+            # Finished with no result and never claimed by a worker: the same
+            # proven-unsent case, so it gets the same finalizer.
+            result = finalize_unsent(task, provider)
+        elif result is None:
+            # A CLAIMED task was cancelled (today's cooperative cancel for every
+            # provider except Pi). It was NOT unsent, so it must never be
+            # recorded as one -- but the caller still gets words, not silence.
+            result = ProviderResult(
+                exit_code=2,
+                reply=(
+                    f"{provider.capitalize()} request stopped before it produced a result; "
+                    "it was already handed to the provider, so check its pane before resending."
+                ),
+                req_id=task.req_id,
+                session_key=(
+                    route_session_key(provider, request.route)
+                    if request.route.present
+                    else f"{provider}:unknown"
+                ),
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
 
-        if not result:
+        if result is None:  # pragma: no cover - finalize_unsent always returns
             return {
                 "type": "ask.response",
                 "v": 1,

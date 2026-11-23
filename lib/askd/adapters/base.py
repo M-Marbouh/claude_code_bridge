@@ -309,6 +309,27 @@ class QueuedTask:
     # that was never sent apart from one already handed to the adapter.
     claim_lock: threading.Lock = field(default_factory=threading.Lock)
     started: bool = False
+    # F2 (B3): a progress-mode turn is bounded in TWO phases so a long queue
+    # wait can never eat the turn's own budget. `queue_deadline` is the
+    # monotonic time by which a worker must CLAIM this task (it expires unsent
+    # after that), and `worker_cap_s` is how long the turn may then run, counted
+    # FROM THE CLAIM. Both are None for every request that does not use progress
+    # mode, which keeps those waits exactly as they were.
+    queue_deadline: Optional[float] = None
+    worker_cap_s: Optional[float] = None
+    #: Set (under `claim_lock`) by whichever path finalises an UNSENT expiry --
+    #: the worker's queue check or the daemon's wait. Exactly one of them may
+    #: record and publish the outcome, so the caller always gets one honest
+    #: result instead of a silent empty reply.
+    unsent_finalized: bool = False
+    #: The provider this task belongs to, so a non-adapter owner (the worker,
+    #: which only knows a session key) can finalise an unsent expiry with the
+    #: right wording and log line.
+    provider_key: str = ""
+    #: Monotonic time the worker CLAIMED this task (set under `claim_lock`
+    #: together with `started`). The turn's cap is counted from here, so a long
+    #: queue wait can never shorten it.
+    claimed_at: Optional[float] = None
     # Remote (cross-machine) deliveries only: the host-qualified request id of
     # the destination journal record this task must keep in step. Set by the
     # remote submit path BEFORE the task is enqueued, so the worker can never

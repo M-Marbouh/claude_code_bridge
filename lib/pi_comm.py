@@ -228,6 +228,25 @@ def load_session(session_dir: Path, session_id: str) -> PiSession:
     return _load_session_path(matches[0], session_id)
 
 
+def load_session_path(path: Path, session_id: str) -> PiSession:
+    """Load one Pi session from an EXACT path whose identity is ALREADY PROVEN.
+
+    The drain at expiry knows both facts: which file the request was anchored in
+    and which session id that anchor belonged to. Both are supplied by the
+    caller and neither is re-derived from the file, so a header REWRITTEN to a
+    different id after the anchor cannot make the drain read a different
+    session -- `_load_session_path` refuses a header whose id no longer matches.
+
+    Parsing is byte-level, line by line (`_load_session_path`), never a
+    whole-file text decode: the file is still growing during a turn, so the last
+    line may be a partial UTF-8 sequence, which must be SKIPPED (an incomplete
+    row) rather than aborting the read.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise PiSessionError("unavailable", "Pi session identity is unknown for this request.")
+    return _load_session_path(Path(path), session_id)
+
+
 def _load_session_path(path: Path, session_id: str) -> PiSession:
     try:
         raw = path.read_bytes()

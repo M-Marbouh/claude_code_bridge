@@ -206,6 +206,9 @@ def test_hello_advertises_delivery_only_and_explicit_reply():
         # M3: `list` replies also carry per-provider availability and the
         # live-session choices; a sender that predates this ignores the key.
         "list_sessions": True,
+        # Share-all (A1): this build can honour a `share_all` grant. A pairing
+        # source that does not see it refuses to claim the grant works.
+        "share_all": True,
     }
     # No provider beyond Claude/Codex may be advertised.
     assert set(response["capabilities"]["reply_modes"]) == {"claude", "codex"}

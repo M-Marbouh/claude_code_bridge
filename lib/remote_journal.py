@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -183,6 +184,16 @@ class Principal:
     name: str
     issuer_token: str
     allowed_aliases: tuple[str, ...] = ()
+    #: Opt-in "share every eligible CCB project on this machine" (default off).
+    #: A strict bool: anything else is a config error (fail closed).
+    share_all: bool = False
+    #: Providers a DERIVED alias may be addressed on. Only meaningful together
+    #: with `share_all_providers_given`: an OMITTED key means the default set,
+    #: an explicitly empty list means NO provider, so `[]` and absent must stay
+    #: distinguishable all the way through the loader.
+    share_all_providers: tuple[str, ...] = ()
+    #: Whether the config actually carried a `share_all_providers` key.
+    share_all_providers_given: bool = False
 
 
 @dataclass(frozen=True)
@@ -190,6 +201,67 @@ class Alias:
     name: str
     work_dir: str
     providers: tuple[str, ...] = ()
+    #: Set on an alias DERIVED from `share_all`, never on a configured one: the
+    #: project identity the sender saw in `list` and must send back (A5).
+    project_id: str = ""
+    derived: bool = False
+
+
+#: Providers a `share_all` grant covers when the config names none. Intersected
+#: with the protocol's own provider set by the caller.
+DEFAULT_SHARE_ALL_PROVIDERS = ("claude", "codex")
+
+#: The alias shape every grant, configured or derived, must have (guide §5).
+SHARE_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+
+
+def _remote_providers() -> tuple[str, ...]:
+    """The protocol's own provider set, imported lazily (no import cycle)."""
+    from remote_protocol import REMOTE_PROVIDERS
+
+    return tuple(REMOTE_PROVIDERS)
+
+
+def derive_alias_name(work_dir: str) -> str:
+    """The alias a `share_all` grant derives from one work_dir.
+
+    The folder name lowercased, every run of non `[a-z0-9]` collapsed to `-`,
+    trimmed and truncated to 32 characters. A name that still does not match
+    the alias shape is returned unchanged for the caller to reject: a derived
+    alias must satisfy exactly the rule a configured one does.
+    """
+    name = Path(str(work_dir or "")).name.lower()
+    name = re.sub(r"[^a-z0-9]+", "-", name).strip("-")
+    return name[:32].strip("-")
+
+
+@dataclass(frozen=True)
+class EffectiveAliases:
+    """What one principal may actually address right now.
+
+    Computed per request from the config PLUS the projects eligible for this
+    destination, and never written back: `share_all` adds no config entries.
+    `skipped` names a derived alias that was refused because its name was
+    ambiguous, with the reason `list` reports.
+    """
+
+    aliases: dict[str, Alias] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)
+    share_all: bool = False
+
+    def derived_names(self) -> tuple[str, ...]:
+        return tuple(name for name, alias in self.aliases.items() if alias.derived)
+
+
+def _resolved_path(value: str) -> str:
+    """A canonical absolute path for comparison, or "" when unusable."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return text
 
 
 @dataclass(frozen=True)
@@ -200,23 +272,120 @@ class RemoteConfig:
     def principal(self, name: str) -> Principal | None:
         return self.principals.get((name or "").strip())
 
-    def may_use(self, principal_name: str, alias_name: str) -> bool:
+    def effective_aliases(
+        self, principal_name: str, projects: object = ()
+    ) -> EffectiveAliases:
+        """The ONE seam both `list` and `submit` authorize through.
+
+        Explicit aliases always apply. With `share_all` on, every eligible
+        project (a registry work_dir that exists, is not under the system temp
+        dir and holds a project config dir) is added under its derived alias:
+
+        * an explicit alias of the same name wins, whatever it points at;
+        * an explicit alias pointing at the same canonical work_dir suppresses
+          the derived one (one project, one name);
+        * two derived projects whose names normalise identically are BOTH
+          dropped and reported as skipped -- an ambiguous name must never be
+          resolved by picking one.
+        """
         principal = self.principal(principal_name)
         if principal is None:
-            return False
-        return alias_name in principal.allowed_aliases and alias_name in self.aliases
+            return EffectiveAliases()
+        aliases: dict[str, Alias] = {
+            name: self.aliases[name]
+            for name in principal.allowed_aliases
+            if name in self.aliases
+        }
+        if not principal.share_all:
+            return EffectiveAliases(aliases=aliases, share_all=False)
 
-    def providers_for(self, principal_name: str, alias_name: str) -> tuple[str, ...]:
-        if not self.may_use(principal_name, alias_name):
-            return ()
-        alias = self.aliases.get(alias_name)
+        if principal.share_all_providers_given:
+            # P2-b: an explicit list is honoured EXACTLY, so `[]` derives
+            # nothing at all rather than silently falling back to the default.
+            providers = tuple(
+                provider
+                for provider in principal.share_all_providers
+                if provider in _remote_providers()
+            )
+        else:
+            providers = tuple(
+                provider
+                for provider in DEFAULT_SHARE_ALL_PROVIDERS
+                if provider in _remote_providers()
+            )
+        if not providers:
+            # No provider is addressable, so no derived alias may exist: `list`
+            # omits them entirely and `submit` refuses them, which keeps the two
+            # verbs in agreement. `share_all` still reports as on -- it is the
+            # grant that is on, with nothing derived under it.
+            return EffectiveAliases(aliases=aliases, share_all=True)
+        explicit_dirs = {
+            _resolved_path(alias.work_dir) for alias in aliases.values()
+        }
+        candidates: list[tuple[str, dict]] = []
+        seen_dirs: set[str] = set()
+        for project in projects if isinstance(projects, (list, tuple)) else ():
+            if not isinstance(project, dict):
+                continue
+            # R1: the project's work_dir is used EXACTLY as the eligibility
+            # pass produced it -- one resolve, one identity. Re-resolving here
+            # would let a directory swapped for a symlink between `list` and
+            # `submit` pair a fresh path with the hash computed for the old one.
+            # Delivery re-resolves independently, and its result is compared
+            # against this identity before anything is written.
+            work_dir = str(project.get("work_dir") or "").strip()
+            if not work_dir or work_dir in seen_dirs:
+                continue
+            seen_dirs.add(work_dir)
+            candidates.append((work_dir, project))
+
+        by_name: dict[str, list[str]] = {}
+        for work_dir, _project in candidates:
+            name = derive_alias_name(work_dir)
+            if not SHARE_ALIAS_RE.fullmatch(name):
+                continue
+            by_name.setdefault(name, []).append(work_dir)
+        derived: dict[str, Alias] = {}
+        skipped: dict[str, str] = {}
+        for name in sorted(by_name):
+            work_dirs = by_name[name]
+            if name in aliases:
+                # An explicit alias wins on a name clash.
+                continue
+            if len(work_dirs) > 1:
+                skipped[name] = (
+                    "skipped: more than one project on this machine normalises to "
+                    f"this alias ({len(work_dirs)}), so none is shared under it"
+                )
+                continue
+            work_dir = work_dirs[0]
+            if work_dir in explicit_dirs:
+                # Already shared explicitly under another name.
+                continue
+            project = next(
+                item for candidate, item in candidates if candidate == work_dir
+            )
+            derived[name] = Alias(
+                name=name,
+                work_dir=work_dir,
+                providers=providers,
+                project_id=str(project.get("project_id") or ""),
+                derived=True,
+            )
+        aliases.update(derived)
+        return EffectiveAliases(aliases=aliases, skipped=skipped, share_all=True)
+
+    def may_use(self, principal_name: str, alias_name: str, projects: object = ()) -> bool:
+        return alias_name in self.effective_aliases(principal_name, projects).aliases
+
+    def providers_for(
+        self, principal_name: str, alias_name: str, projects: object = ()
+    ) -> tuple[str, ...]:
+        alias = self.effective_aliases(principal_name, projects).aliases.get(alias_name)
         return tuple(alias.providers) if alias else ()
 
-    def allowed_aliases(self, principal_name: str) -> tuple[str, ...]:
-        principal = self.principal(principal_name)
-        if principal is None:
-            return ()
-        return tuple(name for name in principal.allowed_aliases if name in self.aliases)
+    def allowed_aliases(self, principal_name: str, projects: object = ()) -> tuple[str, ...]:
+        return tuple(self.effective_aliases(principal_name, projects).aliases)
 
 
 def _string_list(value: object, field_name: str) -> tuple[str, ...]:
@@ -225,6 +394,18 @@ def _string_list(value: object, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
         raise RemoteConfigError(f"{field_name} must be a list of non-empty strings")
     return tuple(item.strip() for item in value)
+
+
+def _strict_bool(value: object, field_name: str) -> bool:
+    """A JSON boolean and nothing else.
+
+    `share_all` decides a whole-machine grant, so a ``"yes"``, ``1`` or
+    ``null`` must be a config error rather than a truthy guess: every verb
+    then refuses until the config is fixed, which is the fail-closed answer.
+    """
+    if not isinstance(value, bool):
+        raise RemoteConfigError(f"{field_name} must be true or false")
+    return value
 
 
 def load_config(path: Path | None = None) -> RemoteConfig:
@@ -260,10 +441,21 @@ def load_config(path: Path | None = None) -> RemoteConfig:
         token = entry.get("issuer_token")
         if not isinstance(token, str) or not token.strip():
             raise RemoteConfigError(f"principal {name} has no issuer_token")
+        share_all = (
+            _strict_bool(entry.get("share_all"), f"principal {name} share_all")
+            if "share_all" in entry
+            else False
+        )
         principals[name.strip()] = Principal(
             name=name.strip(),
             issuer_token=token.strip(),
             allowed_aliases=_string_list(entry.get("allowed_aliases"), "allowed_aliases"),
+            share_all=share_all,
+            share_all_providers=_string_list(
+                entry.get("share_all_providers"),
+                f"principal {name} share_all_providers",
+            ),
+            share_all_providers_given="share_all_providers" in entry,
         )
 
     aliases: dict[str, Alias] = {}

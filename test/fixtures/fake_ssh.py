@@ -323,23 +323,30 @@ def main() -> int:
                 },
             )
             return 0
-        write_frame(
-            stdout,
-            {
-                "ok": True,
-                "op": op,
-                "op_id": op_id,
-                "projects": [
-                    {
-                        "alias": "example-project",
-                        "providers": [
-                            {"provider": "claude", "present": True},
-                            {"provider": "codex", "present": False},
-                        ],
-                    }
-                ],
-            },
-        )
+        reply = {
+            "ok": True,
+            "op": op,
+            "op_id": op_id,
+            "projects": [
+                {
+                    "alias": "example-project",
+                    "providers": [
+                        {"provider": "claude", "present": True},
+                        {"provider": "codex", "present": False},
+                    ],
+                }
+            ],
+        }
+        # `CCB_FAKE_SSH_SHARE_ALL`: "1" reports the grant as in effect (what a
+        # destination with share_all truly on answers), "0" reports it off, and
+        # unset omits the key entirely -- which is what an older build, and a
+        # correctly revoked grant, both answer.
+        reported = (os.environ.get("CCB_FAKE_SSH_SHARE_ALL") or "").strip()
+        if reported == "1":
+            reply["share_all"] = True
+        elif reported == "0":
+            reply["share_all"] = False
+        write_frame(stdout, reply)
         return 0
     return 0
 

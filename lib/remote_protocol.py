@@ -171,6 +171,10 @@ REQUEST_FIELDS = frozenset(
         "source_claims",
         "request_id",
         "digest",
+        # A5: the `ccb_project_id` the sender saw in `list` for a DERIVED alias.
+        # Absent for an explicitly configured alias, so those records are
+        # byte-for-byte unchanged; the digest covers it when present.
+        "dest_project_id",
     }
 )
 
@@ -185,7 +189,12 @@ DIGEST_FIELDS = (
     "reply_expected",
     "intent",
     "request_id",
+    "dest_project_id",
 )
+
+#: The project-identity shape a submit may carry (A5). A sha256 hex id, the
+#: same form `project_id.compute_ccb_project_id` produces.
+_PROJECT_ID_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class ProtocolError(ValueError):
@@ -408,6 +417,11 @@ def capabilities() -> dict:
         "max_frame": MAX_FRAME,
         "proto": {"major": PROTO_MAJOR, "minor": PROTO_MINOR},
         "list_sessions": True,
+        # Share-all (A1): advertised so a pairing source knows this build can
+        # honour a `share_all` grant. The gate answers `hello` itself, so this
+        # says the BUILD can, not that the running askd does -- the `list`
+        # proof before `paired` is what settles that.
+        "share_all": True,
     }
 
 
@@ -525,6 +539,16 @@ def valid_session_id(value: object) -> bool:
     )
 
 
+def valid_project_id(value: object) -> bool:
+    """The shape a project identity must have wherever it travels (A5).
+
+    A sha256 hex id, the same form ``project_id.compute_ccb_project_id``
+    produces. A ``list`` reply, a submit record and a cached observation are
+    all judged by THIS rule, so none of them can carry an id the others refuse.
+    """
+    return isinstance(value, str) and bool(_PROJECT_ID_RE.fullmatch(value))
+
+
 def validate_request_record(record: dict) -> dict:
     """Validate a ``submit`` body and return it normalised.
 
@@ -603,6 +627,12 @@ def _validate_v1(record: dict) -> dict:
     if session is not None and not valid_session_id(session):
         raise ProtocolError(ERR_INVALID_REQUEST, "dest_session must be a short printable string")
 
+    project_id = record.get("dest_project_id")
+    if project_id is not None and not valid_project_id(project_id):
+        raise ProtocolError(
+            ERR_INVALID_REQUEST, "dest_project_id must be a project id (sha256 hex)"
+        )
+
     text = record.get("text")
     if not isinstance(text, str) or not text:
         raise ProtocolError(ERR_INVALID_REQUEST, "text must be a non-empty string")
@@ -658,6 +688,8 @@ def _validate_v1(record: dict) -> dict:
     }
     if session is not None:
         normalised["dest_session"] = session
+    if project_id is not None:
+        normalised["dest_project_id"] = project_id
     if digest is not None:
         normalised["digest"] = digest
     return normalised
@@ -672,6 +704,7 @@ def build_request_record(
     request_id: str,
     source_claims: dict | None = None,
     dest_session: str | None = None,
+    dest_project_id: str | None = None,
     reply_expected: bool = False,
 ) -> dict:
     """Build and validate a ``submit`` record, with its digest.
@@ -694,6 +727,8 @@ def build_request_record(
     }
     if dest_session is not None:
         record["dest_session"] = dest_session
+    if dest_project_id is not None:
+        record["dest_project_id"] = dest_project_id
     normalised = validate_request_record(record)
     normalised["digest"] = compute_digest(normalised)
     return normalised

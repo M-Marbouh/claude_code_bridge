@@ -1371,3 +1371,203 @@ def test_resuming_with_a_replaced_key_refuses(env):
     assert "cannot be resumed under a different key" in err
     assert env.record.read_bytes() == record_before
     assert env.remote_state() == (b"", b"")
+
+
+# --------------------------------------------------------------------------- #
+# share_all revocation through the CLI (fix 2, P1-b) and manual steps (P2-a)
+# --------------------------------------------------------------------------- #
+
+
+def test_no_share_all_with_zero_named_shares_applies_a_revocation(env):
+    """P1-b: a revocation needs no alias picks — it must actually be applied."""
+    # The destination reports the grant as in effect once it is on, and as gone
+    # once revoked, exactly as a real askd does.
+    env.monkeypatch.setenv("CCB_FAKE_SSH_SHARE_ALL", "1")
+    code, out, err = _run_pair(_options(shares={}, share_all=True))
+
+    assert code == 0, err
+    document = json.loads(env.remote_config.read_text())
+    assert document["principals"][PRINCIPAL]["share_all"] is True
+
+    # Now revoke it, still with no named shares. A revoked grant is reported by
+    # an ABSENT key, which is what the fixture now answers.
+    env.monkeypatch.delenv("CCB_FAKE_SSH_SHARE_ALL", raising=False)
+    code, out, err = _run_pair(_options(shares={}, share_all=False))
+
+    assert code == 0, err
+    document = json.loads(env.remote_config.read_text())
+    assert "share_all" not in document["principals"][PRINCIPAL]
+    # The revocation is what went over the wire, and `paired` only after it
+    # was confirmed by that machine's `list`.
+    applies = [call for call in env.calls() if call["verb"] == "apply"]
+    assert applies
+
+
+def test_the_capability_gate_applies_to_a_revocation(monkeypatch):
+    """P1-b: both directions need the capability, not just a grant."""
+    import remote_pair_cli as cli
+
+    old_machine = {"share_all_capability": False}
+    for decision in (True, False):
+        try:
+            cli._resolve_share_all(
+                cli.PairOptions(alias="server", share_all=decision, yes=True),
+                old_machine,
+                record={},
+                interactive=False,
+                alias="server",
+                input_fn=lambda _p: "",
+                out=io.StringIO(),
+            )
+        except cli.PairingError as exc:
+            assert "too old for share_all" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"decision {decision} should have been refused")
+
+    # A current machine is accepted either way.
+    for decision in (True, False):
+        assert (
+            cli._resolve_share_all(
+                cli.PairOptions(alias="server", share_all=decision, yes=True),
+                {"share_all_capability": True},
+                record={},
+                interactive=False,
+                alias="server",
+                input_fn=lambda _p: "",
+                out=io.StringIO(),
+            )
+            is decision
+        )
+
+
+def test_a_revocation_is_not_paired_while_the_destination_still_reports_it_on(env):
+    """P1-b: `paired` requires B's list to confirm the grant is OFF."""
+    env.monkeypatch.setenv("CCB_FAKE_SSH_SHARE_ALL", "1")
+
+    code, _out, err = _run_pair(_options(shares={}, share_all=False))
+
+    assert code == remote_pair_cli.EXIT_REFUSED
+    assert "still reports share_all as on" in err
+    # The revocation was still written; only the claim is withheld.
+    document = json.loads(env.remote_config.read_text())
+    assert "share_all" not in document["principals"][PRINCIPAL]
+
+
+def test_print_remote_steps_carries_the_approved_share_all(env):
+    """P2-a: the printed manual payload applies the same grant."""
+    code, out, err = _run_pair(_options(shares={}, share_all=True, print_remote_steps=True))
+
+    assert code == remote_pair_cli.EXIT_REMOTE_PENDING, err
+    assert '"share_all": true' in out
+    # And nothing was applied automatically in this mode.
+    assert [call for call in env.calls() if call["verb"] == "apply"] == []
+
+
+def test_print_remote_steps_carries_an_approved_revocation(env):
+    """P2-a: a revocation travels in the printed payload too."""
+    code, out, err = _run_pair(_options(shares={}, share_all=False, print_remote_steps=True))
+
+    assert code == remote_pair_cli.EXIT_REMOTE_PENDING, err
+    assert '"share_all": false' in out
+
+
+# --------------------------------------------------------------------------- #
+# Fix 3, R3: an interactive Enter/NO means OMIT, never a silent revocation
+# --------------------------------------------------------------------------- #
+
+
+def _resolve(answers, *, record=None, options=None):
+    """Call the interactive share_all prompt through the real helper."""
+    replies = list(answers)
+
+    def input_fn(_prompt):
+        return replies.pop(0) if replies else ""
+
+    return remote_pair_cli._resolve_share_all(
+        options or remote_pair_cli.PairOptions(alias="server", yes=False),
+        {"share_all_capability": True},
+        record=record or {},
+        interactive=True,
+        alias="server",
+        input_fn=input_fn,
+        out=io.StringIO(),
+    )
+
+
+def test_enter_on_a_fresh_pairing_means_omit_not_revoke():
+    """R3: the default answer leaves the grant alone."""
+    assert _resolve([""]) is None
+
+
+def test_no_on_a_fresh_pairing_means_omit_not_revoke():
+    for answer in ("n", "N", "no", "no thanks"):
+        assert _resolve([answer]) is None, answer
+
+
+def test_an_explicit_yes_is_still_a_grant():
+    for answer in ("y", "Y", "yes", "YES"):
+        assert _resolve([answer]) is True, answer
+
+
+def test_only_y_or_yes_grants_share_all():
+    """Ratifier amendment: other truthy-looking answers are not a grant."""
+    for answer in ("1", "true", "sure", "ok"):
+        assert _resolve([answer]) is None, answer
+
+
+def test_enter_does_not_touch_an_existing_grant():
+    """R3: a pairing that already has share_all on keeps it."""
+    assert _resolve([""], record={"share_all": True}) is True
+
+
+def test_an_explicit_flag_still_revokes():
+    """Only --no-share-all is a revocation."""
+    options = remote_pair_cli.PairOptions(alias="server", yes=True, share_all=False)
+    assert (
+        remote_pair_cli._resolve_share_all(
+            options,
+            {"share_all_capability": True},
+            record={},
+            interactive=False,
+            alias="server",
+            input_fn=lambda _p: "",
+            out=io.StringIO(),
+        )
+        is False
+    )
+
+
+def _seed_remote_project(env, name: str = "demo") -> Path:
+    """A real project directory in the FAKE destination's registry.
+
+    The picker lists what `known_projects` reads on that machine, so the test
+    has to seed the same registry the real `inspect` would.
+    """
+    project = env.tmp / "remote-projects" / name
+    (project / ".ccb").mkdir(parents=True, exist_ok=True)
+    registry = env.remote_home / ".ccb" / "run"
+    registry.mkdir(parents=True, exist_ok=True)
+    (registry / "ccb-session-ai-seeded.json").write_text(
+        json.dumps({"work_dir": str(project), "providers": {"codex": {"pane_id": "%1"}}}),
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_enter_runs_the_named_picker_and_sends_no_share_all_field(env):
+    """R3 end to end: Enter, then pick a project by name — no share_all on B."""
+    env.monkeypatch.delenv("CCB_FAKE_SSH_SHARE_ALL", raising=False)
+    _seed_remote_project(env)
+    options = _options(shares={}, share_all=None, yes=False)
+    # Answers: share_all="", project numbers="1", alias default, providers default,
+    # then the final "yes" to apply.
+    code, out, err = _run_pair(options, answers=["", "1", "", "", "yes"])
+
+    assert code == 0, err
+    remote = json.loads(env.remote_config.read_text())
+    assert "share_all" not in remote["principals"][PRINCIPAL]
+    # The picker really ran (Enter fell through to it) and applied a named
+    # share: the alias exists on B and is in the grant. (`_ask_value` sends its
+    # prompt text to `input_fn`, not `out`, so the RESULT is what proves it.)
+    assert remote["principals"][PRINCIPAL]["allowed_aliases"] == ["demo"]
+    assert "demo" in remote["aliases"]

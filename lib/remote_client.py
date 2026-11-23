@@ -34,6 +34,7 @@ configured host alias and a destination-side project alias.
 from __future__ import annotations
 
 import hmac
+import io
 import json
 import os
 import queue
@@ -773,6 +774,12 @@ class ListResult:
     projects: list[dict] = field(default_factory=list)
     reason: str = ""
     error_code: str = ""
+    #: A2: the principal's EFFECTIVE share_all as the destination reported it.
+    #: ``None`` means the destination did not say (an older build), which is
+    #: exactly what a pairing must not mistake for "the grant works".
+    share_all: bool | None = None
+    #: Derived aliases the destination refused because their name was ambiguous.
+    skipped: list[dict] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -1100,8 +1107,319 @@ def _reject_unexpected_ack(response: dict, *, op: str, op_id: str, request_id: s
 
 
 # --------------------------------------------------------------------------- #
+# Derived (share-all) project identity
+# --------------------------------------------------------------------------- #
+
+#: The destination's A5 refusal, matched on its own words so a real resend
+#: happens exactly once and only for the refusal it can fix. Everything else --
+#: including any other `unauthorized` -- is reported as it is, never retried.
+_SHARE_ALL_IDENTITY_MISMATCH = "did not match the project identity"
+
+
+@dataclass(frozen=True)
+class _CachedAlias:
+    """What the last `list` said about one alias -- the three states that matter.
+
+    ``observed`` is the distinction `submit` needs: an alias the sender HAS
+    looked at before may not be silently re-pointed, while an alias it has
+    never seen may still be resolved by one fresh `list`. Collapsing those two
+    (as an "identity or empty string" answer does) is exactly what allowed a
+    stale identity to be replaced without the user being told.
+    """
+
+    observed: bool = False
+    #: True when the observed entry is a share-all (derived) alias.
+    derived: bool = False
+    #: Its project identity, when it has a usable one.
+    project_id: str = ""
+
+
+def cached_alias(host_alias: str, project: str, *, host: Any = None) -> _CachedAlias:
+    """The cached observation for one alias, or an unobserved placeholder.
+
+    Read from the SAME discovery cache `ccb-remote list` / `ccb-list --remote`
+    writes, and only when that observation still belongs to the configured
+    connection (``read_cache`` enforces both). A read only: it never refreshes,
+    so naming a project this build may not address costs no round trip.
+    """
+    try:
+        document = remote_discovery.read_cache(host_alias, host=host)
+    except Exception:
+        return _CachedAlias()
+    if not isinstance(document, dict):
+        return _CachedAlias()
+    projects = document.get("projects")
+    name = str(project or "").strip()
+    if not name or not isinstance(projects, list):
+        return _CachedAlias()
+    for entry in projects:
+        if not isinstance(entry, dict) or str(entry.get("alias") or "") != name:
+            continue
+        derived = entry.get("derived") is True
+        candidate = entry.get("project_id")
+        return _CachedAlias(
+            observed=True,
+            derived=derived,
+            project_id=(
+                candidate
+                if derived and isinstance(candidate, str) and proto.valid_project_id(candidate)
+                else ""
+            ),
+        )
+    return _CachedAlias()
+
+
+def cached_project_identity(host_alias: str, project: str, *, host: Any = None) -> str:
+    """The `project_id` the last `list` showed for a derived alias, or "".
+
+    Convenience view of :func:`cached_alias`; callers that must tell "never
+    observed" from "observed without an identity" use that instead.
+    """
+    entry = cached_alias(host_alias, project, host=host)
+    return entry.project_id if entry.derived else ""
+
+
+def _fresh_project_identity(
+    host_alias: str,
+    project: str,
+    *,
+    hosts: dict[str, RemoteHost] | None = None,
+    session_factory: Callable[[list[str]], SshSession] | None = None,
+    timeout_s: float | None = None,
+) -> str:
+    """One live `list`, used only to repair a missing or stale identity.
+
+    Its own cache write is suppressed: this observation exists to answer one
+    question for one submit, and letting it overwrite what `ccb-list` renders
+    would make a delivery attempt look like a refresh.
+    """
+    try:
+        result = list_projects(
+            host_alias,
+            hosts=hosts,
+            session_factory=session_factory,
+            out=io.StringIO(),
+            err=io.StringIO(),
+            timeout_s=timeout_s,
+            commit=lambda _kind, _payload: None,
+        )
+    except Exception:
+        return ""
+    if result.exit_code != EXIT_ACCEPTED:
+        return ""
+    for entry in result.projects:
+        if str(entry.get("alias") or "") != str(project or "").strip():
+            continue
+        if entry.get("derived") is not True:
+            return ""
+        candidate = entry.get("project_id")
+        if isinstance(candidate, str) and proto.valid_project_id(candidate):
+            return candidate
+        return ""
+    return ""
+
+
+def _build_record(
+    *,
+    project: str,
+    provider: str,
+    intent: str,
+    text: str,
+    request_id: str,
+    dest_session: str,
+    reply_expected: bool,
+    caller_claims: dict | None,
+    dest_project_id: str = "",
+) -> dict:
+    """The submit record; an explicit alias keeps its byte-identical shape."""
+    return proto.build_request_record(
+        dest_project=project,
+        dest_provider=provider,
+        intent=intent,
+        text=text,
+        request_id=request_id,
+        source_claims=dict(caller_claims or {}),
+        dest_session=dest_session or None,
+        dest_project_id=dest_project_id or None,
+        reply_expected=reply_expected,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # submit
 # --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Attempt:
+    """One submit exchange's classified outcome, before any receipt decision.
+
+    Kept separate from ``RemoteResult`` so `submit` can decide whether ONE
+    bounded retry is allowed and only then commit a state: an attempt that was
+    refused before acceptance never becomes a receipt transition on its own.
+    """
+
+    outcome: str  # accepted | not-delivered | acceptance-unknown
+    reason: str = ""
+    error_code: str = ""
+    remote_state: str = ""
+    digest: str = ""
+    #: History extras this attempt must record: `ssh` names the transport
+    #: verdict, `bytes_written` proves how much of the submit reached the pipe.
+    extras: dict = field(default_factory=dict)
+
+
+def _deliver_once(
+    *,
+    host: RemoteHost,
+    record: dict,
+    request_id: str,
+    provider: str,
+    session_factory: Callable[[list[str]], SshSession] | None,
+) -> _Attempt:
+    """Explain one submit exchange; never touches the receipt.
+
+    Every refusal keeps the exact code, wording and classification it has always
+    had. The only addition is that the outcome is RETURNED rather than applied,
+    so the caller decides (in `submit`) whether a refusal is retryable.
+    """
+    digest = record["digest"]
+    factory = session_factory or SshSession
+    argv = ssh_argv(host)
+    session: SshSession | None = None
+    try:
+        session = factory(argv)
+    except Exception as exc:
+        return _Attempt("not-delivered", f"ssh could not be started: {exc}", digest=digest)
+
+    written = 0
+    frame = b""
+    submit_op_id = f"submit-{request_id}"
+    try:
+        try:
+            capabilities = _hello(session, op_id="hello-1")
+            _require_delivery_only(capabilities, provider)
+            if record["schema_version"] == proto.SCHEMA_VERSION_REPLY:
+                _require_explicit_reply(capabilities, provider)
+        except SessionError as exc:
+            detail = _exit_detail(session, exc)
+            return _Attempt(
+                "not-delivered", detail, error_code=exc.kind, digest=digest,
+                extras={"ssh": str(exc.kind)},
+            )
+
+        envelope = {
+            "proto": {"major": proto.PROTO_MAJOR, "minor": proto.PROTO_MINOR},
+            "op": "submit",
+            "op_id": submit_op_id,
+            "body": record,
+        }
+        frame = proto.encode_frame(envelope)
+        try:
+            written = session.write_all(frame)
+        except SessionError as exc:
+            # Nothing reached the pipe: the destination cannot have accepted it.
+            detail = _exit_detail(session, exc)
+            return _Attempt(
+                "not-delivered", detail, error_code=exc.kind, digest=digest,
+                extras={"ssh": str(exc.kind)},
+            )
+
+        frame_bytes = len(frame)
+        try:
+            ack = session.read_frame()
+        except SessionError as exc:
+            reason = (
+                f"the request was written ({written}/{frame_bytes} bytes) but no valid "
+                f"acknowledgement arrived: {exc.detail}"
+                if written >= frame_bytes
+                else f"the request was only partly written ({written}/{frame_bytes} bytes) and "
+                     f"no acknowledgement arrived: {exc.detail}"
+            )
+            return _Attempt(
+                "acceptance-unknown", reason, error_code=exc.kind, digest=digest,
+                extras={"ssh": str(exc.kind), "bytes_written": written},
+            )
+
+        mismatch = _reject_unexpected_ack(ack, op="submit", op_id=submit_op_id, request_id=request_id)
+        if mismatch:
+            return _Attempt(
+                "acceptance-unknown", f"unusable acknowledgement: {mismatch}", digest=digest
+            )
+
+        ack_ok = ack.get("ok")
+        if ack_ok is True:
+            problem = _acceptance_problem(
+                ack,
+                request_id=request_id,
+                digest=digest,
+                op="submit",
+                op_id=submit_op_id,
+            )
+            if problem:
+                return _Attempt(
+                    "acceptance-unknown", f"untrustworthy acceptance: {problem}", digest=digest
+                )
+            return _Attempt(
+                "accepted", "", remote_state=str(ack.get("state") or ""), digest=digest
+            )
+
+        if ack_ok is not False:
+            # No boolean verdict at all: never guess, never call it a refusal.
+            return _Attempt(
+                "acceptance-unknown",
+                "unusable acknowledgement: no boolean ok field",
+                digest=digest,
+            )
+
+        code = _error_code(ack)
+        message = _error_message(ack)
+        if code not in _PROVEN_PRE_ACCEPTANCE_CODES:
+            reason = (
+                f"the destination refused with {code or 'unknown'} after the request may "
+                f"have been accepted"
+            )
+            if message:
+                reason = f"{reason} ({message})"
+            return _Attempt(
+                "acceptance-unknown", reason, error_code=code, digest=digest
+            )
+
+        reason = f"the destination refused the request: {code}"
+        if message:
+            reason = f"{reason} ({message})"
+        return _Attempt("not-delivered", reason, error_code=code, digest=digest)
+    except Exception as exc:  # unexpected: judge by whether submit bytes went out
+        frame_bytes = len(frame) if frame else 0
+        if frame_bytes and written > 0:
+            return _Attempt(
+                "acceptance-unknown",
+                f"the request was written and then failed unexpectedly: {type(exc).__name__}",
+                digest=digest,
+                extras={"bytes_written": written},
+            )
+        return _Attempt(
+            "not-delivered",
+            f"delivery failed before the request was written: {type(exc).__name__}",
+            digest=digest,
+        )
+    finally:
+        if session is not None:
+            session.close()
+
+
+def _is_identity_mismatch(attempt: _Attempt) -> bool:
+    """Is this refusal the A5 project-identity one, and safely retryable?
+
+    Only a proven pre-acceptance ``unauthorized`` whose message is the
+    destination's own A5 wording qualifies. Nothing that might already have been
+    accepted is ever resent.
+    """
+    if attempt.outcome != "not-delivered":
+        return False
+    if attempt.error_code != proto.ERR_UNAUTHORIZED:
+        return False
+    return _SHARE_ALL_IDENTITY_MISMATCH in (attempt.reason or "")
 
 
 def submit(
@@ -1127,6 +1445,16 @@ def submit(
     the destination's ``hello`` to advertise ``explicit-reply`` and ``fetch``
     BEFORE any submit byte is written. ``poll_owner`` is the source askd state
     file that will poll for the answer; ``--background`` refuses without it.
+
+    Project identity (A5): a DERIVED (share-all) alias is a moving name on the
+    destination, so the record must carry the ``ccb_project_id`` the last
+    ``list`` showed for it. That value is read from the existing discovery
+    cache with no round trip. When it is missing, or the destination refuses
+    with its identity-mismatch refusal -- i.e. the cached observation is stale
+    -- ONE fresh ``list`` is taken and the submit retried once. The retry only
+    ever follows a refusal that provably wrote nothing, so a request is never
+    resent after an acceptance-unknown. An explicitly configured alias sends no
+    identity at all and keeps its byte-identical record and digest.
     """
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
@@ -1139,16 +1467,23 @@ def submit(
     from ccb_protocol import make_req_id
 
     request_id = proto.make_remote_id(make_req_id(), host.issuer_token)
-    record = proto.build_request_record(
-        dest_project=project,
-        dest_provider=provider,
-        intent=intent,
-        text=text,
-        request_id=request_id,
-        source_claims=dict(caller_claims or {}),
-        dest_session=dest_session or None,
-        reply_expected=reply_expected,
-    )
+
+    def build(dest_project_id: str) -> dict:
+        return _build_record(
+            project=project,
+            provider=provider,
+            intent=intent,
+            text=text,
+            request_id=request_id,
+            dest_session=dest_session,
+            reply_expected=reply_expected,
+            caller_claims=caller_claims,
+            dest_project_id=dest_project_id,
+        )
+
+    cached = cached_alias(host_alias, project, host=host)
+    dest_project_id = cached.project_id if cached.derived else ""
+    record = build(dest_project_id)
 
     receipt = {
         "request_id": request_id,
@@ -1187,151 +1522,109 @@ def submit(
         return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
                             reason=reason, digest=record["digest"])
 
-    factory = session_factory or SshSession
-    argv = ssh_argv(host)
-    session: SshSession | None = None
-    try:
-        session = factory(argv)
-    except Exception as exc:
-        reason = f"ssh could not be started: {exc}"
-        _transition(receipt, STATE_NOT_DELIVERED, reason)
-        print(f"id={request_id} state={STATE_NOT_DELIVERED} ({reason})", file=err)
-        return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
-                            reason=reason, digest=record["digest"])
+    attempt = _deliver_once(
+        host=host,
+        record=record,
+        request_id=request_id,
+        provider=provider,
+        session_factory=session_factory,
+    )
 
-    written = 0
-    frame = b""
-    submit_op_id = f"submit-{request_id}"
-    try:
-        try:
-            capabilities = _hello(session, op_id="hello-1")
-            _require_delivery_only(capabilities, provider)
-            if record["schema_version"] == proto.SCHEMA_VERSION_REPLY:
-                _require_explicit_reply(capabilities, provider)
-        except SessionError as exc:
-            detail = _exit_detail(session, exc)
-            _transition(receipt, STATE_NOT_DELIVERED, detail, ssh=str(exc.kind))
-            print(f"id={request_id} state={STATE_NOT_DELIVERED} ({detail})", file=err)
-            return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
-                                reason=detail, error_code=exc.kind, digest=record["digest"])
-
-        envelope = {
-            "proto": {"major": proto.PROTO_MAJOR, "minor": proto.PROTO_MINOR},
-            "op": "submit",
-            "op_id": submit_op_id,
-            "body": record,
-        }
-        frame = proto.encode_frame(envelope)
-        try:
-            written = session.write_all(frame)
-        except SessionError as exc:
-            # Nothing reached the pipe: the destination cannot have accepted it.
-            detail = _exit_detail(session, exc)
-            _transition(receipt, STATE_NOT_DELIVERED, detail, ssh=str(exc.kind))
-            print(f"id={request_id} state={STATE_NOT_DELIVERED} ({detail})", file=err)
-            return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
-                                reason=detail, error_code=exc.kind, digest=record["digest"])
-
-        frame_bytes = len(frame)
-        try:
-            ack = session.read_frame()
-        except SessionError as exc:
-            reason = (
-                f"the request was written ({written}/{frame_bytes} bytes) but no valid "
-                f"acknowledgement arrived: {exc.detail}"
-                if written >= frame_bytes
-                else f"the request was only partly written ({written}/{frame_bytes} bytes) and "
-                     f"no acknowledgement arrived: {exc.detail}"
+    if _is_identity_mismatch(attempt):
+        if cached.observed:
+            # P1-a: the sender has SEEN this alias before, so a different
+            # identity now is a re-pointed destination, not a stale cache.
+            # Repairing it automatically would silently retarget the message at
+            # whatever the alias names today. Refuse, and make the user look.
+            attempt = _Attempt(
+                "not-delivered",
+                f"{host.alias}::{project} now points at a different project than when you "
+                f"last listed it; run `ccb-remote list {host.alias}` and resend",
+                error_code=attempt.error_code,
+                digest=attempt.digest,
             )
-            _transition(receipt, STATE_ACCEPTANCE_UNKNOWN, reason, ssh=str(exc.kind), bytes_written=written)
-            print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({reason})", file=err)
-            print("      run `ccb-remote status " + request_id + "` to recover the destination state", file=err)
-            return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
-                                EXIT_ACCEPTANCE_UNKNOWN, reason=reason, error_code=exc.kind,
-                                digest=record["digest"])
+        elif fresh := _fresh_project_identity(
+            host_alias, project, hosts=hosts, session_factory=session_factory
+        ):
+            # Never observed: resolving it for the first time is not a retarget.
+            # ONE list, then at most ONE resend -- safe because this refusal
+            # provably wrote nothing on the destination.
+            record = build(fresh)
+            # P1-c + R2: the receipt must record the digest that is about to go
+            # out BEFORE it goes out, and that write must happen UNDER the
+            # receipt lock. A bare save here would race the daemon poller and
+            # could overwrite a state it legitimately advanced, so only the
+            # `digest` field is touched, via the same lock every other writer
+            # takes. If it fails, nothing is resent.
+            def _set_digest(latest: dict) -> None:
+                latest["digest"] = record["digest"]
 
-        mismatch = _reject_unexpected_ack(ack, op="submit", op_id=submit_op_id, request_id=request_id)
-        if mismatch:
-            reason = f"unusable acknowledgement: {mismatch}"
-            _transition(receipt, STATE_ACCEPTANCE_UNKNOWN, reason)
-            print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({reason})", file=err)
-            return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
-                                EXIT_ACCEPTANCE_UNKNOWN, reason=reason, digest=record["digest"])
-
-        ack_ok = ack.get("ok")
-        if ack_ok is True:
-            problem = _acceptance_problem(
-                ack,
+            try:
+                update_receipt(request_id, _set_digest)
+            except Exception as exc:
+                reason = (
+                    "the refreshed project identity could not be recorded in the "
+                    f"outbound receipt, so nothing was resent: {exc}"
+                )
+                _transition(receipt, STATE_NOT_DELIVERED, reason)
+                print(f"id={request_id} state={STATE_NOT_DELIVERED} ({reason})", file=err)
+                return RemoteResult(
+                    request_id,
+                    host.alias,
+                    STATE_NOT_DELIVERED,
+                    EXIT_NOT_DELIVERED,
+                    reason=reason,
+                    digest=record["digest"],
+                )
+            receipt["digest"] = record["digest"]
+            attempt = _deliver_once(
+                host=host,
+                record=record,
                 request_id=request_id,
-                digest=record["digest"],
-                op="submit",
-                op_id=submit_op_id,
+                provider=provider,
+                session_factory=session_factory,
             )
-            if problem:
-                reason = f"untrustworthy acceptance: {problem}"
-                _transition(receipt, STATE_ACCEPTANCE_UNKNOWN, reason)
-                print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({reason})", file=err)
-                return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
-                                    EXIT_ACCEPTANCE_UNKNOWN, reason=reason,
-                                    digest=record["digest"])
-            remote_state = str(ack.get("state") or "")
-            _transition(receipt, STATE_ACCEPTED, "destination accepted the request",
-                        remote_state=remote_state)
-            expectation = " reply-expected=yes" if reply_expected else ""
-            print(
-                f"id={request_id} state={STATE_ACCEPTED} destination={remote_state or '-'}{expectation}",
-                file=out,
+        else:
+            attempt = _Attempt(
+                "not-delivered",
+                attempt.reason
+                + " -- and a fresh `list` did not report this alias as a share-all "
+                "project either",
+                error_code=attempt.error_code,
+                digest=attempt.digest,
             )
-            return RemoteResult(request_id, host.alias, STATE_ACCEPTED, EXIT_ACCEPTED,
-                                remote_state=remote_state, digest=record["digest"])
 
-        if ack_ok is not False:
-            # No boolean verdict at all: never guess, never call it a refusal.
-            reason = "unusable acknowledgement: no boolean ok field"
-            _transition(receipt, STATE_ACCEPTANCE_UNKNOWN, reason)
-            print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({reason})", file=err)
-            return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
-                                EXIT_ACCEPTANCE_UNKNOWN, reason=reason,
-                                digest=record["digest"])
+    if attempt.outcome == "accepted":
+        _transition(receipt, STATE_ACCEPTED, "destination accepted the request",
+                    remote_state=attempt.remote_state)
+        expectation = " reply-expected=yes" if reply_expected else ""
+        print(
+            f"id={request_id} state={STATE_ACCEPTED} destination={attempt.remote_state or '-'}{expectation}",
+            file=out,
+        )
+        return RemoteResult(request_id, host.alias, STATE_ACCEPTED, EXIT_ACCEPTED,
+                            remote_state=attempt.remote_state, digest=record["digest"])
 
-        code = _error_code(ack)
-        message = _error_message(ack)
-        if code not in _PROVEN_PRE_ACCEPTANCE_CODES:
-            reason = (
-                f"the destination refused with {code or 'unknown'} after the request may "
-                f"have been accepted"
-            )
-            if message:
-                reason = f"{reason} ({message})"
-            _transition(receipt, STATE_ACCEPTANCE_UNKNOWN, reason, error_code=code)
-            print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({reason})", file=err)
-            return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
-                                EXIT_ACCEPTANCE_UNKNOWN, reason=reason, error_code=code,
-                                digest=record["digest"])
+    if attempt.outcome == "acceptance-unknown":
+        _transition(
+            receipt,
+            STATE_ACCEPTANCE_UNKNOWN,
+            attempt.reason,
+            error_code=attempt.error_code or None,
+            **dict(attempt.extras),
+        )
+        print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({attempt.reason})", file=err)
+        print("      run `ccb-remote status " + request_id + "` to recover the destination state", file=err)
+        return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
+                            EXIT_ACCEPTANCE_UNKNOWN, reason=attempt.reason,
+                            error_code=attempt.error_code, digest=record["digest"])
 
-        reason = f"the destination refused the request: {code}"
-        if message:
-            reason = f"{reason} ({message})"
-        _transition(receipt, STATE_NOT_DELIVERED, reason, error_code=code)
-        print(f"id={request_id} state={STATE_NOT_DELIVERED} ({reason})", file=err)
-        return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
-                            reason=reason, error_code=code, digest=record["digest"])
-    except Exception as exc:  # unexpected: judge by whether submit bytes went out
-        frame_bytes = len(frame) if frame else 0
-        if frame_bytes and written > 0:
-            reason = f"the request was written and then failed unexpectedly: {type(exc).__name__}"
-            _transition(receipt, STATE_ACCEPTANCE_UNKNOWN, reason, bytes_written=written)
-            print(f"id={request_id} state={STATE_ACCEPTANCE_UNKNOWN} ({reason})", file=err)
-            return RemoteResult(request_id, host.alias, STATE_ACCEPTANCE_UNKNOWN,
-                                EXIT_ACCEPTANCE_UNKNOWN, reason=reason, digest=record["digest"])
-        reason = f"delivery failed before the request was written: {type(exc).__name__}"
-        _transition(receipt, STATE_NOT_DELIVERED, reason)
-        print(f"id={request_id} state={STATE_NOT_DELIVERED} ({reason})", file=err)
-        return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
-                            reason=reason, digest=record["digest"])
-    finally:
-        if session is not None:
-            session.close()
+    _transition(receipt, STATE_NOT_DELIVERED, attempt.reason,
+                error_code=attempt.error_code or None, **dict(attempt.extras))
+    print(f"id={request_id} state={STATE_NOT_DELIVERED} ({attempt.reason})", file=err)
+    return RemoteResult(request_id, host.alias, STATE_NOT_DELIVERED, EXIT_NOT_DELIVERED,
+                        reason=attempt.reason, error_code=attempt.error_code,
+                        digest=record["digest"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1461,6 +1754,11 @@ def _advertises_list_sessions(capabilities: dict) -> bool:
     return isinstance(capabilities, dict) and capabilities.get("list_sessions") is True
 
 
+def _advertises_share_all(capabilities: dict) -> bool:
+    """Whether the destination BUILD can honour a `share_all` grant (A1)."""
+    return isinstance(capabilities, dict) and capabilities.get("share_all") is True
+
+
 def _normalize_provider(item: dict, *, detailed: bool) -> dict:
     """One provider row as THIS build understands it.
 
@@ -1508,7 +1806,14 @@ def _normalize_list_projects(projects: list, capabilities: dict) -> list[dict]:
             for item in (project.get("providers") if isinstance(project.get("providers"), list) else [])
             if isinstance(item, dict)
         ]
-        normalized.append({"alias": str(project.get("alias") or ""), "providers": providers})
+        entry = {"alias": str(project.get("alias") or ""), "providers": providers}
+        # A5: only a DERIVED (share-all) alias needs its project identity echoed
+        # back, so an explicitly configured alias keeps its exact old shape.
+        if project.get("derived") is True:
+            project_id = project.get("project_id")
+            entry["derived"] = True
+            entry["project_id"] = project_id if isinstance(project_id, str) else ""
+        normalized.append(entry)
     return normalized
 
 
@@ -1605,8 +1910,21 @@ def list_projects(
         commit("failure", reason)
         return ListResult(host.alias, EXIT_NOT_DELIVERED, reason=reason, error_code=code)
 
-    raw_projects = response.get("projects") if isinstance(response.get("projects"), list) else []
+    reported_projects = response.get("projects")
+    raw_projects: list = reported_projects if isinstance(reported_projects, list) else []
     projects = _normalize_list_projects(raw_projects, capabilities)
+    reported_share_all = response.get("share_all")
+    share_all = True if reported_share_all is True else None
+    reported_skipped = response.get("skipped")
+    raw_skipped: list = reported_skipped if isinstance(reported_skipped, list) else []
+    skipped = [
+        {
+            "alias": str(item.get("alias") or ""),
+            "reason": " ".join(str(item.get("reason") or "").split())[:200],
+        }
+        for item in raw_skipped
+        if isinstance(item, dict) and isinstance(item.get("alias"), str)
+    ]
     if not projects:
         print("no destinations authorized on this host", file=out)
     for project in projects:
@@ -1616,8 +1934,19 @@ def list_projects(
             for item in project.get("providers") or []
         )
         print(f"{alias}\t{rendered}", file=out)
+    for entry in skipped:
+        print(
+            f"{entry['alias']}\tskipped\t{entry['reason'] or 'ambiguous derived alias'}",
+            file=out,
+        )
     commit("success", projects)
-    return ListResult(host.alias, EXIT_ACCEPTED, projects=projects)
+    return ListResult(
+        host.alias,
+        EXIT_ACCEPTED,
+        projects=projects,
+        share_all=share_all,
+        skipped=skipped,
+    )
 
 
 # --------------------------------------------------------------------------- #

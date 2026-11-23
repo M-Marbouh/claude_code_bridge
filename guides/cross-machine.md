@@ -203,6 +203,64 @@ says **remote revocation PENDING**, prints the exact command to run there, and
 exits non-zero; it never claims success from local deletion alone
 (`--local-only` forgets the local half while still reporting the pending grant).
 
+### Sharing every project (`share_all`)
+
+Picking projects one by one is a snapshot: a project started on B *after*
+pairing stays invisible to A until you pair again. The opt-in alternative is a
+single grant per principal that covers every eligible CCB project on B, now and
+in future:
+
+```bash
+# on A, asked as one question during `ccb-remote pair` -- or answer it directly
+ccb-remote pair server --share-all
+```
+
+- **Off by default.** Nothing changes for an existing pairing; without the flag
+  you get exactly the named-project behaviour described above.
+- **Eligible** means a directory in B's CCB registry that still exists, is not
+  under the system temp dir, and holds a CCB project config (`.ccb/`, or the
+  legacy `.ccb_config/`). Stale and temporary registry entries are never shared.
+- A covered project is addressable under a **derived alias**: its folder name
+  lowercased, with runs of anything that is not a letter or digit collapsed to
+  `-`, and truncated to 32 characters (`My_Project` becomes `my-project`).
+  Ambiguous names are dropped rather than guessed: if two folders normalise to
+  the same alias, `list` reports it as skipped with the reason, and neither is
+  shared under it.
+- An **explicit share always wins** on a name clash, and an explicit share of
+  the same directory suppresses the derived alias for it.
+- `ccb-remote list server` shows the derived set; each derived entry carries the
+  project identity A must send back, so a later name collision cannot silently
+  redirect a message to a different project.
+- `--no-share-all` turns it off again (explicit shares stay). `unpair` removes
+  the principal, and the grant goes with it.
+- An older B (one whose CCB does not know `share_all`) is refused **before
+  anything is written** rather than being told yes; pairing never claims a grant
+  the other side would ignore. "Paired" is printed only after B's `list` reply
+  confirms the setting is in effect.
+
+> **Read this before enabling it.** `share_all` means any agent on A holding
+> this key can type into the Claude/Codex panes of **every** CCB project on B,
+> including ones you create later. That is a much broader grant than naming a
+> few projects. Keep it off if you only need specific projects, and prefer
+> explicit shares for anything production-touching. Excluding individual
+> projects from `share_all` is not supported; use explicit shares for selective
+> access.
+
+The manual equivalent, on B, is one field on the principal:
+
+```json
+{
+  "principals": {
+    "laptop-a": { "issuer_token": "alice1", "allowed_aliases": ["demo"], "share_all": true }
+  }
+}
+```
+
+`share_all` must be a real JSON boolean; `"yes"`, `1` or `null` is a config error
+and every verb refuses until it is fixed. Add `"share_all_providers"` (a list,
+default `["claude","codex"]`) to narrow which providers a derived alias may
+address.
+
 ### Both directions
 
 A pairing works in one direction: after `ccb-remote pair server` on A, agents on

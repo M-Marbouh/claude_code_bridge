@@ -159,7 +159,19 @@ def test_inspect_reports_what_a_pairing_would_find(tmp_path):
     assert {item["type"] for item in result["host_keys"]} == {"ssh-ed25519", "ssh-rsa"}
     # Another principal's token is NEVER part of the answer.
     assert "issuer_token" not in json.dumps(result)
-    assert result["principals"] == {"other-b": {"allowed_aliases": ["demo"]}}
+    # A1: the pairing source also learns this principal's current share_all and
+    # the providers a derived alias would use -- never its token.
+    assert result["principals"] == {
+        "other-b": {
+            "allowed_aliases": ["demo"],
+            "share_all": False,
+            "share_all_providers": [],
+        }
+    }
+    # A1/A4: this build advertises share-all support and lists exactly the
+    # projects such a grant would cover.
+    assert result["share_all_capability"] is True
+    assert isinstance(result["share_all_projects"], list)
     assert result["aliases"]["demo"]["work_dir"] == "/srv/demo"
     assert [project["work_dir"] for project in result["projects"]] == ["/srv/demo"]
     assert result["projects"][0]["providers"] == ["codex", "claude"]

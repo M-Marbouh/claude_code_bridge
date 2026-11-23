@@ -103,6 +103,9 @@ class PairOptions:
     yes: bool = False
     print_remote_steps: bool = False
     rotate_pin: bool = False
+    #: Share-all decision for this pairing: None = not given (interactive asks,
+    #: non-interactive leaves it off), True = grant, False = explicitly revoke.
+    share_all: Optional[bool] = None
 
 
 @dataclass
@@ -468,6 +471,98 @@ def resolve_shares(
     return shares
 
 
+def _remote_supports_share_all(inspect_result: dict) -> bool:
+    """Does the machine that answered `inspect` understand a share_all grant?
+
+    A1: asked of B BEFORE any write, because the gate answers `hello` locally
+    and therefore cannot prove the running askd honours it. A build that
+    ignores `share_all` must never be told yes: it would silently share nothing.
+    """
+    return inspect_result.get("share_all_capability") is True
+
+
+SHARE_ALL_WARNING = (
+    "WARNING: this shares EVERY CCB project on {alias}, including ones created "
+    "later. Any agent on this machine holding this key can type into the "
+    "Claude/Codex panes of all of them. Keep it off if that is not what you want."
+)
+
+
+def _resolve_share_all(
+    options: PairOptions,
+    inspect_result: dict,
+    *,
+    record: dict,
+    interactive: bool,
+    alias: str,
+    input_fn: Callable[[str], str],
+    out,
+) -> Optional[bool]:
+    """The tri-state share_all decision for this pairing (A3), or None.
+
+    Precedence, and why:
+
+    * a resume uses the value the pairing already approved, so a retry cannot
+      change the scope under the user (A3: "persist the approved choice");
+    * an explicit --share-all / --no-share-all comes next;
+    * otherwise an interactive run asks ONCE, after trust, with the warning;
+    * a non-interactive run leaves the grant exactly as it is.
+
+    Any request to GRANT is refused before the first write when the machine
+    does not advertise share_all (A1), so pairing never claims a grant the
+    other side would ignore.
+    """
+    approved = record.get("share_all") if isinstance(record, dict) else None
+    approved_value: Optional[bool] = approved if isinstance(approved, bool) else None
+
+    requested = options.share_all
+    if approved_value is not None:
+        if requested is not None and requested != approved_value:
+            raise PairingError(
+                _resume_conflict(
+                    "--share-all" if requested else "--no-share-all",
+                    "true" if approved_value else "false",
+                    alias,
+                )
+            )
+        decision: Optional[bool] = approved_value
+    elif requested is not None:
+        decision = requested
+    elif interactive:
+        print("", file=out)
+        print(
+            SHARE_ALL_WARNING.format(alias=alias),
+            file=out,
+        )
+        # R3: Enter / "N" / anything but an explicit yes means OMIT -- leave the
+        # grant exactly as it is and fall through to the ordinary project
+        # picker. Treating the default as a REVOCATION would let a user who
+        # simply pressed Enter silently narrow a pairing that already had
+        # share_all on. Only `--no-share-all` revokes.
+        answer = _ask_value(
+            f"Share every CCB project on {alias}, including future ones? (y/N)",
+            "N",
+            input_fn=input_fn,
+        )
+        chosen = answer.strip().lower() in ("y", "yes")
+        decision = True if chosen else None
+    else:
+        decision = None
+
+    if decision is not None and not _remote_supports_share_all(inspect_result):
+        # A machine that never heard of share_all cannot be granting it, and
+        # cannot be trusted to have revoked it either: a "revocation" there
+        # would be a no-op reported as success. Refuse both directions.
+        raise PairingError(
+            f"that machine's CCB is too old for share_all (it does not advertise the "
+            f"capability), so this "
+            f"{'grant' if decision else 'revocation'} cannot be confirmed there; "
+            f"nothing was written -- pair without --share-all/--no-share-all and share "
+            f"named projects only, or update CCB on that machine"
+        )
+    return decision
+
+
 def _inherit_project_providers(shares: dict[str, dict], projects: list[dict]) -> None:
     by_dir = {str(project.get("work_dir")): project for project in projects}
     for share in shares.values():
@@ -749,6 +844,7 @@ def _render_diff(
     key_present: bool,
     pin_keys: list[dict],
     host,
+    share_all: Optional[bool] = None,
     out,
 ) -> None:
     print("", file=out)
@@ -765,6 +861,18 @@ def _render_diff(
         providers = ",".join(share["providers"])
         print(
             f"  config.json aliases[{share['alias']}] = {share['work_dir']} ({providers})",
+            file=out,
+        )
+    if share_all is True:
+        print(
+            f"  config.json principals[{principal}].share_all = true "
+            "(every CCB project on that machine, including future ones)",
+            file=out,
+        )
+    elif share_all is False:
+        print(
+            f"  config.json principals[{principal}].share_all = false "
+            "(named projects only)",
             file=out,
         )
     print("On this machine:", file=out)
@@ -980,6 +1088,16 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
             token = generated_token()
         token = validate_token(token)
 
+        share_all = _resolve_share_all(
+            options,
+            inspect_result,
+            record=record if resuming else {},
+            interactive=interactive,
+            alias=alias,
+            input_fn=input_fn,
+            out=out,
+        )
+
         # Shares: explicit values win, then the projects found on that machine.
         shares = resolve_shares(options, inspect_result.get("projects") or [])
         shares_from_record = False
@@ -996,7 +1114,28 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
             if approved:
                 shares = approved
                 shares_from_record = True
-        if not shares:
+        if not shares and share_all is True:
+            # A3: a share-all grant covers every eligible project, so the
+            # per-project picker is skipped entirely (its picks would be a
+            # second, narrower grant) and zero explicit picks is a complete
+            # answer rather than an empty one.
+            print("", file=out)
+            print(
+                f"Sharing every CCB project on {alias} under its folder name; "
+                "nothing is listed project by project.",
+                file=out,
+            )
+        elif not shares and share_all is False:
+            # P1-b: an explicit revocation is a complete answer on its own. The
+            # picker would offer to ADD projects, which is the opposite of what
+            # was asked, so it is skipped entirely (no prompt, no picks).
+            print("", file=out)
+            print(
+                f"Turning share-all off for {alias}; named shares are left exactly as "
+                "they are.",
+                file=out,
+            )
+        elif not shares:
             if not interactive:
                 raise PairingError("no sharing select took place; pass --share ALIAS[=WORK_DIR]")
             projects = inspect_result.get("projects") or []
@@ -1032,7 +1171,11 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
                     "work_dir": validate_work_dir(project.get("work_dir")),
                     "providers": list(validate_providers(providers_raw)),
                 }
-        if not shares:
+        if not shares and share_all is None:
+            # Only an UNSETTLED decision needs named shares: an explicit
+            # `share_all: false` is a complete answer (revoke the whole-machine
+            # grant and keep whatever explicit aliases are already there), and
+            # `true` is covered above.
             raise PairingError("nothing would be shared; pairing would be useless")
         if not shares_from_record:
             _inherit_project_providers(shares, inspect_result.get("projects") or [])
@@ -1067,6 +1210,7 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
             key_present=bool(pubkey_existing),
             pin_keys=verified_keys,
             host=pairing_ssh_target_parts(destination)[0],
+            share_all=share_all,
             out=out,
         )
 
@@ -1108,6 +1252,9 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
                     for item in verified_keys
                 ],
                 "shares": share_list,
+                # A3: the approved share_all decision is part of the durable
+                # scope, so a retry resumes with exactly what was approved.
+                **({"share_all": share_all} if share_all is not None else {}),
                 "approved_at": _now(),
             },
         )
@@ -1149,6 +1296,9 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
                 shares=shares,
                 inspect_hash=str(inspect_result.get("state_hash") or ""),
                 out=out,
+                # P2-a: the APPROVED choice travels with the printed payload,
+                # so the manual path applies the same grant as the automatic one.
+                share_all=share_all,
             )
             _progress(
                 out,
@@ -1178,6 +1328,10 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
             ],
             "expected_state_hash": str(inspect_result.get("state_hash") or ""),
         }
+        # A3: omitted leaves the recorded grant alone; True/False is the
+        # explicit decision this run approved.
+        if share_all is not None:
+            apply_request["share_all"] = share_all
         try:
             applied = channel.call("apply", apply_request)
         except PairingError as exc:
@@ -1234,13 +1388,16 @@ def _pair(options: PairOptions, *, out, err, input_fn) -> int:
         )
 
         # B7: "paired" is only claimed once that machine answers hello + list.
-        example_project = sorted(shares)[0]
+        # A share_all pairing has no explicit shares to name, so the example is
+        # taken from what `list` actually advertised (see _verify_and_report).
+        example_project = sorted(shares)[0] if shares else ""
         verified = _verify_and_report(
             alias,
             out=out,
             err=err,
             example_project=example_project,
-            providers=shares[example_project].get("providers") or (),
+            providers=(shares[example_project].get("providers") or ()) if shares else (),
+            expect_share_all=share_all,
         )
         if not verified:
             _progress(
@@ -1369,6 +1526,7 @@ def _write_local_half(
     pin_keys: list[dict],
     shares: dict[str, dict],
     done: list[str],
+    share_all: Optional[bool] = None,
 ) -> None:
     """The local steps, in the ratified order: pin merge, hosts.json, record.
 
@@ -1415,6 +1573,8 @@ def _write_local_half(
                 "applied_at": _now(),
             }
         )
+        if share_all is not None:
+            record["share_all"] = share_all
         _write_pairing_record(alias, record)
         done.append("pairing record")
 
@@ -1433,6 +1593,7 @@ def _print_remote_steps(
     shares: dict[str, dict],
     inspect_hash: str,
     out,
+    share_all: Optional[bool] = None,
 ) -> None:
     """The exact data and command to run on B by hand, when A cannot reach it."""
     payload = {
@@ -1450,6 +1611,8 @@ def _print_remote_steps(
         ],
         "expected_state_hash": inspect_hash,
     }
+    if share_all is not None:
+        payload["share_all"] = share_all
     print("", file=out)
     print("Run this ON the other machine (it applies the same grant):", file=out)
     print("", file=out)
@@ -1475,8 +1638,15 @@ def _verify_and_report(
     err,
     example_project: str = "PROJECT",
     providers: Sequence[str] | None = None,
+    expect_share_all: Optional[bool] = None,
 ) -> bool:
-    """Run the real delivery check; True only when that machine answered hello + list."""
+    """Run the real delivery check; True only when that machine answered hello + list.
+
+    A2: when this pairing granted (or revoked) share_all, the `list` reply must
+    CONFIRM the effective setting before "paired" is claimed. An empty project
+    list is not proof of a grant, and today a zero-project reply is accepted as
+    success -- so the setting itself is what is checked.
+    """
     import io
 
     captured = io.StringIO()
@@ -1493,9 +1663,46 @@ def _verify_and_report(
             file=err,
         )
         return False
+    if expect_share_all is True and result.share_all is not True:
+        # The grant is written but the machine answering `list` does not report
+        # it -- the running askd is older than the config. Never claim otherwise.
+        print(
+            "warning: the grant is written, but that machine's running CCB did not confirm "
+            "share_all, so only explicitly shared projects work until its CCB is restarted "
+            f"from this build. Run `ccb-remote list {alias}` afterwards to confirm.",
+            file=err,
+        )
+        return False
+    if expect_share_all is False and result.share_all is True:
+        # P1-b: a REVOCATION is confirmed the same way. The destination reports
+        # `share_all: true` only when the running askd really has it on, so an
+        # absent key here is the "off" this pairing needs -- and a machine still
+        # reporting it on means the revocation has not taken effect.
+        print(
+            "warning: the revocation is written, but that machine's running CCB still "
+            "reports share_all as on, so it has not taken effect yet; restart CCB there "
+            f"from this build and run `ccb-remote list {alias}` to confirm.",
+            file=err,
+        )
+        return False
     print("", file=out)
     print("That machine answers as:", file=out)
     print(captured.getvalue().rstrip(), file=out)
+    if not example_project:
+        # Nothing was picked by name (a share_all pairing), so name something
+        # the destination itself just advertised -- never an invented alias.
+        for project in result.projects:
+            candidate = str(project.get("alias") or "")
+            if not candidate:
+                continue
+            present = [
+                str(item.get("provider") or "")
+                for item in project.get("providers") or []
+                if isinstance(item, dict) and item.get("provider")
+            ]
+            example_project = candidate
+            providers = tuple(present) or tuple(providers or ())
+            break
     # The same section `ccb-list` shows, rendered by the same code, so the user
     # sees exactly what their agents will see.
     view = remote_discovery.cache_view(alias)
@@ -1503,6 +1710,13 @@ def _verify_and_report(
     for line in remote_discovery.section_lines([view]):
         print(line, file=out)
     print("", file=out)
+    if not example_project:
+        print(
+            "No project is listed yet; start CCB in one there and run "
+            f"`ccb-remote list {alias}`.",
+            file=out,
+        )
+        return True
     print("Send a message with, for example:", file=out)
     # A provider the destination does not share would be refused, so the example
     # names the first one THIS share lists (already canonicalised by

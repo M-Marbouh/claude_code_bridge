@@ -59,6 +59,7 @@ from typing import Any, Callable, Optional
 
 import remote_protocol as proto
 from remote_journal import (
+    EffectiveAliases,
     RemoteConfig,
     RemoteConfigError,
     JournalError,
@@ -705,6 +706,61 @@ class RemoteDeliveryService:
                 proto.ERR_CONFIG_INVALID, "destination configuration is unavailable"
             ) from None
 
+    def _share_all_projects(self) -> list[dict]:
+        """The projects a `share_all` grant on this machine may cover.
+
+        Read from the SAME registry `known_projects` reads, reduced by the
+        eligibility rules (A4) in `remote_pairing.eligible_projects`. It is
+        re-derived on EVERY request -- never cached with `list` -- so a
+        project created after the grant was written is addressable, and a
+        project deleted since is not. A registry this build cannot read is
+        not a refusal: it simply derives nothing, and explicit aliases keep
+        working exactly as before.
+        """
+        from remote_pairing import eligible_projects
+
+        try:
+            return eligible_projects()
+        except Exception as exc:  # never break list/submit over discovery
+            self._log(f"[WARN] share_all project discovery failed: {exc}")
+            return []
+
+    @staticmethod
+    def _configured_project_id(work_dir: str) -> str:
+        """The project identity of an EXPLICIT alias's own work_dir.
+
+        Computed exactly as `remote_pairing.eligible_projects` computes one for
+        a derived alias (same helper, same canonical directory), so a sender
+        that echoed a derived identity which has since become explicit names the
+        same project under either spelling -- and a genuinely different project
+        is provably different. The identity is a hash of the canonical path, so
+        it is deterministic even for a directory that has since disappeared; a
+        missing/blank work_dir yields "" and therefore no comparison.
+        """
+        from pathlib import Path as _Path
+
+        from project_id import compute_ccb_project_id
+
+        text = str(work_dir or "").strip()
+        if not text:
+            return ""
+        try:
+            return compute_ccb_project_id(_Path(text).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            return ""
+
+    def _effective(self, principal: str, config: RemoteConfig) -> EffectiveAliases:
+        """The single authorization seam `list` and `submit` both use.
+
+        One computation, two consumers: `list` never advertises an alias
+        `submit` would refuse, and `submit` never accepts one `list` hid. The
+        project set is only read when the principal actually has `share_all`,
+        so a config without it never touches the registry here.
+        """
+        entry = config.principal(principal)
+        projects = self._share_all_projects() if entry is not None and entry.share_all else ()
+        return config.effective_aliases(principal, projects)
+
     @staticmethod
     def _ok(msg: dict, remote: dict) -> dict:
         return {
@@ -766,6 +822,12 @@ class RemoteDeliveryService:
         where they overlap: a provider the resolver accepted is reported
         `present`, and `state` can lag behind a registry that changed between
         the two reads -- the resolver remains the only authority for delivery.
+
+        The alias set comes from the same `_effective` seam `submit` uses, so a
+        `share_all` grant cannot advertise a project submit would refuse. A
+        derived alias also carries the project identity the sender must echo
+        back (A5), and an ambiguous derived name is reported as skipped rather
+        than silently dropped.
         """
         principal = str(msg.get("principal") or "").strip()
         try:
@@ -773,16 +835,37 @@ class RemoteDeliveryService:
         except RemoteError as exc:
             return self._error(msg, exc.code, exc.message)
 
+        effective = self._effective(principal, config)
         projects = []
-        for alias_name in config.allowed_aliases(principal):
-            alias = config.aliases[alias_name]
+        for alias_name, alias in effective.aliases.items():
             providers = []
             for provider in alias.providers:
                 if provider not in proto.REMOTE_PROVIDERS:
                     continue
                 providers.append(self._provider_view(provider, alias.work_dir))
-            projects.append({"alias": alias_name, "providers": providers})
-        return self._ok(msg, {"projects": projects})
+            entry = {"alias": alias_name, "providers": providers}
+            if alias.derived:
+                # A5: which project this alias names RIGHT NOW. A submit to a
+                # derived alias must echo this back, so a later collision can
+                # never silently retarget an in-flight request.
+                entry["derived"] = True
+                entry["project_id"] = alias.project_id
+            projects.append(entry)
+        remote: dict = {"projects": projects}
+        # A2: the principal's EFFECTIVE share_all, so a pairing source can
+        # prove the running askd honours the grant (an empty project list alone
+        # is not proof, and today it is accepted as success). Reported only
+        # when ON, so a destination with no share_all answers with exactly the
+        # frame it always did; a source that asked for a grant and does not see
+        # `share_all: true` here refuses to claim the grant works.
+        if effective.share_all:
+            remote["share_all"] = True
+        if effective.skipped:
+            remote["skipped"] = [
+                {"alias": name, "reason": reason}
+                for name, reason in sorted(effective.skipped.items())
+            ]
+        return self._ok(msg, remote)
 
     def _provider_view(self, provider: str, work_dir: str) -> dict:
         """One provider's presence plus its availability and session choices.
@@ -1093,17 +1176,51 @@ class RemoteDeliveryService:
             return self._error(msg, exc.code, exc.message)
 
         alias_name = str(record["dest_project"])
-        if not config.may_use(principal, alias_name):
+        # One seam for both verbs: `list` advertised from this same computation,
+        # so an alias submit accepts is exactly one list showed.
+        effective = self._effective(principal, config)
+        alias = effective.aliases.get(alias_name)
+        if alias is None:
             return self._error(
                 msg, proto.ERR_UNAUTHORIZED, "principal may not deliver to that destination"
             )
-        if record["dest_provider"] not in config.providers_for(principal, alias_name):
+        if record["dest_provider"] not in alias.providers:
             return self._error(
                 msg, proto.ERR_UNSUPPORTED_PROVIDER, "provider is not allowed for that destination"
             )
+        # A5: an alias is a NAME, and the sender must prove it means the project
+        # it last saw. The identity check is therefore applied to a DERIVED
+        # alias always, and to an EXPLICIT alias whenever the record carries an
+        # identity at all -- so an identity minted for a derived alias can never
+        # be redirected onto whatever a re-pointed explicit alias names today.
+        # A record with no identity to an explicit alias is unchanged. Refused
+        # before any journal or queue write.
+        claimed = record.get("dest_project_id")
+        if alias.derived:
+            # A derived alias REQUIRES the identity: it is a name this machine
+            # minted from a folder, so the sender must prove which project it
+            # read. Absent is a mismatch.
+            if claimed != alias.project_id:
+                return self._error(
+                    msg,
+                    proto.ERR_UNAUTHORIZED,
+                    "this share-all destination did not match the project identity it was "
+                    "listed under; run `list` again and resend",
+                )
+        elif claimed is not None:
+            # An explicit alias accepts a record with no identity (unchanged),
+            # but when one IS carried it must still name this project -- so an
+            # identity minted for a derived alias cannot be redirected onto
+            # whatever a re-pointed explicit alias names today.
+            if self._configured_project_id(alias.work_dir) != claimed:
+                return self._error(
+                    msg,
+                    proto.ERR_UNAUTHORIZED,
+                    "this share-all destination did not match the project identity it was "
+                    "listed under; run `list` again and resend",
+                )
 
         # 2. Resolve the exact destination BEFORE acceptance.
-        alias = config.aliases[alias_name]
         try:
             destination = self._resolver(
                 str(record["dest_provider"]), alias.work_dir, str(record.get("dest_session") or "")
@@ -1114,6 +1231,32 @@ class RemoteDeliveryService:
             self._log(f"[WARN] remote destination resolution failed: {exc}")
             return self._error(
                 msg, proto.ERR_DESTINATION_UNAVAILABLE, "destination could not be resolved"
+            )
+
+        # 2a. R1: the identity must still hold AFTER resolution. The check above
+        # proves the name meant the right project when the alias was derived;
+        # the RESOLVER then resolves the directory again, and a directory
+        # swapped for a symlink in between would otherwise deliver to a
+        # different project than the sender proved. Comparing the resolver's own
+        # ccb_project_id closes that window before any journal or queue write.
+        resolved_id = str(getattr(destination, "ccb_project_id", "") or "")
+        # The identity this request is bound to: a derived alias always has one
+        # (it was minted from a folder), an explicit alias has one only when the
+        # record carried it. An explicit alias with no identity is the unchanged
+        # path -- nothing to compare, so nothing is refused.
+        expected_id = alias.project_id if alias.derived else str(claimed or "")
+        # Fail closed: once the request is bound to an identity, the resolver
+        # must report exactly that identity -- an empty one is a mismatch too.
+        if expected_id and resolved_id != expected_id:
+            self._log(
+                f"[WARN] destination identity changed during resolution "
+                f"req_id={record['request_id']} alias={alias_name}"
+            )
+            return self._error(
+                msg,
+                proto.ERR_UNAUTHORIZED,
+                "this share-all destination did not match the project identity it was "
+                "listed under; run `list` again and resend",
             )
 
         # 2b. A reply-expected record additionally binds its reply authority
@@ -1141,6 +1284,8 @@ class RemoteDeliveryService:
                         or existing.get("dest_project") != alias_name
                         or existing.get("dest_provider") != record["dest_provider"]
                         or existing.get("dest_session") != record.get("dest_session")
+                        or str(existing.get("dest_project_id") or "")
+                        != str(record.get("dest_project_id") or alias.project_id or "")
                     ):
                         return self._error(
                             msg,
@@ -1152,6 +1297,11 @@ class RemoteDeliveryService:
                 stored = {
                     **record,
                     "digest": provided_digest,
+                    # The identity this request was actually authorized under:
+                    # for a derived alias that is the project the sender named,
+                    # so `status` can prove which project it landed in.
+                    "dest_project_id": record.get("dest_project_id") or alias.project_id,
+                    "dest_project_derived": alias.derived,
                     "principal": principal,
                     "issuer_token": entry.issuer_token,
                     "source_claims": dict(record.get("source_claims") or {}),

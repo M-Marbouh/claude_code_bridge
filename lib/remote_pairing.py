@@ -145,7 +145,7 @@ def validate_port(value: object) -> int:
     if isinstance(value, bool):
         raise PairingError("port must be a number between 1 and 65535")
     try:
-        port = int(value)
+        port = int(str(value))
     except (TypeError, ValueError):
         raise PairingError("port must be a number between 1 and 65535") from None
     if not 1 <= port <= 65535:
@@ -586,12 +586,85 @@ def known_projects(registry_dir: Path | None = None) -> list[dict]:
     return sorted(projects.values(), key=lambda item: item["work_dir"])
 
 
+def _project_config_present(work_dir: Path) -> bool:
+    """Does this directory hold a CCB project config (primary OR legacy)?
+
+    A4: the registry also records directories CCB was merely launched in. A
+    project anchor -- `.ccb/` or the legacy `.ccb_config/` -- is the signal
+    that this really is a project, resolved by the same helper the rest of CCB
+    uses so the two can never disagree.
+    """
+    from session_utils import resolve_project_config_dir
+
+    try:
+        return resolve_project_config_dir(work_dir).is_dir()
+    except OSError:
+        return False
+
+
+def eligible_projects(
+    registry_dir: Path | None = None, *, temp_dir: Path | str | None = None
+) -> list[dict]:
+    """The projects a `share_all` grant may cover on THIS machine.
+
+    The same registry read `known_projects` does, reduced to what the plan and
+    its ratification (A4) allow:
+
+    * the directory still exists and is a directory;
+    * it is not under the system temp dir (resolved BEFORE the check, so a
+      symlink into /tmp cannot slip past it);
+    * it holds a CCB project config dir (primary `.ccb/` or legacy
+      `.ccb_config/`).
+
+    Work dirs are canonicalised (`resolve`) first, so two registry records for
+    the same real directory become one entry and a symlink dedups with its
+    target. Each entry also carries the `project_id` a sender must echo back
+    in a submit (A5) -- computed from the CANONICAL directory, exactly as the
+    delivery resolver computes it for the destination.
+    """
+    from project_id import compute_ccb_project_id
+
+    temp_root = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
+    try:
+        temp_resolved = temp_root.resolve()
+    except OSError:
+        temp_resolved = temp_root
+    eligible: dict[str, dict] = {}
+    for project in known_projects(registry_dir):
+        raw = str(project.get("work_dir") or "")
+        try:
+            resolved = Path(raw).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_dir():
+            continue
+        if resolved == temp_resolved or temp_resolved in resolved.parents:
+            continue
+        if not _project_config_present(resolved):
+            continue
+        key = str(resolved)
+        if key in eligible:
+            continue
+        try:
+            project_id = compute_ccb_project_id(resolved)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        eligible[key] = {
+            "work_dir": key,
+            "name": resolved.name,
+            "providers": list(project.get("providers") or []),
+            "project_id": project_id,
+        }
+    return sorted(eligible.values(), key=lambda item: item["work_dir"])
+
+
 def inspect_destination(
     *,
     home: Path | None = None,
     gate_path: Path | None = None,
     host_key_dir: Path | str = "/etc/ssh",
     registry_dir: Path | None = None,
+    temp_dir: Path | str | None = None,
     lookup_principal: str = "",
     lookup_pubkey: str = "",
 ) -> dict:
@@ -605,8 +678,10 @@ def inspect_destination(
     with pairing_lock(paths["remote_root"]):
         keys, config, digest = _dest_state(paths)
         document = _load_config_document(config)
-    principals = document.get("principals") if isinstance(document.get("principals"), dict) else {}
-    aliases = document.get("aliases") if isinstance(document.get("aliases"), dict) else {}
+    raw_principals = document.get("principals")
+    principals: dict = raw_principals if isinstance(raw_principals, dict) else {}
+    raw_aliases = document.get("aliases")
+    aliases: dict = raw_aliases if isinstance(raw_aliases, dict) else {}
 
     gate = str(gate_path) if gate_path is not None else ""
     gate_present = bool(gate) and Path(gate).is_file() and os.access(gate, os.X_OK)
@@ -624,7 +699,15 @@ def inspect_destination(
             name: {
                 "allowed_aliases": list(
                     (entry.get("allowed_aliases") if isinstance(entry, dict) else []) or []
-                )
+                ),
+                # A1: the pairing source must be able to see (and refuse an
+                # older machine over) this principal's current share_all.
+                "share_all": (
+                    entry.get("share_all") is True if isinstance(entry, dict) else False
+                ),
+                "share_all_providers": list(
+                    (entry.get("share_all_providers") if isinstance(entry, dict) else []) or []
+                ),
             }
             for name, entry in principals.items()
             if isinstance(name, str)
@@ -642,6 +725,11 @@ def inspect_destination(
             if isinstance(name, str)
         },
         "projects": known_projects(registry_dir),
+        # A1/A4: what a `share_all` grant on this machine would actually cover,
+        # and whether this build understands the grant at all. A pairing source
+        # refuses to claim share_all works when `share_all` is absent here.
+        "share_all_capability": True,
+        "share_all_projects": eligible_projects(registry_dir, temp_dir=temp_dir),
         "state_hash": digest,
         "existing_key_line": False,
         "key_blob_present": False,
@@ -702,8 +790,20 @@ def _authorized_keys_without_newline_dup(text: str, line: str) -> str:
 
 
 def _requested_aliases(request: dict) -> list[dict]:
+    """The explicit aliases an apply asks for (possibly none, A3).
+
+    Zero aliases are allowed when the request carries a `share_all` decision:
+    "share every project" and "share nothing but keep the grant" are both
+    real approvals, and refusing them forced a fake alias pick. Without a
+    share_all decision an apply still needs at least one alias, so the old
+    refusal (and its message) is unchanged for every existing caller.
+    """
     raw = request.get("aliases")
-    if not isinstance(raw, list) or not raw:
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise PairingError("each alias must be an object")
+    if not raw and not isinstance(request.get("share_all"), bool):
         raise PairingError("apply needs at least one alias to share")
     aliases: list[dict] = []
     for entry in raw:
@@ -719,6 +819,20 @@ def _requested_aliases(request: dict) -> list[dict]:
     if len({entry["alias"] for entry in aliases}) != len(aliases):
         raise PairingError("an alias was requested twice")
     return aliases
+
+
+def _requested_share_all(request: dict) -> bool | None:
+    """The tri-state `share_all` decision: True grant, False revoke, None leave.
+
+    A6: a malformed value is refused here, before any write, rather than
+    being coalesced to a truthy guess.
+    """
+    if "share_all" not in request:
+        return None
+    value = request["share_all"]
+    if not isinstance(value, bool):
+        raise PairingError("share_all must be true or false")
+    return value
 
 
 def apply_destination(
@@ -752,6 +866,7 @@ def _apply_destination(
     pubkey = validate_pubkey(request.get("pubkey"))
     token = validate_token(request.get("issuer_token"))
     aliases = _requested_aliases(request)
+    share_all = _requested_share_all(request)
     expected = str(request.get("expected_state_hash") or "").strip()
     if not expected:
         raise PairingError("apply needs the state hash it was inspected with; nothing was written")
@@ -859,6 +974,16 @@ def _apply_destination(
         # Ownership evidence (B5): the grant records WHICH key it was made for,
         # so a revoke can prove the half it is removing is its own.
         merged["pubkey_sha256"] = pubkey_sha256(blob[1])
+        # A3: tri-state share_all. Omitted leaves the recorded value untouched
+        # (a re-apply must never silently turn a whole-machine grant on or
+        # off); True grants, False revokes while keeping the explicit aliases.
+        share_all_changed = False
+        if share_all is not None and bool(merged.get("share_all")) != share_all:
+            share_all_changed = True
+        if share_all is True:
+            merged["share_all"] = True
+        elif share_all is False:
+            merged.pop("share_all", None)
         new_principals[principal] = merged
 
         new_aliases = dict(aliases_document)
@@ -913,6 +1038,8 @@ def _apply_destination(
             "config_changed": config_changed,
             "principals_added": [] if isinstance(existing_principal, dict) else [principal],
             "aliases_added": aliases_added,
+            "share_all": merged.get("share_all") is True,
+            "share_all_changed": share_all_changed,
             "backups": backups,
             "state_hash": digest_after,
         }

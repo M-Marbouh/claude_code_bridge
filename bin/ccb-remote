@@ -386,6 +386,23 @@ def _cmd_pair(argv: list[str]) -> int:
     parser.add_argument(
         "--providers", default="claude,codex", help="default providers for shared projects"
     )
+    share_all_group = parser.add_mutually_exclusive_group()
+    share_all_group.add_argument(
+        "--share-all",
+        dest="share_all",
+        action="store_true",
+        default=None,
+        help=(
+            "share EVERY eligible CCB project on that machine, including ones created later "
+            "(no per-project picker; refused if that machine's CCB is too old)"
+        ),
+    )
+    share_all_group.add_argument(
+        "--no-share-all",
+        dest="share_all",
+        action="store_false",
+        help="turn share-all off for this pairing (explicit shares stay)",
+    )
     parser.add_argument("--yes", action="store_true", help="no prompts (for scripts and tests)")
     parser.add_argument(
         "--print-remote-steps",
@@ -443,6 +460,7 @@ def _cmd_pair(argv: list[str]) -> int:
         yes=parsed.yes,
         print_remote_steps=parsed.print_remote_steps,
         rotate_pin=parsed.rotate_pin,
+        share_all=parsed.share_all,
         share_specs=share_specs,
     )
     return remote_pair_cli.pair(options)

@@ -124,8 +124,9 @@ ccb-ping codex
 `ccb-list` reports any project with a verified live provider, including Codex-only projects. Multiple
 WezTerm tabs or tmux windows for the same project appear under one project entry as separate `sessions`;
 the existing top-level `index`, `work_dir`, `ccb_project_id`, and `providers` fields remain available in
-JSON output. `peer_providers` lists mounted Claude and Codex peer targets. The legacy
-`peer_capable: true` field retains its original Claude-specific meaning. Use `ccb-list --stale` only when
+JSON output. `peer_providers` lists mounted Claude, Codex and (local) Pi peer targets. The legacy
+`peer_capable: true` field retains its original Claude-specific meaning, so a Pi pane never becomes the
+default peer destination. Use `ccb-list --stale` only when
 historical or inactive records are needed for diagnostics.
 
 Managed Codex sessions cannot access the host terminal-multiplexer socket or loopback TCP directly.
@@ -179,6 +180,41 @@ Peer receipts distinguish transcript-observed delivery from successful terminal 
 anchor has not appeared yet. `pend <task-id>` rechecks late anchors and reports `delivery=sent-unconfirmed`
 when delivery cannot yet be observed. CCB does not automatically resend unconfirmed messages because doing
 so without receiver-side idempotency could create real duplicates.
+
+### Pi as a peer target and sender (local only)
+
+```bash
+ask pi --peer ~/dev/another-project --background "Review the parser"
+```
+
+A Pi pane is a peer destination **only when it is named** (`ask pi --peer ...`): bare `ask --peer` still
+selects Claude, and Claude remains the default wherever it is available. A Pi session can also be the
+**sender**: its peer receipt records its pane marker, its launch and its process witness, and the reply is
+routed back to that exact pane.
+
+**Pi peer messaging is local only for now.** `--peer host::project` (cross-machine) still supports Claude
+and Codex as both destination and sender; a Pi session cannot take part in cross-machine messaging yet, and
+such a request is refused before anything is submitted.
+
+Pi cannot queue typed input the way Claude and Codex do, so every CCB send into a Pi pane — a local
+`ask pi`, `autonew pi` and a local peer delivery — passes one shared readiness gate:
+CCB waits for Pi to report itself idle with an empty editor OUTSIDE the pane injection lock, then confirms
+again INSIDE the lock, immediately before typing. A busy pane is waited for; a draft, an open dialog, an
+unreadable or stale report, or a state file belonging to another launch is refused with nothing sent. Peer
+delivery to Pi is delivery-only and is reported `sent` once the message reached the pane: Pi has no
+transcript anchor reader, so there is no `observed` confirmation for it. A reply from Pi is an explicit
+reverse `ask --peer` carrying `--reply-to`; the delivered message states the exact command shape, and the
+installed `peer-ask` skill tells Pi to answer with `--background` and a quoted heredoc body, never `--wait`.
+
+A Pi destination is pasted into only when its process witness still matches: the pane process on tmux, or
+the Pi process and launch token Pi's snapshot publishes on WezTerm. CCB captures that witness when the
+destination is selected (before the message is queued) or, for a reply, in the original receipt, and
+compares it again inside the pane lock immediately before typing — so a pane respawned in place receives
+nothing. Pi peer delivery also obeys the sender's own timeout, including time spent queued.
+
+Accepted limits, identical to a local `ask pi` today: Pi's built-in selectors (`/tree`, the model picker)
+replace the editor without reporting a prompt, so an open selector reads as idle; and a human typing in
+the pane at the same moment is not serialised by CCB's lock.
 
 ## Cross-machine messaging (preview)
 
@@ -252,7 +288,7 @@ Each body takes the role when the user explicitly assigns it in the current conv
 
 CCB manages global instruction blocks for Claude Code and Codex only. On Pi, OpenCode, Gemini CLI and Hermes, add this to that tool's own global instructions file: `If you are a top-level CCB session (CCB_SESSION_ID is set) — never a subagent, helper or native agent spawned inside a session, even though it inherits that environment — run ccb-role brief once at the start of each conversation. If it prints role instructions, follow them: a role CCB recorded for this session is the user's assignment. If it fails, take no role. An explicit assignment from the user later in the conversation overrides it.`
 
-Known limitation: peer-to-peer messaging (`ask --peer`) stays limited to Claude and Codex, as sender and as destination; a Pi session can start a local `ask` and receive the result, and can record a role, but a Pi request cannot be sent with `--peer`. Recording a role needs a CCB launch credential, which CCB exports into every managed pane; a session started outside CCB has none and cannot record a role.
+Known limitation: LOCAL peer messaging (`ask --peer <project>`) works for Claude, Codex and Pi, where Pi is reachable only when named (`ask pi --peer ...`) and is never a default destination. Cross-machine delivery (`ask --peer <host>::<project>`) still supports Claude and Codex only: a Pi session can neither send nor receive one yet, and such a request is refused before anything is submitted. Recording a role needs a CCB launch credential, which CCB exports into every managed pane; a session started outside CCB has none and cannot record a role.
 
 ### Role policy
 
@@ -352,6 +388,7 @@ Native `#[...]` styles and `#()` commands work in the value. Escape literal perc
 
 - `Unreleased` — added independent `ccb codex codex` pairing with contextual sibling routing, exact live-session receipts and completion delivery, preserved cross-project peer behavior, provider-neutral role guidance, and explicit ambiguity failures.
 - `Unreleased` — added opt-in Pi pane launch and request/reply support through Pi's versioned session transcript.
+- `Unreleased` — added local cross-project peer messaging with Pi as sender and as a named destination, through one shared readiness gate that every CCB send into a Pi pane applies (wait outside the pane lock, confirm inside it).
 
 - `0.13.1` — hardened peer routing and failure reporting, restored exact `pend` overlays, bounded agent-visible replies, persisted delivery evidence, and added explicit reply-artifact cleanup.
 - `0.13.0` — replaced relay-style review roles with symmetric mutual ratification and moved managed Codex guidance to the real global `${CODEX_HOME:-~/.codex}/AGENTS.md` target.

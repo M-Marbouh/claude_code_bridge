@@ -5,9 +5,10 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from ccb_protocol import done_line_re, find_done_line, is_done_text
 
@@ -433,6 +434,19 @@ PI_STATE_CONFIRM_POLL_S = 0.1
 PI_STATE_MAX_AGE_S = 3.0
 PI_STATE_MAX_FUTURE_S = 2.0
 
+# Pre-send readiness policy shared by EVERY CCB send into a Pi pane. A busy pane is waited for
+# without spending the dialog retry budget; a draft, prompt, stale, absent or mismatched reading is
+# re-read a bounded number of times and then refused. These names live here (not in the adapter) so
+# the adapter, `autonew` and the peer transports cannot drift apart.
+PRE_SEND_RETRY_WAIT_S = 20.0
+PRE_SEND_RETRY_LIMIT = 3
+# A busy pre-send wait is logged once, then at most this often.
+BUSY_LOG_INTERVAL_S = 60.0
+# Cancellation is polled in slices this short while waiting to retry.
+PRE_SEND_WAIT_POLL_S = 0.25
+# A peer delivery to Pi runs inside the SENDER's own finite budget (queue + lock + readiness).
+PI_PEER_DELIVERY_MAX_S = 3600.0
+
 
 @dataclass(frozen=True)
 class PiState:
@@ -454,12 +468,18 @@ class PiState:
 
 @dataclass(frozen=True)
 class _Reading:
-    """One snapshot read: the public state plus the runtime identity confirmation compares."""
+    """One snapshot read: the public state plus the identity evidence a caller compares.
+
+    `pid` is the Pi PROCESS that wrote the snapshot. It is the incarnation witness for a terminal
+    that cannot report a pane process (WezTerm), because a pane respawned in place keeps its pane
+    id, its binding and even its launch token, but never keeps the old process.
+    """
 
     state: PiState
     launch_token: str = ""
     instance_id: str = ""
     seq: int = -1
+    pid: int | None = None
 
 
 def _pi_state_path(binding: Mapping[str, Any]) -> Path | None:
@@ -538,16 +558,18 @@ def _read_pi_reading(
     launch_token = str(raw.get("launch_token") or "")
     instance_id = str(raw.get("runtime_instance_id") or "")
     seq = _coerce_int(raw.get("seq"))
+    snapshot_pid = _coerce_int(raw.get("pid"))
     reading = _Reading(
         PiState("absent", PI_STATE_MISSING_HINT),
         launch_token=launch_token,
         instance_id=instance_id,
         seq=-1 if seq is None else seq,
+        pid=snapshot_pid,
     )
 
     def refused(status: str, reason: str) -> _Reading:
         return _Reading(PiState(status, reason), launch_token=launch_token,
-                        instance_id=instance_id, seq=reading.seq)
+                        instance_id=instance_id, seq=reading.seq, pid=snapshot_pid)
 
     # Every field is then read with its own type check: a missing key fails that check, so key
     # presence needs no separate test - the values the extension can write are the contract.
@@ -591,6 +613,7 @@ def _read_pi_reading(
         launch_token=launch_token,
         instance_id=instance_id,
         seq=reading.seq,
+        pid=pid,
     )
 
 
@@ -655,6 +678,365 @@ class LivePiSession:
     launch_id: str
     pane_id: str
     terminal: str = ""
+
+
+@dataclass(frozen=True)
+class PiGatePolicy:
+    """How long one caller may wait for a Pi pane before refusing it.
+
+    `busy_wait=False` answers from ONE readiness read and refuses a busy pane instead of waiting
+    for it: `autonew`'s `/new` must never queue behind a turn it would interrupt. `retry_limit`
+    bounds how often a NON-busy refusal (draft, prompt, stale, absent, mismatch) is re-read before
+    the caller is refused.
+    """
+
+    busy_wait: bool = True
+    retry_wait_s: float = PRE_SEND_RETRY_WAIT_S
+    retry_limit: int = PRE_SEND_RETRY_LIMIT
+    busy_log_interval_s: float = BUSY_LOG_INTERVAL_S
+
+
+@dataclass(frozen=True)
+class PiInjectability:
+    """The verdict of `wait_until_pi_injectable`: ready, or exactly why not.
+
+    `outcome` is one of ready | refused | cancelled | expired. Only `ready` may be typed into, and
+    even then the caller confirms again inside the pane-injection lock. `state` is the LAST
+    readiness reading (the refusing one for `refused`).
+    """
+
+    outcome: str
+    state: PiState = PiState("absent", PI_STATE_MISSING_HINT)
+
+    @property
+    def ready(self) -> bool:
+        return self.outcome == "ready"
+
+
+def _wait_polling(seconds: float, cancel: Callable[[], bool] | None) -> bool:
+    """Sleep in short slices; False when the request was cancelled during the wait."""
+    if cancel is not None and cancel():
+        return False
+    remaining = max(0.0, seconds)
+    while remaining > 0:
+        time.sleep(min(PRE_SEND_WAIT_POLL_S, remaining))
+        remaining -= PRE_SEND_WAIT_POLL_S
+        if cancel is not None and cancel():
+            return False
+    return True
+
+
+def wait_until_pi_injectable(
+    resolve: Callable[[], Mapping[str, Any] | None],
+    deadline: float | None,
+    *,
+    policy: PiGatePolicy | None = None,
+    confirm: Callable[..., PiState] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    wait: Callable[[float], bool] | None = None,
+    log: Callable[[str], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    label: str = "provider=pi",
+    req_id: str = "-",
+) -> PiInjectability:
+    """Stage 1 of the Pi injection gate: wait for a pane CCB may type into.
+
+    Extracted from the Pi adapter's pre-send loop so EVERY CCB send into a Pi pane -- the local
+    `ask pi` adapter, `autonew pi`, and the peer transports -- shares one decision. The caller
+    waits with this OUTSIDE the pane-injection lock, then takes the lock and confirms readiness
+    again (`confirm_pi_ready`) immediately before `send_text`; a pane that started working in
+    between releases the lock and resumes waiting, and is never pasted into.
+
+    `resolve` is re-run on EVERY pass, so a `/new` or a relaunch during a long busy wait is picked
+    up instead of being judged against a stale binding. It must return the current binding, or
+    raise the caller's own exception to stop the wait with a caller-specific outcome.
+
+    A busy pane is waited for (`policy.busy_wait`) and logged at `policy.busy_log_interval_s`
+    without spending the dialog retry budget; every other non-ready reading spends it and is then
+    refused. Cancellation is checked before each readiness read and again after a non-ready one --
+    and by the caller after a ready verdict, immediately before the send.
+    """
+    policy = policy or PiGatePolicy()
+    confirmer = confirm if confirm is not None else confirm_pi_ready
+    # Resolved per call, never bound as a default: callers (and tests) replace
+    # `time.monotonic` on the shared module, and a default argument would capture the original.
+    now_source = clock if clock is not None else time.monotonic
+    sleeper = wait if wait is not None else (lambda seconds: _wait_polling(seconds, cancel))
+    last = PiState("absent", PI_STATE_MISSING_HINT)
+    retries_left = policy.retry_limit
+    busy_since: float | None = None
+    busy_logged_at: float | None = None
+
+    def stopped() -> PiInjectability | None:
+        if cancel is not None and cancel():
+            return PiInjectability("cancelled", last)
+        if deadline is not None and now_source() >= deadline:
+            return PiInjectability("expired", last)
+        return None
+
+    while True:
+        binding = resolve()
+        if binding is None:
+            return PiInjectability("refused", last)
+        stop = stopped()
+        if stop is not None:
+            return stop
+        last = confirmer(binding, deadline)
+        if last.status != "ready":
+            stop = stopped()
+            if stop is not None:
+                return stop
+        if last.status == "ready":
+            return PiInjectability("ready", last)
+        if last.status == "busy" and policy.busy_wait:
+            now = now_source()
+            remaining = None if deadline is None else deadline - now
+            if remaining is not None and remaining <= 0:
+                return PiInjectability("expired", last)
+            if busy_since is None:
+                busy_since = now
+            if log is not None and (
+                busy_logged_at is None or now - busy_logged_at >= policy.busy_log_interval_s
+            ):
+                busy_logged_at = now
+                log(
+                    f"[INFO] pre-send waiting for busy Pi {label} req_id={req_id} "
+                    f"waited_s={int(now - busy_since)}"
+                )
+            # Never wait past the request deadline: the poll is clamped to the budget left.
+            wait_s = policy.retry_wait_s if remaining is None else min(policy.retry_wait_s, remaining)
+            if not sleeper(wait_s):
+                return PiInjectability("cancelled", last)
+            continue
+        if retries_left <= 0 or (
+            deadline is not None and now_source() + policy.retry_wait_s > deadline
+        ):
+            return PiInjectability("refused", last)
+        if log is not None:
+            log(
+                f"[INFO] pre-send retry {label} req_id={req_id} "
+                f"state={last.status} retries_left={retries_left}"
+            )
+        if not sleeper(policy.retry_wait_s):
+            return PiInjectability("cancelled", last)
+        retries_left -= 1
+
+
+def peer_pi_destination_binding(
+    work_dir: str | Path,
+    *,
+    pane_id: str,
+    terminal: str = "",
+    launch_id: str = "",
+) -> tuple[dict[str, Any] | None, str]:
+    """The DESTINATION project's own Pi binding a peer message may be pasted into, or why not.
+
+    Loads that project's own `.ccb/.pi-session` record -- the same record the Pi adapter binds to --
+    and corroborates it against the SELECTED live session and the destination pane: pane id,
+    terminal, launch (the binding's `session_id` must be the live registered launch names that
+    pane), and the readiness channel (state file + launch token). Every disagreement refuses, and
+    nothing is sent: a peer message is pasted into the exact Pi the sender selected, never into
+    another Pi the destination project happens to run, and never blindly into a pane with no
+    readiness report.
+    """
+    work_path = Path(str(work_dir or "").strip() or ".").expanduser()
+    wanted_pane = (pane_id or "").strip()
+    wanted_terminal = (terminal or "").strip().lower()
+    wanted_launch = (launch_id or "").strip()
+    if not wanted_pane:
+        return None, "the peer destination names no Pi pane"
+    loaded = load_session_file(work_path)
+    if not loaded:
+        return None, "the destination project has no Pi session binding"
+    _path, data = loaded
+    if not isinstance(data, dict):
+        return None, "the destination project's Pi session binding is unreadable"
+    if data.get("active") is not True:
+        return None, "the destination project's Pi session binding is inactive"
+    bound_pane = str(data.get("pane_id") or "").strip()
+    if bound_pane != wanted_pane:
+        return None, (
+            f"the Pi binding names pane {bound_pane or '<none>'}, "
+            f"not the selected pane {wanted_pane}"
+        )
+    bound_terminal = str(data.get("terminal") or "").strip().lower()
+    if wanted_terminal and bound_terminal != wanted_terminal:
+        return None, (
+            f"the Pi binding names terminal {bound_terminal or '<none>'}, "
+            f"not the selected terminal {wanted_terminal}"
+        )
+    if not str(data.get("pi_session_id") or "").strip() or not str(
+        data.get("pi_session_dir") or ""
+    ).strip():
+        return None, "the destination project's Pi session binding is incomplete"
+    if not str(data.get("pi_launch_token") or "").strip() or _pi_state_path(data) is None:
+        return None, "the destination project's Pi binding has no readiness channel"
+    bound_launch = str(data.get("session_id") or "").strip()
+    if wanted_launch and bound_launch != wanted_launch:
+        return None, (
+            f"the Pi binding launches {bound_launch or '<none>'}, "
+            f"not the selected launch {wanted_launch}"
+        )
+    project_id = str(data.get("ccb_project_id") or "").strip()
+    if not project_id:
+        try:
+            from project_id import compute_ccb_project_id
+
+            project_id = compute_ccb_project_id(work_path)
+        except Exception:
+            project_id = ""
+    if not project_id:
+        return None, "the destination project's Pi binding names no CCB project"
+    sessions, inventory_error = live_pi_sessions(project_id)
+    if inventory_error:
+        return None, inventory_error
+    matches = [session for session in sessions if session.pane_id == wanted_pane]
+    if not matches:
+        return None, f"no live Pi session for the destination project on pane {wanted_pane}"
+    if len(matches) > 1:
+        return None, f"more than one live Pi session claims pane {wanted_pane}"
+    live = matches[0]
+    if bound_launch != live.launch_id:
+        return None, (
+            f"the Pi binding launches {bound_launch or '<none>'}, "
+            f"but pane {wanted_pane} belongs to launch {live.launch_id or '<none>'}"
+        )
+    return data, ""
+
+
+def pi_incarnation_witness(
+    work_dir: str | Path,
+    *,
+    pane_id: str,
+    terminal: str = "",
+    launch_id: str = "",
+) -> tuple[dict[str, str], str]:
+    """The INCARNATION witness to record for a Pi destination: `{"pane_pid", "launch_token"}`.
+
+    Captured from a fresh, verified read when the destination is selected or a return address is
+    receipted -- never later, because the whole point is to notice a pane replaced in between.
+
+    On a backend that reports a pane process (tmux) the witness is that pid. On WezTerm, which
+    reports none, it is the Pi PROCESS that published the snapshot (`pid`) together with the launch
+    token it published. `runtime_instance_id` is deliberately NOT used: it changes legitimately on
+    a reload or `/new` (`lib/pi_extension/ccb-state.ts`), so it could never prove a replacement.
+
+    Returns `({}, reason)` when no trustworthy witness exists -- the caller must then refuse.
+    """
+    binding, error = peer_pi_destination_binding(
+        work_dir, pane_id=pane_id, terminal=terminal, launch_id=launch_id
+    )
+    if error or binding is None:
+        return {}, error or "the Pi destination binding could not be verified"
+    return pi_destination_witness(binding, pane_id=pane_id, terminal=terminal)
+
+
+def pi_destination_witness(
+    binding: Mapping[str, Any],
+    *,
+    pane_id: str,
+    terminal: str = "",
+) -> tuple[dict[str, str], str]:
+    """The witness for an ALREADY VERIFIED binding (see `peer_pi_destination_binding`).
+
+    Split from `pi_incarnation_witness` so a caller that can verify the binding but not read the
+    terminal (a sandboxed pane cannot run tmux) can still refuse on identity while leaving the
+    witness to the host daemon, which captures it before queueing.
+    """
+    terminal_l = (terminal or "").strip().lower()
+    if terminal_l != "wezterm":
+        pid = _backend_pane_pid(terminal, pane_id)
+        if not pid:
+            return {}, "the Pi pane process could not be read"
+        return {"pane_pid": pid, "launch_token": ""}, ""
+    reading = _read_pi_reading(binding)
+    if reading.state.status not in {"ready", "busy", "draft", "prompt"}:
+        # stale / absent / mismatch: the snapshot is NOT a usable witness (Pi stopped reporting,
+        # or it belongs to another launch), so no witness may be recorded from it.
+        return {}, (
+            f"Pi's state snapshot is not usable ({reading.state.status}: {reading.state.reason})"
+        )
+    pid = "" if reading.pid is None else str(reading.pid)
+    token = reading.launch_token
+    if not str(binding.get("session_id") or "").strip() or not token:
+        return {}, "the Pi binding carries no launch evidence for this terminal"
+    if token != str(binding.get("pi_launch_token") or "").strip():
+        return {}, "Pi's state snapshot belongs to a different launch"
+    if not pid:
+        return {}, "Pi's state snapshot does not identify its process"
+    return {"pane_pid": pid, "launch_token": token}, ""
+
+
+def _backend_pane_pid(terminal: str, pane_id: str) -> str:
+    """The pane's current process id through its terminal backend, or "" when unreadable."""
+    try:
+        from terminal import get_backend_for_session
+
+        backend = get_backend_for_session({"terminal": terminal})
+    except Exception:
+        return ""
+    getter = getattr(backend, "pane_pid", None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter(pane_id) or "").strip()
+    except Exception:
+        return ""
+
+
+def pi_incarnation_problem(
+    backend: Any,
+    binding: Mapping[str, Any],
+    *,
+    pane_id: str,
+    terminal: str,
+    recorded_pane_pid: str,
+    recorded_launch_token: str = "",
+    require_ready: bool = False,
+) -> str:
+    """Why this Pi pane is not the pane INCARNATION that was selected ("" when it is).
+
+    Call it again INSIDE the pane-injection lock, immediately before `send_text`: a pane respawned
+    in place keeps its pane id, its `.ccb/.pi-session` record and often its launch token, so only a
+    FRESH process comparison can refuse it. On tmux the recorded pane pid must be present and equal
+    to the current pane process; on WezTerm the recorded Pi snapshot pid and launch token must both
+    still be what the snapshot publishes.
+    """
+    terminal_l = (terminal or "").strip().lower()
+    recorded = (recorded_pane_pid or "").strip()
+    if not recorded:
+        return "no Pi process was recorded for this destination; refusing to deliver to a pane that may have been replaced"
+    if terminal_l != "wezterm":
+        current = ""
+        getter = getattr(backend, "pane_pid", None)
+        if callable(getter):
+            try:
+                current = str(getter(pane_id) or "").strip()
+            except Exception:
+                current = ""
+        if not current:
+            return "the Pi pane process could not be read; refusing to deliver to an unverified pane"
+        if current != recorded:
+            return "the Pi pane is a different process than the one that was selected"
+        return ""
+    token = (recorded_launch_token or "").strip()
+    if not token:
+        return "no Pi launch token was recorded for this destination; refusing to deliver"
+    reading = _read_pi_reading(binding)
+    if require_ready and reading.state.status != "ready":
+        # The FINAL check demands fresh readiness from the same snapshot the witness comes from:
+        # a replacement that is merely busy must not be treated as an acceptable witness.
+        return (
+            f"Pi's state snapshot is not ready ({reading.state.status}: {reading.state.reason})"
+        )
+    current_pid = "" if reading.pid is None else str(reading.pid)
+    if not current_pid:
+        return "Pi's state snapshot does not identify its process"
+    if reading.launch_token != token:
+        return "Pi's state snapshot belongs to a different launch"
+    if current_pid != recorded:
+        return "Pi is a different process than the one that was selected"
+    return ""
 
 
 def _live_session_pane_alive(record: dict[str, Any], session: Any) -> bool:
@@ -748,29 +1130,32 @@ def live_pi_sessions(project_id: str) -> tuple[tuple[LivePiSession, ...], str]:
     return tuple(found), ""
 
 
-def reset_destination(work_dir: Path) -> tuple[Any, str, str]:
-    """Resolve the single live, idle Pi pane that `/new` may be sent to: (backend, pane_id, error).
+def reset_destination(work_dir: Path) -> tuple[Any, str, dict[str, Any] | None, str]:
+    """Resolve the single live, idle Pi pane `/new` may be sent to.
 
-    Fail-closed. Requires exactly one eligible live Pi session for the project (none and several both
-    refuse), and corroborates that session against the binding: same launch, same terminal backend,
-    same pane id. Then the binding and pane identity must verify and the pane must be confirmed idle.
+    Returns `(backend, pane_id, binding, error)`. Fail-closed. Requires exactly one eligible live Pi
+    session for the project (none and several both refuse), and corroborates that session against
+    the binding: same launch, same terminal backend, same pane id. Then the binding and pane
+    identity must verify and the pane must be confirmed injectable through the shared Pi gate --
+    with `busy_wait=False`, because `/new` must never queue behind a turn it would interrupt.
+    The caller confirms again INSIDE the pane-injection lock, immediately before the keystrokes.
     """
     from project_id import compute_ccb_project_id
 
     try:
         project_id = compute_ccb_project_id(work_dir)
     except Exception as exc:
-        return None, "", f"Pi project identity could not be computed: {exc}"
+        return None, "", None, f"Pi project identity could not be computed: {exc}"
     sessions, inventory_error = live_pi_sessions(project_id)
     if inventory_error:
-        return None, "", inventory_error
+        return None, "", None, inventory_error
     if len(sessions) != 1:
         if not sessions:
-            return None, "", "no live Pi session for this project; refusing to send /new"
-        return None, "", f"{len(sessions)} live Pi sessions for this project; refusing to pick one"
+            return None, "", None, "no live Pi session for this project; refusing to send /new"
+        return None, "", None, f"{len(sessions)} live Pi sessions for this project; refusing to pick one"
     backend, pane_id, binding, error = _verify_pane(work_dir)
     if error:
-        return None, "", error
+        return None, "", None, error
     bound = binding or {}
     disagree = []
     launch_id = str(bound.get("session_id") or "").strip()
@@ -783,8 +1168,13 @@ def reset_destination(work_dir: Path) -> tuple[Any, str, str]:
     if sole.pane_id != pane_id:
         disagree.append(f"live pane {sole.pane_id or '<none>'} is not binding pane {pane_id or '<none>'}")
     if disagree:
-        return None, "", "Pi destination disagrees with its binding: " + "; ".join(disagree)
-    state = confirm_pi_ready(bound)
-    if state.status != "ready":
-        return None, "", f"Pi pane is {state.status}: {state.reason}; refusing to send /new"
-    return backend, pane_id, ""
+        return None, "", None, "Pi destination disagrees with its binding: " + "; ".join(disagree)
+    verdict = wait_until_pi_injectable(
+        lambda: bound,
+        None,
+        policy=PiGatePolicy(busy_wait=False, retry_limit=0),
+    )
+    if verdict.outcome != "ready":
+        state = verdict.state
+        return None, "", None, f"Pi pane is {state.status}: {state.reason}; refusing to send /new"
+    return backend, pane_id, bound, ""

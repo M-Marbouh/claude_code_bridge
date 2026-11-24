@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,8 @@ from terminal import get_backend_for_session
 setup_windows_encoding()
 
 PEER_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-PEER_PROVIDERS = ("claude", "codex")
+# Pi joins the LOCAL peer transport only (see docs/plans/pi-peer-remote-plan.md, phase 1).
+PEER_PROVIDERS = ("claude", "codex", "pi")
 
 
 def _write_background_status(line: str) -> None:
@@ -297,7 +300,78 @@ def _select_live_session_target(
         "ccb_project_id": project_id,
         "pane_title_marker": marker,
     }
+    # The launch this exact session was selected as, when the inventory names one. Only a Pi
+    # destination uses it (and its incarnation witness); every other provider's endpoint fields
+    # stay exactly as they always were.
+    if provider == "pi":
+        selected_launch = str(status.get("launch_id") or session.get("session_id") or "").strip()
+        if selected_launch:
+            selected["peer_destination"]["launch_id"] = selected_launch
+        witness, reason = _pi_witness_for(
+            work_dir,
+            pane_id=pane_id,
+            terminal=terminal,
+            launch_id=selected_launch,
+        )
+        if reason:
+            raise RuntimeError(
+                f"the selected Pi session cannot be bound ({reason}); refusing to deliver"
+            )
+        selected["peer_destination"].update(witness)
     return selected
+
+
+def _pi_probe_allowed() -> bool:
+    """May this process read the destination pane itself? (G2)
+
+    A managed Codex sandbox cannot: tmux and the terminal socket are outside it, so a liveness,
+    marker or pid probe raises PermissionError instead of answering. Such a caller must NOT fail
+    before dispatch -- it hands the host-discovered identity to askd, which validates the binding
+    and captures the witness at admission, BEFORE queueing.
+    """
+    try:
+        from ccb_runtime_status import inside_managed_codex_sandbox
+
+        return not inside_managed_codex_sandbox()
+    except Exception:
+        # A caller that cannot even answer this is treated as unsandboxed: the probe below is
+        # wrapped, and a failure is still deferred to admission.
+        return True
+
+
+def _pi_witness_for(
+    work_dir: str, *, pane_id: str, terminal: str, launch_id: str = ""
+) -> tuple[dict[str, str], str]:
+    """The incarnation witness to record for a Pi destination, or why it cannot be bound.
+
+    Returns `(witness, identity_error)`. The identity must be the destination project's own bound
+    Pi; the process witness is what proves the incarnation later, under the lock.
+
+    A caller that cannot read the pane (a managed Codex sandbox) defers BOTH to daemon admission:
+    it returns no witness and no error, and askd validates the binding and captures the witness
+    before queueing (G2). Nothing is pasted into a destination without a witness either way: the
+    daemon refuses when it cannot capture one, and every send re-checks it under the lock.
+    """
+    from pi_comm import peer_pi_destination_binding, pi_destination_witness
+
+    if not _pi_probe_allowed():
+        return {}, ""
+    try:
+        binding, error = peer_pi_destination_binding(
+            work_dir, pane_id=pane_id, terminal=terminal, launch_id=launch_id
+        )
+    except PermissionError:
+        # The sandbox refused a terminal probe inside the binding check: defer to admission.
+        return {}, ""
+    if error or binding is None:
+        return {}, f"the selected Pi session cannot be bound ({error or 'no Pi binding'})"
+    try:
+        witness, _capture_error = pi_destination_witness(
+            binding, pane_id=pane_id, terminal=terminal
+        )
+    except PermissionError:
+        return {}, ""
+    return witness, ""
 
 
 def _correlated_reply_receipt(reply_to: str, target: str, provider: str) -> dict[str, Any] | None:
@@ -340,6 +414,16 @@ def _validated_direct_reply_target(
     project_id = str(receipt.get("ccb_project_id") or "").strip()
     if not pane_id or terminal not in {"tmux", "wezterm"} or not work_dir or not project_id:
         raise RuntimeError("peer reply receipt has no complete direct return address")
+    if provider == "pi":
+        # A Pi reply is addressed to a PROCESS, not just a pane id: a pane can be respawned in
+        # place, so the witness captured at submission (tmux pane pid, or the Pi process on
+        # WezTerm) is the only proof that this is still the Pi that asked. A receipt without it
+        # cannot be delivered safely, and re-reading it here would adopt a replacement.
+        if not str(receipt.get("caller_pane_pid") or "").strip():
+            raise RuntimeError(
+                "peer reply receipt has no Pi process witness; refusing to deliver to a pane "
+                "that may have been replaced"
+            )
 
     backend = get_backend_for_session({"terminal": terminal})
     if backend is None:
@@ -470,6 +554,176 @@ def _send_to_direct_reply_target(
             "confirmation": "sent",
         },
     )
+
+
+def _deliver_pi_direct_reply(
+    target: dict[str, Any],
+    backend: Any,
+    receipt: dict[str, Any] | None,
+    *,
+    message: str,
+    sender_work_dir: str,
+    intent: str,
+    peer_task_id: str,
+    reply_to: str,
+    timeout: float,
+    caller: str,
+    to_role: str = "",
+) -> tuple[int, str, dict[str, Any]]:
+    """Paste a correlated peer reply into a Pi caller's pane: gate, lock, confirm, send.
+
+    This path reaches a pane without the daemon, so it owns everything the daemon would otherwise
+    do, in the same order: wait until Pi is injectable OUTSIDE the pane lock, take the lock, confirm
+    readiness AGAIN, revalidate the destination, apply the role policy, then paste. A pane that is
+    busy, holds a draft, shows a prompt, mismatches its binding, or is a different process than the
+    one that sent the request refuses with nothing sent.
+    """
+    from ccb_protocol import wrap_pi_delivery_prompt
+    from pane_lock import PaneLockError, default_timeout_s, pane_injection_lock
+    from pi_comm import (
+        BUSY_LOG_INTERVAL_S,
+        PI_PEER_DELIVERY_MAX_S,
+        PRE_SEND_RETRY_LIMIT,
+        PRE_SEND_RETRY_WAIT_S,
+        PiGatePolicy,
+        confirm_pi_ready,
+        peer_pi_destination_binding,
+        pi_incarnation_problem,
+        wait_until_pi_injectable,
+    )
+
+    receipt_data = receipt if isinstance(receipt, dict) else {}
+    pane_id = str(receipt_data.get("caller_pane_id") or "").strip()
+    terminal = str(receipt_data.get("caller_terminal") or "").strip().lower()
+    work_dir = str(receipt_data.get("work_dir") or "").strip()
+    recorded_pid = str(receipt_data.get("caller_pane_pid") or "").strip()
+    recorded_token = str(receipt_data.get("caller_pi_launch_token") or "").strip()
+    launch_id = str(receipt_data.get("caller_registry_session_id") or "").strip()
+    if not pane_id or not terminal or not work_dir:
+        raise RuntimeError("peer reply receipt has no complete Pi return address")
+
+    def incarnation(binding_data: dict[str, Any], *, require_ready: bool = False) -> str:
+        return pi_incarnation_problem(
+            backend,
+            binding_data,
+            pane_id=pane_id,
+            terminal=terminal,
+            recorded_pane_pid=recorded_pid,
+            recorded_launch_token=recorded_token,
+            require_ready=require_ready,
+        )
+
+    binding, error = peer_pi_destination_binding(
+        work_dir, pane_id=pane_id, terminal=terminal, launch_id=launch_id
+    )
+    if error or binding is None:
+        raise RuntimeError(f"Pi peer reply destination is unusable ({error or 'no Pi binding'})")
+    problem = incarnation(binding)
+    if problem:
+        raise RuntimeError(f"Pi peer reply destination is not the pane that asked ({problem})")
+
+    req_id = peer_task_id or _task_id()
+    # H2: the envelope's CCB_REPLY_PROVIDER is the PARSED caller (--caller, defaulting to this
+    # process's own), never a re-read of the environment -- the daemon path and the Claude/Codex
+    # direct path both take it from the caller they were given.
+    message_for_target = _append_peer_context(
+        message, sender_work_dir, intent, peer_task_id, reply_to, provider="pi", caller=caller,
+    )
+    prompt = wrap_pi_delivery_prompt(message_for_target, req_id)
+    budget_s = float(timeout)
+    if not math.isfinite(budget_s):
+        # F3: a NaN/inf budget can never expire, and an explicit 0 expires at once -- both are
+        # refused BEFORE the lock, with zero sends.
+        raise RuntimeError("Pi peer reply delivery has a non-finite timeout; nothing was sent")
+    if budget_s < 0:
+        budget_s = PI_PEER_DELIVERY_MAX_S
+    deadline = time.monotonic() + budget_s
+    if deadline <= time.monotonic():
+        raise RuntimeError("Pi peer reply delivery has no time budget; nothing was sent")
+
+    while True:
+        verdict = wait_until_pi_injectable(
+            lambda: binding,
+            deadline,
+            policy=PiGatePolicy(
+                retry_wait_s=PRE_SEND_RETRY_WAIT_S,
+                retry_limit=PRE_SEND_RETRY_LIMIT,
+                busy_log_interval_s=BUSY_LOG_INTERVAL_S,
+            ),
+            label="provider=pi peer",
+            req_id=req_id,
+        )
+        if verdict.outcome == "cancelled":
+            raise RuntimeError("Pi peer reply delivery was cancelled; nothing was sent")
+        if verdict.outcome == "expired":
+            raise RuntimeError("Pi peer reply delivery timed out before Pi was ready; nothing was sent")
+        if not verdict.ready:
+            state = verdict.state
+            raise RuntimeError(
+                f"Pi pane is {state.status}: {state.reason}; refusing to deliver the reply"
+            )
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            # F3: an exhausted budget refuses before the lock is even attempted.
+            raise RuntimeError("Pi peer reply delivery timed out before Pi was ready; nothing was sent")
+        lock_budget_s = min(default_timeout_s(), remaining_s)
+        try:
+            with pane_injection_lock(backend, pane_id, lock_budget_s):
+                # G1: the ORDER inside the lock is the safety property, not any single check.
+                # 1. Revalidate the endpoint (pane alive, cwd, marker) and apply this path's own
+                #    role policy. Both can take real time, so everything they could invalidate is
+                #    re-read AFTER them.
+                _target, _backend = _validated_direct_reply_target(receipt_data, "pi")
+                direct_refusal = _direct_reply_policy_refusal(
+                    provider="pi",
+                    pane_id=pane_id,
+                    work_dir=work_dir,
+                    ccb_project_id=str(receipt_data.get("ccb_project_id") or ""),
+                    reply_receipt=receipt_data,
+                    to_role=to_role,
+                )
+                if direct_refusal:
+                    raise RuntimeError(direct_refusal)
+                # 2. Reload the binding after those checks: it, or the readiness file behind it,
+                #    can have been switched while they ran.
+                lock_binding, lock_error = peer_pi_destination_binding(
+                    work_dir, pane_id=pane_id, terminal=terminal, launch_id=launch_id
+                )
+                if lock_error or lock_binding is None:
+                    raise RuntimeError(
+                        f"Pi peer reply destination changed while waiting ({lock_error or 'no Pi binding'})"
+                    )
+                # 3. Confirm readiness against THE BINDING WE WOULD SEND WITH. Not ready: release
+                #    the lock and resume the outer wait against the refreshed binding, inside the
+                #    original deadline; never paste.
+                fresh = confirm_pi_ready(lock_binding, deadline)
+                if fresh.status != "ready":
+                    binding = lock_binding
+                    continue
+                # 4. The saved witness, against that binding and a fresh ready snapshot.
+                problem = incarnation(lock_binding, require_ready=True)
+                if problem:
+                    raise RuntimeError(f"Pi peer reply destination changed while waiting ({problem})")
+                binding = lock_binding
+                # 5. The deadline, last; the checks above take time.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "Pi peer reply delivery timed out before Pi was ready; nothing was sent"
+                    )
+                # 6. Paste.
+                backend.send_text(pane_id, prompt)
+        except PaneLockError as exc:
+            raise RuntimeError(f"pane injection lock unavailable: {exc}") from exc
+        return (
+            0,
+            "Peer reply delivered directly.",
+            {
+                "status": "completed",
+                "req_id": req_id,
+                "direct_reply_fallback": True,
+                "confirmation": "sent",
+            },
+        )
 
 
 def _write_correlated_status(receipt: dict[str, Any], line: str) -> None:
@@ -649,6 +903,11 @@ def _send_to_daemon(
         "to_role": to_role,
         "reply_to": reply_to,
     }
+    if provider == "pi":
+        # G4: only a Pi destination carries this flag. It lets the daemon fail closed on a Pi peer
+        # delivery with no verified endpoint (A5) without guessing from `delivery_only`, which a
+        # local one-way notify also sets; a Claude/Codex envelope stays exactly as it was.
+        req["peer_delivery"] = True
     sender_member_id, sender_member_token = _sender_credential()
     if sender_member_id and sender_member_token:
         req["sender_member_id"] = sender_member_id
@@ -853,6 +1112,14 @@ def main(argv: list[str] | None = None) -> int:
             provider_mounted = isinstance(provider_status, dict) and provider_status.get("mounted") is not False
             provider_ambiguous = isinstance(provider_status, dict) and bool(provider_status.get("ambiguous"))
             legacy_claude_block = args.provider == "claude" and target.get("peer_capable") is False
+            # Pi is only a peer provider when the project actually publishes it: a Pi-only
+            # project has peer_capable False (that flag keeps its Claude meaning), so its own
+            # reachability is judged from the advertised peer providers instead.
+            legacy_pi_block = (
+                args.provider == "pi"
+                and isinstance(target.get("peer_providers"), list)
+                and args.provider not in target["peer_providers"]
+            )
 
             # Task 4 / Item 2: a correlated reply whose receipt names a
             # saved return pane is PINNED to that exact session -- daemon
@@ -890,6 +1157,23 @@ def main(argv: list[str] | None = None) -> int:
                         "ccb_project_id": receipt_project_id,
                         "pane_title_marker": receipt_marker,
                     }
+                    if args.provider == "pi":
+                        # F1: the witness the receipt recorded at submission -- never a fresh
+                        # read here, which would adopt whatever pane exists now. A receipt
+                        # without one cannot be delivered safely.
+                        recorded_witness = {
+                            "pane_pid": str(reply_receipt.get("caller_pane_pid") or "").strip(),
+                            "launch_token": str(reply_receipt.get("caller_pi_launch_token") or "").strip(),
+                        }
+                        if not recorded_witness["pane_pid"]:
+                            raise RuntimeError(
+                                "peer reply receipt has no Pi process witness; refusing to "
+                                "deliver to a pane that may have been replaced"
+                            )
+                        target["peer_destination"]["launch_id"] = str(
+                            reply_receipt.get("caller_registry_session_id") or ""
+                        ).strip()
+                        target["peer_destination"].update(recorded_witness)
             elif provider_ambiguous:
                 # Task 3: more than one live session of this provider in
                 # the target project -- refuse outright, before anything
@@ -899,7 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"target project has more than one live {args.provider} session; "
                     "refusing to guess which one to deliver to"
                 )
-            elif not provider_alive or not provider_mounted or legacy_claude_block:
+            elif not provider_alive or not provider_mounted or legacy_claude_block or legacy_pi_block:
                 if reply_receipt is None:
                     print(
                         f"[ERROR] Target project has no mounted {args.provider.capitalize()} pane",
@@ -922,11 +1206,58 @@ def main(argv: list[str] | None = None) -> int:
                     "ccb_project_id": str(target.get("ccb_project_id") or ""),
                     "pane_title_marker": str(status.get("pane_title_marker") or ""),
                 }
+                if args.provider == "pi":
+                    # F1: capture the incarnation witness at selection, BEFORE the request is
+                    # queued, so a pane replaced later is refused under the lock. Only a Pi
+                    # destination carries these fields.
+                    pi_launch = str(status.get("launch_id") or "").strip()
+                    if pi_launch:
+                        target["peer_destination"]["launch_id"] = pi_launch
+                    witness, reason = _pi_witness_for(
+                        str(target.get("work_dir") or ""),
+                        pane_id=str(status.get("pane_id") or ""),
+                        terminal=str(
+                            status.get("terminal") or target.get("terminal") or ""
+                        ),
+                        launch_id=pi_launch,
+                    )
+                    if reason:
+                        raise RuntimeError(
+                            f"the selected Pi session cannot be bound ({reason}); "
+                            "refusing to deliver"
+                        )
+                    target["peer_destination"].update(witness)
+
+        if args.provider == "pi" and direct_backend is None and not target.get("peer_destination"):
+            # A5: fail closed. A Pi peer delivery without a verified endpoint must never reach the
+            # ordinary Pi adapter (which would paste into whatever pane the destination project
+            # happens to bind, and arm CCB_DONE capture for a message nobody is waiting on).
+            raise RuntimeError(
+                "Pi peer delivery needs a verified live Pi pane; this target carries no endpoint "
+                "identity, so nothing was sent"
+            )
 
         target_hash = str(target.get("ccb_project_id") or "")
         lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
         try:
-            if direct_backend is not None:
+            if direct_backend is not None and args.provider == "pi":
+                # A Pi pane cannot queue typed input, so its reply is delivered through the
+                # shared Pi gate, which owns the lock ordering itself (wait outside, confirm
+                # inside). The Claude/Codex block below is byte-for-byte unchanged.
+                exit_code, reply, meta = _deliver_pi_direct_reply(
+                    target,
+                    direct_backend,
+                    reply_receipt,
+                    message=message,
+                    sender_work_dir=str(args.sender_work_dir or ""),
+                    intent=str(args.intent or "wait"),
+                    peer_task_id=str(args.peer_task_id or ""),
+                    reply_to=str(args.reply_to or ""),
+                    timeout=float(args.timeout or 0),
+                    caller=str(args.caller or "claude"),
+                    to_role=to_role,
+                )
+            elif direct_backend is not None:
                 # Item 1/A6: this path bypasses the daemon, so it takes the
                 # same cross-process PANE injection lock the daemon send path
                 # takes, and revalidates only AFTER it holds it -- a pane

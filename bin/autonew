@@ -77,11 +77,36 @@ def main(argv: list[str]) -> int:
     work_dir = Path(os.getcwd())
 
     if provider == "pi":
-        # Fail-closed gate: unique live Pi session, verified pane identity, confirmed idle pane.
-        backend, pane_id, error = reset_destination(work_dir)
+        # Fail-closed gate: unique live Pi session, verified pane identity, confirmed injectable pane.
+        backend, pane_id, binding, error = reset_destination(work_dir)
         if error:
             print(f"[ERROR] {provider}: {error}", file=sys.stderr)
             return EXIT_ERROR
+        # Stage 2 of the shared Pi gate: a fresh readiness confirmation runs INSIDE the
+        # pane-injection lock, immediately before the keystrokes. `/new` must never be typed into a
+        # pane that started working (or that the user started typing into) after the check above.
+        from pane_lock import PaneLockError, pane_injection_lock
+        from pi_comm import confirm_pi_ready
+
+        try:
+            with pane_injection_lock(backend, pane_id, None):
+                state = confirm_pi_ready(binding or {})
+                if state.status != "ready":
+                    print(
+                        f"[ERROR] {provider}: Pi pane is {state.status}: {state.reason}; "
+                        "refusing to send /new",
+                        file=sys.stderr,
+                    )
+                    return EXIT_ERROR
+                backend.send_text(pane_id, PROVIDER_COMMANDS[provider])
+        except PaneLockError as exc:
+            print(f"[ERROR] {provider}: pane injection lock unavailable: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        except Exception as e:
+            print(f"[ERROR] Failed to send {PROVIDER_COMMANDS[provider]}: {e}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"Sent {PROVIDER_COMMANDS[provider]} to {provider} (pane: {pane_id})")
+        return EXIT_OK
     else:
         # Get current project ID
         try:

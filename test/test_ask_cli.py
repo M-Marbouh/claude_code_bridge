@@ -180,40 +180,81 @@ PI_PEER_ARGVS = (
 )
 
 
-def test_pi_peer_request_refuses_at_the_shared_bridge_boundary(
+def test_a_pi_caller_reaches_the_shared_bridge_for_every_peer_syntax(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
+    """Pi is a local peer sender like Claude and Codex: no refusal at the Pi boundary."""
     ask = _load_ask_module()
     monkeypatch.setenv("CCB_WORK_DIR", str(tmp_path))
     monkeypatch.setattr(ask, "_detect_caller", lambda: "pi")
-    for name in (
-        "_run_peer_bridge_foreground",
-        "_run_peer_bridge_background",
-        "_prepare_peer_task",
-        "_resolve_sender_work_dir",
-        "_peer_bridge_cmd",
-    ):
-        monkeypatch.setattr(
-            ask, name, lambda *a, _name=name, **k: pytest.fail(f"{_name} must not run for pi")
-        )
+    dispatched: list[str] = []
+    monkeypatch.setattr(ask, "_resolve_sender_work_dir", lambda _caller: tmp_path)
+    monkeypatch.setattr(
+        ask, "_run_peer_bridge_foreground", lambda *a, **k: dispatched.append("foreground") or 0
+    )
+    monkeypatch.setattr(
+        ask, "_run_peer_bridge_background", lambda *a, **k: dispatched.append("background") or 0
+    )
 
     for argv in PI_PEER_ARGVS:
-        assert ask.main(["ask", *argv]) == 1
-        assert "not available from a Pi session" in capsys.readouterr().err
+        assert ask.main(["ask", *argv]) == 0
+    assert dispatched
+    assert "not available from a Pi session" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("argv", PI_PEER_ARGVS)
-def test_pi_peer_request_creates_no_receipt_or_artifact(tmp_path: Path, argv) -> None:
+def test_a_pi_peer_request_no_longer_stops_at_a_pi_refusal(tmp_path: Path, argv) -> None:
     env = _peer_env(tmp_path, caller="pi")
-    run_dir = tmp_path / "run"
 
     proc = _run_ask(list(argv), cwd=tmp_path, env=env)
 
+    # The target does not exist here, so the run still fails -- but on its own merits, never
+    # because the caller is Pi.
     assert proc.returncode == 1
-    assert "not available from a Pi session" in proc.stderr
+    assert "not available from a Pi session" not in proc.stderr
     assert "[CCB_ASYNC_SUBMITTED" not in proc.stdout
     assert "[CCB_BACKGROUND_SUBMITTED" not in proc.stdout
-    assert not run_dir.exists() or not list(run_dir.rglob("*"))
+
+
+def test_a_pi_caller_records_its_return_pane_and_launch_for_a_peer_task(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The return address a Pi sender records is the same shape Claude/Codex record."""
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("CCB_CALLER", "pi")
+    monkeypatch.setattr(ask, "_detect_caller", lambda: "pi")
+    monkeypatch.setattr(ask, "_resolve_sender_work_dir", lambda _caller: tmp_path)
+    monkeypatch.setattr(ask, "_preflight_delivery", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(ask, "_peer_caller_pane_info", lambda: ("%21", "tmux"))
+    captured: dict = {}
+
+    def prepare(peer_provider, message, caller, intent, sender_work_dir, timeout,
+                caller_pane_id, caller_terminal, **kwargs):
+        captured.update(
+            provider=peer_provider, caller=caller, pane=caller_pane_id, terminal=caller_terminal,
+        )
+        raise SystemExit(0)
+
+    monkeypatch.setattr(ask, "_prepare_peer_task", prepare)
+    with pytest.raises(SystemExit):
+        ask.main(["ask", "pi", "--peer", str(tmp_path), "hello"])
+    assert captured == {"provider": "pi", "caller": "pi", "pane": "%21", "terminal": "tmux"}
+
+
+def test_bare_peer_still_selects_claude(tmp_path: Path, monkeypatch) -> None:
+    """A2: adding Pi to the peer providers must not move the DEFAULT destination."""
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_WORK_DIR", str(tmp_path))
+    monkeypatch.setattr(ask, "_detect_caller", lambda: "claude")
+    seen: dict = {}
+    monkeypatch.setattr(
+        ask, "_run_peer_bridge", lambda *a, **k: (seen.setdefault("provider", a[1]), 0)[1]
+    )
+
+    assert ask.main(["ask", "--peer", "abcd", "hello"]) == 0
+    assert seen["provider"] == "claude"
+    assert "pi" in ask.PEER_PROVIDERS
 
 
 @pytest.mark.parametrize("caller", ["gemini", "opencode", "hermes"])
@@ -251,3 +292,55 @@ def test_other_providers_still_reach_peer_dispatch_for_both_syntaxes(
     entry = dispatched.get("foreground") or dispatched.get("background")
     assert entry is not None, "peer dispatch was not reached"
     assert caller in repr(entry)
+
+
+# --- F2: Pi peer messaging is local only ----------------------------------------
+
+
+def test_a_pi_caller_is_refused_a_cross_machine_target_before_any_dispatch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_WORK_DIR", str(tmp_path))
+    monkeypatch.setattr(ask, "_detect_caller", lambda: "pi")
+    for name in ("_run_remote_peer", "_run_peer_bridge_foreground", "_run_peer_bridge_background",
+                 "_prepare_peer_task", "_peer_bridge_cmd"):
+        monkeypatch.setattr(
+            ask, name, lambda *a, _name=name, **k: pytest.fail(f"{_name} must not run")
+        )
+
+    for argv in (
+        ["ask", "claude", "--peer", "host::demo", "hello"],
+        ["ask", "claude", "--peer", "host::demo", "--background", "hello"],
+        ["ask", "pi", "--peer", "host::demo", "hello"],
+    ):
+        assert ask.main(argv) == 1
+        assert "not available from a Pi session" in capsys.readouterr().err
+
+    receipts = tmp_path / "ccb-tasks"
+    assert not receipts.exists() or not list(receipts.rglob("*"))
+
+
+def test_a_pi_destination_provider_is_refused_for_a_cross_machine_target(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`ask pi --peer host::project`: refused before any remote submit or receipt."""
+    ask = _load_ask_module()
+    monkeypatch.setenv("CCB_WORK_DIR", str(tmp_path))
+    monkeypatch.setattr(ask, "_detect_caller", lambda: "claude")
+
+    for name in ("submit", "register_watch", "wait_for_answer", "capture_caller_identity"):
+        monkeypatch.setattr(
+            f"remote_client.{name}",
+            lambda *a, _name=name, **k: pytest.fail(f"{_name} must not run"),
+        )
+
+    for argv in (
+        ["ask", "pi", "--peer", "host::demo", "hello"],
+        ["ask", "pi", "--peer", "host::demo", "--notify", "hello"],
+    ):
+        assert ask.main(argv) == 1
+        assert "supports claude and codex only, not pi" in capsys.readouterr().err
+
+    receipts = tmp_path / "ccb-tasks"
+    assert not receipts.exists() or not list(receipts.rglob("*"))

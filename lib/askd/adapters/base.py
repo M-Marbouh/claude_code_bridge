@@ -176,13 +176,36 @@ class PeerDestination:
     work_dir: str = ""
     ccb_project_id: str = ""
     pane_title_marker: str = ""
+    #: The launch the endpoint was SELECTED from (`live_sessions` launch id), when the
+    #: sender knew it. Optional and additive: absent means "not captured", never
+    #: "any launch is fine" for the providers whose delivery demands it (a Pi peer
+    #: delivery refuses without a binding that belongs to a live launch).
+    launch_id: str = ""
+    #: The INCARNATION witness captured when the endpoint was selected: on a backend that
+    #: reports a pane process (tmux) that pid; on WezTerm the Pi process that published the
+    #: snapshot. A pane respawned in place keeps its id, its binding and often its launch
+    #: token, so this is compared again INSIDE the pane-injection lock immediately before the
+    #: paste. Required for a Pi destination (captured before queueing); ignored by others.
+    pane_pid: str = ""
+    #: The launch token the Pi snapshot published when the endpoint was captured (WezTerm):
+    #: together with `pane_pid` it proves the pane still holds the same Pi process.
+    launch_token: str = ""
 
     @property
     def present(self) -> bool:
         return bool(self.pane_id) and bool(self.terminal) and bool(self.work_dir)
 
 
-_PEER_DESTINATION_FIELDS = ("pane_id", "terminal", "work_dir", "ccb_project_id", "pane_title_marker")
+_PEER_DESTINATION_FIELDS = (
+    "pane_id",
+    "terminal",
+    "work_dir",
+    "ccb_project_id",
+    "pane_title_marker",
+    "launch_id",
+    "pane_pid",
+    "launch_token",
+)
 _PEER_DESTINATION_MANDATORY_FIELDS = ("pane_id", "terminal", "work_dir")
 
 
@@ -268,6 +291,11 @@ class ProviderRequest:
     sender_member_id: str = ""
     sender_member_token: str = ""
     reply_to: str = ""
+    #: True only for a CROSS-PROJECT peer submission (set by bin/ccb-bridge-ask). It is what lets
+    #: the daemon judge "this is a peer delivery, so a verified endpoint is mandatory" without
+    #: inferring it from `delivery_only`, which a LOCAL one-way notify also sets. Inert for every
+    #: provider except Pi, whose peer delivery fails closed (A5).
+    peer_delivery: bool = False
 
 
 @dataclass

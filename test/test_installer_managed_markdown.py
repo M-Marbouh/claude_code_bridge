@@ -25,6 +25,8 @@ CLAUDE_END = "<!-- CCB_CONFIG_END -->"
 RATIFICATION_START = "<!-- MUTUAL_RATIFICATION_START -->"
 RATIFICATION_END = "<!-- MUTUAL_RATIFICATION_END -->"
 CCB_ROLE_SKILLS = ("ccb-lead", "ccb-implementer", "ccb-ratifier")
+# Pi-only skills shipped from pi_skills/ by the SAME install/uninstall step.
+CCB_PI_SKILLS = ("peer-ask",)
 NEUTRAL_ROLE_SKILLS_DIR = REPO_ROOT / "role_skills"
 
 
@@ -541,7 +543,7 @@ def test_role_skills_install_under_overrides_and_reinstall_is_idempotent(
         }
 
     first = snapshot()
-    assert len(first) == len(roots) * len(CCB_ROLE_SKILLS)
+    assert len(first) == len(roots) * len(CCB_ROLE_SKILLS) + len(CCB_PI_SKILLS)
 
     _run_install_functions(
         home=home,
@@ -819,12 +821,9 @@ def test_role_skills_leave_foreign_skills_untouched_and_uninstall_only_ccb_dirs(
 
     for name in CCB_ROLE_SKILLS:
         assert (pi_skills / name / "SKILL.md").is_file()
-    assert sorted(p.name for p in pi_skills.iterdir()) == [
-        "ccb-implementer",
-        "ccb-lead",
-        "ccb-ratifier",
-        "pi-typescript",
-    ]
+    assert sorted(p.name for p in pi_skills.iterdir()) == sorted(
+        [*CCB_ROLE_SKILLS, *CCB_PI_SKILLS, "pi-typescript"]
+    )
     assert fixture.read_text(encoding="utf-8") == PI_TYPESCRIPT_SKILL
     for path, content in foreign.items():
         assert path.read_text(encoding="utf-8") == content
@@ -841,8 +840,59 @@ def test_role_skills_leave_foreign_skills_untouched_and_uninstall_only_ccb_dirs(
         assert not (home / ".hermes" / "skills" / name).exists()
         assert not (home / ".config" / "opencode" / "skills" / name).exists()
         assert not (home / ".gemini" / "skills" / name).exists()
+    for name in CCB_PI_SKILLS:
+        # Pi-only skills are removed too; no other provider ever received them.
+        assert not (pi_skills / name).exists()
+        assert not (home / ".hermes" / "skills" / name).exists()
+        assert not (home / ".config" / "opencode" / "skills" / name).exists()
+        assert not (home / ".gemini" / "skills" / name).exists()
     assert fixture.read_text(encoding="utf-8") == PI_TYPESCRIPT_SKILL
     for path, content in foreign.items():
+        assert path.read_text(encoding="utf-8") == content
+
+
+def test_uninstall_removes_pi_only_skills_from_the_pi_home_only(tmp_path: Path) -> None:
+    """F4: a same-named skill in another provider's home was never CCB's and must survive."""
+    home = tmp_path / "home"
+    install_prefix = _prepare_install_prefix(tmp_path)
+
+    pi_skills = home / ".pi" / "agent" / "skills"
+    pi_skills.mkdir(parents=True)
+    foreign = {}
+    for skills_root in (
+        home / ".config" / "opencode" / "skills",
+        home / ".gemini" / "skills",
+        home / ".hermes" / "skills",
+    ):
+        for name in CCB_PI_SKILLS:
+            path = skills_root / name / "SKILL.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = f"---\nname: {name}\ndescription: Not CCB's.\n---\nkeep me\n"
+            path.write_text(content, encoding="utf-8")
+            foreign[path] = content
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("install_role_skills",),
+    )
+    for name in CCB_PI_SKILLS:
+        assert (pi_skills / name / "SKILL.md").is_file()
+    for path, content in foreign.items():
+        assert path.read_text(encoding="utf-8") == content
+
+    _run_install_functions(
+        home=home,
+        install_prefix=install_prefix,
+        codex_home=None,
+        functions=("uninstall_role_skills",),
+    )
+
+    for name in CCB_PI_SKILLS:
+        assert not (pi_skills / name).exists()
+    for path, content in foreign.items():
+        # Untouched: only Pi's own skills home is in scope for the Pi-only removal.
         assert path.read_text(encoding="utf-8") == content
 
 

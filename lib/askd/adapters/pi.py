@@ -20,12 +20,14 @@ from completion_hook import (
 from pane_registry import validate_route
 from pi_comm import (
     PiExchange,
+    PiGatePolicy,
     PiSessionError,
     PiState,
     confirm_pi_ready,
     load_candidate_sessions,
     load_session_path,
     read_pi_state,
+    wait_until_pi_injectable,
 )
 from project_id import compute_ccb_project_id
 from providers import PI_SPEC
@@ -37,12 +39,16 @@ ANCHOR_TIMEOUT_S = 12.0
 ERROR_GRACE_S = 10.0
 # A retry whose pane stays confirmed idle this long has stopped without writing a reply.
 RETRY_IDLE_S = 30.0
-# A non-idle pre-send screen is re-checked after this wait. A dialog or unknown state gets
-# PRE_SEND_RETRY_LIMIT retries (~60 s); a busy pane is waited for without spending that budget.
-PRE_SEND_RETRY_WAIT_S = 20.0
-PRE_SEND_RETRY_LIMIT = 3
-# A busy pre-send wait is logged once, then at most this often.
-BUSY_LOG_INTERVAL_S = 60.0
+# The pre-send readiness policy lives in pi_comm, where EVERY CCB send into a Pi pane reads it.
+# These module-level aliases are the adapter's own knobs (its tests tune them), reseated from
+# one source so the adapter, autonew and the peer transports can never drift apart:
+# a non-idle pre-send reading is re-checked after PRE_SEND_RETRY_WAIT_S, PRE_SEND_RETRY_LIMIT
+# times; a busy pane is waited for without spending that budget, logged at BUSY_LOG_INTERVAL_S.
+from pi_comm import (  # noqa: E402  (imports below the module docstring and stdlib block)
+    BUSY_LOG_INTERVAL_S,
+    PRE_SEND_RETRY_LIMIT,
+    PRE_SEND_RETRY_WAIT_S,
+)
 # A request stopped before injection was never delivered; its reply says so plainly.
 #: The agreed sentence for a request CCB never injected. Shared with the unsent
 #: finalizer so both paths cannot drift apart.
@@ -56,6 +62,20 @@ PROGRESS_POLL_S = 0.25
 
 def _write_log(line: str) -> None:
     write_log(log_path(PI_SPEC.log_file_name), line)
+
+
+class _PreSendStop(Exception):
+    """Ends the readiness wait with a result the per-pass resolver already built.
+
+    The destination, pane and anchor checks decide their own outcome (a failed
+    request, or an ambiguous anchor) and must report it verbatim; raising keeps
+    that verdict out of the shared gate's readiness vocabulary, which only knows
+    ready / refused / cancelled / expired.
+    """
+
+    def __init__(self, result: ProviderResult):
+        super().__init__(str(getattr(result, "reply", "")))
+        self.result = result
 
 
 def _load_destination(req: ProviderRequest) -> tuple[Path | None, dict[str, Any] | None, str]:
@@ -267,36 +287,40 @@ class PiAdapter(BaseProviderAdapter):
             else None
         )
         progress_cap_deadline = worker_cap_deadline
-        retries_left = PRE_SEND_RETRY_LIMIT
-        busy_since: float | None = None
-        busy_logged_at: float | None = None
-        # The whole pre-send sequence re-runs after a wait: /new or a relaunch can change the
-        # binding, the pane and the anchor evidence while we wait for a non-idle pane.
-        while True:
+
+        # Stage 1 of the shared Pi injection gate (pi_comm.wait_until_pi_injectable):
+        # `resolve_binding` proves THIS pass's destination -- the session binding, the pane identity,
+        # and the absence of an existing anchor for this request -- and the gate decides whether the
+        # pane may be typed into. The per-pass resolution is why /new or a relaunch during a long
+        # busy wait is judged fresh instead of against a stale binding.
+        attempt: dict[str, Any] = {}
+
+        def resolve_binding() -> dict[str, Any]:
+            """Prove this pass's destination, or end the request with that pass's own result."""
             _session_path, session, error = _load_destination(req)
             session_key = route_session_key(self.key, req.route) if req.route.present else self.compute_session_key(session)
+            attempt["session_key"] = session_key
             if error or session is None:
-                return self._finish(task, ProviderResult(
+                raise _PreSendStop(self._finish(task, ProviderResult(
                     exit_code=1, reply=error or "Pi session unavailable.", req_id=task.req_id,
                     session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-                ))
-            backend, error = _check_pane(session, work_dir)
-            if error or backend is None:
-                return self._finish(task, ProviderResult(
-                    exit_code=1, reply=error, req_id=task.req_id, session_key=session_key,
+                )))
+            backend, pane_error = _check_pane(session, work_dir)
+            if pane_error or backend is None:
+                raise _PreSendStop(self._finish(task, ProviderResult(
+                    exit_code=1, reply=pane_error, req_id=task.req_id, session_key=session_key,
                     done_seen=False, status=COMPLETION_STATUS_FAILED,
-                ))
-            pane_id = str(session["pane_id"])
-
-            # A cancelled or expired request is never injected. This guard runs on EVERY
-            # pass, including the first idle attempt, so zero sends happen after a stop.
+                )))
+            # A cancelled or expired request is never injected, and this guard runs BEFORE any
+            # transcript or anchor work -- exactly where it sat before the shared gate took over
+            # the readiness loop. It is not merely cosmetic: reading candidates can take real time,
+            # and a request whose caller stopped waiting must not be injected afterwards.
             stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
             if stop is not None:
-                return self._finish(task, stop)
+                raise _PreSendStop(self._finish(task, stop))
 
             session_dir = Path(session["pi_session_dir"]).expanduser()
             bound_session_id = str(session["pi_session_id"])
-            pi_session_id = bound_session_id
             session_cache: dict = {}
             try:
                 candidates = load_candidate_sessions(
@@ -304,10 +328,10 @@ class PiAdapter(BaseProviderAdapter):
                     start_dir=session.get("start_dir"), cache=session_cache,
                 )
             except PiSessionError as exc:
-                return self._finish(task, ProviderResult(
+                raise _PreSendStop(self._finish(task, ProviderResult(
                     exit_code=1, reply=f"Pi session {exc.kind}: {exc}", req_id=task.req_id,
                     session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-                ))
+                ))) from exc
             existing_anchors = [
                 candidate for candidate in candidates
                 if candidate.anchors(task.req_id)
@@ -317,74 +341,21 @@ class PiAdapter(BaseProviderAdapter):
                     len(candidate.anchors(task.req_id)) > 1 for candidate in existing_anchors
                 )
                 reason = f"Pi request anchor is ambiguous for {task.req_id}." if ambiguous else f"Pi request anchor already exists for {task.req_id}."
-                return self._finish(task, ProviderResult(
+                raise _PreSendStop(self._finish(task, ProviderResult(
                     exit_code=2 if ambiguous else 1, reply=reason,
                     req_id=task.req_id, session_key=session_key, done_seen=False,
                     status=COMPLETION_STATUS_INCOMPLETE if ambiguous else COMPLETION_STATUS_FAILED,
-                ))
-
-            pane_state = _confirm_pi_ready(session, deadline)
-            # A3: judge EXPIRY before the readiness VERDICT. The confirmation
-            # above polls (up to ~2 s) and can itself spend the last of the
-            # budget; branching on `stale`/`draft` first would then report a
-            # generic readiness failure for a request whose real outcome is
-            # "CCB stopped waiting and never sent it". A ready pane still wins,
-            # because an accepted read means the request is deliverable.
-            if pane_state.status != "ready":
-                stop = self._pre_send_stop(
-                    task, session_key, deadline, unsent=progress_mode
-                )
-                if stop is not None:
-                    return self._finish(task, stop)
-            if pane_state.status == "ready":
-                break
-            if pane_state.status == "busy":
-                # Busy is not a refusal: Pi may be busy outside CCB's tracking (the user is
-                # typing, or an earlier request is still running past its own wait). Wait for
-                # the pane instead of spending the dialog retry budget, so queued work is
-                # delivered when Pi is free rather than bounced back to the caller.
-                now = time.monotonic()
-                remaining = None if deadline is None else deadline - now
-                if remaining is not None and remaining <= 0:
-                    stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
-                    if stop is not None:
-                        return self._finish(task, stop)
-                    return self._finish(task, ProviderResult(
-                        exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
-                        req_id=task.req_id, session_key=session_key, done_seen=False,
-                        status=COMPLETION_STATUS_INCOMPLETE,
-                    ))
-                if busy_since is None:
-                    busy_since = now
-                if busy_logged_at is None or now - busy_logged_at >= BUSY_LOG_INTERVAL_S:
-                    busy_logged_at = now
-                    _write_log(
-                        f"[INFO] pre-send waiting for busy Pi provider=pi req_id={task.req_id} "
-                        f"waited_s={int(now - busy_since)}"
-                    )
-                # Never wait past the request deadline: the poll is clamped to the budget left.
-                wait_s = PRE_SEND_RETRY_WAIT_S if remaining is None else min(PRE_SEND_RETRY_WAIT_S, remaining)
-                if not _wait_before_retry(task, wait_s):
-                    return self._finish(task, self._not_sent(task, session_key))
-                continue
-            if retries_left <= 0 or (
-                deadline is not None and time.monotonic() + PRE_SEND_RETRY_WAIT_S > deadline
-            ):
-                return self._refuse_state(task, session_key, pane_state)
-            _write_log(
-                f"[INFO] pre-send retry provider=pi req_id={task.req_id} "
-                f"state={pane_state.status} retries_left={retries_left}"
-            )
-            if not _wait_before_retry(task, PRE_SEND_RETRY_WAIT_S):
-                return self._finish(task, self._not_sent(task, session_key))
-            retries_left -= 1
-
-        # The readiness re-check after a wait can itself consume the last of the budget or see a
-        # cancellation; this guard is the LAST step before the policy gate, so nothing is sent
-        # for a stopped request.
-        stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
-        if stop is not None:
-            return self._finish(task, stop)
+                )))
+            attempt.update({
+                "session": session,
+                "backend": backend,
+                "pane_id": str(session["pane_id"]),
+                "session_dir": session_dir,
+                "bound_session_id": bound_session_id,
+                "pi_session_id": bound_session_id,
+                "session_cache": session_cache,
+            })
+            return session
 
         # Phase 3 (E5) + Item 1: the identity/role-policy recheck runs INSIDE
         # the cross-process pane-injection lock, so a revoked permission or a
@@ -393,80 +364,160 @@ class PiAdapter(BaseProviderAdapter):
         from delivery_policy import refusal_for_request
         from pane_lock import PaneLockError, pane_injection_lock
 
-        # A1: bound the lock ACQUISITION.
-        #
-        # PROGRESS MODE ONLY. The wait is min(configured lock timeout, whatever
-        # is left of the worker budget); when no budget is left the lock is not
-        # even attempted and the request ends UNSENT. Every EXPLICIT/legacy
-        # request keeps `pane_lock.default_timeout_s()` exactly as it always
-        # had -- their `deadline` is a turn budget, not a lock budget, and
-        # narrowing it here once made a 3 s configured lock wait look like a
-        # 50 s one (and vice versa).
-        from pane_lock import default_timeout_s as _lock_default_timeout_s
+        gate_policy = PiGatePolicy(
+            retry_wait_s=PRE_SEND_RETRY_WAIT_S,
+            retry_limit=PRE_SEND_RETRY_LIMIT,
+            busy_log_interval_s=BUSY_LOG_INTERVAL_S,
+        )
 
-        if progress_mode:
-            configured_lock_s = _lock_default_timeout_s()
-            remaining_budget_s = (
-                None if deadline is None else deadline - time.monotonic()
-            )
-            if remaining_budget_s is not None and remaining_budget_s <= 0:
-                return self._finish(task, self._not_sent(task, session_key))
-            lock_budget_s: float | None = (
-                configured_lock_s
-                if remaining_budget_s is None
-                else min(configured_lock_s, remaining_budget_s)
-            )
-        else:
-            lock_budget_s = _lock_default_timeout_s()
-
-        try:
-            with pane_injection_lock(backend, pane_id, lock_budget_s):
-                # F2: the lock wait itself can consume the budget (it serialises
-                # every injection into this pane). Re-check expiry HERE, after
-                # the wait and immediately before injection, so a stopped
-                # request is never sent just because the guard ran earlier.
-                stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
-                if stop is not None:
-                    return self._finish(task, stop)
-                refusal = refusal_for_request(
-                    req, self.key, expected_pane=pane_id, session=session
+        while True:
+            try:
+                verdict = wait_until_pi_injectable(
+                    resolve_binding,
+                    deadline,
+                    policy=gate_policy,
+                    confirm=_confirm_pi_ready,
+                    cancel=lambda: bool(task.cancel_event and task.cancel_event.is_set()),
+                    wait=lambda seconds: _wait_before_retry(task, seconds),
+                    log=_write_log,
+                    label="provider=pi",
+                    req_id=task.req_id,
                 )
-                if refusal:
-                    _write_log(
-                        f"[INFO] policy refused provider=pi req_id={task.req_id} reason={refusal}"
-                    )
-                    return self._finish(task, ProviderResult(
-                        exit_code=1, reply=refusal, req_id=task.req_id, session_key=session_key,
-                        done_seen=False, status=COMPLETION_STATUS_FAILED,
-                    ))
-                # ITEM 3: evaluating the policy can itself take time (it reads
-                # the destination session). Re-check expiry ONCE MORE here, the
-                # last possible moment before the keystrokes go out, so a cap
-                # that ran out during the wait or the policy check means ZERO
-                # sends rather than an injected request nobody is waiting for.
+            except _PreSendStop as stopped:
+                return stopped.result
+            session_key = attempt["session_key"]
+            # A3: judge EXPIRY before the readiness VERDICT. The gate's confirmation polls (up to ~2 s)
+            # and can itself spend the last of the budget, and a busy pane's clamped wait can end
+            # exactly on the deadline; a generic readiness failure there would misreport a request
+            # CCB stopped waiting for. A ready pane still wins, because an accepted read means the
+            # request is deliverable.
+            if verdict.outcome == "cancelled":
+                return self._finish(task, self._not_sent(task, session_key))
+            if verdict.outcome == "expired":
                 stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
                 if stop is not None:
                     return self._finish(task, stop)
-                try:
-                    backend.send_text(pane_id, wrap_codex_prompt(req.message, task.req_id))
-                except Exception as exc:
-                    return self._finish(task, ProviderResult(
-                        exit_code=1, reply=f"Failed to send to Pi pane: {exc}", req_id=task.req_id,
-                        session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-                    ))
-        except PaneLockError as exc:
-            # No injection happened: this IS proven non-delivery. When the cap
-            # expired while waiting for the lock, report the explicit unsent
-            # outcome (the agreed Pi sentence) rather than a generic failure.
-            _write_log(
-                f"[WARN] pane injection lock unavailable provider=pi req_id={task.req_id}: {exc}"
-            )
-            if progress_mode and deadline is not None and time.monotonic() >= deadline:
-                return self._finish(task, self._not_sent(task, session_key))
-            return self._finish(task, ProviderResult(
-                exit_code=1, reply=f"Pane injection lock unavailable: {exc}", req_id=task.req_id,
-                session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
-            ))
+                return self._finish(task, ProviderResult(
+                    exit_code=2, reply="Pi request timed out before a terminal CCB_DONE was observed.",
+                    req_id=task.req_id, session_key=session_key,
+                    done_seen=False, status=COMPLETION_STATUS_INCOMPLETE,
+                ))
+            if verdict.outcome != "ready":
+                return self._refuse_state(task, session_key, verdict.state)
+
+            session = attempt["session"]
+            backend = attempt["backend"]
+            pane_id = attempt["pane_id"]
+            session_dir = attempt["session_dir"]
+            bound_session_id = attempt["bound_session_id"]
+            pi_session_id = attempt["pi_session_id"]
+            session_cache = attempt["session_cache"]
+
+            # The readiness re-check after a wait can itself consume the last of the budget or see a
+            # cancellation; this guard is the LAST step before the policy gate, so nothing is sent
+            # for a stopped request.
+            stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
+            if stop is not None:
+                return self._finish(task, stop)
+
+            # A1: bound the lock ACQUISITION.
+            #
+            # PROGRESS MODE ONLY. The wait is min(configured lock timeout, whatever
+            # is left of the worker budget); when no budget is left the lock is not
+            # even attempted and the request ends UNSENT. Every EXPLICIT/legacy
+            # request keeps `pane_lock.default_timeout_s()` exactly as it always
+            # had -- their `deadline` is a turn budget, not a lock budget, and
+            # narrowing it here once made a 3 s configured lock wait look like a
+            # 50 s one (and vice versa).
+            from pane_lock import default_timeout_s as _lock_default_timeout_s
+
+            if progress_mode:
+                configured_lock_s = _lock_default_timeout_s()
+                remaining_budget_s = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining_budget_s is not None and remaining_budget_s <= 0:
+                    return self._finish(task, self._not_sent(task, session_key))
+                lock_budget_s: float | None = (
+                    configured_lock_s
+                    if remaining_budget_s is None
+                    else min(configured_lock_s, remaining_budget_s)
+                )
+            else:
+                lock_budget_s = _lock_default_timeout_s()
+
+            retry_after_lock = False
+            try:
+                with pane_injection_lock(backend, pane_id, lock_budget_s):
+                    # F2: the lock wait itself can consume the budget (it serialises
+                    # every injection into this pane). Re-check expiry HERE, after
+                    # the wait and immediately before injection, so a stopped
+                    # request is never sent just because the guard ran earlier.
+                    stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
+                    if stop is not None:
+                        return self._finish(task, stop)
+                    refusal = refusal_for_request(
+                        req, self.key, expected_pane=pane_id, session=session
+                    )
+                    if refusal:
+                        _write_log(
+                            f"[INFO] policy refused provider=pi req_id={task.req_id} reason={refusal}"
+                        )
+                        return self._finish(task, ProviderResult(
+                            exit_code=1, reply=refusal, req_id=task.req_id, session_key=session_key,
+                            done_seen=False, status=COMPLETION_STATUS_FAILED,
+                        ))
+                    # ITEM 3: evaluating the policy can itself take time (it reads
+                    # the destination session). Re-check expiry ONCE MORE here, the
+                    # last possible moment before the keystrokes go out, so a cap
+                    # that ran out during the wait or the policy check means ZERO
+                    # sends rather than an injected request nobody is waiting for.
+                    stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
+                    if stop is not None:
+                        return self._finish(task, stop)
+                    # Stage 2 of the shared gate (A4): a FRESH readiness confirmation runs
+                    # INSIDE the lock, immediately before the keystrokes. Another sender (or the
+                    # user) can start Pi between the wait outside the lock and this moment; a
+                    # paste then would steer that turn or merge with that draft. A not-ready
+                    # verdict releases the lock and resumes waiting inside the same budget --
+                    # this pane is never pasted into while it is not ready.
+                    fresh = _confirm_pi_ready(session, deadline)
+                    if fresh.status != "ready":
+                        _write_log(
+                            f"[INFO] pre-send re-confirm after lock provider=pi "
+                            f"req_id={task.req_id} state={fresh.status}"
+                        )
+                        retry_after_lock = True
+                    else:
+                        # F3: the confirmation polls for up to ~2 s, so cancellation and expiry are
+                        # judged ONE more time immediately before the keystrokes go out.
+                        stop = self._pre_send_stop(task, session_key, deadline, unsent=progress_mode)
+                        if stop is not None:
+                            return self._finish(task, stop)
+                        try:
+                            backend.send_text(pane_id, wrap_codex_prompt(req.message, task.req_id))
+                        except Exception as exc:
+                            return self._finish(task, ProviderResult(
+                                exit_code=1, reply=f"Failed to send to Pi pane: {exc}", req_id=task.req_id,
+                                session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+                            ))
+            except PaneLockError as exc:
+                # No injection happened: this IS proven non-delivery. When the cap
+                # expired while waiting for the lock, report the explicit unsent
+                # outcome (the agreed Pi sentence) rather than a generic failure.
+                _write_log(
+                    f"[WARN] pane injection lock unavailable provider=pi req_id={task.req_id}: {exc}"
+                )
+                if progress_mode and deadline is not None and time.monotonic() >= deadline:
+                    return self._finish(task, self._not_sent(task, session_key))
+                return self._finish(task, ProviderResult(
+                    exit_code=1, reply=f"Pane injection lock unavailable: {exc}", req_id=task.req_id,
+                    session_key=session_key, done_seen=False, status=COMPLETION_STATUS_FAILED,
+                ))
+            if retry_after_lock:
+                continue
+            break
+
         anchor_deadline = time.monotonic() + ANCHOR_TIMEOUT_S
 
         parked_at: float | None = None

@@ -37,7 +37,9 @@ process can't see the answer itself.
 """
 from __future__ import annotations
 
+import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -428,6 +430,232 @@ def revalidate_peer_destination(destination) -> DestinationResolution:
     return DestinationResolution()
 
 
+def _write_peer_log(line: str) -> None:
+    """Busy-wait and retry lines for a peer delivery: the Pi provider's own log file."""
+    from askd_runtime import log_path, write_log
+    from providers import PI_SPEC
+
+    write_log(log_path(PI_SPEC.log_file_name), line)
+
+
+def _pi_peer_delivery_deadline(task) -> float | None:
+    """The sender's OWN finite budget for one Pi peer delivery, as a monotonic deadline.
+
+    The budget is the request's own timeout, counted from when the task was created, so queue time,
+    the readiness wait and the lock wait all spend the same money -- a delivery can never outlive the
+    caller's wait. An unlimited request (`timeout_s < 0`) still gets `PI_PEER_DELIVERY_MAX_S`: a Pi
+    pane that never becomes injectable must not hold a peer task for ever (A3).
+    """
+    from pi_comm import PI_PEER_DELIVERY_MAX_S
+
+    request = task.request
+    try:
+        budget_s = float(request.timeout_s)
+    except (TypeError, ValueError):
+        budget_s = -1.0
+    if not math.isfinite(budget_s):
+        # A NaN/inf budget can never expire: refuse instead of inventing one.
+        return None
+    if budget_s < 0:
+        budget_s = PI_PEER_DELIVERY_MAX_S
+    created_ms = int(getattr(task, "created_ms", 0) or 0)
+    elapsed_s = max(0.0, time.time() - created_ms / 1000.0) if created_ms else 0.0
+    return time.monotonic() + max(0.0, budget_s - elapsed_s)
+
+
+def _send_pi_peer_message(task, session_key: str):
+    """Deliver one peer message into a Pi pane: the shared gate, then the lock, then the paste.
+
+    Pi cannot queue typed input: a paste while it works becomes a steering message mid-turn, and a
+    paste into a non-empty editor merges with the draft. So this path applies, in this order:
+
+    1. the destination project's OWN Pi binding, corroborated against the selected live session
+       (pane, terminal, launch) -- no binding, or any disagreement, refuses with zero sends;
+    2. the pane incarnation a reply was captured for (tmux pid, or WezTerm launch/state evidence);
+    3. `wait_until_pi_injectable` OUTSIDE the lock, inside the sender's own finite budget;
+    4. the lock, a FRESH `confirm_pi_ready`, the destination revalidation and the role policy --
+       a not-ready verdict releases the lock and resumes waiting, and never pastes.
+
+    Delivery confirmation stays `sent`: Pi has no transcript anchor reader, so a peer delivery is
+    complete once the message reached the pane (`provider_log_reader` is untouched).
+    """
+    from askd.adapters.base import ProviderResult
+    from ccb_protocol import wrap_pi_delivery_prompt
+    from completion_hook import COMPLETION_STATUS_FAILED
+    from pane_lock import PaneLockError, default_timeout_s, pane_injection_lock
+    from pi_comm import (
+        BUSY_LOG_INTERVAL_S,
+        PRE_SEND_RETRY_LIMIT,
+        PRE_SEND_RETRY_WAIT_S,
+        PiGatePolicy,
+        confirm_pi_ready,
+        peer_pi_destination_binding,
+        pi_incarnation_problem,
+        wait_until_pi_injectable,
+    )
+    from terminal import get_backend_for_session
+
+    request = task.request
+    destination = request.peer_destination
+    if not request.delivery_only or request.route.present:
+        raise ValueError("peer destinations require a delivery-only Pi request")
+
+    def cancelled() -> bool:
+        return bool(task.cancelled or (task.cancel_event and task.cancel_event.is_set()))
+
+    def failed(reply: str, status: str = COMPLETION_STATUS_FAILED):
+        return ProviderResult(exit_code=1, reply=reply, req_id=task.req_id, session_key=session_key,
+                              done_seen=False, status=status)
+
+    if cancelled():
+        return ProviderResult(exit_code=2, reply="Peer delivery cancelled.", req_id=task.req_id,
+                              session_key=session_key, done_seen=False, status="cancelled")
+
+    binding, error = peer_pi_destination_binding(
+        destination.work_dir,
+        pane_id=destination.pane_id,
+        terminal=destination.terminal,
+        launch_id=destination.launch_id,
+    )
+    if error or binding is None:
+        return failed(f"Peer Pi destination unavailable ({error or 'no Pi binding'}).")
+    backend = get_backend_for_session({"terminal": destination.terminal})
+    if backend is None:
+        return failed("Peer destination terminal backend is unavailable.")
+    # The incarnation witness (F1) is required for EVERY Pi destination, in both directions: a
+    # forward send's pid is captured host-side before queueing, a reply's comes from the original
+    # receipt. Here it is checked once to fail early -- and again inside the lock, because a pane
+    # respawned in place keeps its id, its binding and often its launch token.
+    problem = pi_incarnation_problem(
+        backend,
+        binding,
+        pane_id=destination.pane_id,
+        terminal=destination.terminal,
+        recorded_pane_pid=destination.pane_pid,
+        recorded_launch_token=destination.launch_token,
+    )
+    if problem:
+        return failed(f"Peer Pi destination is not the pane that was selected ({problem}).")
+
+    prompt = request.message if request.no_wrap else wrap_pi_delivery_prompt(request.message, task.req_id)
+    deadline = _pi_peer_delivery_deadline(task)
+    if deadline is None:
+        return failed("Peer Pi delivery has a non-finite timeout; refusing to deliver.")
+
+    from contextlib import ExitStack
+
+    while True:
+        verdict = wait_until_pi_injectable(
+            lambda: binding,
+            deadline,
+            # Resolved from pi_comm's own defaults at call time (not bound into the
+            # dataclass), so one place tunes the wait for every Pi peer delivery.
+            policy=PiGatePolicy(
+                retry_wait_s=PRE_SEND_RETRY_WAIT_S,
+                retry_limit=PRE_SEND_RETRY_LIMIT,
+                busy_log_interval_s=BUSY_LOG_INTERVAL_S,
+            ),
+            cancel=cancelled,
+            log=_write_peer_log,
+            label="provider=pi peer",
+            req_id=task.req_id,
+        )
+        if verdict.outcome == "cancelled":
+            return ProviderResult(exit_code=2, reply="Peer delivery cancelled.", req_id=task.req_id,
+                                  session_key=session_key, done_seen=False, status="cancelled")
+        if verdict.outcome == "expired":
+            return failed("Peer Pi delivery timed out before Pi was ready; nothing was sent.")
+        if not verdict.ready:
+            state = verdict.state
+            return failed(f"Peer Pi destination is not injectable (state: {state.status}; {state.reason}); nothing was sent.")
+
+        # F3: an exhausted budget refuses BEFORE the lock is even attempted, so nothing can be
+        # pasted for a caller that already stopped waiting.
+        if cancelled():
+            return ProviderResult(exit_code=2, reply="Peer delivery cancelled.", req_id=task.req_id,
+                                  session_key=session_key, done_seen=False, status="cancelled")
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            return failed("Peer Pi delivery timed out before Pi was ready; nothing was sent.")
+        lock_budget_s: float | None = min(default_timeout_s(), remaining_s)
+        with ExitStack() as stack:
+            # ONLY the acquisition is a proven zero-send refusal. Anything a PaneLockError raised
+            # later (inside the body) means the lock WAS held and the send may have started, so it
+            # must reach the caller as an exception (a remote record becomes `outcome-unknown`).
+            try:
+                stack.enter_context(pane_injection_lock(backend, destination.pane_id, lock_budget_s))
+            except PaneLockError as exc:
+                return failed(f"Pane injection lock unavailable: {exc}")
+            if cancelled():
+                return ProviderResult(exit_code=2, reply="Peer delivery cancelled.", req_id=task.req_id,
+                                      session_key=session_key, done_seen=False, status="cancelled")
+            if time.monotonic() >= deadline:
+                return failed("Peer Pi delivery timed out before Pi was ready; nothing was sent.")
+
+            # G1: the ORDER inside the lock is the safety property here, not any single check.
+            #
+            # 1. Revalidate the endpoint and apply the role policy. Both can take real time (the
+            #    policy module reads the destination launch), and they must judge the endpoint this
+            #    send resolved.
+            outcome = revalidate_peer_destination(destination)
+            if not outcome.ok:
+                return failed(f"Peer destination unavailable ({outcome.error}).", status="failed")
+            from delivery_policy import refusal_for_request
+
+            refusal = refusal_for_request(request, "pi", expected_pane=destination.pane_id)
+            if refusal:
+                return failed(refusal)
+
+            # 2. Reload the binding AFTER those checks: the readiness file, or the binding itself,
+            #    can have been switched while they ran.
+            lock_binding, lock_error = peer_pi_destination_binding(
+                destination.work_dir,
+                pane_id=destination.pane_id,
+                terminal=destination.terminal,
+                launch_id=destination.launch_id,
+            )
+            if lock_error or lock_binding is None:
+                return failed(
+                    f"Peer Pi destination changed while waiting ({lock_error or 'no Pi binding'})."
+                )
+            # 3. Confirm readiness against THE BINDING WE WOULD SEND WITH -- the reloaded one, not
+            #    the pre-lock copy. Not ready: release the lock and resume the outer wait against
+            #    the refreshed binding, still inside the original deadline; never paste.
+            fresh = confirm_pi_ready(lock_binding, deadline)
+            if fresh.status != "ready":
+                _write_peer_log(
+                    f"[INFO] peer delivery re-confirm after lock provider=pi req_id={task.req_id} "
+                    f"state={fresh.status}"
+                )
+                binding = lock_binding
+                continue
+            # 4. The saved process witness, versus that same reloaded binding and a fresh ready
+            #    snapshot. Nothing slow runs between here and the paste.
+            problem = pi_incarnation_problem(
+                backend,
+                lock_binding,
+                pane_id=destination.pane_id,
+                terminal=destination.terminal,
+                recorded_pane_pid=destination.pane_pid,
+                recorded_launch_token=destination.launch_token,
+                require_ready=True,
+            )
+            if problem:
+                return failed(f"Peer Pi destination changed while waiting ({problem}).")
+            binding = lock_binding
+            # 5. Cancellation and expiry, last.
+            if cancelled():
+                return ProviderResult(exit_code=2, reply="Peer delivery cancelled.", req_id=task.req_id,
+                                      session_key=session_key, done_seen=False, status="cancelled")
+            if time.monotonic() >= deadline:
+                return failed("Peer Pi delivery timed out before Pi was ready; nothing was sent.")
+            # 6. Paste.
+            backend.send_text(destination.pane_id, prompt)
+        return ProviderResult(exit_code=0, reply="Peer message accepted.", req_id=task.req_id,
+                              session_key=session_key, done_seen=False, status="completed",
+                              extra={"confirmation": "sent"})
+
+
 def send_peer_message(task, provider: str, session_key: str, *, before_dispatch=None):
     """Send a queued delivery-only message to its exact saved endpoint.
 
@@ -440,7 +668,32 @@ def send_peer_message(task, provider: str, session_key: str, *, before_dispatch=
     immediately before `send_text`; T2's remote dispatch uses it to durably
     commit `dispatch-in-progress`. If it raises, nothing is sent (proven
     non-delivery) and the caller may record `failed`.
+
+    Pi is the exception to "paste and go": a Pi pane cannot queue typed input, so
+    `_send_pi_peer_message` runs the shared readiness gate outside the lock and confirms
+    again inside it. A Pi delivery rejects `before_dispatch` outright (phase 1 has no Pi
+    dispatch hook); the Claude/Codex paths are byte-for-byte what they were.
     """
+    if provider == "pi":
+        if before_dispatch is not None:
+            # H1: a Pi peer delivery has no dispatch hook in phase 1. The hook exists for the
+            # remote journal's durable commit, and Pi's remote path (with its journal + send
+            # ordering) is phase 2. Refuse BEFORE any readiness wait, lock or paste -- a caller
+            # that expects a commit it will never get must hear "nothing was sent", and the
+            # callback must not run at all.
+            from askd.adapters.base import ProviderResult as _ProviderResult
+            from completion_hook import COMPLETION_STATUS_FAILED as _FAILED
+
+            return _ProviderResult(
+                exit_code=1,
+                reply="Pi peer delivery has no dispatch hook in this phase; nothing was sent.",
+                req_id=task.req_id,
+                session_key=session_key,
+                done_seen=False,
+                status=_FAILED,
+            )
+        return _send_pi_peer_message(task, session_key)
+
     from askd.adapters.base import ProviderResult
     from ccb_protocol import wrap_codex_delivery_prompt
     from completion_hook import COMPLETION_STATUS_FAILED

@@ -50,6 +50,27 @@ def caller_session_id() -> str:
     return (os.environ.get("CCB_SESSION_ID") or "").strip()
 
 
+def _pi_caller_witness(work_dir: Path, terminal: str, pane_id: str) -> dict[str, str]:
+    """The INCARNATION witness a Pi caller records as its return address, or {} when unprovable.
+
+    Captured NOW, at submission, from the caller's own verified binding: on tmux that is the pane
+    process, on WezTerm the Pi process that published the snapshot plus its launch token. The reply
+    route compares it under the pane lock, so a pane replaced in between cannot inherit the answer.
+    A failure records NO witness -- the reply then refuses instead of pasting into a substitute.
+    """
+    if not terminal or not pane_id:
+        return {}
+    try:
+        from pi_comm import pi_incarnation_witness
+
+        witness, _reason = pi_incarnation_witness(
+            work_dir, pane_id=pane_id, terminal=terminal
+        )
+    except Exception:
+        return {}
+    return witness if witness.get("pane_pid") else {}
+
+
 def _identity_fields_from_route(route: Optional[ResolvedRoute]) -> dict[str, Any]:
     """The exact-identity block Task 1 adds to a receipt, additively.
 
@@ -163,8 +184,21 @@ def new_peer_receipt(
 
     pane_id = str(receipt.get("caller_pane_id") or "").strip()
     project_id = str(receipt.get("ccb_project_id") or "").strip()
-    if not pane_id or not project_id or caller not in {"claude", "codex"}:
+    if not pane_id or not project_id or caller not in {"claude", "codex", "pi"}:
         return receipt
+
+    if caller == "pi":
+        # A Pi caller's return address also carries the PROCESS witness, so a replacement
+        # pane can never inherit this task's answer: both local reply routes re-check it
+        # inside the pane lock, immediately before the paste. Recorded once here, at
+        # submission, from the caller's own verified binding.
+        witness = _pi_caller_witness(
+            Path(str(receipt.get("work_dir") or "")),
+            str(receipt.get("caller_terminal") or "").strip().lower(),
+            pane_id,
+        )
+        receipt["caller_pane_pid"] = witness.get("pane_pid", "")
+        receipt["caller_pi_launch_token"] = witness.get("launch_token", "")
 
     # Inventory topology is authoritative, including an empty or broken
     # inventory. Never invent a provider-wide return marker for a pair.

@@ -948,6 +948,26 @@ hermes_role_skills_base() {
   printf '%s/.hermes%s' "${HOME:-}" "${HERMES_DATA_DIR_SUFFIX:-}"
 }
 
+# Pi-only CCB skills (not role skills). They ship to Pi's skills home from the
+# same step that installs Pi's role skills, and are removed by the same uninstall.
+CCB_PI_SKILLS="peer-ask"
+
+install_pi_skill_set() {
+  local skills_dst="$1"
+  local skills_src="$REPO_ROOT/pi_skills"
+  local skill skill_dir
+
+  [[ -d "$skills_src" ]] || return 0
+  for skill in $CCB_PI_SKILLS; do
+    skill_dir="$skills_src/$skill"
+    [[ -f "$skill_dir/SKILL.md" ]] || continue
+    mkdir -p "$skills_dst/$skill" || continue
+    cp -f "$skill_dir/SKILL.md" "$skills_dst/$skill/SKILL.md"
+    chmod 0644 "$skills_dst/$skill/SKILL.md" 2>/dev/null || true
+    echo "  Installed pi skill: $skill"
+  done
+}
+
 install_role_skills() {
   local roles_src="$REPO_ROOT/role_skills"
 
@@ -960,6 +980,7 @@ install_role_skills() {
   local pi_base="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
   if [[ -n "${PI_CODING_AGENT_DIR:-}" || -d "$pi_base" ]]; then
     install_role_skill_set pi "$pi_base/skills"
+    install_pi_skill_set "$pi_base/skills"
   fi
 
   local opencode_base="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
@@ -978,6 +999,19 @@ install_role_skills() {
       install_role_skill_set hermes "$hermes_base/skills"
     fi
   fi
+}
+
+uninstall_pi_skill_set() {
+  local skills_dst="$1"
+  local skill
+
+  [[ -d "$skills_dst" ]] || return 0
+  for skill in $CCB_PI_SKILLS; do
+    if [[ -d "$skills_dst/$skill" ]]; then
+      rm -rf "$skills_dst/$skill"
+      echo "  Removed CCB pi skill: $skills_dst/$skill"
+    fi
+  done
 }
 
 uninstall_role_skills() {
@@ -1001,6 +1035,9 @@ uninstall_role_skills() {
       fi
     done
   done
+  # Pi-only skills live in Pi's own home ONLY: a same-named directory in another
+  # provider's skills root was never installed by CCB and must survive.
+  uninstall_pi_skill_set "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/skills"
 }
 
 overlay_path_is_inside() {

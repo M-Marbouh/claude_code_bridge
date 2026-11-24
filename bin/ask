@@ -133,7 +133,10 @@ PROVIDER_DAEMONS = {
     "pi": "",
 }
 
-PEER_PROVIDERS = {"claude", "codex"}
+# Providers a cross-project peer message may be addressed to. Pi is here for LOCAL peer messaging
+# only: it is reached when NAMED (`ask pi --peer ...`), never by default -- bare `ask --peer` still
+# selects Claude, and `ccb-list`'s `peer_capable` keeps its Claude-first meaning.
+PEER_PROVIDERS = {"claude", "codex", "pi"}
 
 CALLER_SESSION_FILES = {
     "claude": ".claude-session",
@@ -1246,6 +1249,9 @@ def _active_sender_records(candidate: Path, caller: str) -> list[RegistryProvide
         return []
 
     if caller in PEER_PROVIDERS:
+        # Claude, Codex and Pi: a peer sender is pinned to its OWN provider's records, so a
+        # sibling pane of another provider can never stand in for it. Pi is in this set now
+        # (a Pi session can send a peer request), and needs no separate branch.
         records = [record for record in records if record.provider == caller]
     return records
 
@@ -1303,6 +1309,8 @@ def _sender_candidate_evidence(candidate: Path, caller: str) -> _SenderCandidate
 
 
 def _sender_pane_conflicts(evidence: _SenderCandidateEvidence, caller: str) -> bool:
+    # Same three peer senders as `_active_sender_records`: a record that names a DIFFERENT pane
+    # than the caller's own is a conflict for Pi exactly as it is for Claude and Codex.
     if caller not in PEER_PROVIDERS or not evidence.valid:
         return False
     pane_id, _terminal = _peer_caller_pane_info()
@@ -1947,20 +1955,23 @@ def _run_peer_bridge(
         )
         return EXIT_ERROR
     caller = _require_caller()
-    # Pi is now a local caller, but it has no peer identity: refuse it here, on
-    # the one path both peer syntaxes (`ask --peer T`, `ask P --peer T`) take,
-    # before any project lookup, task receipt or bridge dispatch. Every other
-    # caller keeps the behaviour it had before Pi could call at all.
-    if caller == "pi":
-        print(
-            "[ERROR] Peer messaging is not available from a Pi session; "
-            "start the request from a Claude or Codex pane.",
-            file=sys.stderr,
-        )
-        return EXIT_ERROR
+    # Pi is a local peer SENDER like Claude and Codex: its receipt records the return pane (and the
+    # pane process), and a reply lands back in that pane through the shared Pi gate. It has no
+    # cross-machine identity yet, so the remote branch below refuses it on its own terms.
     if "::" in (peer_target or ""):
         # Cross-machine: a new, separate path. A target with "::" never falls
         # back to local peer lookup, so a typo cannot deliver to a local pane.
+        #
+        # Pi peer messaging is LOCAL only in this phase (F2): a Pi caller has no cross-machine
+        # identity yet, and a Pi destination provider is refused by `_remote_peer_refusal`. Both
+        # checks happen before any remote dispatch, so nothing is submitted and no receipt written.
+        if caller == "pi":
+            print(
+                "[ERROR] Cross-machine delivery is not available from a Pi session yet; "
+                "use a Claude or Codex pane.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
         return _run_remote_peer(
             peer_target,
             peer_provider,

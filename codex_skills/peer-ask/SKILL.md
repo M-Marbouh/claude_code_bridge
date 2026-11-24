@@ -122,7 +122,8 @@ EOF
 
 ## Notes
 
-- Supported peer targets are Claude and Codex. Gemini and OpenCode remain same-project only.
+- Supported peer targets are Claude, Codex, and (local only, when named) Pi: `ask pi --peer <work_dir>`.
+  Bare `ask --peer` still selects Claude. Gemini and OpenCode remain same-project only.
 - Multiple live sessions are an unresolved ambiguity, not an unconditional refusal: an exact current
   session selection may use `--live-id`.
 - Claude and Codex peer messages are delivery-only; replies are explicit reverse peer messages.

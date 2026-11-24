@@ -38,7 +38,10 @@ from session_utils import find_project_session_file
 setup_windows_encoding()
 
 SUPPORTED_PROVIDERS = ("claude", "codex", "gemini", "opencode", "hermes", "pi")
-PEER_PROVIDERS = ("claude", "codex")
+# Providers a peer message may be addressed to. Pi is a LOCAL peer target only, and only when named
+# (`ask pi --peer ...`): `peer_capable` below keeps its Claude-first meaning, so it never becomes a
+# default destination.
+PEER_PROVIDERS = ("claude", "codex", "pi")
 SESSION_FILENAMES = {provider: f".{provider}-session" for provider in SUPPORTED_PROVIDERS}
 
 

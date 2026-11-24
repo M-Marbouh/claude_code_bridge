@@ -179,7 +179,8 @@ User: "Ask Claude in project 3 about the current task"
 
 ## Notes
 
-- Claude and Codex panes are supported. Gemini and OpenCode are not peer targets.
+- Claude, Codex, and (local only, when named) Pi panes are supported peer targets: `ask pi --peer <work_dir>`.
+  Bare `ask --peer` still selects Claude. Gemini and OpenCode are not peer targets.
 - If the requested provider is not mounted, report the error and show the live provider options.
 - Multiple live sessions are an unresolved ambiguity, not an unconditional refusal: an exact current
   selection may use `--live-id`.

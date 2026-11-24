@@ -4,6 +4,7 @@ Unified Ask Daemon - Single daemon for all AI providers.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import subprocess
@@ -101,6 +102,24 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
 
     def _handle_task(self, task: QueuedTask) -> ProviderResult:
         request = task.request
+        if request.peer_delivery and self.adapter.key == "pi" and not request.peer_destination.present:
+            # A5, second checkpoint: a Pi peer delivery without a verified endpoint is refused
+            # here too, so no path can fall through to the ordinary Pi adapter / CCB_DONE capture.
+            _write_log(
+                f"[WARN] refused peer delivery provider=pi req_id={task.req_id} "
+                "reason=no verified endpoint"
+            )
+            return ProviderResult(
+                exit_code=1,
+                reply=(
+                    "Pi peer delivery needs a verified live Pi pane; this request carries no "
+                    "endpoint identity, so nothing was sent."
+                ),
+                req_id=task.req_id,
+                session_key=self.session_key,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
         if request.peer_destination.present:
             # Checkpoint B (Item 1): re-confirm the saved peer destination
             # immediately before the actual send -- at ENQUEUE time
@@ -172,6 +191,78 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
                 owner=getattr(task, "remote_owner", ""),
             )
         return self.adapter.handle_exception(exc, task)
+
+
+def _pi_peer_destination_witness(request, destination):
+    """The Pi peer destination to queue, with its incarnation witness captured before queueing.
+
+    Returns `(destination, reason)`. A REPLY keeps the witness its original receipt recorded and is
+    refused when the receipt has none -- re-reading it here would adopt a replacement pane. A
+    forward request is captured now, from a fresh verified read, and refused when no trustworthy
+    witness exists (F1: a Pi destination without one is never pasted into).
+    """
+    import dataclasses
+
+    from pi_comm import pi_incarnation_witness
+
+    is_reply = bool(request.reply_to) or str(request.kind or "").strip().lower() == "reply"
+    if destination.pane_pid or destination.launch_token:
+        return destination, ""
+    if is_reply:
+        return destination, "the original receipt recorded no Pi process witness"
+    witness, error = pi_incarnation_witness(
+        destination.work_dir,
+        pane_id=destination.pane_id,
+        terminal=destination.terminal,
+        launch_id=destination.launch_id,
+    )
+    if error or not witness:
+        return destination, error or "no Pi process witness could be captured"
+    return dataclasses.replace(destination, **witness), ""
+
+
+#: The daemon waits for a queued request for its timeout PLUS this allowance (`_progress_budgets`,
+#: and the post-claim wait), so a timeout this close to `threading.TIMEOUT_MAX` cannot be waited for.
+DAEMON_WAIT_ALLOWANCE_S = 5.0
+
+
+def _pi_peer_timeout_problem(raw) -> str:
+    """Why a Pi peer delivery's `timeout_s` cannot be honoured, else "" (G3).
+
+    A MISSING value keeps the historical 300 s default. A present one must be a real, strictly
+    positive, finite number the daemon can actually wait for: the delivery budgets its queue wait,
+    its readiness wait and its lock wait from it, so `0`, NaN and infinity can neither expire nor be
+    honoured, and Pi has no unlimited peer budget. (A negative value still means "use
+    `PI_PEER_DELIVERY_MAX_S`".)
+
+    The upper bound is `threading.TIMEOUT_MAX`: the daemon's own wait for the queue phase is the
+    request's timeout plus its five-second allowance (`_progress_budgets`), and a longer
+    `Event.wait` raises `OverflowError` in the waiting thread instead of waiting.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str) and not raw.strip():
+        return ""
+    if isinstance(raw, bool):
+        return "Pi peer delivery needs a numeric timeout, not a boolean."
+    try:
+        value = float(raw)
+    except OverflowError:
+        # e.g. 10**400: a JSON integer too large for a float, so certainly too large to wait for.
+        return "Pi peer delivery needs a timeout the daemon can wait for; nothing was sent."
+    except (TypeError, ValueError):
+        return f"Pi peer delivery needs a numeric timeout, not {raw!r}."
+    if not math.isfinite(value):
+        return "Pi peer delivery needs a finite timeout; nothing was sent."
+    if value == 0:
+        return "Pi peer delivery needs a positive timeout; nothing was sent."
+    wait_limit = getattr(threading, "TIMEOUT_MAX", 0.0)
+    if value > 0 and wait_limit and value + DAEMON_WAIT_ALLOWANCE_S > wait_limit:
+        return (
+            "Pi peer delivery needs a timeout the daemon can wait for "
+            f"(at most {wait_limit - DAEMON_WAIT_ALLOWANCE_S:.0f}s); nothing was sent."
+        )
+    return ""
 
 
 class _UnifiedWorkerPool:
@@ -288,6 +379,26 @@ class _UnifiedWorkerPool:
                     return task
             if request.peer_destination.present:
                 destination = request.peer_destination
+                if provider == "pi":
+                    # F1: a Pi destination's INCARNATION witness is captured HERE, host-side and
+                    # BEFORE queueing, so it is settled before any queue/lock wait and a caller that
+                    # cannot read the terminal itself (a sandboxed Codex pane) still routes. A reply
+                    # already carries the witness its receipt recorded; filling it here would adopt
+                    # whatever pane exists now, which is exactly the substitution to refuse.
+                    destination, reason = _pi_peer_destination_witness(request, destination)
+                    if reason:
+                        task.refused_before_queue = True
+                        task.result = ProviderResult(
+                            exit_code=1,
+                            reply=f"Pi peer destination cannot be bound ({reason}).",
+                            req_id=req_id,
+                            session_key=f"{provider}:peer:{request.peer_destination.pane_id}",
+                            done_seen=False,
+                            status=COMPLETION_STATUS_FAILED,
+                        )
+                        task.done_event.set()
+                        return task
+                    request.peer_destination = destination
                 session_key = "peer:" + json.dumps(
                     [provider, destination.terminal, destination.pane_id, destination.pane_title_marker]
                 )
@@ -359,17 +470,19 @@ def _progress_budgets(
     )
     if progress_budget and provider == "pi":
         max_wait = positive_timeout_s(request.max_wait_s, provider_max_wait_s(provider))
-        return True, max_wait, max_wait + 5.0
+        return True, max_wait, max_wait + DAEMON_WAIT_ALLOWANCE_S
     if progress_budget:
         # Codex/Hermes: one budget, unchanged.
         return False, None, positive_timeout_s(
             request.max_wait_s, provider_max_wait_s(provider)
-        ) + 5.0
+        ) + DAEMON_WAIT_ALLOWANCE_S
     # Explicit timeout / legacy client / non-progress provider: ONE wall clock.
     return (
         False,
         None,
-        None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0),
+        None
+        if float(request.timeout_s) < 0.0
+        else (float(request.timeout_s) + DAEMON_WAIT_ALLOWANCE_S),
     )
 
 
@@ -545,6 +658,27 @@ class UnifiedAskDaemon:
                     msg.get("max_wait_s"), provider_max_wait_s(provider)
                 )
 
+        peer_delivery = _request_bool(msg.get("peer_delivery"))
+        if peer_delivery and provider == "pi":
+            # G3: the historical `float(msg.get("timeout_s") or 300.0)` turns a NUMERIC 0 into the
+            # default, so a Pi peer delivery could be queued with a budget nobody asked for. Pi
+            # peer deliveries are judged here, at the real ingress, before anything is queued.
+            timeout_problem = _pi_peer_timeout_problem(msg.get("timeout_s"))
+            if timeout_problem:
+                _write_log(
+                    f"[WARN] refused peer delivery provider=pi req_id={msg.get('req_id') or '-'} "
+                    f"reason={timeout_problem}"
+                )
+                return {
+                    "type": "ask.response",
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "req_id": str(msg.get("req_id") or ""),
+                    "exit_code": 1,
+                    "reply": timeout_problem,
+                    "accepted": False,
+                }
+
         try:
             request = ProviderRequest(
                 client_id=str(msg.get("id") or ""),
@@ -575,6 +709,7 @@ class UnifiedAskDaemon:
                 sender_member_id=sender_member_id,
                 sender_member_token=sender_member_token,
                 reply_to=reply_to,
+                peer_delivery=peer_delivery,
             )
         except Exception as exc:
             return {
@@ -583,6 +718,28 @@ class UnifiedAskDaemon:
                 "id": msg.get("id"),
                 "exit_code": 1,
                 "reply": f"Bad request: {exc}",
+            }
+
+        # A5: fail closed. A Pi peer delivery with no verified destination endpoint must never be
+        # enqueued -- it would reach the ordinary Pi adapter, paste into whatever pane the
+        # destination project happens to bind, and arm CCB_DONE capture for a message nobody is
+        # waiting on. `peer_delivery` is the bridge's own claim; `peer_destination` is the proof.
+        if request.peer_delivery and provider == "pi" and not request.peer_destination.present:
+            _write_log(
+                f"[WARN] refused peer delivery provider=pi req_id={request.req_id or '-'} "
+                "reason=no verified endpoint"
+            )
+            return {
+                "type": "ask.response",
+                "v": 1,
+                "id": request.client_id,
+                "req_id": request.req_id or "",
+                "exit_code": 1,
+                "reply": (
+                    "Pi peer delivery needs a verified live Pi pane; this request carries no "
+                    "endpoint identity, so nothing was sent."
+                ),
+                "accepted": False,
             }
 
         # Role delivery policy (Phase 3): the accept gate. Evaluated BEFORE
@@ -701,7 +858,7 @@ class UnifiedAskDaemon:
                     f"req_id={task.req_id} remaining_s={int(max(0.0, remaining_turn))}"
                 )
                 if remaining_turn > 0:
-                    task.done_event.wait(timeout=remaining_turn + 5.0)
+                    task.done_event.wait(timeout=remaining_turn + DAEMON_WAIT_ALLOWANCE_S)
                     result = task.result
 
         # If timeout occurred and task is still running, mark it as cancelled. A task the
@@ -732,7 +889,7 @@ class UnifiedAskDaemon:
             # have got from a receipt -- never an empty reply.
             result = finalize_unsent(
                 task, provider,
-                budget_s=(wait_timeout - 5.0) if wait_timeout is not None else None,
+                budget_s=(wait_timeout - DAEMON_WAIT_ALLOWANCE_S) if wait_timeout is not None else None,
             )
         elif result is None and not getattr(task, "started", False):
             # Finished with no result and never claimed by a worker: the same

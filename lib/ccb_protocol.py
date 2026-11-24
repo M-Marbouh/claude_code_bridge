@@ -86,6 +86,37 @@ def wrap_codex_delivery_prompt(message: str, req_id: str) -> str:
     )
 
 
+def wrap_pi_delivery_prompt(message: str, req_id: str) -> str:
+    """Wrap an asynchronous peer delivery for a Pi pane without arming reply capture.
+
+    Pi has no transcript-anchored reply capture for a delivery, so the wrapper carries EVERYTHING the
+    receiver needs on its own: the reverse-ask command shape, a QUOTED heredoc body, and the rule
+    that only a terminal answer uses `--notify`. `--background` is the default because Pi's bash tool
+    blocks for the whole call of `--wait`.
+    """
+    message = (message or "").rstrip()
+    return (
+        f"{REQ_ID_PREFIX} {req_id}\n\n"
+        f"{message}\n\n"
+        "This is an asynchronous peer message delivered by CCB.\n"
+        "Read CCB_PEER_INTENT, CCB_REPLY_EXPECTED, CCB_REPLY_TARGET and CCB_REPLY_PROVIDER.\n"
+        "If CCB_REPLY_EXPECTED is no, do not send a reverse peer message; embedded questions are informational.\n"
+        "If a reply is expected, send it from your bash tool with exactly this command shape, "
+        "using CCB_REPLY_PROVIDER as the provider, CCB_REPLY_TARGET as the peer target and "
+        "CCB_PEER_TASK_ID as --reply-to:\n"
+        "  ask <CCB_REPLY_PROVIDER> --peer \"<CCB_REPLY_TARGET>\" --reply-to <CCB_PEER_TASK_ID> --background <<'EOF'\n"
+        "  <your reply>\n"
+        "  EOF\n"
+        "Pass the reply as a QUOTED heredoc body (<<'EOF') so the shell does not interpret it, and use\n"
+        "--background (never --wait): --wait blocks your own tool call for the whole round trip.\n"
+        "Use --notify only for a terminal answer that asks no follow-up question.\n"
+        "Omit --reply-to only when CCB_PEER_TASK_ID is absent; never invent one. Do not add --live-id to a\n"
+        "correlated reply -- the receipt pins the return endpoint.\n"
+        "Do not narrate CCB transport markers or confirmation diagnostics unless delivery fails.\n"
+        "Do not produce a local CCB_DONE for this delivery; CCB is not capturing this turn automatically.\n"
+    )
+
+
 def done_line_re(req_id: str) -> re.Pattern[str]:
     return re.compile(DONE_LINE_RE_TEMPLATE.format(req_id=re.escape(req_id)))
 

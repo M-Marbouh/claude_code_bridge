@@ -350,8 +350,9 @@ def test_completed_reply_strips_trailing_done_marker(monkeypatch, tmp_path: Path
 
     backend.send_text = accept
     # Readiness holds for the send; the follow-up reads find no reporting extension, which must
-    # not stop the transcript from delivering the completion.
-    _script_states(monkeypatch, [READY, READY, ABSENT])
+    # not stop the transcript from delivering the completion. Four ready reads cover the gate's
+    # wait and the in-lock confirmation that precedes every send (A4).
+    _script_states(monkeypatch, [READY, READY, READY, READY, ABSENT])
     monkeypatch.setattr("askd.adapters.pi._load_destination", lambda _req: (tmp_path / ".pi-session", binding, ""))
     monkeypatch.setattr("askd.adapters.pi._check_pane", lambda *_args: (backend, ""))
     monkeypatch.setattr("askd.adapters.pi.time.monotonic", count(0.1, 0.01).__next__)
@@ -559,6 +560,8 @@ def test_unchanged_candidate_session_is_parsed_once_across_polls(monkeypatch, tm
     _script_states(monkeypatch, [
         READY,
         READY,
+        READY,
+        READY,
         ABSENT, ABSENT,
         READY,
         READY,
@@ -579,6 +582,8 @@ def test_dialog_after_anchor_deadline_fails_with_dialog_message(monkeypatch, tmp
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
     _script_states(monkeypatch, [
+        READY,
+        READY,
         READY,
         READY,
         PROMPT,
@@ -657,6 +662,8 @@ def test_busy_then_idle_without_anchor_reports_unlocated_activity(monkeypatch, t
     _script_states(monkeypatch, [
         READY,
         READY,
+        READY,
+        READY,
         BUSY,
         READY,
         READY,
@@ -677,7 +684,7 @@ def test_unknown_state_after_anchor_deadline_allows_late_completion(monkeypatch,
     session_dir.mkdir()
     binding = _binding(tmp_path, session_dir, "8a18f4e0-1b8f-4d3b-8588-c741a703bc75")
     backend = FakeBackend()
-    _script_states(monkeypatch, [READY, READY, ABSENT, ABSENT])
+    _script_states(monkeypatch, [READY, READY, READY, READY, ABSENT, ABSENT])
     adapter, _ = _adapter_with_real_binding(monkeypatch, tmp_path, session_dir, binding, backend)
     original_find = __import__("pi_comm").load_candidate_sessions
     calls = count()
@@ -713,8 +720,10 @@ def test_completion_landing_during_deadline_confirmation_is_delivered(monkeypatc
 
     def confirm(*_args, **_kwargs) -> PiState:
         confirms["calls"] += 1
-        # The anchored completion is persisted while the deadline readiness check confirms.
-        if confirms["calls"] == 2 and backend.sent and not target.exists():
+        # The anchored completion is persisted while the deadline readiness check confirms. The
+        # third confirmation is that one: the gate's wait, the in-lock one that precedes the send
+        # (A4), then the anchor-deadline re-check after the paste.
+        if confirms["calls"] == 3 and backend.sent and not target.exists():
             content = source.read_text(encoding="utf-8").replace("<SCRATCH>/work", str(tmp_path), 1).replace("s8-b", req_id)
             target.write_text(content, encoding="utf-8")
         return READY
@@ -730,7 +739,7 @@ def test_completion_landing_during_deadline_confirmation_is_delivered(monkeypatc
     result = adapter.handle_task(_task(tmp_path, req_id, timeout_s=60))
     assert result.exit_code == 0
     assert result.status == "completed"
-    assert confirms["calls"] == 2
+    assert confirms["calls"] == 3
     assert len(backend.sent) == 1
 
 

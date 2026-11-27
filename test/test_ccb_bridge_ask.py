@@ -42,7 +42,11 @@ def test_bridge_lock_remains_exclusive_in_writable_task_dir(tmp_path: Path, monk
 
     first_handle, first_fcntl = bridge._acquire_lock("abcd1234", "claude")
     try:
-        with pytest.raises(RuntimeError, match="target provider is busy"):
+        # F2: a Claude/Codex hold is still an instant refusal, with no retry estimate.
+        with pytest.raises(
+            RuntimeError,
+            match="another delivery to abcd1234 claude is in progress; nothing was sent",
+        ):
             bridge._acquire_lock("abcd1234", "claude")
     finally:
         first_fcntl.flock(first_handle.fileno(), first_fcntl.LOCK_UN)
@@ -466,7 +470,7 @@ class _DirectBackend:
 def test_wezterm_direct_reply_accepts_dynamic_application_title(monkeypatch, tmp_path: Path) -> None:
     bridge = _load_bridge_module()
     backend = _DirectBackend("2")
-    backend.find_pane_by_title_marker = lambda _marker, _work_dir: None
+    backend.find_pane_by_title_marker = lambda _marker, _work_dir: ""
     monkeypatch.setattr(bridge, "get_backend_for_session", lambda _session: backend)
     receipt = {
         "caller_pane_id": "2",
@@ -889,7 +893,7 @@ def test_direct_reply_revalidates_after_lock(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setattr(bridge, "get_backend_for_session", lambda _: backend)
 
     def acquire(*_):
-        backend.pane_matches_cwd_strict = lambda *_: False
+        backend.pane_matches_cwd_strict = lambda pane_id, _work_dir: False
         return _Lock(), _Fcntl()
 
     monkeypatch.setattr(bridge, "_acquire_lock", acquire)
@@ -920,7 +924,7 @@ def test_reverse_reply_rejects_reused_pane_but_preserves_result(
         "status_file": str(status_file),
     }
     backend = _DirectBackend()
-    backend.pane_matches_cwd_strict = lambda _pane, _work_dir: False
+    backend.pane_matches_cwd_strict = lambda pane_id, _work_dir: False
 
     monkeypatch.setattr(bridge, "find_receipt", lambda _task: (tmp_path / "receipt.json", receipt))
     monkeypatch.setattr(bridge, "_load_targets", lambda: [])

@@ -344,6 +344,7 @@ def _peer_task(
     kind: str = "request",
     message: str = "check the parser",
     reply_to: str = "",
+    paste_deadline_s: float | None = None,
 ) -> QueuedTask:
     request = ProviderRequest(
         client_id="peer",
@@ -355,6 +356,7 @@ def _peer_task(
         delivery_only=True,
         kind=kind,
         reply_to=reply_to,
+        paste_deadline_s=paste_deadline_s,
         peer_destination=PeerDestination(
             pane_id=pane.pane_id,
             terminal=pane.terminal,

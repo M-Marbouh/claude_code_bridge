@@ -296,6 +296,12 @@ class ProviderRequest:
     #: inferring it from `delivery_only`, which a LOCAL one-way notify also sets. Inert for every
     #: provider except Pi, whose peer delivery fails closed (A5).
     peer_delivery: bool = False
+    #: The ABSOLUTE wall-clock instant (epoch seconds) after which a Pi peer delivery may no longer
+    #: START a paste (A1). Fixed by `bin/ccb-bridge-ask` at ITS start and carried through the
+    #: daemon, so daemon discovery, the preflight and askd's own queue/wait can never stretch the
+    #: caller's deadline. `None` for every request that does not carry one -- including every
+    #: Claude/Codex request and every older client, whose relative `timeout_s` keeps its meaning.
+    paste_deadline_s: float | None = None
 
 
 @dataclass

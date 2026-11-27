@@ -445,6 +445,11 @@ def _pi_peer_delivery_deadline(task) -> float | None:
     the readiness wait and the lock wait all spend the same money -- a delivery can never outlive the
     caller's wait. An unlimited request (`timeout_s < 0`) still gets `PI_PEER_DELIVERY_MAX_S`: a Pi
     pane that never becomes injectable must not hold a peer task for ever (A3).
+
+    A1: when the request also carries the bridge's ABSOLUTE paste-start deadline
+    (`paste_deadline_s`, wall clock), the EARLIER of the two governs. The relative budget restarts
+    here at task creation, so on its own it could outlive a caller whose own deadline passed while
+    the request was discovered, preflighted and queued.
     """
     from pi_comm import PI_PEER_DELIVERY_MAX_S
 
@@ -460,7 +465,13 @@ def _pi_peer_delivery_deadline(task) -> float | None:
         budget_s = PI_PEER_DELIVERY_MAX_S
     created_ms = int(getattr(task, "created_ms", 0) or 0)
     elapsed_s = max(0.0, time.time() - created_ms / 1000.0) if created_ms else 0.0
-    return time.monotonic() + max(0.0, budget_s - elapsed_s)
+    deadline = time.monotonic() + max(0.0, budget_s - elapsed_s)
+    absolute_s = getattr(request, "paste_deadline_s", None)
+    if absolute_s is not None:
+        # Same instant, expressed in this process's monotonic clock, then the earlier-of rule.
+        absolute_deadline = time.monotonic() + max(0.0, float(absolute_s) - time.time())
+        deadline = min(deadline, absolute_deadline)
+    return deadline
 
 
 def _send_pi_peer_message(task, session_key: str):

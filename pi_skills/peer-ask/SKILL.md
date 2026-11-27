@@ -48,6 +48,21 @@ EOF
 
 Do not acknowledge a peer message ("Got it", "Thanks"). Send the completed result, once.
 
+## When a Reply Does Not Go Out
+
+- `[RECOVERABLE] Reply saved for task <id>; the sender can run pend <id>`: the reply is already
+  saved. The **original requester** recovers it with `pend <id>`; the replier does **not** resend
+  it. Repeating `ask ... --reply-to` only reproduces the same failure -- retrying in a loop is
+  never the answer.
+- `another delivery to <hash> pi is still waiting for that Pi; nothing was sent`: CCB already
+  waited its turn behind an earlier delivery to that Pi, and the wait ran out. Do not send it
+  again -- report that the delivery timed out and stop.
+- `another delivery to <hash> <claude|codex> is in progress; nothing was sent`: a Claude or Codex
+  pane refuses at once while another delivery to it is being made (those take seconds). Nothing
+  was sent; send once more after a short pause, never in a loop.
+- Long bodies go on stdin, as in the heredoc above. There is **no `-f`/`--file` option**: an
+  argument like `-f /tmp/reply.md` is sent as literal message text.
+
 ## Send a Peer Request
 
 ### 1. Discover targets

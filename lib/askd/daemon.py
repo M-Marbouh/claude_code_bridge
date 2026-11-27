@@ -265,6 +265,39 @@ def _pi_peer_timeout_problem(raw) -> str:
     return ""
 
 
+def _pi_peer_paste_deadline(raw) -> tuple[float | None, str]:
+    """The absolute paste-start deadline a Pi peer delivery carried, and why it is unusable (A1).
+
+    `bin/ccb-bridge-ask` fixes this instant at ITS start and sends it alongside the remaining
+    relative `timeout_s`; askd refuses a paste that would START after it. It is optional -- an
+    older bridge sends none and keeps the relative-only behaviour -- but a present one must be a
+    real, strictly positive, finite number, never a boolean.
+
+    There is deliberately NO `threading.TIMEOUT_MAX` bound here: that bound belongs to a DURATION
+    this daemon has to wait for, and it is already enforced on the relative `timeout_s`. As an
+    epoch, a perfectly valid deadline can legitimately exceed `TIMEOUT_MAX` (a request just under
+    the limit plus today's wall clock does), so comparing the two would refuse valid deliveries.
+    """
+    if raw is None:
+        return None, ""
+    if isinstance(raw, str) and not raw.strip():
+        return None, ""
+    if isinstance(raw, bool):
+        return None, "Pi peer delivery needs a numeric paste deadline, not a boolean."
+    try:
+        value = float(raw)
+    except OverflowError:
+        # e.g. 10**400: a JSON integer too large for a float, so certainly not an instant.
+        return None, "Pi peer delivery needs a paste deadline the daemon can read; nothing was sent."
+    except (TypeError, ValueError):
+        return None, f"Pi peer delivery needs a numeric paste deadline, not {raw!r}."
+    if not math.isfinite(value):
+        return None, "Pi peer delivery needs a finite paste deadline; nothing was sent."
+    if value <= 0:
+        return None, "Pi peer delivery needs a positive paste deadline; nothing was sent."
+    return value, ""
+
+
 class _UnifiedWorkerPool:
     """Worker pool that routes tasks to provider-specific workers."""
 
@@ -659,6 +692,7 @@ class UnifiedAskDaemon:
                 )
 
         peer_delivery = _request_bool(msg.get("peer_delivery"))
+        paste_deadline_s: float | None = None
         if peer_delivery and provider == "pi":
             # G3: the historical `float(msg.get("timeout_s") or 300.0)` turns a NUMERIC 0 into the
             # default, so a Pi peer delivery could be queued with a budget nobody asked for. Pi
@@ -676,6 +710,22 @@ class UnifiedAskDaemon:
                     "req_id": str(msg.get("req_id") or ""),
                     "exit_code": 1,
                     "reply": timeout_problem,
+                    "accepted": False,
+                }
+            # A1: the optional ABSOLUTE paste-start deadline is judged the same way, here.
+            paste_deadline_s, deadline_problem = _pi_peer_paste_deadline(msg.get("paste_deadline"))
+            if deadline_problem:
+                _write_log(
+                    f"[WARN] refused peer delivery provider=pi req_id={msg.get('req_id') or '-'} "
+                    f"reason={deadline_problem}"
+                )
+                return {
+                    "type": "ask.response",
+                    "v": 1,
+                    "id": msg.get("id"),
+                    "req_id": str(msg.get("req_id") or ""),
+                    "exit_code": 1,
+                    "reply": deadline_problem,
                     "accepted": False,
                 }
 
@@ -710,6 +760,7 @@ class UnifiedAskDaemon:
                 sender_member_token=sender_member_token,
                 reply_to=reply_to,
                 peer_delivery=peer_delivery,
+                paste_deadline_s=paste_deadline_s,
             )
         except Exception as exc:
             return {

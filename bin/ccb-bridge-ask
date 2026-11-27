@@ -569,6 +569,7 @@ def _deliver_pi_direct_reply(
     timeout: float,
     caller: str,
     to_role: str = "",
+    deadline: float | None = None,
 ) -> tuple[int, str, dict[str, Any]]:
     """Paste a correlated peer reply into a Pi caller's pane: gate, lock, confirm, send.
 
@@ -637,7 +638,10 @@ def _deliver_pi_direct_reply(
         raise RuntimeError("Pi peer reply delivery has a non-finite timeout; nothing was sent")
     if budget_s < 0:
         budget_s = PI_PEER_DELIVERY_MAX_S
-    deadline = time.monotonic() + budget_s
+    own_deadline = time.monotonic() + budget_s
+    # A1: the bridge's absolute paste-start deadline, fixed at bridge start, is the LAST instant a
+    # paste may start. `timeout` is only what remains of it, so neither can be extended here.
+    deadline = own_deadline if deadline is None else min(deadline, own_deadline)
     if deadline <= time.monotonic():
         raise RuntimeError("Pi peer reply delivery has no time budget; nothing was sent")
 
@@ -738,7 +742,19 @@ def _write_correlated_status(receipt: dict[str, Any], line: str) -> None:
         pass
 
 
-def _acquire_lock(target_hash: str, provider: str):
+#: How often a waiting Pi delivery re-tries the bridge lock.
+BRIDGE_LOCK_POLL_S = 0.5
+
+
+def _acquire_lock(target_hash: str, provider: str, *, wait_until: float | None = None):
+    """Take the per-target bridge lock, or refuse with nothing sent.
+
+    A Claude/Codex delivery holds this lock only briefly, so a contended caller refuses at once
+    (F2). A Pi delivery can hold it for a whole readiness wait (the 2026-11-27 incident), so a
+    contended Pi caller WAITS for it instead: it polls `LOCK_NB` and never runs past its OWN
+    deadline (`wait_until`, monotonic). Whatever that wait costs is then spent from the same
+    budget by the delivery the lock guards (A1).
+    """
     try:
         import fcntl
     except Exception as exc:
@@ -757,12 +773,59 @@ def _acquire_lock(target_hash: str, provider: str):
             file=sys.stderr,
         )
         return None, fcntl
-    try:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        lock_handle.close()
-        raise RuntimeError(f"target provider is busy: {target_hash[:8]} {provider}") from exc
-    return lock_handle, fcntl
+    while True:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            if wait_until is None:
+                lock_handle.close()
+                raise RuntimeError(
+                    f"another delivery to {target_hash[:8]} {provider} is in progress; "
+                    "nothing was sent"
+                ) from exc
+            remaining_s = wait_until - time.monotonic()
+            if remaining_s <= 0:
+                lock_handle.close()
+                raise RuntimeError(
+                    f"another delivery to {target_hash[:8]} {provider} is still waiting for "
+                    "that Pi; nothing was sent"
+                ) from exc
+            time.sleep(min(BRIDGE_LOCK_POLL_S, remaining_s))
+            continue
+        return lock_handle, fcntl
+
+
+def _pi_paste_deadline(timeout: float, started_mono: float, started_epoch: float) -> tuple[float, float]:
+    """The ONE paste-start deadline for this Pi delivery: (monotonic, wall clock).
+
+    Fixed at bridge start (`started_mono` / `started_epoch`, recorded in `main()` right after the
+    arguments are parsed) from the request's own parsed timeout, after the same normalisation the
+    delivery paths use (F3, A1): a non-finite or zero budget is refused BEFORE any lock, and a
+    negative one keeps its historical meaning (`PI_PEER_DELIVERY_MAX_S`). Both numbers name the
+    same instant, so the local waits compare against the monotonic one and the daemon receives
+    the wall-clock one.
+    """
+    from pi_comm import PI_PEER_DELIVERY_MAX_S
+
+    budget_s = float(timeout)
+    if not math.isfinite(budget_s):
+        raise RuntimeError("Pi peer reply delivery has a non-finite timeout; nothing was sent")
+    if budget_s < 0:
+        budget_s = PI_PEER_DELIVERY_MAX_S
+    if budget_s <= 0:
+        raise RuntimeError("Pi peer reply delivery has no time budget; nothing was sent")
+    return started_mono + budget_s, started_epoch + budget_s
+
+
+PI_PASTE_DEADLINE_REFUSAL = (
+    "Pi peer reply delivery reached its paste deadline before submission; nothing was sent"
+)
+
+
+def _refuse_expired_paste_deadline(deadline: float | None) -> None:
+    """A1: after the deadline no paste may START -- refuse before anything is submitted."""
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RuntimeError(PI_PASTE_DEADLINE_REFUSAL)
 
 
 DAEMON_CAPABILITY_REFUSAL = (
@@ -853,6 +916,7 @@ def _send_to_daemon(
     to_role: str = "",
     peer_pane_id: str = "",
     peer_project_id: str = "",
+    paste_deadline: float | None = None,
 ) -> tuple[int, str, dict[str, Any]]:
     state_file = find_running_state_file(
         "askd.json",
@@ -908,6 +972,13 @@ def _send_to_daemon(
         # delivery with no verified endpoint (A5) without guessing from `delivery_only`, which a
         # local one-way notify also sets; a Claude/Codex envelope stays exactly as it was.
         req["peer_delivery"] = True
+        if paste_deadline is not None:
+            # A1: the ABSOLUTE wall-clock deadline at which a paste may no longer start. The
+            # relative `timeout_s` above is what remains of the same budget; this field is what
+            # survives daemon discovery, the preflight and askd's own wait, so neither side can
+            # stretch the caller's deadline. An older askd ignores it (residual overrun bounded
+            # by the preflight time) instead of failing the delivery.
+            req["paste_deadline"] = paste_deadline
     sender_member_id, sender_member_token = _sender_credential()
     if sender_member_id and sender_member_token:
         req["sender_member_id"] = sender_member_id
@@ -943,6 +1014,11 @@ def _send_to_daemon(
         refusal = _capability_preflight(state, req)
         if refusal:
             raise RuntimeError(refusal)
+
+    if provider == "pi" and paste_deadline is not None and time.time() >= paste_deadline:
+        # A1: the preflight above is real work and may have spent the whole budget. Re-check the
+        # absolute deadline IMMEDIATELY before submission: an expired one submits nothing.
+        raise RuntimeError(PI_PASTE_DEADLINE_REFUSAL)
 
     try:
         resp = askd_rpc.request_daemon(
@@ -1051,6 +1127,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*", help="Message to send. Reads stdin when omitted.")
     args = parser.parse_args(argv)
+    # A1: the request's deadline starts HERE, when the bridge start is decided -- not after receipt
+    # handling, target discovery and destination validation, which are real work and must spend
+    # the caller's budget like everything else. Both clocks name the same instant.
+    started_mono = time.monotonic()
+    started_epoch = time.time()
 
     message = " ".join(args.message).strip()
     if not message and not sys.stdin.isatty():
@@ -1238,8 +1319,33 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         target_hash = str(target.get("ccb_project_id") or "")
-        lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
+        # A1: ONE absolute paste-start deadline, counted from the bridge's own start (recorded
+        # above), so discovery and preflight cannot extend it. Zero and a non-finite value are
+        # refused here, inside the try, so a reply still reports itself recoverable.
+        paste_deadline: float | None = None
+        paste_deadline_epoch: float | None = None
+        if args.provider == "pi":
+            paste_deadline, paste_deadline_epoch = _pi_paste_deadline(
+                float(args.timeout or 0), started_mono, started_epoch
+            )
+            # Nothing is queued for a caller that already stopped waiting: with the deadline
+            # counted from bridge start, discovery alone can have spent the whole budget.
+            _refuse_expired_paste_deadline(paste_deadline)
+            lock_handle, fcntl_mod = _acquire_lock(
+                target_hash, args.provider, wait_until=paste_deadline
+            )
+        else:
+            # Claude/Codex keep the instant refusal: their holds are short (F2 wording only).
+            lock_handle, fcntl_mod = _acquire_lock(target_hash, args.provider)
         try:
+            # A1: acquiring the lock may have spent the whole budget. Re-check the absolute
+            # deadline before anything is submitted, and give the delivery only what is left.
+            _refuse_expired_paste_deadline(paste_deadline)
+            delivery_timeout = (
+                args.timeout
+                if paste_deadline is None
+                else paste_deadline - time.monotonic()
+            )
             if direct_backend is not None and args.provider == "pi":
                 # A Pi pane cannot queue typed input, so its reply is delivered through the
                 # shared Pi gate, which owns the lock ordering itself (wait outside, confirm
@@ -1253,9 +1359,10 @@ def main(argv: list[str] | None = None) -> int:
                     intent=str(args.intent or "wait"),
                     peer_task_id=str(args.peer_task_id or ""),
                     reply_to=str(args.reply_to or ""),
-                    timeout=float(args.timeout or 0),
+                    timeout=delivery_timeout,
                     caller=str(args.caller or "claude"),
                     to_role=to_role,
+                    deadline=paste_deadline,
                 )
             elif direct_backend is not None:
                 # Item 1/A6: this path bypasses the daemon, so it takes the
@@ -1305,7 +1412,7 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code, reply, meta = _send_to_daemon(
                     target,
                     message,
-                    args.timeout,
+                    delivery_timeout,
                     str(args.caller_pane_id or ""),
                     str(args.caller_terminal or ""),
                     str(args.sender_work_dir or ""),
@@ -1320,6 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
                         ((target.get("providers") or {}).get(args.provider) or {}).get("pane_id") or ""
                     ),
                     peer_project_id=str(target.get("ccb_project_id") or ""),
+                    paste_deadline=paste_deadline_epoch,
                 )
         finally:
             if lock_handle is not None:

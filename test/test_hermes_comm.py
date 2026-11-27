@@ -1,3 +1,7 @@
+# This repo puts lib/ on sys.path at runtime (test/conftest.py) and ships no pyright
+# configuration, so the workspace-rooted analyzer cannot see these flat imports.
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import importlib.machinery
@@ -22,14 +26,16 @@ from ccb_protocol import append_trailing_notice, split_done_text
 _check_pane = hermes_adapter_module._check_pane
 
 
-def _db(path: Path, *, version: int = 30) -> sqlite3.Connection:
+def _db(path: Path, *, version: int = 30, omit: tuple[str, ...] = ()) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     schema_31 = """
         , auto_archived INTEGER DEFAULT 0
     """ if version >= 31 else ""
-    message_identity_columns = """
-            , message_uid TEXT, absorbed_message_uids TEXT, tool_call_uids TEXT, tool_call_uid TEXT
-    """ if version >= 31 else ""
+    message_identity_columns = "".join(
+        f", {column} TEXT"
+        for column in ("message_uid", "absorbed_message_uids", "tool_call_uids", "tool_call_uid")
+        if version >= 31 and column not in omit
+    )
     conn.executescript(
         f"""
         CREATE TABLE schema_version(version INTEGER NOT NULL);
@@ -384,16 +390,196 @@ def test_wrong_workdir_anchor_and_unsupported_schema_fail_closed(tmp_path: Path)
     conn = _db(bad_db, version=29)
     conn.commit()
     conn.close()
-    with pytest.raises(HermesStateError, match="schema version"):
+    with pytest.raises(HermesStateError, match="schema version") as old_error:
         read_exchange(bad_db, tmp_path, "req")  # negative: unsupported schema is an error, not no-reply
+    assert old_error.value.kind == "incompatible"
 
-    newer_db = tmp_path / "newer.db"
-    conn = _db(newer_db, version=32)
+
+@pytest.mark.parametrize("version", [32, 33])
+def test_tested_newer_schema_versions_read_anchored_exchange(tmp_path: Path, version: int) -> None:
+    db = tmp_path / f"v{version}.db"
+    conn = _db(db, version=version)
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "req")
+    _done(conn, "s1", "req")
     conn.commit()
     conn.close()
-    with pytest.raises(HermesStateError, match="schema version 32") as error:
-        read_exchange(newer_db, tmp_path, "req")
+
+    exchange = read_exchange(db, tmp_path, "req")
+    assert exchange is not None
+    assert exchange.reply("req") == "Answer"
+
+
+def test_untested_newer_schema_reads_and_warns_once(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=34)
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "req")
+    _done(conn, "s1", "req")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(hermes_comm, "_WARNED_UNTESTED_VERSIONS", set())
+
+    exchange = read_exchange(db, tmp_path, "req")
+    assert exchange is not None
+    assert exchange.reply("req") == "Answer"
+    read_exchange(db, tmp_path, "req")
+    warnings = [
+        line for line in capsys.readouterr().err.splitlines()
+        if "newer than tested 33" in line
+    ]
+    assert len(warnings) == 1  # negative: the read path warns once per DB and version
+
+    status = hermes_comm.verify_schema_version(db)
+    assert status.version == 34 and not status.tested
+
+
+def test_untested_newer_schema_missing_required_column_still_fails_closed(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=34, omit=("message_uid",))
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "req")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(HermesStateError, match="message_uid") as error:
+        read_exchange(db, tmp_path, "req")
+    assert error.value.kind == "incompatible"  # negative: a newer number never waives the shape check
+
+
+def test_schema_31_columns_are_checked_above_version_31(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=33, omit=("absorbed_message_uids",))
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "req")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(HermesStateError, match="absorbed_message_uids") as error:
+        read_exchange(db, tmp_path, "req")
     assert error.value.kind == "incompatible"
+
+
+def test_unrelated_group_table_does_not_break_schema_check(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=34)
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "group")
+    _done(conn, "s1", "group")
+    conn.execute('CREATE TABLE "group"(id INTEGER)')
+    conn.commit()
+    conn.close()
+
+    exchange = read_exchange(db, tmp_path, "group")
+    assert exchange is not None
+    assert exchange.reply("group") == "Answer"  # negative: an unrelated table name is never inspected
+
+
+def test_missing_messages_table_fails_closed(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=33)
+    _session(conn, "s1", tmp_path)
+    conn.execute("DROP TABLE messages")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(HermesStateError, match="lacks messages columns") as error:
+        read_exchange(db, tmp_path, "req")
+    assert error.value.kind == "incompatible"
+
+
+def test_ping_names_an_untested_schema(tmp_path: Path, monkeypatch) -> None:
+    from terminal import TmuxBackend
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    session = {"active": True, "pane_id": "%1", "terminal": "tmux", "hermes_home": str(home)}
+    monkeypatch.setattr(
+        hermes_comm, "load_session_file",
+        lambda *_args, **_kwargs: (tmp_path / ".hermes-session", session),
+    )
+    monkeypatch.setattr(TmuxBackend, "is_alive", lambda self, _pane: True)
+
+    def ping_for(version: int) -> tuple[bool, str]:
+        db = home / "state.db"
+        db.unlink(missing_ok=True)
+        conn = _db(db, version=version)
+        conn.commit()
+        conn.close()
+        return hermes_comm.HermesCommunicator().ping()
+
+    assert ping_for(33) == (True, "Hermes pane and state DB OK")
+    ok, message = ping_for(34)
+    assert ok
+    assert message == (
+        "Hermes pane and state DB OK (schema 34 is newer than tested 33; reply capture unverified)"
+    )
+
+
+_LENOVO_MESSAGES_COLUMNS = [
+    "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
+    "effect_disposition", "timestamp", "token_count", "finish_reason", "reasoning",
+    "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
+    "platform_message_id", "observed", "active", "compacted", "api_content", "display_kind",
+    "display_metadata", "_compressed_summary", "display_identity", "display_order", "message_uid",
+    "absorbed_message_uids", "tool_call_uids", "tool_call_uid",
+]
+_LENOVO_SESSIONS_COLUMNS = [
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type", "thread_id", "display_name",
+    "origin_json", "expiry_finalized", "model", "model_config", "system_prompt",
+    "system_prompt_hash", "parent_session_id", "started_at", "ended_at", "end_reason",
+    "message_count", "tool_call_count", "input_tokens", "output_tokens", "cache_read_tokens",
+    "cache_write_tokens", "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "billing_provider", "billing_base_url", "billing_mode", "estimated_cost_usd",
+    "actual_cost_usd", "cost_status", "cost_source", "pricing_version", "title", "title_source",
+    "last_activity_at", "last_activity_description", "last_activity_provenance", "api_call_count",
+    "handoff_state", "handoff_platform", "handoff_error", "compression_failure_cooldown_until",
+    "compression_failure_error", "compression_fallback_streak", "compression_ineffective_count",
+    "profile_name", "rewind_count", "archived", "pinned", "last_read_at",
+    "git_metadata_generation", "hidden", "compression_recovery_deadline", "tool_names",
+    "transport_profile", "created_source", "compression_overload_streak", "auto_archived",
+    "runtime_revision", "runtime_generation", "transcript_revision", "prompt_cache_clock",
+]
+
+
+def _lenovo_v33_db(path: Path) -> sqlite3.Connection:
+    """Build the exact live Lenovo v33 column shape (schema.sqlite, 2026-11-23)."""
+    conn = sqlite3.connect(path)
+    messages = ", ".join(
+        "id INTEGER PRIMARY KEY" if column == "id"
+        else "_compressed_summary INTEGER DEFAULT 0" if column == "_compressed_summary"
+        else f"{column} TEXT"
+        for column in _LENOVO_MESSAGES_COLUMNS
+    )
+    sessions = ", ".join(
+        "id TEXT PRIMARY KEY" if column == "id" else f"{column} TEXT"
+        for column in _LENOVO_SESSIONS_COLUMNS
+    )
+    conn.executescript(
+        f"""
+        CREATE TABLE schema_version(version INTEGER NOT NULL);
+        CREATE TABLE sessions({sessions});
+        CREATE TABLE messages({messages});
+        """
+    )
+    conn.execute("INSERT INTO schema_version(version) VALUES (33)")
+    return conn
+
+
+def test_live_lenovo_v33_shape_reads_an_anchored_exchange(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    conn = _lenovo_v33_db(db)
+    _session(conn, "s1", tmp_path)
+    _anchor(conn, "s1", "lenovo")
+    _done(conn, "s1", "lenovo")
+    conn.commit()
+    conn.close()
+
+    exchange = read_exchange(db, tmp_path, "lenovo")
+    assert exchange is not None
+    assert exchange.reply("lenovo") == "Answer"
 
 
 def test_queued_prompt_anchor_survives_accept_and_drain_replacement(tmp_path: Path) -> None:
@@ -459,6 +645,7 @@ def test_session_home_binding_and_exact_pend_recovery(tmp_path: Path, monkeypatc
     source = Path(__file__).resolve().parents[1] / "bin" / "pend"
     loader = importlib.machinery.SourceFileLoader("pend_for_hermes_test", str(source))
     spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
     pend = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(pend)
@@ -498,6 +685,46 @@ def test_busy_database_is_retried_and_reported_as_busy(tmp_path: Path, monkeypat
         with pytest.raises(HermesStateError) as error:
             read_exchange(db, tmp_path, "req")
         assert error.value.kind == "busy"  # negative: contention cannot be mistaken for an absent anchor
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_verify_schema_version_retries_brief_busy(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=33)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(hermes_comm, "BUSY_RETRIES", 2)
+    monkeypatch.setattr(hermes_comm, "BUSY_RETRY_DELAY_S", 0)
+    real_verify = hermes_comm._verify_schema
+    attempts: list[int] = []
+
+    def flaky(conn, db_path=None):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise HermesStateError("busy", "locked")
+        return real_verify(conn, db_path)
+
+    monkeypatch.setattr(hermes_comm, "_verify_schema", flaky)
+
+    status = hermes_comm.verify_schema_version(db)
+
+    assert status.version == 33 and status.tested
+    assert len(attempts) == 2  # negative: one brief lock is retried, never surfaced as a failed send
+
+
+def test_verify_schema_version_reports_persistent_busy(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=33)
+    conn.commit()
+    monkeypatch.setattr(hermes_comm, "BUSY_RETRIES", 2)
+    monkeypatch.setattr(hermes_comm, "BUSY_RETRY_DELAY_S", 0)
+    conn.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(HermesStateError) as error:
+            hermes_comm.verify_schema_version(db)
+        assert error.value.kind == "busy"  # negative: exhaustion is still reported as contention
     finally:
         conn.rollback()
         conn.close()
@@ -668,10 +895,134 @@ def test_incompatible_database_early_failure_is_persisted_and_notified(monkeypat
     assert len(notifications) == 1 and notifications[0]["status"] == "failed"
 
 
+def test_untested_schema_no_reply_names_the_version(tmp_path: Path, monkeypatch, capsys) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=34)
+    _session(conn, "s1", tmp_path)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(hermes_comm, "_WARNED_UNTESTED_VERSIONS", set())
+    backend = SimpleNamespace(
+        send_text=lambda *_args: None, find_pane_by_title_marker=lambda *_args: "%1",
+    )
+    _configure_adapter(monkeypatch, tmp_path, db, backend)
+    monkeypatch.setattr(hermes_adapter_module, "probe_pane_liveness", lambda *_args: "alive")
+
+    result = hermes_adapter_module.HermesAdapter().handle_task(_adapter_task(tmp_path, "silent"))
+
+    assert result.status == "incomplete"
+    assert result.reply == (
+        "Hermes request incomplete: no terminal CCB_DONE was observed. "
+        "(Hermes state DB schema 34 is newer than tested 33; reply capture unverified)"
+    )
+    assert "newer than tested 33" in capsys.readouterr().err  # daemon log still carries the warning
+
+
+def test_tested_schema_no_reply_has_no_untested_note(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=33)
+    _session(conn, "s1", tmp_path)
+    conn.commit()
+    conn.close()
+    backend = SimpleNamespace(
+        send_text=lambda *_args: None, find_pane_by_title_marker=lambda *_args: "%1",
+    )
+    _configure_adapter(monkeypatch, tmp_path, db, backend)
+    monkeypatch.setattr(hermes_adapter_module, "probe_pane_liveness", lambda *_args: "alive")
+
+    result = hermes_adapter_module.HermesAdapter().handle_task(_adapter_task(tmp_path, "silent"))
+
+    assert result.status == "incomplete"
+    assert result.reply == "Hermes request incomplete: no terminal CCB_DONE was observed."
+
+
+def test_untested_schema_send_logs_one_daemon_warning(tmp_path: Path, monkeypatch) -> None:
+    logged: list[str] = []
+    monkeypatch.setattr(hermes_adapter_module, "_write_log", logged.append)
+    monkeypatch.setattr(hermes_comm, "_WARNED_UNTESTED_VERSIONS", set())
+
+    def run(version: int) -> Path:
+        work_dir = tmp_path / f"v{version}"
+        work_dir.mkdir()
+        db = work_dir / "state.db"
+        conn = _db(db, version=version)
+        _session(conn, "s1", work_dir)
+        conn.commit()
+        conn.close()
+        backend = SimpleNamespace(
+            send_text=lambda *_args: None, find_pane_by_title_marker=lambda *_args: "%1",
+        )
+        _configure_adapter(monkeypatch, work_dir, db, backend)
+        monkeypatch.setattr(hermes_adapter_module, "probe_pane_liveness", lambda *_args: "alive")
+        hermes_adapter_module.HermesAdapter().handle_task(_adapter_task(work_dir, "logged"))
+        return db
+
+    db = run(34)
+    warnings = [line for line in logged if str(db) in line and "newer than tested 33" in line]
+    assert len(warnings) == 1  # negative: askd's stderr goes to DEVNULL, so the log carries it
+    assert "schema 34" in warnings[0]
+
+    logged.clear()
+    run(33)
+    assert not [line for line in logged if "newer than tested 33" in line]
+
+
+def test_captured_reply_equal_to_the_default_text_is_completed_unchanged(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=34)
+    _session(conn, "s1", tmp_path)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(hermes_comm, "_WARNED_UNTESTED_VERSIONS", set())
+    monkeypatch.setattr(hermes_adapter_module, "_write_log", lambda _line: None)
+    default_text = hermes_adapter_module._NO_TERMINAL_REPLY
+
+    def send(_pane, _text):
+        writer = sqlite3.connect(db)
+        _anchor(writer, "s1", "literal")
+        _done(writer, "s1", "literal", text=f"{default_text}\nCCB_DONE: literal")
+        writer.commit()
+        writer.close()
+
+    backend = SimpleNamespace(send_text=send, find_pane_by_title_marker=lambda *_args: "%1")
+    _configure_adapter(monkeypatch, tmp_path, db, backend)
+    monkeypatch.setattr(hermes_adapter_module, "probe_pane_liveness", lambda *_args: "alive")
+
+    result = hermes_adapter_module.HermesAdapter().handle_task(
+        _adapter_task(tmp_path, "literal", timeout=2.0)
+    )
+
+    assert result.status == "completed" and result.exit_code == 0
+    assert result.reply == default_text  # negative: a real reply is never annotated
+
+
+def test_incompatible_schema_is_refused_before_send_text(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "state.db"
+    conn = _db(db, version=34, omit=("message_uid",))
+    _session(conn, "s1", tmp_path)
+    conn.commit()
+    conn.close()
+    sends: list[tuple] = []
+    backend = SimpleNamespace(
+        send_text=lambda *args: sends.append(args), find_pane_by_title_marker=lambda *_args: "%1",
+    )
+    _configure_adapter(monkeypatch, tmp_path, db, backend)
+    monkeypatch.setattr(hermes_adapter_module, "probe_pane_liveness", lambda *_args: "alive")
+
+    result = hermes_adapter_module.HermesAdapter().handle_task(_adapter_task(tmp_path, "refused"))
+
+    assert result.status == "failed"
+    assert "lacks messages columns: message_uid" in result.reply
+    assert sends == []  # negative: a shape-mismatched DB never receives a paste
+
+
 def test_pend_surfaces_hermes_state_error_instead_of_pending(tmp_path: Path, monkeypatch, capsys) -> None:
     source = Path(__file__).resolve().parents[1] / "bin" / "pend"
     loader = importlib.machinery.SourceFileLoader("pend_hermes_error_test", str(source))
     spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
     pend = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(pend)

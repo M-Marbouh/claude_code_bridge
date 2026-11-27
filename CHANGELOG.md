@@ -15,6 +15,7 @@
 
 - A launch that starts exactly one agent session no longer applies a role from `ccb.config`, and prints one line naming the role it dropped (run `ccb-role set <role>` inside the session to assign one). Roles exist for agents working together; the single configured provider of a one-provider config is covered too. Multi-agent launches keep their configured roles, their refusals and the existing skipped-roles note unchanged, and a shape-broken `roles` config still stops any launch before a pane starts.
 - Text injection into a provider pane is now serialized per physical pane across all CCB processes (a file lock under `~/.ccb/locks/pane/`, held only for the paste-and-Enter step, not for the provider's turn), so concurrent local, peer and remote sends can no longer interleave. Every provider adapter and the peer paths now re-confirm the destination pane and the role policy after acquiring that lock; a pane that changed while waiting is refused with nothing sent.
+- Hermes state DB schemas 32 and 33 are accepted, and a newer version is used when every required column is still present: such a version is flagged as untested in `ccb-ping` and in the daemon log (once per database and version), and a request that ends without a captured reply says so. A database missing a required column, or older than version 30, is still refused before anything is pasted.
 
 ### Fixed
 

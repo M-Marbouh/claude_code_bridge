@@ -15,8 +15,9 @@ from ccb_protocol import append_trailing_notice, find_done_line, split_done_text
 from session_utils import find_project_session_file
 
 
-SCHEMA_VERSION = 31
-SUPPORTED_SCHEMA_VERSIONS = {30, SCHEMA_VERSION}
+SCHEMA_VERSION = 33  # newest version this build was written against
+SUPPORTED_SCHEMA_VERSIONS = {30, 31, 32, SCHEMA_VERSION}
+_WARNED_UNTESTED_VERSIONS: set[tuple[str, int]] = set()
 BUSY_RETRIES = 3
 BUSY_RETRY_DELAY_S = 0.05
 READ_TIMEOUT_S = 0.1
@@ -156,6 +157,18 @@ class HermesStateError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class HermesSchemaStatus:
+    """A verified Hermes schema version and whether this build has tested it."""
+
+    version: int
+    tested: bool
+
+    @property
+    def note(self) -> str:
+        return f"schema {self.version} is newer than tested {SCHEMA_VERSION}; reply capture unverified"
+
+
+@dataclass(frozen=True)
 class HermesExchange:
     session_id: str
     anchor_id: int
@@ -254,31 +267,78 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     raise HermesStateError("busy", f"Hermes state DB remained busy: {db_path}") from last
 
 
-def _verify_schema(conn: sqlite3.Connection) -> None:
+def _warn_untested_schema(db_path: Path, status: HermesSchemaStatus) -> None:
+    """Warn once per process per database and version."""
+    key = (os.path.realpath(str(db_path)), status.version)
+    if key in _WARNED_UNTESTED_VERSIONS:
+        return
+    _WARNED_UNTESTED_VERSIONS.add(key)
+    print(
+        f"Hermes warning: state DB {db_path} {status.note}; required columns are present.",
+        file=sys.stderr,
+    )
+
+
+def _verify_schema(conn: sqlite3.Connection, db_path: Path | None = None) -> HermesSchemaStatus:
+    """Refuse a DB missing required shape; tolerate untested newer schema numbers."""
     try:
+        def table_columns(table: str) -> set[str]:
+            # Only the tables CCB reads, with the identifier quoted: an unrelated table whose
+            # name is a SQL keyword (e.g. ``group``) must not make this check fail.
+            quoted = '"' + table.replace('"', '""') + '"'
+            return {str(col[1]) for col in conn.execute(f"PRAGMA table_info({quoted})")}
+
         tables = {
-            str(row[0]): {str(col[1]) for col in conn.execute(f"PRAGMA table_info({row[0]})")}
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            table: table_columns(table)
+            for table in set(REQUIRED_COLUMNS) | set(SCHEMA_31_REQUIRED_COLUMNS)
         }
         for table, columns in REQUIRED_COLUMNS.items():
-            if table not in tables or not columns.issubset(tables[table]):
-                missing = sorted(columns - tables.get(table, set()))
+            if not columns.issubset(tables[table]):
+                missing = sorted(columns - tables[table])
                 raise HermesStateError("incompatible", f"Hermes state DB lacks {table} columns: {', '.join(missing)}")
         row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-        if row is None or int(row[0]) not in SUPPORTED_SCHEMA_VERSIONS:
-            found = "missing" if row is None else str(row[0])
-            supported = ", ".join(str(version) for version in sorted(SUPPORTED_SCHEMA_VERSIONS))
-            raise HermesStateError("incompatible", f"Hermes state DB schema version {found}; supported: {supported}")
-        if int(row[0]) == SCHEMA_VERSION:
+        supported = ", ".join(str(version) for version in sorted(SUPPORTED_SCHEMA_VERSIONS))
+        if row is None:
+            raise HermesStateError("incompatible", f"Hermes state DB schema version missing; supported: {supported}")
+        version = int(row[0])
+        if version < min(SUPPORTED_SCHEMA_VERSIONS):
+            raise HermesStateError("incompatible", f"Hermes state DB schema version {version}; supported: {supported}")
+        status = HermesSchemaStatus(version=version, tested=version in SUPPORTED_SCHEMA_VERSIONS)
+        if version >= 31:
             for table, columns in SCHEMA_31_REQUIRED_COLUMNS.items():
-                if not columns.issubset(tables.get(table, set())):
-                    missing = sorted(columns - tables.get(table, set()))
+                if not columns.issubset(tables[table]):
+                    missing = sorted(columns - tables[table])
                     raise HermesStateError("incompatible", f"Hermes state DB lacks {table} columns: {', '.join(missing)}")
+        if not status.tested and db_path is not None:
+            _warn_untested_schema(db_path, status)
+        return status
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
         if "locked" in message or "busy" in message or "i/o error" in message:
             raise HermesStateError("busy", f"Hermes state DB remained busy during schema check: {exc}") from exc
         raise HermesStateError("incompatible", f"Cannot inspect Hermes state DB schema: {exc}") from exc
+
+
+def verify_schema_version(db_path: Path) -> HermesSchemaStatus:
+    """Verify (read-only) the schema of a DB about to receive a request.
+
+    The returned status names the version and whether this build has tested it, so a caller
+    can mark a request that never produces a reply on an untested version. Brief SQLite
+    contention is retried exactly like ``read_exchange``, so a locked DB cannot fail a send.
+    """
+    path = Path(db_path)
+    for attempt in range(BUSY_RETRIES):
+        try:
+            conn = _connect_readonly(path)
+            try:
+                return _verify_schema(conn, path)
+            finally:
+                conn.close()
+        except HermesStateError as exc:
+            if exc.kind != "busy" or attempt + 1 == BUSY_RETRIES:
+                raise
+            time.sleep(BUSY_RETRY_DELAY_S)
+    raise AssertionError("bounded Hermes DB retry loop exhausted unexpectedly")
 
 
 def _content_text(content: Any) -> str:
@@ -465,7 +525,7 @@ def _read_exchange_once(
     work_dir_real = os.path.realpath(str(work_dir))
     conn = _connect_readonly(db_path)
     try:
-        _verify_schema(conn)
+        _verify_schema(conn, db_path)
         conn.execute("BEGIN")
         session_rows = conn.execute(
             "SELECT id, cwd, ended_at, end_reason, parent_session_id FROM sessions "
@@ -494,8 +554,10 @@ def _read_exchange_once(
             owner = str(row["session_id"])
             anchors_by_session.setdefault(owner, []).append(row)
 
-        anchors_by_session = {owner: min(rows, key=lambda row: int(row["id"])) for owner, rows in anchors_by_session.items()}
-        session_anchor_groups = list(anchors_by_session.items())
+        earliest_by_session: dict[str, dict[str, Any]] = {
+            owner: min(rows, key=lambda row: int(row["id"])) for owner, rows in anchors_by_session.items()
+        }
+        session_anchor_groups = list(earliest_by_session.items())
         if len(session_anchor_groups) == 1:
             selected_session, anchor = session_anchor_groups[0]
         elif len(session_anchor_groups) == 2:
@@ -597,9 +659,11 @@ class HermesCommunicator:
             db_path = session_db_path(data)
             conn = _connect_readonly(db_path)
             try:
-                _verify_schema(conn)
+                status = _verify_schema(conn, db_path)
             finally:
                 conn.close()
         except HermesStateError as exc:
             return False, str(exc)
-        return True, "Hermes pane and state DB OK"
+        if status.tested:
+            return True, "Hermes pane and state DB OK"
+        return True, f"Hermes pane and state DB OK ({status.note})"

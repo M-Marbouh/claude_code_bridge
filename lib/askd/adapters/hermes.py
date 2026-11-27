@@ -18,7 +18,14 @@ from completion_hook import (
     COMPLETION_STATUS_INCOMPLETE,
     notify_completion,
 )
-from hermes_comm import HermesStateError, load_session_file, read_exchange, session_db_path
+from hermes_comm import (
+    HermesSchemaStatus,
+    HermesStateError,
+    load_session_file,
+    read_exchange,
+    session_db_path,
+    verify_schema_version,
+)
 from pane_registry import validate_route
 from project_id import compute_ccb_project_id
 from providers import HASKD_SPEC
@@ -28,6 +35,14 @@ from terminal import get_backend_for_session
 
 def _write_log(line: str) -> None:
     write_log(log_path(HASKD_SPEC.log_file_name), line)
+
+
+_NO_TERMINAL_REPLY = "Hermes request incomplete: no terminal CCB_DONE was observed."
+
+
+def _untested_version_note(status: HermesSchemaStatus) -> str:
+    """Name an untested schema version when a request ended with no captured reply."""
+    return f" (Hermes state DB {status.note})"
 
 
 def _normalize_path(value: str) -> str:
@@ -149,7 +164,13 @@ class HermesAdapter(BaseProviderAdapter):
 
         try:
             # Validate accessibility/schema before submitting text so an incompatible DB never
-            # gets confused with a request that merely has no reply yet.
+            # gets confused with a request that merely has no reply yet. The verified version is
+            # kept so a reply that never arrives on an untested schema can say so.
+            schema_status = verify_schema_version(db_path)
+            if not schema_status.tested:
+                # askd autostarts with stderr on DEVNULL, so the hermes_comm warning would be
+                # lost here; record it in the daemon log instead.
+                _write_log(f"[WARN] hermes state DB {db_path} {schema_status.note}")
             existing = read_exchange(db_path, work_dir, task.req_id)
             if existing is not None:
                 return self._finish(task, ProviderResult(
@@ -220,7 +241,7 @@ class HermesAdapter(BaseProviderAdapter):
         last_pane_check = 0.0
         db_session_id = ""
         db_snapshot = None
-        reply = "Hermes request incomplete: no terminal CCB_DONE was observed."
+        reply = _NO_TERMINAL_REPLY
         result_status = COMPLETION_STATUS_INCOMPLETE
         exit_code = 2
         done_ms: int | None = None
@@ -296,6 +317,14 @@ class HermesAdapter(BaseProviderAdapter):
             if deadline is not None and now >= deadline:
                 break
             time.sleep(0.25)
+
+        # Only the no-terminal-reply exit gets this note: a captured reply that happens to read
+        # like the default text is already complete and must come back unchanged.
+        if (
+            result_status == COMPLETION_STATUS_INCOMPLETE and exit_code == 2
+            and reply == _NO_TERMINAL_REPLY and not schema_status.tested
+        ):
+            reply += _untested_version_note(schema_status)
 
         result = ProviderResult(
             exit_code=exit_code, reply=reply, req_id=task.req_id, session_key=session_key,
